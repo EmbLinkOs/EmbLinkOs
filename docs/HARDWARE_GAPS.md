@@ -1,0 +1,131 @@
+# Hardware this machine can emulate and this OS cannot drive
+
+**Companion to [PILLARS.md](PILLARS.md), held to the same goal:** EmbLinkOS as
+the main operating system of a separate, physical machine. PILLARS.md asks
+"what is missing"; this asks the narrower and more actionable question —
+**what can we build and TEST right now, on the machine we develop on.**
+
+Everything below was checked on 2026-09-14 against `qemu-system-x86_64 -device
+help`, `qemu-system-aarch64 -M virt -device help`, and the driver files in
+`kernel/drivers/`. Not recalled. Where something is marked untestable, the
+reason is named.
+
+## What is already driven
+
+| Class | Drivers |
+|---|---|
+| Storage | ATA/IDE, AHCI, NVMe, virtio-blk, USB mass storage (Bulk-Only Transport) |
+| Network | virtio-net, e1000 (covers e1000e), rtl8139 |
+| Display | bochs/VGA (`bochs_vbe.c`), virtio-gpu, UEFI GOP framebuffer |
+| Input | i8042 PS/2, USB HID (keyboard + tablet), virtio-input |
+| Audio | AC'97, Intel HDA, virtio-snd — behind a runtime `struct pcm_driver` table |
+| USB host | UHCI, OHCI, EHCI, xHCI (+ single-level hubs, not on the hot-plug path) |
+| Timers | PIT, HPET, RTC, LAPIC timer, ARM generic timer |
+| Firmware | ACPI tables + a real AML interpreter; `_PRT` PCI interrupt routing |
+| Entropy | RDRAND/RDSEED where the CPU has them (`cpu_features.c`) |
+
+---
+
+## A. Matters on a real machine
+
+These are the ones where "we cannot drive it" means a person's hardware does
+not work.
+
+| Device | QEMU | Why it matters | Today |
+|---|---|---|---|
+| **I²C / SMBus** | `smbus-ipmi`, `i2c-ddc`, `i2c-echo` | SMBus reaches the battery, the memory SPD, and a monitor's EDID over its DDC lines | ✅ **host controller done** — `kernel/drivers/i2c/smbus.c` drives the PIIX4 and ICH9 hosts, probes the bus, and reads + validates EDID (header *and* checksum). `make test-i2c`. ⚠️ **This is not the touchpad.** I²C-HID hangs off an Intel LPSS or AMD designware controller, which **QEMU does not emulate at all** — that driver can only be written against the target machine |
+| **SD / eMMC** | `sdhci-pci`, `sd-card`, `emmc` | Laptop card readers. Many ARM boards *boot* from eMMC | ✅ **done** — `kernel/drivers/storage/sdhci.c`, PIO. `make test-sdcard` covers SD (byte addressing), SDHC (block addressing) and eMMC (capacity from the extended CSD). ⚠️ No DMA yet: 128 register reads per block |
+| **usb-net** | `usb-net` | A USB ethernet dongle is how you get networking on a laptop whose wireless chip has no driver | ✅ **RNDIS done** — `kernel/net/usb_net.c`, registered in the `net_driver` table below the PCI cards. DHCP, DNS, TCP and UDP all verified over it. ⚠️ **CDC-ECM is what most real dongles speak and QEMU emulates none**, so that path is detected and refused rather than guessed at |
+| **usb-uas** | `usb-uas`, `usb-bot` | We speak Bulk-Only Transport only. A USB 3 stick negotiates UAS; BOT still works as a fallback, but UAS is the fast path | ✅ **done** — `kernel/drivers/usb/usb_uas.c`. BOT remains the fallback for a device whose pipes are not named. ⚠️ One command at a time: the tagging is on the wire but nothing above it is asynchronous yet |
+| **ATAPI / ISO9660** | `ide-cd`, `scsi-cd` | No optical path at all — no ATAPI command set, no ISO9660 filesystem. El Torito is already open in TODO.md | ✅ **done** — `drivers/storage/atapi.c` (SCSI down an IDE cable) and `fs/iso9660.c` (read-only, because the medium is). `make test-cdrom` reads the same disc over IDE **and** virtio-scsi. ⚠️ No El Torito: a disc can be read, not booted from |
+| **igb** | `igb` (Intel 82576) | Closer to modern Intel server parts than e1000. `i82559`/`i8255x` covers a lot of older machines | ✅ **both done** — `kernel/net/igb.c` (advanced descriptors; the link comes up through the PHY, not CTRL.SLU) and `kernel/net/i8255x.c` (a linked list of command blocks, MAC from a three-wire EEPROM). `make test-nics` covers both |
+| **TPM** | `tpm-tis`, `tpm-crb` | The natural continuation of Secure Boot: measured boot, and sealing the EMBKFS encryption key to the boot state so a stolen disk is useless | ⚠️ **written, never executed** — `kernel/drivers/tpm/tpm.c` implements both interfaces (TIS's FIFO and CRB's command buffer), TPM2_Startup, PCR extend and PCR read. **No path past the probe has ever run.** `qemu-system-x86_64 -device tpm-tis` answers "'tpmdev' property is required", the only backends are `swtpm` (not installed) and passthrough to a real `/dev/tpm` (none here). What IS verified is the probe DECLINING: a machine with no TPM boots unchanged. The probe is deliberately strict and read-only for that reason. Sealing (Create/Load/Unseal under a PCR policy) is not written |
+| **IOMMU** | `intel-iommu`, `amd-iommu`, `virtio-iommu` | Any device can currently DMA anywhere in memory. This is what stops a malicious Thunderbolt device | ✅ **all three done** — `drivers/iommu/intel_iommu.c` (VT-d: root table, context table, four-level second-level paging, and cache invalidation that is not coherent with memory), `amd_iommu.c` (AMD-Vi: one flat device table, invalidations posted as commands), `virtio_iommu.c`. `make test-iommu` enables each in turn and reads a block through translated DMA. ⚠️ **The map is an identity one and protects nothing yet** — per-buffer map/unmap is what would contain a hostile device |
+| **SCSI / SAS HBAs** | `megasas`, `mptsas1068`, `lsi53c895a`, `am53c974`, `pvscsi` | Workstations and servers. Lower priority than the laptop parts above | ✅ **all five done**, on the shared SCSI layer: `megasas.c` (a firmware mailbox), `pvscsi.c` (paravirtual rings), `mptsas.c` (message-passing FIFOs), `esp.c` (a 16-byte FIFO and the bus phases walked by hand), `lsi53c895a.c` (a processor that executes a program the driver writes). `make test-hba` runs the same disk and the same read/write/verify through all five and virtio-scsi |
+| **UFS** | `ufs` | Modern phone and thin-laptop storage | absent |
+
+---
+
+## B. Platform plumbing the firmware already describes and nothing listens to
+
+Each of these is something the machine is *offering* — the information is
+already in the tables the AML interpreter now reads.
+
+| Thing | QEMU | Note |
+|---|---|---|
+| **PCI bridge configuration** | `pcie-root-port`, `pci-bridge`, `pxb` | ✅ **done** — `pci_bridge_configure()` in `drivers/bus/pci.c`: reports every bridge, fills in a bus range or memory window nobody assigned, and turns on decoding **and bus mastering on the bridge itself** — without which a device behind it cannot complete a single DMA however it is configured. Never rewrites a window firmware already set. `make test-bridge` drives a SCSI controller behind a `pcie-root-port` and behind a legacy `pci-bridge` |
+| **CPU hot-plug** | built into `-smp` | ✅ **done** — `kernel/acpi/hotplug.c` polls the ACPI hot-plug register block (0x0CD8 on q35, 0xAF00 on i440fx — the two chipsets differ and nothing says which) and `smp_hotplug_cpu()` runs the same trampoline and startup-IPI sequence boot does. `make test-hotplug`: 2 cores → add one over QMP → 3 online |
+| **Memory hot-plug** | `pc-dimm`, `nvdimm`, `virtio-mem` | ✅ **`pc-dimm` and `nvdimm` done.** The ACPI poller reads a memory slot's base and size and `pmm_add_region()` grows the page bitmap — which cannot be extended in place (it sits immediately after the kernel image) so it is reallocated from the heap. `make test-hotplug` adds 256 MiB and checks the allocator grew by exactly 65536 pages. `nvdimm` is a different thing entirely — no device, just memory in a slot and an NFIT entry whose type GUID says it is persistent — and is in `drivers/storage/nvdimm.c`, covered by `make test-pmem`. ⚠️ **`virtio-mem` is written and has never run:** this build of QEMU has no such device (*"'virtio-mem-pci' is not a valid device model name"*), so only the probe declining is verified. Removal is not implemented for any of them: this allocator cannot vacate a range that is in use |
+| **`acpi-erst`** | `acpi-erst` | ✅ **done** — `kernel/acpi/erst.c`. The unusual part: the ACPI table does not describe a device, it contains a PROGRAM, and the OS is the interpreter. `make test-erst` writes a UEFI CPER record, kills the machine, reads the backing file from the host, and boots again to find it. ⚠️ Nothing writes a record on an actual panic yet — that is the panic path's change, not the driver's |
+| **`pvpanic`** | `pvpanic`, `pvpanic-pci` | Tells the host the guest panicked. A dozen lines; makes CI failures loud instead of a timeout |
+| **Watchdog** | `i6300esb` | Auto-reset on a hang |
+| **`isa-debug-exit`** | `isa-debug-exit` | Lets the guest exit QEMU with a status code. Would let a test return pass/fail **directly** instead of every harness scraping serial for a verdict string — see `tools/console_test.py` and the six other harnesses that all reimplement that |
+
+---
+
+## C. virtio we do not drive
+
+| Device | Why it is worth something |
+|---|---|
+| **`virtio-9p` / `virtio-fs`** | Share the build directory straight into the VM. **Pays for itself immediately in development turnaround** — no image rebuild to test a changed file |
+| `virtio-rng` | An entropy source. x86 has RDSEED; **aarch64 has nothing** |
+| ~~`virtio-scsi`~~ | ✅ done — `drivers/storage/virtio_scsi.c`, on the shared SCSI layer. `make test-scsi` |
+| ~~`virtio-console`~~ | ✅ done — `drivers/char/virtio_console.c` |
+| ~~`virtio-balloon`~~ | ✅ done — `drivers/misc/virtio_balloon.c` |
+| ~~`virtio-crypto`~~ | ✅ done — `drivers/crypto/virtio_crypto.c`. `make test-crypto` checks the device's AES-CBC against `kernel/crypto/aes.c`. ⚠️ Nothing above it uses the offload yet: EMBKFS still encrypts in software |
+| ~~`virtio-iommu`~~ | ✅ done — `drivers/iommu/virtio_iommu.c`. `make test-iommu`. ⚠️ The map is an IDENTITY one over the low 4 GiB, so it protects nothing yet; per-buffer map/unmap is what would actually contain a hostile device |
+| ~~`virtio-pmem`~~ | ✅ done — `drivers/storage/virtio_pmem.c`. `make test-pmem` proves durability by killing the machine and reading the backing file from the host. ⚠️ Mapped uncacheable, which costs the speed that is the point of it |
+| `vhost-vsock` | ⚠️ **Not emulable on this host.** vsock in QEMU is vhost-only and vhost is a Linux kernel interface; `qemu-system-x86_64 -device help` on macOS lists no vsock device at all. A driver written here could not be run even once |
+| ~~`virtio-multitouch`~~ | ✅ done — `drivers/input/virtio_input.c`, which is also now built on x86 for the first time. `make test-touch` |
+
+---
+
+## D. Deliberately not worth it
+
+Said out loud so the absence does not read as an oversight.
+
+`pcnet`, `tulip`, `ne2k`, `rocker` (legacy or toy NICs) · `cirrus-vga`,
+`vmware-svga`, `ati-vga`, `qxl` (legacy or SPICE-specific display) · floppy ·
+CAN bus, IndustryPack, SSI serial flash · `edu`, `pci-testdev`, `pc-testdev`,
+`iommu-testdev` · `applesmc`.
+
+**On display specifically:** QEMU cannot emulate an Intel, AMD or NVIDIA GPU.
+For real hardware the UEFI GOP framebuffer we already have **is the ceiling**
+until somebody writes a native GPU driver, and nothing in QEMU's device list
+moves that. `ramfb` is the one small exception — a plain firmware-set
+framebuffer, mildly useful on aarch64 where there is no VGA to fall back to.
+
+---
+
+## Where this stands
+
+**Sections A, B and C are done**, with four exceptions, and every one of them
+is a limit of THIS MACHINE rather than a decision:
+
+| Not done | Why |
+|---|---|
+| **I²C-HID** (the touchpad) | Hangs off an Intel LPSS or AMD designware controller. **QEMU emulates neither.** Needs the target machine to develop against |
+| **CDC-ECM** (most real USB ethernet dongles) | QEMU emulates no ECM device. The path is detected and refused rather than guessed at |
+| **TPM** | Written for both interfaces; **never executed.** `swtpm` is not installed and QEMU's TPM devices require it |
+| **virtio-mem**, **vhost-vsock** | This QEMU build has neither device. virtio-mem is written and unrun; vhost-vsock is not written, because vsock in QEMU is vhost-only and vhost is a Linux kernel interface |
+
+Everything else in A, B and C has a driver and a test that runs it:
+
+    make test-hba      seven SCSI transports, one disk, one read/write/verify
+    make test-sdcard   SD, SDHC and eMMC
+    make test-cdrom    ATAPI over IDE and over virtio-scsi
+    make test-nics     five network cards
+    make test-iommu    virtio-iommu, Intel VT-d, AMD-Vi
+    make test-pmem     virtio-pmem and nvdimm, across a kill and a reboot
+    make test-erst     a crash record, likewise
+    make test-hotplug  a CPU and a DIMM added to a running machine
+    make test-bridge   a controller behind a PCIe root port and a pci-bridge
+    make test-touch    a touchscreen's contacts
+    make test-crypto   the device's AES against our own
+    make test-i2c      SMBus and EDID
+    make test-ninep    the host's filesystem, mounted
+
+**What is left is not on this list.** The next real gaps are the ones
+PILLARS.md names and no emulator can answer: a GPU driver for a machine whose
+framebuffer the firmware did not set up, wireless, and suspend-to-RAM. For
+those the missing thing is hardware, not code.

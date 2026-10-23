@@ -15,6 +15,7 @@
  * normalization) before reaching a RAW SDK call -- those bypass the libc.
  * ========================================================================== */
 #include "builtins/builtins.h"
+#include "eval/exec.h"     /* the background-job table */
 #include "sval/sval.h"
 #include "hist/hist.h"
 #include "embk.h"
@@ -404,11 +405,28 @@ static struct value bi_ps(const struct command *cmd, struct value input,
     for (int i = 0; i < n; i++) {
         struct value r = value_record();
         value_record_set(&r, "pid",   value_int((int64_t)info[i].pid));
+        /* WHAT IT IS, not just which number it is. A process list whose only
+         * identifier is a pid can be sorted and filtered but not READ -- you
+         * cannot answer "what is that" without killing it to find out. The
+         * kernel records the binary's basename at spawn; kernel threads have
+         * none and show "-". It is a label for a person and decides nothing:
+         * `kill` still takes the pid. */
+        value_record_set(&r, "name",  value_string(info[i].name[0] ? info[i].name : "-"));
         value_record_set(&r, "ppid",  value_int((int64_t)info[i].parent_pid));
         value_record_set(&r, "state", value_string(
             (info[i].state >= 0 && info[i].state <= 4) ? state_names[info[i].state] : "?"));
         value_record_set(&r, "pri",   value_int((int64_t)info[i].priority));
         value_record_set(&r, "kind",  value_string(info[i].is_kthread ? "kthread" : "process"));
+        /* WHOSE it is: the session id. 0 is the system (kernel, init, the
+         * login screen); `ps | where sess == (whoami --id)` is "mine". */
+        value_record_set(&r, "sess",  value_int((int64_t)info[i].session_id));
+        /* CPU actually consumed, in MILLISECONDS. A column rather than a
+         * pretty string, so it sorts and filters like everything else here:
+         *   ps | sort-by cpu | last 5      -- what is this machine busy with
+         *   ps | where cpu > 1000          -- who has burned a second
+         * Milliseconds because nanoseconds is precision nobody reading a
+         * process list is asking for, and it would push the column wide. */
+        value_record_set(&r, "cpu",   value_int((int64_t)(info[i].cpu_ns / 1000000ULL)));
         value_table_push_row(&out, r);
     }
     return out;
@@ -493,8 +511,11 @@ static struct value bi_kill(const struct command *cmd, struct value input,
     uint32_t pid = (uint32_t)pv.u.i;
     int rc = embk_proc_kill(pid);
     if (rc != 0) {
-        char msg[64];
-        snprintf(msg, sizeof msg, "kill: no live process with pid %u", pid);
+        char msg[80];
+        if (rc == -EMBK_EPERM)
+            snprintf(msg, sizeof msg, "kill: pid %u is not yours (another session, or the kernel's)", pid);
+        else
+            snprintf(msg, sizeof msg, "kill: no live process with pid %u", pid);
         return value_error(msg);
     }
     return value_null();
@@ -506,11 +527,32 @@ static struct value bi_kill(const struct command *cmd, struct value input,
 /* -------------------------------------------------------------------------
  * The identity-and-orientation set every Unix hand types on reflex.
  * ------------------------------------------------------------------------- */
+/* whoami: the KERNEL's answer. It used to read $USER, which is whatever the
+ * parent put in the environment -- a claim, not an identity. The session a
+ * process belongs to is set by init when it authenticates someone and can
+ * never be changed from inside, so that is what this reports. */
 static struct value bi_whoami(const struct command *cmd, struct value input,
                               struct scope *env) {
     (void)cmd; (void)env; value_free(&input);
-    const char *u = getenv("USER");
-    return value_string(u && *u ? u : "user");
+    struct embk_session_info si;
+    if (embk_session_info(&si) != 0)
+        return value_error("whoami: the kernel would not say");
+    return value_string(si.user[0] ? si.user : "system");
+}
+
+/* session -> {id, user, leader}: the session this shell runs in, as the
+ * kernel records it. `ps | where sess == (session).id` is "my processes". */
+static struct value bi_session(const struct command *cmd, struct value input,
+                               struct scope *env) {
+    (void)cmd; (void)env; value_free(&input);
+    struct embk_session_info si;
+    if (embk_session_info(&si) != 0)
+        return value_error("session: the kernel would not say");
+    struct value r = value_record();
+    value_record_set(&r, "id",     value_int((int64_t)si.id));
+    value_record_set(&r, "user",   value_string(si.user[0] ? si.user : "system"));
+    value_record_set(&r, "leader", value_int((int64_t)si.leader_pid));
+    return r;
 }
 
 static struct value bi_hostname(const struct command *cmd, struct value input,
@@ -582,6 +624,441 @@ static struct value bi_clip(const struct command *cmd, struct value input,
     return value_null();
 }
 
+/* ==========================================================================
+ * glob PATTERN -- file selection by wildcard.
+ *
+ * `ls *.txt` is what a person types. This shell's structured answer --
+ * `ls | where name =~ ".txt"` -- works and composes and is not what anyone
+ * reaches for first, so the pattern gets a name of its own:
+ *
+ *     glob "*.c"                  -> a table, the same shape ls produces
+ *     for f in $(glob "src/*.c") { ... }
+ *     glob "*.tmp" | count
+ *
+ * A TABLE with ls's columns rather than a bare list of names, deliberately:
+ * it means every transform already written works on the result
+ * (`glob "*.log" | where size > 1mb | sort-by modified`), where a list of
+ * strings would have dead-ended.
+ *
+ * WHAT IS AND IS NOT MATCHED. `*` matches any run of characters WITHIN one
+ * path component and `?` matches exactly one. `*` deliberately does not cross
+ * '/': `*.c` must not reach into subdirectories, because a pattern that
+ * silently recursed would make `rm *.tmp` a very different command from the
+ * one it looks like. Recursive matching wants its own spelling (`**`) and is
+ * not here yet.
+ *
+ * A pattern that matches NOTHING yields an empty table -- not an error, and
+ * not the pattern itself passed through as a literal filename, which is the
+ * single worst thing the Bourne shell does. `for f in $(glob "*.none") { }`
+ * running zero times is what every caller means.
+ * ========================================================================== */
+
+/* One path component against one pattern component. Iterative with a
+ * backtrack point rather than recursive: a pattern is user input, and a
+ * recursive matcher on `a*a*a*a*b` is a stack the caller chooses the depth
+ * of. */
+static bool glob_match_1(const char *pat, size_t plen, const char *str, size_t slen) {
+    size_t p = 0, s = 0, star = (size_t)-1, mark = 0;
+
+    while (s < slen) {
+        if (p < plen && (pat[p] == '?' || pat[p] == str[s])) { p++; s++; continue; }
+        if (p < plen && pat[p] == '*') { star = p++; mark = s; continue; }
+        if (star != (size_t)-1) { p = star + 1; s = ++mark; continue; }
+        return false;
+    }
+    while (p < plen && pat[p] == '*') p++;
+    return p == plen;
+}
+
+static bool has_glob_chars(const char *s) {
+    for (; *s; s++)
+        if (*s == '*' || *s == '?') return true;
+    return false;
+}
+
+/* ln TARGET LINK -- make a symbolic link.
+ *
+ * NO `-s` FLAG, for two reasons that agree.
+ *
+ * There is nothing for it to distinguish: this OS has symbolic links and does
+ * not have hard links, so `ln` means one thing. A flag whose only job is to
+ * select the only option is ceremony.
+ *
+ * And it could not be written anyway. This shell's word rules make a LEADING
+ * '-' an operator -- `-` joins a word only when flanked by word characters on
+ * both sides -- so `-s` lexes as a minus applied to `s`, not as a flag. That is
+ * the documented grammar, and bending it here to accept one command's dash
+ * would be a special case in the LEXER, paid for by every line anyone ever
+ * writes. The house convention is subcommand words (`env set`, `pkg install`),
+ * and this fits it.
+ *
+ * The target is not resolved -- a link to something that does not exist yet is
+ * the normal case, not a mistake to catch. */
+/* `link <existing> <newname>` -- a HARD link: a second name for the same
+ * object. Its own verb rather than a flag on `ln`, for two reasons. The lexer
+ * reads a leading `-` as an operator, so `ln -s` cannot be typed; and the two
+ * are different things that Unix happened to spell alike -- `ln` here makes
+ * a NAME THAT POINTS (a string, re-resolved on every walk), `link` makes a
+ * NAME THAT IS (the object itself, alive until its last name is gone).
+ * Both paths are resolved against the cwd, unlike `ln`'s target, because a
+ * hard link's target must exist NOW and be the actual object. */
+static struct value bi_link(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    if (cmd->nargs != 2)
+        return value_error("link: usage: link <existing> <newname>  "
+                           "(a hard link; `ln` makes symbolic ones)");
+
+    const char *oldw = expr_as_word(cmd->args[0]);
+    const char *neww = expr_as_word(cmd->args[1]);
+    if (!oldw || !neww)
+        return value_error("link: both names must be plain words or strings");
+
+    char oldpath[PATH_MAX_LEN], newpath[PATH_MAX_LEN];
+    path_resolve(oldw, oldpath, sizeof oldpath);
+    path_resolve(neww, newpath, sizeof newpath);
+
+    int rc = embk_link(oldpath, newpath);
+    if (rc < 0) return err_os("link: can't create", newpath, rc);
+
+    struct value out = value_record();
+    value_record_set(&out, "name",     value_path(newpath));
+    value_record_set(&out, "same_as",  value_path(oldpath));
+    return out;
+}
+
+static struct value bi_ln(const struct command *cmd, struct value input,
+                          struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    if (cmd->nargs != 2)
+        return value_error("ln: usage: ln <target> <linkname>  "
+                           "(no -s: symbolic is the only kind here)");
+
+    const char *target = expr_as_word(cmd->args[0]);
+    const char *linkw  = expr_as_word(cmd->args[1]);
+    if (!target || !linkw)
+        return value_error("ln: target and link must be plain words or strings");
+
+    /* The LINK's path is resolved against the cwd, because that is where the
+     * name is being created. The TARGET is passed through untouched -- turning
+     * a relative target absolute here would silently change what the link
+     * means if the tree is ever moved. */
+    char linkpath[PATH_MAX_LEN];
+    path_resolve(linkw, linkpath, sizeof linkpath);
+
+    int rc = embk_symlink(target, linkpath);
+    if (rc < 0) return err_os("ln: can't create", linkpath, rc);
+
+    struct value out = value_record();
+    value_record_set(&out, "link",   value_path(linkpath));
+    value_record_set(&out, "target", value_string(target));
+    return out;
+}
+
+/* readlink PATH -- the text a link holds, without following it. */
+static struct value bi_readlink(const struct command *cmd, struct value input,
+                                struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    char path[PATH_MAX_LEN];
+    if (cmd->nargs != 1 || arg_path(cmd, 0, NULL, path, sizeof path) != 0)
+        return value_error("readlink: usage: readlink <path>");
+
+    char buf[PATH_MAX_LEN];
+    int64_t n = embk_readlink(path, buf, sizeof buf - 1);
+    if (n < 0) return err_os("readlink", path, (int)n);
+    if ((size_t)n >= sizeof buf) return value_error("readlink: target is too long");
+    buf[n] = '\0';
+    return value_string(buf);
+}
+
+static struct value err_glob(const char *what) {
+    char msg[128];
+    snprintf(msg, sizeof msg, "glob: %s", what);
+    return value_error(msg);
+}
+
+static struct value bi_glob(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    if (cmd->nargs != 1)
+        return err_glob("takes one pattern");
+
+    const char *pat = expr_as_word(cmd->args[0]);
+    if (!pat)
+        return err_glob("pattern must be a plain word or string");
+
+    /* Split the pattern into "the directory to read" and "the name pattern".
+     * Only the LAST component may contain wildcards -- a wildcard in a
+     * directory component would need to walk a tree, which is the recursive
+     * case this deliberately does not do yet. */
+    const char *slash = strrchr(pat, '/');
+    char dir[PATH_MAX_LEN];
+    const char *namepat;
+
+    if (slash) {
+        size_t dlen = (size_t)(slash - pat);
+        if (dlen == 0) { dir[0] = '/'; dir[1] = '\0'; }       /* "/foo" -> "/" */
+        else {
+            if (dlen >= sizeof dir) return err_glob("pattern is too long");
+            memcpy(dir, pat, dlen);
+            dir[dlen] = '\0';
+        }
+        namepat = slash + 1;
+        if (has_glob_chars(dir))
+            return err_glob("wildcards are only allowed in the last path component");
+    } else {
+        dir[0] = '.'; dir[1] = '\0';
+        namepat = pat;
+    }
+
+    char resolved[PATH_MAX_LEN];
+    path_resolve(dir, resolved, sizeof resolved);
+
+    struct embk_dirent *ents =
+        (struct embk_dirent *)malloc(LS_MAX_ENTRIES * sizeof(*ents));
+    if (!ents) return value_error("out of memory");
+
+    int64_t n = embk_readdir(resolved, ents, LS_MAX_ENTRIES);
+    if (n < 0) { free(ents); return err_os("glob: can't read", resolved, (int)n); }
+
+    size_t patlen = strlen(namepat);
+    struct value out = value_table();
+
+    for (int64_t i = 0; i < n; i++) {
+        if (!glob_match_1(namepat, patlen, ents[i].name, strlen(ents[i].name)))
+            continue;
+
+        /* "." and ".." are never matched by a wildcard, only by naming them.
+         * `rm *` reaching ".." is not a hypothetical class of accident. */
+        if (has_glob_chars(namepat) &&
+            (strcmp(ents[i].name, ".") == 0 || strcmp(ents[i].name, "..") == 0))
+            continue;
+
+        struct value row = value_record();
+        value_record_set(&row, "name", value_string(ents[i].name));
+        value_record_set(&row, "type", value_string(dt_name(ents[i].type)));
+
+        /* The full path as a PATH value, because that is what the caller
+         * feeds back to `rm`/`cat`. Without it every loop over a glob has to
+         * re-join the directory by hand and half of them get it wrong. */
+        char full[PATH_MAX_LEN + 64];
+        size_t rlen = strlen(resolved);
+        bool slash_end = rlen > 0 && resolved[rlen - 1] == '/';
+        snprintf(full, sizeof full, "%s%s%s", resolved, slash_end ? "" : "/", ents[i].name);
+        value_record_set(&row, "path", value_path(full));
+
+        struct embk_stat st;
+        bool have_st = (ents[i].type == EMBK_DT_REG || ents[i].type == EMBK_DT_DIR) &&
+                       embk_stat(full, &st) == 0;
+        value_record_set(&row, "size",
+                         (have_st && ents[i].type == EMBK_DT_REG)
+                             ? value_filesize((int64_t)st.size) : value_null());
+        value_record_set(&row, "modified",
+                         (have_st && st.mtime > 0) ? value_date((int64_t)st.mtime) : value_null());
+
+        value_table_push_row(&out, row);
+    }
+    free(ents);
+    return out;
+}
+
+/* --- background jobs -------------------------------------------------------
+ *
+ * `jobs` is a TABLE like everything else here, so it composes:
+ *   jobs | where state == "running" | count
+ * A structured shell that printed a special-cased job listing would be
+ * throwing away the one property that makes it worth using.
+ *
+ * A finished job is shown ONCE and then forgotten. Keeping it forever fills
+ * the table; dropping it the moment it exits would let a job finish between
+ * two prompts and leave no trace that it ever ran -- which is exactly the
+ * case a person needs to see. */
+static struct value bi_jobs(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)cmd; (void)env;
+    value_free(&input);
+
+    jobs_poll();
+
+    struct value out = value_table();
+    /* Walk by index and re-fetch, because reporting a finished job FREES its
+     * slot and shifts everything after it. */
+    for (size_t i = 0; i < JOB_MAX; ) {
+        struct job *j = jobs_at(i);
+        if (!j) break;
+
+        struct value row = value_record();
+        value_record_set(&row, "job",   value_int(j->id));
+        value_record_set(&row, "state",
+                         value_string(j->reaped  ? "done"
+                                    : j->stopped ? "stopped"
+                                                 : "running"));
+        value_record_set(&row, "exit",  j->reaped ? value_int(j->status) : value_null());
+        value_record_set(&row, "cmd",   value_string(j->cmd ? j->cmd : ""));
+        value_table_push_row(&out, row);
+
+        if (j->reaped) jobs_forget(j);   /* shown once; the slot is free now */
+        else i++;
+    }
+    return out;
+}
+
+/* Resolve the single job-id argument the three job commands share. Returns
+ * NULL and fills `err` when the argument is not a job id or names nothing. */
+static struct job *job_arg(const struct command *cmd, struct scope *env,
+                           const char *who, struct value *err) {
+    if (cmd->nargs != 1) {
+        char m[64]; snprintf(m, sizeof m, "%s takes one job id", who);
+        *err = value_error(m);
+        return NULL;
+    }
+    struct value idv = expr_eval(cmd->args[0], env);
+    if (idv.type == VAL_ERROR) { *err = idv; return NULL; }
+    if (idv.type != VAL_INT) {
+        value_free(&idv);
+        char m[64]; snprintf(m, sizeof m, "%s takes a job id", who);
+        *err = value_error(m);
+        return NULL;
+    }
+    int id = (int)idv.u.i;
+    value_free(&idv);
+
+    struct job *j = jobs_by_id(id);
+    if (!j) { *err = value_error("no such job"); return NULL; }
+    return j;
+}
+
+/* `stop N` -- freeze job N where it stands.
+ *
+ * The same thing ^Z does to a foreground command, addressed at a job by name.
+ * A stopped job keeps everything: its memory, its open files, its place in
+ * this shell's handle table. It is simply not scheduled until `bg` or `fg`. */
+static struct value bi_stop(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    value_free(&input);
+    struct value err = value_null();
+    struct job *j = job_arg(cmd, env, "stop", &err);
+    if (!j) return err;
+
+    if (j->reaped) return value_error("that job has already finished");
+    int rc = jobs_stop(j);
+    if (rc < 0) return value_error("could not stop that job");
+
+    struct value out = value_record();
+    value_record_set(&out, "job",   value_int(j->id));
+    value_record_set(&out, "state", value_string("stopped"));
+    value_record_set(&out, "cmd",   value_string(j->cmd ? j->cmd : ""));
+    return out;
+}
+
+/* `bg N` -- let a stopped job carry on, without waiting for it.
+ *
+ * The difference from `fg` is the waiting, not the scheduling: both resume it,
+ * and only `fg` blocks. A job that was already running is left alone rather
+ * than reported as an error -- "carry on" is already true of it. */
+static struct value bi_bg(const struct command *cmd, struct value input,
+                          struct scope *env) {
+    value_free(&input);
+    struct value err = value_null();
+    struct job *j = job_arg(cmd, env, "bg", &err);
+    if (!j) return err;
+
+    if (j->reaped) return value_error("that job has already finished");
+    int rc = jobs_resume(j);
+    if (rc < 0) return value_error("could not resume that job");
+
+    struct value out = value_record();
+    value_record_set(&out, "job",   value_int(j->id));
+    value_record_set(&out, "state", value_string("running"));
+    value_record_set(&out, "cmd",   value_string(j->cmd ? j->cmd : ""));
+    return out;
+}
+
+/* `fg N` -- wait for job N and hand back its exit status.
+ *
+ * Not "bring it to the foreground" in the terminal sense: there is no terminal
+ * ownership to transfer, because a background job here is a separate shell
+ * with its own stdio. What a person actually wants from `fg` is "block until
+ * that finishes", and that is what this does -- honestly named for what it
+ * gives rather than borrowed from a mechanism this OS does not have.
+ *
+ * A STOPPED JOB IS RESUMED FIRST. Waiting for a frozen process to exit is
+ * waiting for something that is not going to happen, and `fg` on a job you
+ * just suspended is the most ordinary thing anyone would type. */
+static struct value bi_fg(const struct command *cmd, struct value input,
+                          struct scope *env) {
+    value_free(&input);
+    struct value err = value_null();
+    struct job *j = job_arg(cmd, env, "fg", &err);
+    if (!j) return err;
+
+    int id = j->id;
+    int status = jobs_wait(j);
+
+    /* Stopped AGAIN while we waited: someone pressed ^Z. It is not finished
+     * and has no exit code, so say what happened and leave it in the table. */
+    if (status == -EMBK_ESTOPPED) {
+        struct value out = value_record();
+        value_record_set(&out, "job",   value_int(id));
+        value_record_set(&out, "state", value_string("stopped"));
+        value_record_set(&out, "cmd",   value_string(j->cmd ? j->cmd : ""));
+        return out;
+    }
+
+    struct value out = value_record();
+    value_record_set(&out, "job",  value_int(id));
+    value_record_set(&out, "exit", value_int(status));
+    value_record_set(&out, "cmd",  value_string(j->cmd ? j->cmd : ""));
+    jobs_forget(j);
+    return out;
+}
+
+/* `sleep MS` -- wait, and give back how long it actually took.
+ *
+ * Milliseconds, not seconds. A shell that can pace a loop, poll for something,
+ * or hold a job open long enough to be worth stopping needs a unit smaller
+ * than a second far more often than it needs one larger, and `sleep 1000` says
+ * what it means. Returning the measured elapsed time rather than nothing makes
+ * it composable and makes oversleeping visible instead of invisible.
+ *
+ * Interruptible: ^C during a sleep gives the shell back, because the sleep is
+ * a blocking syscall and cancellation is what those answer. */
+static struct value bi_sleep(const struct command *cmd, struct value input,
+                             struct scope *env) {
+    value_free(&input);
+    if (cmd->nargs != 1)
+        return value_error("sleep takes a number of milliseconds");
+
+    struct value msv = expr_eval(cmd->args[0], env);
+    if (msv.type == VAL_ERROR) return msv;
+    if (msv.type != VAL_INT) {
+        value_free(&msv);
+        return value_error("sleep takes a number of milliseconds");
+    }
+    int64_t ms = msv.u.i;
+    value_free(&msv);
+    if (ms < 0) return value_error("sleep cannot go backwards");
+
+    uint64_t t0 = embk_uptime_ms();
+    int rc = embk_sleep_ms((uint64_t)ms);
+    uint64_t took = embk_uptime_ms() - t0;
+
+    if (rc < 0) return value_error("sleep was interrupted");
+
+    struct value out = value_record();
+    value_record_set(&out, "ms",   value_int(ms));
+    value_record_set(&out, "took", value_int((int64_t)took));
+    return out;
+}
+
 static struct value bi_uptime(const struct command *cmd, struct value input,
                               struct scope *env) {
     (void)cmd; (void)env;
@@ -630,10 +1107,17 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "ps",     bi_ps     }, { "kill",   bi_kill   },
         { "env",    bi_env    },
         { "uptime", bi_uptime }, { "date",   bi_date   },
+        { "sleep",  bi_sleep  },
         { "whoami", bi_whoami }, { "hostname", bi_hostname },
+        { "session", bi_session },
         { "history", bi_history }, { "which", bi_which },
         { "clip",    bi_clip    },
         { "clear",  bi_clear  },
+        { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
+        { "bg",     bi_bg     }, { "stop",   bi_stop   },
+        { "glob",   bi_glob   },
+        { "ln",     bi_ln     }, { "readlink", bi_readlink },
+        { "link",   bi_link   },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
         if (strcmp(tab[i].name, name) == 0) return tab[i].fn;

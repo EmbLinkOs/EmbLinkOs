@@ -1,5 +1,5 @@
 /* Git smart-HTTP transport over libtls -- see githttp.h. Adapted from the
- * pkgfetch HTTPS helper (user/bin/pkgfetch.c), generalized to GET+POST and to
+ * pkgfetch HTTPS helper (user/tools/pkgfetch/pkgfetch.c), generalized to GET+POST and to
  * return the raw body (git speaks its own pkt-line framing on top). */
 #include "githttp.h"
 #include <stdio.h>

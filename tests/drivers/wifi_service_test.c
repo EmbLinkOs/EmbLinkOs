@@ -95,3 +95,5 @@ int main(void) {
     r.action=EMBK_WIFI_DISCONNECT;complete(&r,0);assert(!scanning && !want_join);
     puts("Wi-Fi service: asynchronous requests, secret wiping, atomic profiles, disk errors and forget/reload OK");
 }
+
+void net_address_ready(void) {}

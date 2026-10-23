@@ -1,6 +1,4 @@
 #include "power/policy.h"
-#include "drivers/input/keyboard.h"
-#include "acpi/power.h"
 #include "drivers/i2c/hid_i2c.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "drivers/char/serial.h"
@@ -12,6 +10,8 @@
 #include "drivers/timer/pit.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/cpu/percpu.h"
+#include "power/power.h"
+#include "process/process.h"   /* sched_next_wake_in_ms */
 
 void net_tick(void);   /* kernel/net/net.c -- 10 ms net clock, wired from the tick */
 #include <stdint.h>
@@ -92,6 +92,31 @@ static void lapic_timer_arm_tsc_deadline(void) {
 static void lapic_enable_this_core(void) {
     // Enable the local APIC by setting the enable bit in the Spurious Interrupt Vector Register
     uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
+
+    /* THE FIRMWARE MAY HAVE LEFT THIS CORE IN x2APIC MODE. Recent Intel
+     * machines commonly do, and in x2APIC mode the memory-mapped register page
+     * this whole file talks to is switched OFF: reads return nothing useful and
+     * writes go nowhere. The kernel would come up with no timer, no IPIs and no
+     * other cores, and hang without a word. QEMU never does this, so nothing
+     * here had ever met it.
+     *
+     * The SDM does not allow x2APIC -> xAPIC directly (that write faults); the
+     * legal path is through DISABLED -- clear EN and EXTD together -- and then
+     * EN alone. That is safe on any machine whose APIC IDs fit in eight bits,
+     * which every laptop's do. Each core does it for itself: the mode is
+     * per-core state and survives the INIT that starts a secondary. */
+#define IA32_APIC_BASE_EXTD (1ULL << 10)
+    if (base & IA32_APIC_BASE_EXTD) {
+        wrmsr(IA32_APIC_BASE_MSR, base & ~(IA32_APIC_BASE_EXTD | (uint64_t)A32_APIC_BASE_ENABLE));
+        base = rdmsr(IA32_APIC_BASE_MSR);
+        static bool said;
+        if (!said) {
+            said = true;
+            kprintf("LAPIC: the firmware left x2APIC mode on -- switched back to the "
+                    "memory-mapped interface\n");
+        }
+    }
+
     base |= A32_APIC_BASE_ENABLE; // Set the enable bit
     wrmsr(IA32_APIC_BASE_MSR, base);
 
@@ -159,6 +184,33 @@ static void smp_min_delay(void) {
     }
 }
 
+/* Send `vector` to every core EXCEPT this one.
+ *
+ * "All excluding self" is a DESTINATION SHORTHAND the hardware understands
+ * (ICR bits 19:18 = 0b11), so this is one register write regardless of how
+ * many cores exist -- no loop, no list of APIC ids, and no chance of missing a
+ * core that came online after such a list was built.
+ *
+ * Kept here rather than exporting lapic_write(): the ICR is the one register
+ * where a careless write reaches every other core, and one named function is a
+ * smaller surface than a general accessor. */
+void lapic_send_ipi_all_but_self(uint8_t vector) {
+    lapic_write(LAPIC_REG_ICR_HIGH, 0);
+    lapic_write(LAPIC_REG_ICR_LOW, (uint32_t)vector | (3u << 18));
+    lapic_wait_icr_idle();
+}
+
+/* One core, by APIC id. The broadcast above is the wrong tool for waking a
+ * single idle core: it interrupts every other core to hand ONE thread to one
+ * of them, and measured on a four-core desktop that thundering herd cost more
+ * than the 100 Hz tick it was meant to replace -- system idle fell from 98% to
+ * 87%. Fixed destination, no shorthand. */
+void lapic_send_ipi_one(uint32_t dest_apic_id, uint8_t vector) {
+    lapic_write(LAPIC_REG_ICR_HIGH, dest_apic_id << LAPIC_ICR_DEST_SHIFT);
+    lapic_write(LAPIC_REG_ICR_LOW, (uint32_t)vector);   /* fixed, physical, no shorthand */
+    lapic_wait_icr_idle();
+}
+
 void lapic_start_ap(uint32_t dest_apic_id, uint64_t trampoline_phys) {
     uint32_t dest = dest_apic_id << LAPIC_ICR_DEST_SHIFT;
     uint8_t sipi_vector = (uint8_t)(trampoline_phys >> 12);
@@ -221,7 +273,15 @@ void lapic_timer_init(uint8_t vector) {
      * read the bit as 0), and no KVM is available here to advertise it. The gate
      * therefore always picks periodic under TCG; this path activates only on
      * KVM/real hardware. Written to the SDM (Vol.3 10.5.4.1) but not yet run. */
-    if (tsc_deadline_supported() && tsc_get_freq_hz() != 0) {
+    /* OFF UNTIL IT HAS RUN ONCE. The paragraph above is honest that this path
+     * has never executed -- TCG cannot offer TSC-deadline and this project has
+     * no KVM -- and a real laptop is the first machine that would take it.
+     * The scheduler's heartbeat is the wrong thing to debut on unfamiliar
+     * silicon with no serial port: if it is wrong, nothing ticks, and nothing
+     * says so. The one-shot LVT timer below has run on every boot of this
+     * kernel. Flip this after TSC-deadline has been seen working. */
+#define LAPIC_TRY_TSC_DEADLINE 0
+    if (LAPIC_TRY_TSC_DEADLINE && tsc_deadline_supported() && tsc_get_freq_hz() != 0) {
         lapic_timer_tsc_deadline = true;
         lapic_tsc_period = tsc_get_freq_hz() / 100;   // 100 Hz quantum
 
@@ -246,8 +306,21 @@ void lapic_timer_init(uint8_t vector) {
     lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_MASKED); // Max initial count
     lapic_write(LAPIC_REG_TIMER_INIT, 0XFFFFFFFF); // Set the interrupt vector (unmasked, one-shot)
 
-    // Wait for the timer to count down for the calibration time
-    if (hpet_available()) {
+    // Wait for the timer to count down for the calibration time. Against the
+    // TSC when its frequency is known -- it is on every boot now, and it is the
+    // one reference that cannot be missing -- else the HPET, else the PIT.
+    if (tsc_get_freq_hz()) {
+        uint64_t hz = tsc_get_freq_hz();
+        uint64_t ticks = hz / 1000ULL * calibration_time_ms;
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t t0 = ((uint64_t)hi << 32) | lo, t = t0;
+        while (t - t0 < ticks) {
+            __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+            t = ((uint64_t)hi << 32) | lo;
+        }
+        kprintf("LAPIC timer: calibrating against the TSC\n");
+    } else if (hpet_available()) {
         hpet_delay_ms(calibration_time_ms);
         kprintf("LAPIC timer: calibrating against HPET\n");
     } else {
@@ -268,15 +341,78 @@ void lapic_timer_init(uint8_t vector) {
     // now configure periodic mode at 100hz
     uint32_t initial_count = lapic_timer_ticks_per_ms * 10; // 10 ms per tick for 100 Hz
     lapic_write(LAPIC_REG_TIMER_DIVIDE, LAPIC_REG_TIMER_DIVIDE); // Divide by 16
-    lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_PERIODIC | vector ); // Set the interrupt vector and periodic mode
-    lapic_write(LAPIC_REG_TIMER_INIT, initial_count); // Set the initial count for 100 Hz
+    /* ONE-SHOT, not periodic. A periodic timer fires whatever the kernel
+     * wants; a one-shot is re-armed by the handler, which is what lets an idle
+     * core arm for the next thing actually due instead of for 10 ms hence.
+     * The cost is that the handler MUST re-arm -- a missed re-arm stops this
+     * core's clock dead -- so it re-arms at the very top, before anything that
+     * could take a branch. */
+    lapic_write(LAPIC_REG_LVT_TIMER, vector);         /* bit 17 clear = one-shot */
+    lapic_write(LAPIC_REG_TIMER_INIT, initial_count);
     kprintf("LAPIC timer: configured for 100 Hz with initial (count= %u), vector=%u \n", (unsigned int)initial_count, (unsigned int)vector);
 
     idt_set_entry(vector, (uint64_t)lapic_timer_stub, 0x8E); // Set the LAPIC timer handler in the IDT
 }
 
+/* When each core's next full QUANTUM is due, in uptime milliseconds. 0 = not
+ * yet established (the first interrupt on this core sets it).
+ *
+ * Exists because this handler now fires for two reasons -- the quantum, and a
+ * sleeper coming due sooner -- and the tick counters must only advance for the
+ * first. An absolute deadline rather than a countdown so an early fire does
+ * not push the quantum out: a core interrupted at 3 ms is still preempted at
+ * 10, not at 13. aarch64's timer has always worked this way, for the drift
+ * reason its own comment gives; this is the same shape for the same kind of
+ * reason. */
+static volatile uint64_t lapic_next_quantum_ms[MAX_CPUS];
+
 void lapic_timer_handler(void){
-    cpu_power_poll();
+    /* RE-ARM FIRST, unconditionally. In one-shot mode this core has no clock
+     * at all until this write happens, so it comes before the counting, the
+     * scheduling, and anything else that could return early. The idle path
+     * re-arms for longer on its way to halting; this is a core that has work.
+     *
+     * NOT ALWAYS A FULL QUANTUM, AND NOT ALWAYS A TICK. A sleeping thread only
+     * becomes runnable inside schedule(), so a busy core that always armed for
+     * 10 ms could not notice a sleeper due in 3 -- worth half a tick of
+     * lateness on average to everything periodic on the machine.
+     *
+     * That means this handler now runs for two different reasons, and only one
+     * of them is a TICK. `lapic_ticks` is a clock and net_tick() is a 10 ms
+     * clock; counting an early wake as a tick would make both run fast. So the
+     * quantum is tracked as an absolute deadline per core -- the same shape
+     * aarch64 has always used -- and the counting below is gated on having
+     * actually reached it. */
+    uint32_t cpu = this_cpu()->cpu_index & (MAX_CPUS - 1);
+    uint64_t now = timer_uptime_ms();
+
+    bool real_tick = (lapic_next_quantum_ms[cpu] == 0) ||
+                     (now >= lapic_next_quantum_ms[cpu]);
+    if (real_tick)
+        lapic_next_quantum_ms[cpu] = now + TIMER_QUANTUM_MS;
+
+    uint64_t left = lapic_next_quantum_ms[cpu] - now;
+    uint32_t arm  = (left == 0 || left > TIMER_QUANTUM_MS)
+                        ? TIMER_QUANTUM_MS : (uint32_t)left;
+
+    /* EVERY CORE, not just the boot core. Restricting this to the BSP was
+     * tried, on the theory that one core noticing a sleeper is enough and that
+     * four arming for the same instant would pile into the scheduler lock the
+     * way the idle path does. Neither half held up: the lock was no quieter
+     * (148k spins against 140k) and the worst-case lateness got worse (10 ms
+     * against 3-4), because the one core allowed to notice was not always the
+     * one free to run the thread. The extra lock traffic is not lockstep, it
+     * is simply the extra schedule() calls that noticing sleepers on time
+     * consists of. */
+    uint32_t wake = sched_next_wake_in_ms();
+    if (wake && wake < arm) arm = wake;
+
+    lapic_timer_arm_ms(arm);
+
+    if (real_tick)cpu_power_poll();
+    if (real_tick)
+        power_timer_tick();   /* count it: see power.h */
+
     /* Once every core has its own LAPIC timer firing independently (SMP),
      * incrementing this SHARED counter from every core's handler would
      * silently change its meaning from "wall-clock ticks" to "sum of every
@@ -285,12 +421,11 @@ void lapic_timer_handler(void){
      * online. Keep it a true wall clock: only the BSP's own timer
      * advances it. Every core (BSP and every AP) still unconditionally
      * calls schedule() below on its OWN tick -- that part doesn't change. */
-    if (this_cpu_is_bsp()) {
+    if (real_tick && this_cpu_is_bsp()) {
         lapic_ticks++; // Increment the LAPIC timer tick count
-        net_tick();        // network RX and client timeout wakeups
-        keyboard_repeat_tick();
-        acpi_power_tick();
-        i2c_hid_tick();    // polling laptop input; no-op before discovery
+        i2c_hid_tick();
+        net_tick();    // 10 ms net clock: drive event-driven RX + client timeouts
+                       // (a no-op with empty queues before the net stack is up)
     }
     lapic_send_eoi(); // Acknowledge the timer interrupt BEFORE any reschedule
                       // below, so the LAPIC can keep delivering interrupts to
@@ -312,9 +447,34 @@ void lapic_timer_handler(void){
      * == NULL) or nothing else is runnable — same mechanism sys_exit already
      * uses to reach a different process's saved context via
      * kernel_ctx_switch, just triggered by the timer instead of a syscall. */
+    /* schedule() wakes expired sleepers itself, inside the same critical
+     * section it picks the next thread in -- see wake_expired_locked(). */
     extern void schedule(void);
     schedule();
 }
+
+/* Arm this core's LAPIC timer for `ms` milliseconds, one shot.
+ *
+ * TSC-deadline mode has its own absolute-deadline path (lapic_timer_arm_tsc_
+ * deadline) and is untested here -- QEMU's TCG APIC does not advertise it, as
+ * lapic_timer_init explains at length -- so this handles the LVT count path
+ * and defers to that one where it is live. */
+void lapic_timer_arm_ms(uint32_t ms) {
+    if (lapic_timer_tsc_deadline) {
+        lapic_timer_arm_tsc_deadline();
+        return;
+    }
+    if (ms == 0) ms = 1;
+    uint64_t count = (uint64_t)lapic_timer_ticks_per_ms * ms;
+    /* The initial-count register is 32 bits. A longer sleep than it can
+     * express simply becomes the longest it can: waking early is a wasted
+     * interrupt, waking late is a missed deadline. */
+    if (count > 0xFFFFFFFFULL) count = 0xFFFFFFFFULL;
+    if (count == 0) count = 1;
+    lapic_write(LAPIC_REG_TIMER_INIT, (uint32_t)count);
+}
+
+void timer_arm_this_cpu_ms(uint32_t ms) { lapic_timer_arm_ms(ms); }
 
 uint64_t lapic_timer_get_ticks(void) {
     return lapic_ticks;

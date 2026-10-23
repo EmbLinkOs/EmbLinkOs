@@ -1,16 +1,41 @@
 /* sys/mman.h -- EmbLink override header (newlib ships none).
  *
- * EmbLink has NO mmap. Memory comes from sbrk (a real, growable heap) and from
- * the typed object primitives (shared surfaces, zero-copy windows) -- mapping a
- * FILE into an address space is a capability this OS has never had, not one it
- * mislaid. The kernel VMM could grow it; nothing has needed it.
+ * mmap IS REAL: a per-process list of mapped ranges (kernel/mm/vma.h),
+ * DEMAND-PAGED -- a mapping costs nothing until a page is touched -- with
+ * the permissions you ask for, at an address the kernel picks, and taken
+ * back on munmap, page tables included.
  *
- * These exist so portable code COMPILES (TCC's tccrun.c -- its `-run` mode --
- * includes this unconditionally even when you only ever compile to a file).
- * The functions are defined in syscalls.c as honest ENOSYS refusals, so
- * `tcc -run` fails loudly and `tcc -o` never comes near them. Nothing here
- * fakes an anonymous mapping out of malloc: a caller that asked for MAP_SHARED
- * or a file mapping would get something that silently is not one. */
+ *   MAP_ANONYMOUS|MAP_PRIVATE   zero-filled memory that can be PAGED OUT: it
+ *                               lives in a kernel object that writes it to
+ *                               the swap store under memory pressure and
+ *                               reads it back on the next touch. Running out
+ *                               of RAM slows a program down; it no longer
+ *                               kills it. (`make test-swap` is the proof.)
+ *   a FILE (fd >= 0)            real, over the unified page cache. MAP_SHARED
+ *                               sees the file's bytes and changes them -- a
+ *                               write is visible to read() at once and
+ *                               reaches the device by writeback. MAP_PRIVATE
+ *                               copies on the first write.
+ *   mprotect                    real, and the other half of W^X: mmap will
+ *                               not hand out a page that is writable AND
+ *                               executable, so map W, emit, flip to X.
+ *                               PROT_NONE is no access at all (a guard page),
+ *                               not rounded to read-only.
+ *
+ * WHAT IS REFUSED, loudly rather than approximated:
+ *
+ *   MAP_SHARED|MAP_ANONYMOUS    ENOTSUP  -- shared with nobody: there is no
+ *                                           fork, and the anonymous object
+ *                                           has one mapper by design
+ *                                           (kernel/mm/vm_object.h).
+ *   MAP_FIXED / a non-NULL addr ENOTSUP  -- the kernel chooses the address.
+ *   PROT_WRITE|PROT_EXEC        EINVAL   -- refused in the kernel; that page
+ *                                           is the primitive every code
+ *                                           injection needs.
+ *   an unaligned file offset    EINVAL   -- there is no page it corresponds to.
+ *   msync                       ENOSYS   -- writeback already covers
+ *                                           durability; a caller asking by
+ *                                           name is told no, not yes. */
 #ifndef _EMBK_SYS_MMAN_H
 #define _EMBK_SYS_MMAN_H
 

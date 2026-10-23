@@ -1,11 +1,11 @@
 #include "power/policy.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "boot/boot_protocol.h"
 #include "acpi/power.h"
 #include "acpi/display.h"
 #include "process/session.h"
 #include "ipc/notify.h"
 #include "drivers/timer/timer.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "include/errno.h"
 static spinlock_t lock=SPINLOCK_INIT;
 static struct embk_policy config={.version=EMBK_POLICY_VERSION,.flags=EMBK_POLICY_LID_LOCK,.idle_dim_seconds=120,.idle_lock_seconds=300};

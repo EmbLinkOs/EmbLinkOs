@@ -25,6 +25,73 @@
 #define EK_DOWN  0x14
 #define EK_DEL   0x7F
 
+/* ---- the EDITING commands -----------------------------------------------
+ *
+ * The other half of a text field: selecting, and the clipboard. These are not
+ * characters and there was nowhere to put them -- C0 is Ctrl+letter's and the
+ * navigation codes' -- so they go ABOVE the character range instead. That is
+ * not an arbitrary free corner: THIRTEEN byte values can never occur in valid
+ * UTF-8 at any position -- 0xC0, 0xC1 and 0xF5..0xFF -- because the lead bytes
+ * stop at 0xF4 (U+10FFFF encodes as F4 8F BF BF) and 0xC0/0xC1 would be
+ * overlong forms of ASCII. Carrying commands there is safe in a stream that is
+ * otherwise text.
+ *
+ * The first eight commands took 0xF8..0xFF and this comment then said "eight
+ * values, eight commands, which is either elegant or a warning". It was the
+ * warning: undo and redo arrived and needed two more. They are 0xF6/0xF7, and
+ * 0xF5, 0xC0 and 0xC1 remain.
+ *
+ * IN THE SAME STREAM ON PURPOSE. A separate command channel would lose the
+ * ORDER: a paste between two typed characters has to land between them, and
+ * two queues cannot promise that. One queue can, and does, for free.
+ *
+ * WHY THE GUI KEY AND NOT CTRL, which is the question that decided all of
+ * this. Ctrl+C cannot be copy in this operating system: 0x03 is intercepted in
+ * keyboard_deliver() and routed at the console's interrupt target, so in a text
+ * field it would cancel whatever the terminal is running rather than reach the
+ * field. That is CORRECT -- ^C is an interruption here (docs/INTERRUPTION.md)
+ * and must stay one. So the rule this OS adopts is a division of the two
+ * modifiers: CTRL BELONGS TO THE TERMINAL -- interrupt, job control, the C0
+ * codes -- AND THE GUI KEY BELONGS TO THE INTERFACE. It is the same separation
+ * macOS makes between Ctrl and Cmd, and for the same reason.
+ *
+ * The driver decides these, not userspace, because the driver is where the
+ * modifier state is known at the instant the key went down -- exactly as it
+ * already decides that Ctrl+letter is a C0 code. Mirrored by EMBK_KEY_* in
+ * user/lib/embk.h and UI_KEY_* in ui/kit/kit.h; all three must agree. */
+#define EK_SEL_LEFT  0xF8   /* Shift+Left   */
+#define EK_SEL_RIGHT 0xF9   /* Shift+Right  */
+#define EK_SEL_HOME  0xFA   /* Shift+Home   */
+#define EK_SEL_END   0xFB   /* Shift+End    */
+#define EK_SEL_ALL   0xFC   /* GUI+A        */
+#define EK_COPY      0xFD   /* GUI+C        */
+#define EK_CUT       0xFE   /* GUI+X        */
+#define EK_PASTE     0xFF   /* GUI+V        */
+#define EK_UNDO      0xF6   /* GUI+Z        */
+#define EK_REDO      0xF7   /* GUI+Shift+Z, and GUI+Y */
+
+/* ---- SYSTEM shortcuts ----------------------------------------------------
+ *
+ * These never reach an application, and that is the whole point of them. GUI+
+ * Tab switches windows and GUI+W closes one: an app that could see them could
+ * also decline them, and a machine where the window switcher works only in the
+ * applications that bothered to implement it is a machine with no window
+ * switcher. Same reasoning as ^C, which the driver consumes rather than
+ * delivering (docs/INTERRUPTION.md).
+ *
+ * They are NOT acted on here. This runs in the keyboard IRQ and the compositor
+ * takes a plain spinlock and repaints -- so the driver only records what was
+ * asked, and the kernel's main loop performs it in schedulable context, the
+ * same arrangement compositor_pointer_tick() already uses. */
+enum {
+    SYSKEY_NONE = 0,
+    SYSKEY_NEXT_WINDOW,      /* GUI+Tab */
+    SYSKEY_CLOSE_WINDOW,     /* GUI+W   */
+    SYSKEY_QUIT_APP,         /* GUI+Q   */
+};
+/* Take the pending system shortcut, if any, and clear it. */
+int keyboard_take_syskey(void);
+
 /* ---- the KEY EVENT stream -----------------------------------------------
  * The char stream above answers "what did the user TYPE". It cannot answer
  * "what key is DOWN", and it never will -- not from lack of effort, but
@@ -109,11 +176,37 @@ uint8_t keyboard_mods(void);
  * keyboard_set_layout() returns 0 on success, -1 for an unknown name (it does
  * NOT fall back to US silently -- a typo'd layout name that quietly keeps
  * QWERTY is worse than a refusal). */
+/* A layout is three tables of CODEPOINTS -- not characters.
+ *
+ * It was `const char *` until French made that untenable: é è ç à ù are on the
+ * number row of a real AZERTY keyboard, and none of them exists in 7 bits. The
+ * tables are Unicode scalar values now, the char stream carries UTF-8, and a
+ * pure-ASCII layout is unaffected -- 'a' is as valid a uint32_t initialiser as
+ * a char one, so the US and Dvorak tables did not change a single entry.
+ *
+ * A DEAD KEY is an entry wrapped in KEY_DEAD(): it produces no character of its
+ * own and instead combines with the next key (^ then e -> ê). AltGr is the
+ * third level every non-US layout needs for @ # { } [ ] | \ €. */
+#define KEY_DEAD_BIT     0x80000000u
+#define KEY_DEAD(cp)     (KEY_DEAD_BIT | (uint32_t)(cp))
+#define KEY_IS_DEAD(v)   (((v) & KEY_DEAD_BIT) != 0)
+#define KEY_BARE(v)      ((v) & ~KEY_DEAD_BIT)
+
 struct keymap {
     const char *name;
-    const char *normal;   /* [128], indexed by set-1 make code */
-    const char *shift;    /* [128] */
+    const uint32_t *normal;   /* [128], indexed by set-1 make code */
+    const uint32_t *shift;    /* [128] */
+    const uint32_t *altgr;    /* [128], or NULL if the layout has no third level */
 };
+/* Translate one set-1 MAKE code through the current layout, exactly as the
+ * interrupt handler does (dead keys, AltGr, Caps, Ctrl, UTF-8 delivery). Public
+ * for the keymap selftest; nothing else should need it. */
+void        kbd_translate(uint8_t make, int pressed);
+/* Inject a key from a NON-PS/2 keyboard (virtio-input): the event code, and
+ * the codepoint it typed, which is encoded to UTF-8 into the char stream. */
+void        keyboard_inject_cp(uint16_t code, int pressed, uint32_t cp);
+void        kbd_mods_force(uint8_t mods);   /* selftest: hold Shift/Caps/Ctrl  */
+void        kbd_altgr_force(int on);        /* selftest: hold AltGr (right Alt) */
 int         keyboard_set_layout(const char *name);
 const char *keyboard_layout(void);
 
@@ -126,8 +219,6 @@ char keyboard_getchar(void);
 
 // Non-blocking read: returns 1 if the next ASCII character is available, otherwise returns 0
 int keyboard_has_char(void);
-void keyboard_flush_input(void);
-void keyboard_desktop_actions(void);
 
 /* Ctrl-C routing — docs/INTERRUPTION.md.
  *
@@ -140,6 +231,16 @@ void keyboard_desktop_actions(void);
  * sys_console_interrupt_route(), which only accepts a HANDLE the caller holds,
  * so nobody can route interrupts at a process they were never given. */
 void keyboard_set_interrupt_target(uint32_t pid);
+
+/* sys_console_interrupt_route's two non-handle values. SELF is -2, not 0: 0 is
+ * a valid spawn handle (a process's first child), and meaning "self" by it
+ * routed a shell's first child's ^C to the shell. */
+#define EMBK_INTR_ROUTE_SELF  (-2)
+#define EMBK_INTR_ROUTE_NONE  (-1)
+/* Who did the routing. ^C needs only the target; ^Z also has to wake the
+ * parent, because a frozen child never exits and a parent waiting for one
+ * would wait forever. Set by the same call that sets the target. */
+void keyboard_set_interrupt_router(uint32_t pid);
 uint32_t keyboard_get_interrupt_target(void);
 
 /* Cancellation-aware console read (docs/INTERRUPTION.md). EMBK_OK + *out, or
@@ -147,12 +248,36 @@ uint32_t keyboard_get_interrupt_target(void);
 int keyboard_getchar_blocking_cancelable(char *out);
 
 // Inject a character into the keyboard buffer (used by USB HID driver).
+void keyboard_flush_input(void);
 void keyboard_inject_char(char c);
-void keyboard_inject_hid_usage(uint16_t usage, int pressed);
-void keyboard_repeat_tick(void);
-int keyboard_test_hid_repeat(void);
-void keyboard_hid_boot_report(uint8_t previous[6], uint8_t *previous_modifiers,
-    const uint8_t *report, unsigned length);
+void keyboard_inject_hid_usage(uint16_t usage,int down);
+
+/* Deliver one DECODED key from any hardware -- the seam every input driver that
+ * is not PS/2 comes in through (virtio-input today, and where USB HID belongs).
+ * `code` is an unshifted ASCII or an EKC_*; `ascii` is the character the key
+ * produces, or 0 for keys that produce none, and is delivered only on a make.
+ * Modifiers and locks are recognised by their EKC_* and update the live
+ * modifier bitmap, so a caller never has to track Shift itself. */
+void keyboard_inject_event(uint16_t code, int pressed, char ascii);
+
+/* Compose the CHARACTER an AT set-1 make code produces under `mods`, through
+ * the CURRENT layout -- shift table, Caps Lock and Ctrl all applied. Returns 0
+ * for a key with no character.
+ *
+ * A Linux evdev keycode is an AT set-1 make code for the main key block (evdev
+ * took its numbering from set 1), so a virtio-input driver can call this
+ * directly and inherits `keyboard_set_layout` for free. */
+/* Apply the CURRENT layout to a make code: shift, AltGr, dead keys, Caps and
+ * Ctrl, returning a Unicode codepoint (0 = this key types nothing, which is
+ * also what a dead key returns while it waits for the next one).
+ *
+ * Returns a CODEPOINT, not a char, because a layout can produce é and a char
+ * cannot hold it -- the virtio path truncated exactly that into a lone 0xE9,
+ * which is not even valid UTF-8. Deliver it with keyboard_inject_cp(). */
+uint32_t keyboard_compose_cp(uint8_t make, uint8_t mods);
+
+/* The UNSHIFTED key identity for the same code -- what an event carries. */
+uint16_t keyboard_keycode_of(uint8_t make);
 
 // Keyboard grab: while grabbed, the kernel shell stops draining the buffer so a
 // ring-3 UI app has exclusive keystrokes. Auto-released when the grabber exits.

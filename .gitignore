@@ -25,7 +25,5 @@ __pycache__/
 .claude/settings.json
 .claude/settings.local.json
 build/webreal/
-
-# Local network credentials; mkfs packs the profile only when explicitly made.
-/system/config/wifi.conf
-/system/config/.wifi.conf.*
+build/sbkeys/
+build/modules/

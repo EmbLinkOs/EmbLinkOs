@@ -1,0 +1,6 @@
+# Calculator namespace manifest (docs/USERSPACE_v2.md UP4).
+#
+# It reads the UI runtime out of the sealed /system and owns a window. That is
+# the entire list: a calculator that could open your files would be a
+# calculator with a reason to, and there isn't one.
+ro /system

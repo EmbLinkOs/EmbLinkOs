@@ -10,20 +10,18 @@ physical laptop compatibility. No laptop has been tested yet.
 | Graphics | UEFI preferred-mode selection; validated Intel Gen9 firmware scanout handoff | No native modesetting, connector management or 3D; software rendering. See [DAILY_USE.md](DAILY_USE.md). |
 | CPU energy | Per-core Intel HWP/EPP with CPUID gating and advertised performance bounds | Register model tests. No measured battery-life or suspend/resume acceptance. |
 | NVMe | PCI class-based discovery, admin/I/O queues, namespace identify, read/write/flush, native 512-byte through 4-KiB blocks | QEMU: full POSIX suite on both 512-byte and 4-KiB namespaces with two CPUs. Polling, one command at a time; two controllers and eight namespaces per controller maximum. No hotplug, interrupt mode, reset recovery or suspend restore. |
-| Wired Ethernet | Intel 8254x/82574 (listed IDs in `pci_net.c`), Realtek RTL8139, existing virtio-net | QEMU e1000, e1000e and rtl8139: DHCP, gateway ICMP and byte-verified 64-KiB HTTP transfers with an initially empty ARP cache. Polling; one selected interface. I219/I225 and RTL8168/8125 need separate drivers. Physical PHY behavior remains untested. |
-| Battery/firmware | uACPI AML runtime; ACPI control-method battery `_BST` plus `_BIF`/`_BIX`, AC adapter `_PSR`; `test power` serial command | QEMU boot and synthetic SSDT verify mWh/mAh, percentage and unknown values. ECDT/PNP0C09 Embedded Controller byte operation regions and deferred `_Qxx` GPE queries are implemented; `_GLK` firmware lock is honored. EC protocol is host-model tested, not physically tested. A cached top-bar indicator and capability-gated shutdown/reboot are implemented; suspend/resume is not. |
+| Wired Ethernet | Intel 8254x/82574 (listed IDs in `e1000.c`), Realtek RTL8139, existing virtio-net | QEMU e1000, e1000e and rtl8139: DHCP, gateway ICMP and byte-verified 64-KiB HTTP transfers with an initially empty ARP cache. Polling; one selected interface. I219/I225 and RTL8168/8125 need separate drivers. Physical PHY behavior remains untested. |
+| Battery/firmware | Native AML interpreter; cached `_BST`, `_BIF`/`_BIX`, `_PSR` and `_LID`; upstream shutdown/reset | Native synthetic SSDT round trips pass. Physical EC/battery/GPE behavior is unverified; suspend/resume remains open. |
 | Built-in I2C input | Intel LPSS DesignWare master and ACPI HID-over-I2C discovery/reset/input, generic HID report decoder, native keyboard/pointer integration | Host-model tests cover FIFO bounds, repeated starts, reset completion, keyboard edges/modifiers, relative mouse and primary-contact touchpads. QEMU verifies native key/text integration. Intel PCI IDs are listed in `designware.c`; AMD controllers and GPIO interrupt routing are not implemented. Physical hardware testing remains pending. |
 | Wi-Fi | Experimental Intel AX200 PCIe (`8086:2723`), API-77 firmware, DMA command/RX/TX queues, passive scan, legacy association, WPA2-Personal/CCMP and Ethernet-stack integration | Firmware/MMIO/AP model passes an association/handshake/data exchange and 1,100 TX with queue wrapping. Physical radio acceptance is outstanding. AX201 CNVio, AX210, Realtek, hidden SSIDs, WPA3/enterprise/required PMF and HT/VHT aggregation are unsupported. See [WIFI.md](WIFI.md) for setup and limits. |
 
-The ACPI host supports legacy PCI configuration segment zero and an exclusive
-SCI GSI 9 on vector 41 routed through the IOAPIC. Other SCI lines, shared SCI handling and GPIO operation regions remain unsupported.
-EC operation regions support two controllers with byte-addressable 256-byte spaces;
-resource layouts other than two single-byte SystemIO ports, and device-local GPE
-blocks described by package-form `_GPE`, remain unsupported. Firmware failures are reported; missing
-batteries are never represented as a fully charged battery. AML loops have a
-five-second timeout and method call depth is limited to 64. All firmware deferred
-work executes on CPU 0. The interpreter is vendored under `third_party/uacpi`
-with its upstream version and license.
+The merged kernel uses the repository's native AML interpreter and SCI/PCI
+routing. Laptop methods now use that API, including serialized AML execution
+and typed buffer/package arguments. The older uACPI host, EC adapter and vendor
+source remain as reference and host-model code; they are **not linked into the
+kernel**. Their EC/GPE/global-lock behavior is therefore not active laptop
+support. Native AML coverage and real firmware compatibility need hardware
+acceptance. Missing or invalid readings remain unavailable.
 
 The receive path learns the immediate neighbor from a validated unicast IPv4
 Ethernet frame before generating replies. This avoids the receive worker waiting
@@ -33,14 +31,9 @@ This has ordinary ARP trust semantics; it does not authenticate neighbors.
 
 ## I2C and embedded-controller details
 
-The EC driver installs ECDT handlers before AML loading when the table exists,
-then resolves PNP0C09 resources before namespace `_INI` methods run. Read, write
-and query operations use IBF/OBF handshakes and a shared half-second transaction
-deadline. A timeout or stale output byte stops that transport instead of treating
-a late response as another register's data. GPE handlers queue work on the ACPI
-worker; `_Qxx` methods run outside the EC transaction lock. `_GLK` cooperates with
-an AML Field that already holds the global lock. The ownership check uses the
-pinned uACPI 7 internal interface; revisit it when upgrading that dependency.
+The retained EC transport has bounded host-model tests. Its uACPI integration
+is not active after the merge. Native firmware operation-region coverage must
+be validated before claiming EC-backed battery or lid support on a laptop.
 
 The Intel I2C driver selects known 120-MHz LPSS controllers, checks the Synopsys
 component ID, disables DMA/interrupts and uses conservative standard/fast timings.

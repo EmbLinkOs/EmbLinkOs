@@ -139,9 +139,169 @@ struct acpi_info{
 };
 
 
+/* ---- Generic Address Structure: how ACPI names a register ---------------- */
+#define ACPI_GAS_MEMORY   0
+#define ACPI_GAS_IO       1
+#define ACPI_GAS_PCI_CFG  2
+
+struct acpi_gas {
+    uint8_t  space_id;      /* ACPI_GAS_*                                         */
+    uint8_t  bit_width;
+    uint8_t  bit_offset;
+    uint8_t  access_size;   /* 0 = undefined, 1 = byte, 2 = word, 3 = dword, 4 = qword */
+    uint64_t address;
+} __attribute__((packed));
+
+/* ---- FADT (signature "FACP"): where the power hardware is ---------------
+ * The full ACPI 6 layout, because the fields this kernel needs are spread
+ * across all three generations of it: the ACPI 1.0 I/O-port blocks, the 2.0
+ * reset register and 64-bit addresses, and the 5.0 hardware-reduced sleep
+ * registers. A table is only as long as its header says; every field past an
+ * old table's end is ABSENT, and acpi.c checks the length before reading one. */
+struct acpi_fadt {
+    struct acpi_sdt_header header;
+    uint32_t firmware_ctrl;
+    uint32_t dsdt;
+    uint8_t  reserved0;
+    uint8_t  preferred_pm_profile;
+    uint16_t sci_int;
+    uint32_t smi_cmd;
+    uint8_t  acpi_enable;
+    uint8_t  acpi_disable;
+    uint8_t  s4bios_req;
+    uint8_t  pstate_cnt;
+    uint32_t pm1a_evt_blk;
+    uint32_t pm1b_evt_blk;
+    uint32_t pm1a_cnt_blk;
+    uint32_t pm1b_cnt_blk;
+    uint32_t pm2_cnt_blk;
+    uint32_t pm_tmr_blk;
+    uint32_t gpe0_blk;
+    uint32_t gpe1_blk;
+    uint8_t  pm1_evt_len;
+    uint8_t  pm1_cnt_len;
+    uint8_t  pm2_cnt_len;
+    uint8_t  pm_tmr_len;
+    uint8_t  gpe0_blk_len;
+    uint8_t  gpe1_blk_len;
+    uint8_t  gpe1_base;
+    uint8_t  cst_cnt;
+    uint16_t p_lvl2_lat;
+    uint16_t p_lvl3_lat;
+    uint16_t flush_size;
+    uint16_t flush_stride;
+    uint8_t  duty_offset;
+    uint8_t  duty_width;
+    uint8_t  day_alrm;
+    uint8_t  mon_alrm;
+    uint8_t  century;
+    uint16_t iapc_boot_arch;
+    uint8_t  reserved1;
+    uint32_t flags;
+    struct acpi_gas reset_reg;          /* ACPI 2.0 -- offset 116 */
+    uint8_t  reset_value;
+    uint16_t arm_boot_arch;
+    uint8_t  fadt_minor_version;
+    uint64_t x_firmware_ctrl;
+    uint64_t x_dsdt;                    /* offset 140 */
+    struct acpi_gas x_pm1a_evt_blk;
+    struct acpi_gas x_pm1b_evt_blk;
+    struct acpi_gas x_pm1a_cnt_blk;     /* offset 172 */
+    struct acpi_gas x_pm1b_cnt_blk;
+    struct acpi_gas x_pm2_cnt_blk;
+    struct acpi_gas x_pm_tmr_blk;
+    struct acpi_gas x_gpe0_blk;
+    struct acpi_gas x_gpe1_blk;
+    struct acpi_gas sleep_control_reg;  /* ACPI 5.0 -- offset 244 */
+    struct acpi_gas sleep_status_reg;
+    uint64_t hypervisor_vendor_id;
+} __attribute__((packed));
+
+#define ACPI_FADT_RESET_REG_SUP  (1u << 10)
+#define ACPI_FADT_HW_REDUCED     (1u << 20)
+
+/* What power-off and reboot need, read out of the FADT and the AML. Filled by
+ * acpi_init(); every field is honest about absence (fadt_found, s5_found,
+ * reset_supported), so the power code can say WHICH part of ACPI was missing
+ * rather than "power-off failed". */
+struct acpi_power_info {
+    bool     fadt_found;
+    uint8_t  fadt_revision;
+    bool     hw_reduced;            /* ACPI 5 hardware-reduced: no PM1 blocks  */
+    uint32_t smi_cmd;               /* port that switches the chipset to ACPI  */
+    uint8_t  acpi_enable;           /* value to write there                    */
+    struct acpi_gas pm1a_cnt;       /* address 0 = absent                      */
+    struct acpi_gas pm1b_cnt;
+    struct acpi_gas sleep_control;  /* hardware-reduced platforms only         */
+    bool     reset_supported;
+    struct acpi_gas reset_reg;
+    uint8_t  reset_value;
+    bool     s5_found;              /* \_S5_ decoded from the AML              */
+    uint8_t  s5_typa, s5_typb;      /* SLP_TYP for PM1a / PM1b                 */
+    char     s5_table[5];           /* which table it came from: DSDT or SSDT  */
+    /* THE ACPI PM TIMER: a free-running counter at exactly 3,579,545 Hz, on
+     * every PC chipset that is not hardware-reduced. It matters because it is
+     * often the ONLY known-frequency clock a modern laptop leaves standing --
+     * the HPET is commonly hidden and the 8254 PIT is clock-gated -- and a
+     * kernel with no reference cannot know how fast its own TSC runs. 0 =
+     * absent (or not in I/O space, which is the only kind read here). */
+    uint16_t pm_tmr_port;
+};
+
+/* ---- what the AML interpreter answers (kernel/acpi/acpi_dev.c) ----------
+ *
+ * Build the PCI interrupt routing table from _PRT. Call after aml_init() and
+ * after the I/O APIC has been chosen: it tells the firmware which controller
+ * we use (_PIC), and on many machines -- QEMU included -- that changes what
+ * _PRT returns. */
+void acpi_pci_routing_init(void);
+
+/* Announce `pic_mode` (0 = 8259, 1 = I/O APIC) and rebuild the routing table.
+ * On a machine with a _PIC method the two modes give DIFFERENT tables, and
+ * that difference is how `test prt` proves the call took effect. */
+void acpi_pci_routing_rebuild(int pic_mode);
+bool acpi_pic_method_exists(void);
+
+/* Where (bus, device, pin) actually lands, pin 0..3 for INTA..INTD. False
+ * means ACPI did not describe it and the caller keeps what it had. */
+bool acpi_pci_route(uint8_t bus, uint8_t device, uint8_t pin,
+                    uint32_t *out_gsi, bool *out_active_low, bool *out_level);
+uint32_t acpi_pci_route_count(void);
+bool acpi_pci_route_at(uint32_t i, uint8_t *bus, uint8_t *device, uint8_t *pin,
+                       uint32_t *gsi, bool *active_low, bool *level);
+
+/* Writable access to the power block, for acpi_dev.c only. */
+struct acpi_power_info *acpi_power_info_mutable(void);
+
+/* Replace the byte-decoded \_S5_ with the EVALUATED one. After aml_init(). */
+void acpi_power_adopt_aml_s5(void);
+
+/* SLP_TYP values for sleep state `state`, by EVALUATING \_Sx_ rather than
+ * recognising its encoding -- so a machine whose _S5 is a method works. */
+bool acpi_aml_sleep_typ(int state, uint8_t *typa, uint8_t *typb);
+
+/* A laptop's own devices. WRITTEN BUT NEVER EXECUTED: QEMU emulates no
+ * battery, lid or thermal zone, so none of these has met its hardware. */
+bool acpi_battery_present(void);
+bool acpi_battery_state(uint64_t *remaining, uint64_t *full, uint64_t *state);
+bool acpi_lid_open(bool *open);
+bool acpi_thermal_temp(uint64_t *decikelvin);
+
+/* The DSDT and the SSDTs, for the AML interpreter. NULL before acpi_init(),
+ * and NULL past the last SSDT. */
+const struct acpi_sdt_header *acpi_dsdt(void);
+
+/* Any table, by signature, checksum-verified and raw. For hardware whose
+ * description one driver owns -- DMAR, IVRS -- where a second parser in
+ * acpi.c would be a parser in the wrong place. NULL when absent. */
+const struct acpi_sdt_header *acpi_find_table(const char *signature);
+const struct acpi_sdt_header *acpi_ssdt(int nth);
+
+/* The power part of the ACPI tables, or NULL before acpi_init(). */
+const struct acpi_power_info *acpi_power_info(void);
+
 // Discover and parse ACPI tables, fill the acpi_info struct with relevant data for APIC initialization and interrupt routing
 const struct acpi_info *acpi_init(void);
-uint64_t acpi_rsdp_address(void);
 
 // Get the parsed info after acpi_init. Returns NULL if ACPI tables were not found or failed to parse.
 const struct acpi_info *acpi_get_info(void);

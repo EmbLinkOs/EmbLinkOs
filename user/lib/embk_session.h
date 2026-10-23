@@ -3,7 +3,8 @@
 #define EMBK_SESSION_STATUS 0
 #define EMBK_SESSION_LOCK 1
 #define EMBK_SESSION_LOGOUT 2
-/* Only the init process named by the kernel can manage authentication. */
+/* BEGIN binds the trusted session leader; only that leader can unlock.
+ * Account authentication and NEW_SESSION creation remain owned by init. */
 #define EMBK_SESSION_BEGIN 10
 #define EMBK_SESSION_GREETER 11
 #define EMBK_SESSION_UNLOCK 12

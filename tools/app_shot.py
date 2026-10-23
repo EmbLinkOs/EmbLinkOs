@@ -37,7 +37,7 @@ def sock_path(name, kind):
     return os.path.join(BUILD, "shot-%s-%s.sock" % (name, kind))
 
 
-def boot(name, scratch, audio=None):
+def boot(name, scratch, audio=None, tablet=False, nic=None):
     ser, qmp = sock_path(name, "ser"), sock_path(name, "qmp")
     for p in (ser, qmp):
         if os.path.exists(p):
@@ -46,12 +46,10 @@ def boot(name, scratch, audio=None):
     # the tree it was given is a test you can only run once.
     subprocess.run(["cp", "-f", os.path.join(ROOT, "embkfs.img"), scratch],
                    check=True, cwd=ROOT)
-    boot_copy=os.path.join(BUILD,"shot-%s-boot.img" % name)
-    subprocess.run(["cp","-f",os.path.join(ROOT,"myos.img"),boot_copy],check=True,cwd=ROOT)
     argv = [
         "qemu-system-x86_64", "-cpu", "max",
         "-fw_cfg", "name=opt/emblink/live,string=1",
-        "-drive", "format=raw,file=%s,if=ide,index=0" % boot_copy,
+        "-drive", "format=raw,file=myos.img,if=ide,index=0",
         "-drive", "format=raw,file=%s,if=ide,index=1" % scratch,
         "-vga", "none", "-device", "virtio-vga,xres=1024,yres=768",
         "-display", "none",
@@ -60,14 +58,38 @@ def boot(name, scratch, audio=None):
         "-no-reboot", "-no-shutdown", "-m", "1024m", "-smp", "2",
         "-accel", "tcg,thread=multi",
     ]
+    # A NETWORK, when the caller asks for one. Off by default because most of
+    # these tests do not care and a NIC is one more thing to go wrong -- but a
+    # test of the network indicator has to be able to produce BOTH answers, and
+    # "no device at all" is only one of them. QEMU's user-mode stack hands out
+    # 10.0.2.15 over DHCP with a router at 10.0.2.2.
+    if os.environ.get("NET") == "1":
+        argv += ["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]
+    # A NIC on QEMU's user-mode stack, with an id so QMP `set_link` can
+    # reach it -- which is how a test unplugs the cable.
+    if nic:
+        argv += ["-netdev", "user,id=net0",
+                 "-device", "%s,netdev=net0" % nic]
+    if tablet:
+        # AN ABSOLUTE POINTING DEVICE, for a test that has to put the cursor on
+        # a named pixel. QEMU gives a PC a PS/2 mouse, which is RELATIVE: a tool
+        # can only aim by shoving the pointer into a corner and counting deltas
+        # back out, and a dropped or coalesced packet silently lands it
+        # somewhere else -- measured, the same script hit a dock icon and then
+        # missed a 24px window button by 90px on the same boot.
+        #
+        # The kernel already drives QEMU's usb-tablet as an absolute device
+        # (usb_tablet_process_report -> mouse_set_absolute), so attaching one
+        # makes `input-send-event` with abs axes land on the pixel asked for.
+        # Off by default: it is extra hardware to enumerate, and a test that
+        # does not move the pointer should not pay for it.
+        argv += ["-device", "qemu-xhci,id=xhci", "-device", "usb-tablet,bus=xhci.0"]
     if audio:
         # The guest's audio written to a FILE on this machine. The same trick
         # `make test-audio` uses: what a speaker did is not observable from a
         # test, but what the device was handed is.
         argv += ["-device", "AC97,audiodev=snd0",
                  "-audiodev", "wav,id=snd0,path=%s" % audio]
-    if os.environ.get("EMBLINK_ACPI_TABLE"):
-        argv += ["-acpitable","file=" + os.environ["EMBLINK_ACPI_TABLE"]]
     log = open(os.path.join(BUILD, "shot-%s-qemu.log" % name), "wb")
     return subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=log), ser, qmp
 
@@ -90,8 +112,11 @@ class Qmp:
         self.f.readline()                       # greeting
         self.cmd("qmp_capabilities")
 
-    def cmd(self, name, **args):
-        msg = {"execute": name}
+    def cmd(self, _command, **args):
+        """The parameter is underscored because QMP has commands whose OWN
+        argument is called `name` -- set_link is one -- and a plain `name` here
+        collides with it. Every caller passes the command positionally."""
+        msg = {"execute": _command}
         if args:
             msg["arguments"] = args
         self.f.write((json.dumps(msg) + "\n").encode())
@@ -170,13 +195,11 @@ def main():
     ap.add_argument("--keys", default="", help="comma-separated chars to type after launch")
     ap.add_argument("--audio", action="store_true",
                     help="attach an AC97 and capture what it plays to a WAV")
-    ap.add_argument("--attach-audio",action="store_true",
-                    help="attach AC97 for device-control UI without requiring playback")
     args = ap.parse_args()
 
     scratch = os.path.join(BUILD, "shot-%s.img" % args.name)
     print("=== app-shot: booting for %s" % args.app)
-    wav = os.path.join(BUILD, "shot-%s.wav" % args.name) if args.audio or args.attach_audio else None
+    wav = os.path.join(BUILD, "shot-%s.wav" % args.name) if args.audio else None
     if wav and os.path.exists(wav):
         os.remove(wav)
     q, ser_path, qmp_path = boot(args.name, scratch, wav)
@@ -260,7 +283,7 @@ def main():
             print("     FAIL: %s" % f)
         print("=== app-shot: FAIL (%d)" % len(fails))
         return 1
-    if wav and args.audio:
+    if wav:
         # Measure it here rather than asserting a tone: a player's output is
         # music, so what matters is that it is LONG enough (no starvation) and
         # not silent (the decode reached the device).

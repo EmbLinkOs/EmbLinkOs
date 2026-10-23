@@ -103,3 +103,38 @@ struct cpu_data *this_cpu(void) {
     }
     return &cpu_table[idx];
 }
+
+
+/* ---- a processor that was not in the MADT --------------------------------
+ *
+ * percpu_init_topology builds this table once from ACPI's processor list,
+ * which is a list of the processors that existed when the firmware wrote it.
+ * A CPU plugged in while the machine runs is not in it and has to be added,
+ * which is only a matter of taking the next free index -- the per-core
+ * storage (stacks, TSS slots in the GDT) is already sized for MAX_CPUS and
+ * has always been. */
+struct cpu_data *percpu_register_cpu(uint8_t apic_id) {
+    if (!topology_ready) return NULL;
+    if (apic_id_to_index[apic_id] != APIC_ID_UNKNOWN)
+        return &cpu_table[apic_id_to_index[apic_id]];
+    if (cpu_count >= MAX_CPUS) return NULL;
+
+    uint32_t idx = cpu_count;
+    memset(&cpu_table[idx], 0, sizeof cpu_table[idx]);
+    cpu_table[idx].apic_id = apic_id;
+    cpu_table[idx].cpu_index = idx;
+    cpu_table[idx].online = false;
+    apic_id_to_index[apic_id] = (uint8_t)idx;
+    /* LAST, AND DELIBERATELY SO. cpu_count is what every other core reads to
+     * decide how many entries are valid; publishing the count before the
+     * entry is filled in is a window where another core can find a blank. */
+    __sync_synchronize();
+    cpu_count = idx + 1;
+    return &cpu_table[idx];
+}
+
+struct cpu_data *percpu_by_apic_id(uint8_t apic_id) {
+    if (!topology_ready) return NULL;
+    uint8_t idx = apic_id_to_index[apic_id];
+    return idx == APIC_ID_UNKNOWN ? NULL : &cpu_table[idx];
+}

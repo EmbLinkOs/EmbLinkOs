@@ -1,6 +1,6 @@
+#include "boot/boot_protocol.h"
 #include "block/partition.h"
 #include "block/block.h"
-#include "arch/x86_64/boot/boot_protocol.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
@@ -45,7 +45,7 @@ struct embk_partition {
     struct embk_block_device *parent;    // underlying whole disk
     uint64_t                  start_lba;  // offset of this partition in parent
     bool                      in_use;
-    uint8_t                   guid[16];
+    uint8_t guid[16];
 };
 
 // Pool of partition descriptors. The block registry caps total devices at
@@ -161,8 +161,7 @@ static int register_one_partition(struct embk_block_device *disk,
         return -EMBK_ENOMEM;
     }
 
-    memset(&p->dev, 0, sizeof(p->dev));
-    memset(p->guid, 0, sizeof p->guid);
+    memset(p, 0, sizeof *p);
     p->parent    = disk;
     p->start_lba = start_lba;
 
@@ -199,8 +198,22 @@ static int register_one_partition(struct embk_block_device *disk,
  * ceremony: every number we are about to act on -- where the entries live, how
  * many, how big -- comes out of this block, and a corrupt one would have us
  * register partitions over arbitrary sectors. Fail closed. */
+/* THE LARGEST LOGICAL BLOCK THIS PARSER HANDLES. 512 is the historical one and
+ * 4096 is what a 4Kn drive uses -- many NVMe parts can be formatted either way,
+ * and the installer has to be able to partition whichever it meets. Anything
+ * else is refused rather than parsed with the wrong stride. */
+#define PART_MAX_BLOCK 4096
+
 static int gpt_scan(struct embk_block_device *disk) {
-    uint8_t hdr[512];
+    /* EVERY ADDRESS IN GPT IS IN LOGICAL BLOCKS, NOT IN 512-BYTE UNITS. The
+     * header is in LBA 1 whatever an LBA is on this disk, the entry array
+     * starts at an LBA, and how many entries fit in one read is the block size
+     * divided by the entry size. This parser used to hard-code 512 in all
+     * three places, so on a 4Kn disk it read the header from a quarter of the
+     * way into the wrong block and gave up -- which is why `partition.c skips
+     * them` was the honest description. */
+    const uint32_t bs = disk->block_size;
+    uint8_t hdr[PART_MAX_BLOCK];
     if (embk_block_read(disk, 1, 1, hdr) != EMBK_OK) {
         kprintf("part: %s: GPT header (LBA 1) unreadable\n", disk->name);
         return 0;
@@ -212,13 +225,13 @@ static int gpt_scan(struct embk_block_device *disk) {
     }
 
     uint32_t hsize = rd_le32(hdr + 12);
-    if (hsize < 92 || hsize > 512) {
+    if (hsize < 92 || hsize > bs) {
         kprintf("part: %s: GPT header_size %u implausible\n", disk->name, (unsigned)hsize);
         return 0;
     }
     /* The CRC is computed with its OWN field zeroed -- it cannot cover itself. */
     uint32_t stored = rd_le32(hdr + 16);
-    uint8_t tmp[512];
+    uint8_t tmp[PART_MAX_BLOCK];
     for (uint32_t i = 0; i < hsize; i++) tmp[i] = hdr[i];
     tmp[16] = tmp[17] = tmp[18] = tmp[19] = 0;
     uint32_t calc = crc32_ieee(tmp, hsize);
@@ -231,15 +244,15 @@ static int gpt_scan(struct embk_block_device *disk) {
     uint64_t ent_lba = rd_le64(hdr + 72);
     uint32_t n_ent   = rd_le32(hdr + 80);
     uint32_t ent_sz  = rd_le32(hdr + 84);
-    if (ent_sz < 128 || ent_sz > 512 || (512 % ent_sz) != 0) {
+    if (ent_sz < 128 || ent_sz > bs || (bs % ent_sz) != 0) {
         kprintf("part: %s: GPT entry size %u unsupported\n", disk->name, (unsigned)ent_sz);
         return 0;
     }
     if (n_ent > 128) n_ent = 128;        /* the spec's usual max; bound the loop */
 
     int registered = 0;
-    uint32_t per_sec = 512 / ent_sz;
-    uint8_t sec[512];
+    uint32_t per_sec = bs / ent_sz;
+    uint8_t sec[PART_MAX_BLOCK];
     for (uint32_t i = 0; i < n_ent; i++) {
         if ((i % per_sec) == 0) {
             if (embk_block_read(disk, ent_lba + i / per_sec, 1, sec) != EMBK_OK) break;
@@ -257,12 +270,10 @@ static int gpt_scan(struct embk_block_device *disk) {
         if (last < first) continue;
         /* type is a 16-byte GUID; we log its first word purely as a hint. GPT
          * has no 1-byte type, so register_one_partition's `type` is cosmetic. */
-        if (register_one_partition(disk, i + 1, (uint8_t)e[0], first, last - first + 1) == EMBK_OK)
-        {
-            for (unsigned pi = 0; pi < BLOCK_MAX_DEVICES; pi++)
-                if (partitions[pi].in_use && partitions[pi].parent == disk &&
-                    partitions[pi].start_lba == first)
-                    memcpy(partitions[pi].guid, e + 16, 16);
+        if (register_one_partition(disk, i + 1, (uint8_t)e[0], first, last - first + 1) == EMBK_OK) {
+            for(unsigned j=0;j<BLOCK_MAX_DEVICES;j++)
+                if(partitions[j].in_use && partitions[j].parent==disk && partitions[j].start_lba==first)
+                    memcpy(partitions[j].guid,e+16,16);
             registered++;
         }
     }
@@ -285,7 +296,7 @@ static int ebr_walk(struct embk_block_device *disk, uint32_t ext_start, uint32_t
     int registered = 0;
 
     for (int guard = 0; guard < 32; guard++) {
-        uint8_t sec[512];
+        uint8_t sec[PART_MAX_BLOCK];
         if (embk_block_read(disk, cur, 1, sec) != EMBK_OK) break;
         if (sec[MBR_SIG_OFFSET] != MBR_SIG_0 || sec[MBR_SIG_OFFSET + 1] != MBR_SIG_1) break;
 
@@ -313,12 +324,19 @@ static int ebr_walk(struct embk_block_device *disk, uint32_t ext_start, uint32_t
 
 int embk_partition_scan(struct embk_block_device *disk) {
     if (!disk || !disk->read) return -EMBK_ENODEV;
-    if (disk->block_size != 512) {
-        // MBR is defined for 512-byte sectors; skip anything else for now.
+    /* 512 OR 4096, AND NOTHING ELSE. A 4Kn disk is partitioned exactly like a
+     * 512-byte one -- the MBR is still the first 512 bytes of block 0 and the
+     * GPT header is still in block 1 -- so the only thing that changes is how
+     * far apart the blocks are. A size this parser does not know is refused
+     * rather than parsed with the wrong stride, which would register
+     * partitions over arbitrary sectors. */
+    if (disk->block_size != 512 && disk->block_size != 4096) {
+        kprintf("part: %s: %u-byte blocks are not a size this parser knows\n",
+                disk->name, (unsigned)disk->block_size);
         return 0;
     }
 
-    uint8_t sector[512];
+    uint8_t sector[PART_MAX_BLOCK];
     int rc = embk_block_read(disk, 0, 1, sector);
     if (rc != EMBK_OK) {
         kprintf("part: %s: failed to read MBR (%d)\n", disk->name, rc);
@@ -407,7 +425,6 @@ void embk_partition_scan_all(void) {
         }
     }
 }
-
 /* Resolve the actual EFI loaded device, rather than enumeration order. */
 struct embk_block_device *embk_partition_boot_disk(void) {
     const struct boot_protocol *bp = boot_protocol_get();
@@ -420,10 +437,10 @@ struct embk_block_device *embk_partition_boot_disk(void) {
                 return partitions[i].parent;
     }
     if (bp->boot_disk_sig) {
-        uint8_t mbr[512];
+        uint8_t mbr[PART_MAX_BLOCK];
         for (unsigned i = 0; i < embk_block_count(); i++) {
             struct embk_block_device *d = embk_block_get(i);
-            if (embk_partition_parent(d) != d || d->block_size != 512) continue;
+            if (embk_partition_parent(d) != d || (d->block_size != 512 && d->block_size != 4096)) continue;
             if (!embk_block_read(d, 0, 1, mbr) && rd_le32(mbr + 440) == bp->boot_disk_sig)
                 return d;
         }

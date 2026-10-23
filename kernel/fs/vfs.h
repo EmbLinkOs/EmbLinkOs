@@ -145,6 +145,40 @@ struct vfs_ops {
      * changes permissions, never what an object IS. */
     int (*chmod)(struct vnode *vn, uint32_t mode);
 
+    /* --- symbolic links -----------------------------------------------------
+     *
+     * Create `name` in `dir` as a link holding the TEXT `target`, and read that
+     * text back. A symlink is not a reference to an object: it is a STRING the
+     * path walker splices in and re-resolves, which is why it may name
+     * something that does not exist, may cross mounts, and may be created
+     * before its target is. Everything that makes symlinks useful and
+     * everything that makes them dangerous comes from that one fact.
+     *
+     * `readlink` fills at most `cap` bytes and reports the FULL length in
+     * *out_len, so a caller can tell a truncated answer from a complete one
+     * rather than silently acting on half a path.
+     *
+     * NULL = this filesystem has no symlinks; the VFS answers -ENOSYS rather
+     * than pretending. */
+    int (*symlink)(struct vnode *dir, const char *name, size_t name_len,
+                   const char *target);
+    int (*readlink)(struct vnode *vn, char *buf, size_t cap, size_t *out_len);
+
+    /* HARD LINK: a second NAME for an existing object. `target` is the object
+     * (resolved by the VFS, so a symlink in the target path has already been
+     * followed -- a hard link is to the thing, never to the pointer); `dir`
+     * and `name` are where the new name goes. The object's link count goes
+     * up by one and the data is freed only when it reaches zero, which is the
+     * whole point: two names, one object, and neither name is the "real" one.
+     *
+     * A filesystem may refuse a DIRECTORY target (EMBKFS does, with EPERM):
+     * a directory with two parents is a cycle waiting to happen, and every
+     * Unix has refused it for fifty years for that reason.
+     *
+     * NULL = no hard links here (FAT32); the VFS answers -ENOSYS. */
+    int (*link)(struct vnode *dir, const char *name, size_t name_len,
+                struct vnode *target);
+
     /* fill *out with metadata for object `vn` */
     int (*stat)(struct vnode *vn, struct vfs_stat *out);
     int (*vget)(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
@@ -156,8 +190,10 @@ struct vfs_ops {
     * A fs without unlink-while-open semantics (e.g. FAT32) leaves both NULL - the fd layer then no-ops. */
     int (*obj_get)(struct vfs_mount *mnt, uint64_t ino);
     int (*obj_put)(struct vfs_mount *mnt, uint64_t ino);
-    /* Make prior writes durable. NULL means unsupported, never success. */
+    /* Barrier for direct vnode transactions; fd writers flush their page object first. */
     int (*sync)(struct vnode *vn);
+    int (*rename_noreplace)(struct vnode *,const char *,size_t,
+                            struct vnode *,const char *,size_t);
 };
 
 /* ---- a mounted filesystem instance ---------------------------------- */
@@ -194,6 +230,13 @@ void vfs_init(void);
 int  vfs_mount(const char *path, const struct vfs_ops *ops, void *fs_data,
                uint64_t root_ino);
 
+/* Remove a mount: the medium is gone. No busy check -- see vfs.c on why
+ * refusing would be worse than failing the next read. */
+int  vfs_unmount(const char *path);
+
+/* The volume serving `path`, or NULL -- so an unmounter can free it. */
+void *vfs_mount_fs_data(const char *path);
+
 /* Resolve an absolute path to a vnode. This is the component-by-component
  * walk — the ONLY path parser in the kernel. Honors the current process's
  * namespace (UP2); falls back to the global mount table in kernel context. */
@@ -204,6 +247,12 @@ int  vfs_resolve(const char *path, struct vnode *out);
  * to refuse a read-only binding. NS_MODE_RW in the global-fallback (kernel)
  * case. */
 int  vfs_resolve_ex(const char *path, struct vnode *out, uint8_t *mode_out);
+
+/* As vfs_resolve, but a symlink in the FINAL position is returned as itself
+ * rather than followed. lstat, readlink and unlink-the-link are built on it.
+ * Links in the MIDDLE of a path are still followed: `/a/link/b` has only one
+ * reading. */
+int  vfs_resolve_nofollow(const char *path, struct vnode *out);
 
 /* Convenience wrappers: resolve `path`, then call the matching op. */
 int  vfs_read(const char *path, uint64_t off, void *buf, size_t len, size_t *out_read);

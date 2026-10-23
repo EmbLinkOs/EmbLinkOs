@@ -23,6 +23,7 @@
 #include "embk.h"
 #include "oscfg.h"   /* the user's preferences apply to every app */
 #include "ui.h"
+#include "kit.h"   /* ui_clipboard_provider: the kit needs one handed to it */
 #include "em.h"
 #include "theme.h"
 #include "scene_render.h"
@@ -81,6 +82,162 @@ void em_set_idle_hook(void (*fn)(void)) { g_em_idle_hook = fn; }
 
 static int g_refresh_override = -1;
 void em_app_set_refresh(int ms) { g_refresh_override = ms; }
+
+/* ===========================================================================
+ * TELLING THE SCHEDULER WHAT THIS LOOP IS.
+ *
+ * An app loop is periodic while it is animating and idle the rest of the time,
+ * and the difference matters to the machine. embk_sched_period() lets a thread
+ * say "wake me every `pace` ms, I need about `budget` of it" -- which under the
+ * deadline policy is the difference between a frame arriving on time under
+ * load and arriving whenever a busy machine gets round to it (measured: a
+ * 16 ms loop against six busy threads misses ~half its frames without one and
+ * none with).
+ *
+ * TWO THINGS ARE DELIBERATE HERE.
+ *
+ * IT IS DECLARED ONLY WHILE ANIMATING. The reservation costs no CPU when the
+ * thread is not running, but it does cost ADMISSION: the machine refuses
+ * declarations past a ceiling, so a desktop where five idle apps each hold a
+ * permanent claim is a desktop where the sixth -- the one actually animating --
+ * is refused. Held during a run of frames, given back after a stretch of
+ * nothing, with hysteresis so a hesitant app does not churn the syscall.
+ *
+ * THE BUDGET IS MEASURED, NOT GUESSED. Declaring half the period "to be safe"
+ * is claiming half a core for a frame that costs two milliseconds, and two
+ * such apps would fill the machine between them. So it is the MINIMUM of the
+ * recent frames' CPU cost -- CPU, from embk_thread_cpu_ns(), because on a busy
+ * machine the clock measures preemption rather than work, and the minimum of
+ * several because even CPU accounting has a tick of noise in it. Erring low is
+ * the safe direction: a budget that is too small costs this app its urgency
+ * for the tail of a frame; one that is too large costs everyone else their
+ * admission.
+ * ======================================================================== */
+#define CAD_HIST      8    /* frames remembered for the budget estimate      */
+#define CAD_GAIN      3    /* heat added by a frame                          */
+#define CAD_HOT       9    /* heat at which this counts as animating         */
+#define CAD_MAX      24    /* ceiling, so a long animation cools down promptly */
+
+/* HOW "ANIMATING" IS DECIDED, and the first version of this got it wrong.
+ *
+ * The obvious rule is "N frames in a row", and it is wrong for most of the
+ * things that actually animate. A loop polling every 10 ms that renders a
+ * 30 fps video builds one frame in every three iterations -- never two in a
+ * row -- so a consecutive-frames rule sees a video as idle. (Measured: with
+ * that rule nothing on the desktop ever declared anything.)
+ *
+ * So it is a heat counter instead: a frame adds three, an idle iteration
+ * subtracts one, and the claim is held while the total is nine or more. That
+ * says "frames are arriving at least a third of the time", which is the
+ * property that matters, and it costs one integer. The ceiling keeps a long
+ * animation from banking so much heat that it holds the claim for a second
+ * after it stops. */
+#define CAD_COOLOFF 120    /* frames to wait after a declaration is refused */
+
+struct cadence {
+    int      period;          /* what is declared now, 0 = nothing          */
+    int      budget;
+    int      heat;
+    int      cooloff;
+    int      said;            /* the one-time explanation has been printed  */
+    int      n;
+    uint64_t cost[CAD_HIST];
+};
+
+static void cad_say(struct cadence *c, const char *title, const char *what) {
+    if (c->said) return;
+    c->said = 1;
+    char b[128];
+    snprintf(b, sizeof b, "%s: %s\n", title, what);
+    embk_puts(1, b);
+}
+
+static void cad_frame(struct cadence *c, int pace, uint64_t cost_ms,
+                      const char *title) {
+    c->cost[c->n % CAD_HIST] = cost_ms;
+    if (c->n < 1000000) c->n++;
+    c->heat += CAD_GAIN;
+    if (c->heat > CAD_MAX) c->heat = CAD_MAX;
+    if (c->heat < CAD_HOT) return;
+
+    /* BACKING OFF AFTER A REFUSAL IS NOT POLITENESS, IT IS CORRECTNESS.
+     * Retrying every frame means a syscall per frame that scans the thread
+     * table and fails -- measured: with the retry unthrottled, this app's best
+     * frame interval went from 20 ms to 45 ms. A refused declaration made the
+     * app slower than not asking at all. */
+    if (c->cooloff > 0) { c->cooloff--; return; }
+
+    int have = c->n < CAD_HIST ? c->n : CAD_HIST;
+    uint64_t lo = c->cost[0];
+    for (int i = 1; i < have; i++) if (c->cost[i] < lo) lo = c->cost[i];
+
+    int budget = (int)lo + 1;              /* +1: em_now_ms has 1 ms teeth */
+    if (budget < 1) budget = 1;
+
+    /* MORE THAN HALF THE PERIOD IS NOT A CADENCE, it is a hog with a timer.
+     * An app whose frame costs more than half its pace cannot be run at that
+     * pace on this machine whatever the scheduler does, and asking for it
+     * would claim more than half a core continuously -- which admission
+     * control rightly refuses, and which would deny the claim to an app that
+     * could actually keep it. Say so once and stop asking. */
+    if (budget * 2 > pace) {
+        if (c->period) { embk_sched_period(0, 0); c->period = 0; c->budget = 0; }
+        if (!c->said) {
+            char b[144];
+            snprintf(b, sizeof b,
+                     "%s: a frame costs %d ms of CPU, more than half the %d ms "
+                     "pace -- not asking for a cadence this machine cannot "
+                     "keep\n", title, budget, pace);
+            embk_puts(1, b);
+            c->said = 1;
+        }
+        c->cooloff = CAD_COOLOFF;
+        return;
+    }
+
+    if (c->period == pace && c->budget == budget) return;   /* nothing new */
+
+    int rc = embk_sched_period((uint32_t)pace, (uint32_t)budget);
+    if (rc == 0) {
+        c->period = pace; c->budget = budget;
+        if (!c->said) {
+            char b[96];
+            snprintf(b, sizeof b, "%s: pacing %d ms, budget %d ms\n",
+                     title, pace, budget);
+            embk_puts(1, b);
+            c->said = 1;
+        }
+    } else {
+        /* Refused -- the machine has promised out as much as it will. Not an
+         * error: run the ordinary way, exactly as every app did before this
+         * existed. */
+        cad_say(c, title, "no cadence available (the machine is fully "
+                          "reserved) -- running unpaced");
+        c->period = 0; c->budget = 0;
+        c->cooloff = CAD_COOLOFF;
+    }
+}
+
+static void cad_idle_tick(struct cadence *c) {
+    if (c->heat > 0) c->heat--;
+    if (c->period && c->heat == 0) {
+        embk_sched_period(0, 0);
+        c->period = 0; c->budget = 0;
+    }
+}
+
+/* Thin adapters: the kit's clipboard signatures are its own (it must not know
+ * about embk), and embk_clip_get returns what the clipboard HOLDS, which can
+ * exceed the buffer -- so clamp before reporting how much was written. */
+static unsigned emapp_mods(void) { return (unsigned)embk_key_mods(); }
+static int emapp_clip_set(const char *buf, unsigned len) {
+    return embk_clip_set(buf, len);
+}
+static int emapp_clip_get(char *buf, unsigned cap) {
+    int64_t held = embk_clip_get(buf, cap);
+    if (held < 0) return 0;
+    return held > (int64_t)cap ? (int)cap : (int)held;
+}
 
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
@@ -176,6 +333,23 @@ int em_app_run(const EmApp *app) {
     em_window_set_glass(glass);          /* Window() adds a faint accent cast when glass */
     embk_key_grab(1);
 
+    /* HAND THE WIDGET KIT A CLIPBOARD. It cannot call embk_clip_set itself --
+     * it is built and unit-tested on the host, where there is no kernel to ask
+     * -- so the runtime installs the real one and the kit calls through. This
+     * is what makes copy and cut work in every field in every application
+     * without a single line in any of them. */
+    ui_clipboard_provider(emapp_clip_set, emapp_clip_get);
+    /* ...and a clock, for the same reason: the kit cannot ask the kernel what
+     * time it is, and double-click has to know how long ago the last press
+     * was. Counting frames would not do -- this loop skips them when nothing
+     * moves. */
+    ui_clock_provider(embk_uptime_ms);
+    /* ...and the modifier keys, for shift-click. A click carries no byte, so
+     * unlike Shift+Left -- which the driver decides before sending -- the kit
+     * has to ask what was held. */
+    ui_mods_provider(emapp_mods);
+
+
     /* THE BACK BUFFER, and the reason for it.
      *
      * `px` is SHARED with the compositor: it composites from that memory on its
@@ -204,26 +378,105 @@ int em_app_run(const EmApp *app) {
     int pace = app->pace_ms > 0 ? app->pace_ms : 10;
     int prev_epoch = em_ui_epoch(), first = 1;
     int maximized = 0;
+    /* Where the window is RIGHT NOW, and what it was before a placement moved
+     * it. The runtime never knew its own position before: it told the
+     * compositor where to put the window and then forgot, which is fine while
+     * "restore" is the only thing that ever moves it back. With six
+     * placements, going Left then Right has to restore the size the window had
+     * when it was last normal, so both have to be tracked. */
+    EmWinLayout layout_now = EmWinNormal;
+    int wx_now = wx, wy_now = wy;
     int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
     int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
     uint64_t last_app_tick = 0;
+    struct cadence cad; memset(&cad, 0, sizeof cad);
 
     for (;;) {
+        /* THE WHOLE ACTIVE PART OF AN ITERATION, IN CPU RATHER THAN WALL TIME.
+         *
+         * Two things had to be right here and neither was obvious. The span
+         * has to cover the input polling, the idle hook and the present's own
+         * copy, not just build-render-present -- timing only the render gave a
+         * budget the app exhausted inside its own frame and then spent the
+         * rest of every period unprivileged.
+         *
+         * And it has to be CPU, not the clock. On a contended machine wall
+         * time is mostly preemption: measured with em_now_ms(), a frame whose
+         * real work was a few milliseconds read as 40 ms, and the app then
+         * refused to ask for a cadence it could comfortably have kept.
+         * embk_thread_cpu_ns() is what the kernel actually charged us. */
+        uint64_t iter_c0 = embk_thread_cpu_ns();
+
         /* --- inputs (always polled; they are the retained-update triggers) --- */
         if (g_em_idle_hook) g_em_idle_hook();   /* every iteration, even idle --
                                                  * the terminal's pipe poll */
         struct embk_win_input in;
         embk_win_input(&in);
 
-        /* Native maximize/restore request from the compositor. Resizing must
-         * happen in the client because it owns the shared pixel mapping. */
-        if (in.win == EMBK_WIN_ACTION_MAXIMIZE && !app->fullscreen) {
-            int nw = maximized ? normal_w : (int)sw;
-            int nh = maximized ? normal_h : (int)sh - 32 - dock_band - 26;
-            int nx = maximized ? normal_x : 0;
-            int ny = maximized ? normal_y : 32;
+        /* WHERE THE WINDOW GOES, from the zoom light's board (the toolkit
+         * posts a layout during the view) or from the compositor's own
+         * title-bar action. Both arrive here and take the SAME path, so the
+         * button and the chrome cannot end up doing two different things.
+         *
+         * The resize has to happen in the client: it owns the shared pixel
+         * mapping, and the toolkit's scene renderer has to be rebuilt around
+         * the new one. */
+        EmWinLayout want = EmWinNormal;
+        int have_want = em_window_take_layout(&want);
+        if (!have_want && em_window_take_maximize()) { want = EmWinFill; have_want = 1; }
+        /* PLEASE CLOSE -- the close light, or GUI+W. The runtime takes the app
+         * down the ordinary way (the same path Escape and em_app_request_exit
+         * use), so main() returns, files close and the window is destroyed by
+         * its owner. Before this the compositor killed the process outright and
+         * an unsaved document went with it.
+         *
+         * An app that wants to ask "save first?" sets a key hook and handles
+         * this itself; doing nothing still closes, which is the right default
+         * for the many apps with nothing to lose. */
+        if (in.win == EMBK_WIN_ACTION_CLOSE) em_app_request_exit(0);
+        /* A DROP LANDED. The payload is the application's to take
+         * (embk_drop_take, in its view); all the runtime owes it is a frame in
+         * which to notice -- an idle app builds none, and the drop would sit
+         * unread while the drag looked like it had done nothing. */
+        if (in.win == EMBK_WIN_ACTION_DROP) em_request_frame();
+
+        if (!have_want && in.win == EMBK_WIN_ACTION_MAXIMIZE) {
+            /* The kernel chrome's zoom button is a TOGGLE, because it has no
+             * board to offer: fill, or go back. */
+            want = layout_now == EmWinFill ? EmWinNormal : EmWinFill;
+            have_want = 1;
+        }
+
+        if (have_want && !app->fullscreen) {
+            /* THE WORK AREA: the display minus the top bar and minus the dock
+             * band. Every placement but Full is measured inside it, which is
+             * what makes "Fill" different from "Full" and why both are offered
+             * -- one leaves the shell reachable, the other does not. */
+            int ax = 0, ay = 32;
+            int aw = (int)sw, ah = (int)sh - 32 - dock_band;
+            int nx = normal_x, ny = normal_y, nw = normal_w, nh = normal_h;
+
+            switch (want) {
+            case EmWinNormal:                                            break;
+            case EmWinFill:   nx = ax; ny = ay; nw = aw; nh = ah - 26;    break;
+            case EmWinFull:   nx = 0;  ny = 0;  nw = (int)sw; nh = (int)sh; break;
+            case EmWinLeft:   nx = ax; ny = ay; nw = aw / 2; nh = ah - 26; break;
+            case EmWinRight:  nx = ax + aw / 2; ny = ay; nw = aw - aw / 2; nh = ah - 26; break;
+            case EmWinTop:    nx = ax; ny = ay; nw = aw; nh = (ah - 26) / 2; break;
+            case EmWinBottom: nh = (ah - 26) / 2; nx = ax; ny = ay + nh;  nw = aw; break;
+            }
+            if (nw < 200) nw = 200;
             if (nh < 160) nh = 160;
+
+            /* Remember where it was, but only when LEAVING the normal state --
+             * otherwise going Left and then Right would record the left half
+             * as "normal" and there would be no way back to the size the
+             * window actually had. */
+            if (layout_now == EmWinNormal && want != EmWinNormal) {
+                normal_x = wx_now; normal_y = wy_now; normal_w = winw; normal_h = winh;
+            }
+
             uint32_t *npx = 0;
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
@@ -233,9 +486,11 @@ int em_app_run(const EmApp *app) {
                 rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 embk_win_move(win, nx, ny);
+                wx_now = nx; wy_now = ny;
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                 em_request_frame();
-                maximized = !maximized;
+                layout_now = want;
+                maximized = (want == EmWinFill || want == EmWinFull);
             }
         }
 
@@ -280,8 +535,15 @@ int em_app_run(const EmApp *app) {
              * where it silently flattens a pasted block onto one line. An app
              * that wants the raw clipboard handles 0x16 itself; every app that
              * does not still gets the safe replay. */
-            if (c == 0x16 && g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
-            if (c == 0x16) {                       /* Ctrl+V: paste, app-wide */
+            /* TWO KEYS, ONE PASTE. Ctrl+V is what this OS has always used and
+             * what its terminal-shaped apps expect; EMBK_KEY_PASTE is the GUI
+             * key's (Cmd+V), which is where the rest of the editing commands
+             * live now -- Ctrl+C could never be copy here, because 0x03 is the
+             * console interrupt. Keeping both means nothing that worked stops
+             * working. */
+            if ((c == 0x16 || c == EMBK_KEY_PASTE) &&
+                g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
+            if (c == 0x16 || c == EMBK_KEY_PASTE) {   /* paste, app-wide */
                 /* The runtime replays the clipboard through the SAME delivery
                  * path as typing -- key hook first, else the focused field --
                  * so every app that can take a keystroke can take a paste,
@@ -294,7 +556,14 @@ int em_app_run(const EmApp *app) {
                 for (int i = 0; i < n; i++) {
                     int ch = (unsigned char)clip[i];
                     if (ch == '\n' || ch == '\t') ch = ' ';
-                    if (ch < 0x20 || ch > 0x7E) continue;
+                    /* CONTROL BYTES OUT, UTF-8 THROUGH. The old bound was
+                     * 0x20..0x7E, which dropped every byte of every accented
+                     * character: you could TYPE é into a field (the driver
+                     * encodes UTF-8 now) and then not paste it, in the same
+                     * field, on the same machine. 0x80 and above is a byte of a
+                     * real character; the bytes of one arrive consecutively and
+                     * the caret advances one at a time, so it lands intact. */
+                    if (ch < 0x20 || ch == 0x7F) continue;
                     if (g_em_key_hook && g_em_key_hook(ch)) continue;
                     ui_input_char(ch);
                 }
@@ -344,6 +613,7 @@ int em_app_run(const EmApp *app) {
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
                     em_overlay_active() || win_moved;
         if (!build) {
+            cad_idle_tick(&cad);
             /* SAMPLE THE POINTER WHILE IDLING, in slices, rather than sleeping
              * through it. A frame here can be far apart from the next under an
              * emulator, and a press and release that both happen in the gap
@@ -354,6 +624,7 @@ int em_app_run(const EmApp *app) {
                 embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
                 struct embk_win_input pin;
                 embk_win_input(&pin);
+                ui_pointer_at_time(pin.when);
                 em_feed_pointer((float)pin.x, (float)pin.y,
                                 pin.buttons & EMBK_MOUSE_LEFT,
                                 pin.buttons & EMBK_MOUSE_RIGHT,
@@ -364,6 +635,7 @@ int em_app_run(const EmApp *app) {
             continue;
         }
 
+        ui_pointer_at_time(in.when);   /* when the press HAPPENED, not now */
         em_feed_pointer((float)in.x, (float)in.y,
                         in.buttons & EMBK_MOUSE_LEFT, in.buttons & EMBK_MOUSE_RIGHT,
                         in.wheel, in.focused);
@@ -395,8 +667,14 @@ int em_app_run(const EmApp *app) {
          * until its dock icon calls win_restore. Checked before the close
          * path so a frame can't do both. */
         if (em_window_minimized()) embk_win_minimize(win);
+        if (em_window_maximized()) em_window_post_maximize();   /* acted on next pass */
 
         if (g_app_exit_requested || em_window_closed() || em_window_take_close()) {
+            /* Give the reservation back before leaving. The thread dying would
+             * do it too, but em_app_run RETURNS -- an app that goes on to do
+             * something else must not still be holding a claim on a cadence it
+             * no longer has. */
+            if (cad.period) embk_sched_period(0, 0);
             embk_win_destroy(win); embk_key_grab(0); free(back);
             char b[64]; snprintf(b, sizeof b, "%s: window closed cleanly\n", title); embk_puts(1, b);
             return g_app_exit_requested ? g_app_exit_code : 0;
@@ -435,6 +713,11 @@ int em_app_run(const EmApp *app) {
                 embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
             }
         }
+
+        /* The frame is on screen. What it COST is the budget estimate -- see
+         * the cadence note above for why the minimum of several is used and
+         * not the last one. */
+        cad_frame(&cad, pace, (embk_thread_cpu_ns() - iter_c0) / 1000000u, title);
 
         if (first) {
             first = 0;
@@ -534,6 +817,7 @@ int em_widget_run(const EmWidget *wg) {
     { char b[64]; snprintf(b, sizeof b, "%s: widget up\n", title); embk_puts(1, b); }
 
     int pace = wg->pace_ms > 0 ? wg->pace_ms : 50;   /* widgets idle harder */
+    struct cadence cad; memset(&cad, 0, sizeof cad);
     int prev_epoch = em_ui_epoch(), first = 1;
     uint64_t last_tick = 0;
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
@@ -551,9 +835,10 @@ int em_widget_run(const EmWidget *wg) {
 
         int build = first || input_edge || tick || em_take_frame_request() ||
                     em_ui_epoch() != prev_epoch;
-        if (!build) { embk_sleep_ms(pace); continue; }
+        if (!build) { cad_idle_tick(&cad); embk_sleep_ms(pace); continue; }
         if (tick) last_tick = now;
 
+        ui_pointer_at_time(in.when);   /* when it HAPPENED, not when we noticed */
         if (in.focused) ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
         else            ui_pointer(-100.0f, -100.0f, false);
 
@@ -575,11 +860,13 @@ int em_widget_run(const EmWidget *wg) {
             prev_epoch = em_ui_epoch();
         }
 
+        uint64_t frame_c0 = embk_thread_cpu_ns();
         ui_frame_begin(); em_new_frame(); wg->view(); em_flush(); ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
         if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
         embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
+        cad_frame(&cad, pace, (embk_thread_cpu_ns() - frame_c0) / 1000000u, title);
 
         if (first) { first = 0; char b[64]; snprintf(b, sizeof b, "%s: widget first frame\n", title); embk_puts(1, b); }
         /* The same slicing as the idle path above, and for the same reason:
@@ -590,6 +877,7 @@ int em_widget_run(const EmWidget *wg) {
             embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
             struct embk_win_input pin;
             embk_win_input(&pin);
+            ui_pointer_at_time(pin.when);
             em_feed_pointer((float)pin.x, (float)pin.y,
                             pin.buttons & EMBK_MOUSE_LEFT,
                             pin.buttons & EMBK_MOUSE_RIGHT,

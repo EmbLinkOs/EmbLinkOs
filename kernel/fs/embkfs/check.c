@@ -82,7 +82,8 @@ int embkfs_check(struct embkfs_volume *v) {
     /* Check durable media again, including files warmed by login/font loading
      * or a previous scan. Cached data cannot establish on-disk integrity. */
     for(unsigned i=0;i<EMBKFS_RCACHE_SLOTS;i++)v->rcache[i].oid=0;
-    v->ecache_oid=0;v->icache_valid=false;v->wcache_oid=0;
+    v->ecache_oid=0;v->wcache_oid=0;
+    for(unsigned i=0;i<sizeof v->icache/sizeof v->icache[0];i++)v->icache[i].valid=false;
     struct embk_inode_item root;
     int rc=embkfs_stat_object(v,EMBKFS_ROOT_OBJECT_ID,&root);
     if(!rc && (root.mode&0170000)!=0040000)rc=-EMBK_EINVAL;

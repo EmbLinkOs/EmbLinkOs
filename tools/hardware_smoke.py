@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 root = Path(__file__).resolve().parents[1]
 test_command = os.environ.get('EMBLINK_SMOKE_COMMAND', 'test posix')
-wait_desktop = (test_command.startswith(('test power', 'test persist'))
+wait_desktop = (test_command.startswith(('test power', 'test persist', 'test devices'))
                 or test_command in ('poweroff', 'reboot', 'test posix'))
 success = os.environ.get('EMBLINK_SMOKE_EXPECT', '[cmd] test posix: exit=0 -> OK').encode()
 out = Path(tempfile.mkdtemp(prefix='emblink-hardware-'))
@@ -36,6 +36,8 @@ command = [
     '-gdb', f'unix:{out / "smoke-gdb.sock"},server=on,wait=off',
     '-no-reboot', '-no-shutdown',
 ]
+if os.environ.get('EMBLINK_LIVE', '1') == '1':
+    command += ['-fw_cfg', 'name=opt/emblink/live,string=1']
 if uefi:
     firmware = Path(os.environ.get('EMBLINK_OVMF_DIR', '/usr/share/OVMF'))
     shutil.copyfile(firmware / 'OVMF_VARS_4M.fd', out / 'vars.fd')
@@ -120,8 +122,19 @@ with (out / 'smoke-qemu.log').open('wb') as errors:
         seen = b''
         sent = False
         transferred = False
+        def verify_power_exit():
+            if process.wait(timeout=10) or not (b'power: flushed ' in seen and b'block device cache(s) flushed' in seen):
+                raise RuntimeError('guest exited without storage writeback and device flush markers')
+            qmp_reader.join(timeout=2)
+            expected_reason = 'guest-reset' if power_test == 'reboot' else 'guest-shutdown'
+            if expected_reason not in (out / 'qmp-events.log').read_text():
+                raise RuntimeError(f'missing QMP power reason {expected_reason}')
+            print(f'PASS: {expected_reason} after storage writeback and device flush')
         with (out / 'smoke-serial.log').open('wb') as log:
             while time.monotonic() < deadline:
+                if power_test and process.poll() is not None:
+                    verify_power_exit()
+                    break
                 if transferred and http_result.done():
                     http_result.result()
                 try:
@@ -130,15 +143,7 @@ with (out / 'smoke-qemu.log').open('wb') as errors:
                     continue
                 if not chunk:
                     if power_test:
-                        code = process.wait(timeout=10)
-                        if code or b'power: storage synchronized;' not in seen:
-                            raise RuntimeError('guest exited without synchronized power transition')
-                        qmp_reader.join(timeout=2)
-                        event_log = (out / 'qmp-events.log').read_text()
-                        expected_reason = 'guest-reset' if power_test == 'reboot' else 'guest-shutdown'
-                        if expected_reason not in event_log:
-                            raise RuntimeError(f'missing QMP power reason {expected_reason}')
-                        print(f'PASS: {expected_reason} after disk synchronization')
+                        verify_power_exit()
                         break
                     raise RuntimeError('guest serial connection closed')
                 log.write(chunk)
@@ -149,7 +154,8 @@ with (out / 'smoke-qemu.log').open('wb') as errors:
                 if test_command.startswith('test devices') and b'[cmd] test devices: exit=' in seen and b'-> FAIL' in seen:
                     raise RuntimeError('device ABI acceptance failed; see smoke-serial.log')
                 if (not sent and b'init: launched /system/bin/init.elf' in seen
-                        and (not wait_desktop or b'first frame presented' in seen)):
+                        and (not wait_desktop or (b'TopBar: first frame presented' in seen
+                                                 and b'home: time zone' in seen))):
                     connection.sendall((test_command + '\n').encode())
                     sent = True
                     deadline = time.monotonic() + 240

@@ -29,8 +29,10 @@ enum em_cap {
     EM_CAP_RAWDISK    = 8,
     EM_CAP_KERNEL_EXT = 9,
     EM_CAP_DEBUG      = 10,
-    EM_CAP_POWER      = 11,
-    EM_CAP_NETWORK_ADMIN = 12,
+    EM_CAP_SESSION    = 11,
+    EM_CAP_POWER      = 12,
+    EM_CAP_SCREEN     = 13,
+    EM_CAP_NETWORK_ADMIN = 14,
 };
 
 #define EM_CAP_BIT(id)  (1UL << (id))

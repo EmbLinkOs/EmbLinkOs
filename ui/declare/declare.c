@@ -76,6 +76,7 @@ static struct instance_handle g_clicked;   /* deepest instance a press landed on
 static int g_press_edges;
 static struct instance_handle g_active;    /* instance that owns the current drag (pointer capture) */
 static struct instance_handle g_focused;   /* instance with keyboard focus (text field) */
+static bool g_focus_seen;                   /* the focused widget asked this frame */
 static float g_ptr_x, g_ptr_y;
 static bool  g_ptr_down;
 static bool  g_press_edge;                  /* a press landed this frame (for defocus-on-outside-click) */
@@ -168,7 +169,7 @@ static void inst_unlink_child(struct instance *p, struct instance_handle c) {
 }
 
 static struct instance_handle create_instance(struct instance_handle parent,
-                                              enum instance_kind kind,
+                                              enum instance_kind kind, uint8_t axis,
                                               uint64_t key, bool has_key) {
     struct instance *pi = instance_resolve(parent);
     if (!pi) return INSTANCE_HANDLE_NULL;
@@ -176,7 +177,7 @@ static struct instance_handle create_instance(struct instance_handle parent,
     struct instance *n = instance_resolve(h);
     if (!n) return INSTANCE_HANDLE_NULL;
 
-    n->kind = kind; n->parent = parent;
+    n->kind = kind; n->box_axis = axis; n->parent = parent;
     n->has_explicit_key = has_key; n->explicit_key = key;
 
     n->scene_node  = scene_create_node(g_sa, scene_kind_for(kind), pi->scene_node);
@@ -266,7 +267,8 @@ static void relink_after(struct instance_handle parent, struct instance_handle h
 }
 
 /* match-or-create at the current cursor position. Sets *created. */
-static struct instance_handle match_or_create(enum instance_kind kind, uint64_t key,
+static struct instance_handle match_or_create(enum instance_kind kind, uint8_t axis,
+                                              uint64_t key,
                                               bool has_key, bool *created) {
     struct reconcile_cursor *cur = &g_cursor[g_cursor_top];
     struct instance *pi = instance_resolve(cur->parent);
@@ -294,7 +296,8 @@ static struct instance_handle match_or_create(enum instance_kind kind, uint64_t 
 
     if (has_key) {
         struct instance *xi = instance_resolve(expected);
-        if (xi && xi->has_explicit_key && xi->explicit_key == key && xi->kind == kind)
+        if (xi && xi->has_explicit_key && xi->explicit_key == key &&
+            xi->kind == kind && xi->box_axis == axis)
             matched = expected;
         for (struct instance_handle c = matched.index ? INSTANCE_HANDLE_NULL : pi->first_child;
              !instance_handle_is_null(c); ) {
@@ -302,7 +305,7 @@ static struct instance_handle match_or_create(enum instance_kind kind, uint64_t 
             if (!cn) break;
             struct instance_handle next = cn->next_sibling;
             if (cn->has_explicit_key && cn->explicit_key == key) {
-                if (cn->kind == kind) matched = c;
+                if (cn->kind == kind && cn->box_axis == axis) matched = c;
                 else { destroy_instance(c); }   /* key kept, type changed -> replace */
                 break;
             }
@@ -310,13 +313,14 @@ static struct instance_handle match_or_create(enum instance_kind kind, uint64_t 
         }
     } else {
         struct instance *ci = instance_resolve(expected);
-        if (ci && ci->kind == kind && !ci->has_explicit_key && !ci->visited_this_run)
+        if (ci && ci->kind == kind && ci->box_axis == axis &&
+            !ci->has_explicit_key && !ci->visited_this_run)
             matched = expected;
     }
 
     struct instance_handle inst;
     if (!instance_handle_is_null(matched)) { inst = matched; }
-    else { inst = create_instance(cur->parent, kind, key, has_key); *created = true; }
+    else { inst = create_instance(cur->parent, kind, axis, key, has_key); *created = true; }
 
     relink_after(cur->parent, inst, cur->insert_after);
     struct instance *n = instance_resolve(inst);
@@ -350,9 +354,27 @@ static void sweep_unvisited_children(struct instance_handle parent) {
 }
 
 /* enter a container: match/create it, then push a cursor for its children */
-static struct instance_handle enter_container(enum instance_kind kind, uint64_t key, bool has_key) {
+static struct instance_handle enter_container(enum instance_kind kind, uint8_t axis,
+                                             uint64_t key, bool has_key) {
     bool created;
-    struct instance_handle inst = match_or_create(kind, key, has_key, &created);
+    struct instance_handle inst = match_or_create(kind, axis, key, has_key, &created);
+
+    /* OUT-OF-FLOW IS DECLARED EVERY FRAME, NEVER INHERITED.
+     *
+     * `is_overlay` takes a node out of its parent's layout entirely, and it is
+     * set by exactly two callers (the kit's overlay and the DSL's menu panel),
+     * both immediately after entering their container -- so clearing it here
+     * costs them nothing and stops it surviving into whatever reuses the slot
+     * next. A reused node that kept it was never laid out and never hit-tested:
+     * the element looked fine and could not be clicked.
+     *
+     * Same rule the padding bug taught, applied to the one property whose
+     * staleness makes a control disappear from the input path rather than
+     * merely sit in the wrong place. */
+    { struct instance *n = instance_resolve(inst);
+      struct layout_node *ln = n ? layout_resolve(g_la, n->layout_node) : 0;
+      if (ln && ln->is_overlay) { ln->is_overlay = false; ln->dirty = true; } }
+
     reset_children_unvisited(inst);
     if (g_cursor_top + 1 < CURSOR_STACK_MAX)
         g_cursor[++g_cursor_top] = (struct reconcile_cursor){ inst, INSTANCE_HANDLE_NULL };
@@ -389,7 +411,7 @@ static void component_trampoline(void *ctx) {
 
 void ui_component(void (*fn)(void *props), const void *props, size_t props_size, uint64_t key) {
     bool created;
-    struct instance_handle h = match_or_create(INSTANCE_COMPONENT, key, key != 0, &created);
+    struct instance_handle h = match_or_create(INSTANCE_COMPONENT, 0, key, key != 0, &created);
     struct instance *inst = instance_resolve(h);
     if (!inst) return;
 
@@ -419,21 +441,21 @@ void ui_component(void (*fn)(void *props), const void *props, size_t props_size,
 /* containers + property setters                                             */
 /* ------------------------------------------------------------------------- */
 
-void ui_box_begin(uint64_t key) { enter_container(INSTANCE_BOX, key, key != 0); }
+void ui_box_begin(uint64_t key) { enter_container(INSTANCE_BOX, 0, key, key != 0); }
 void ui_box_end(void) { exit_container(); }
 /* cur_box() can be NULL -- at the depth clamp, and after an unbalanced end
  * that no longer corrupts anything but still has nowhere to write. Checked
  * here rather than trusted: this exact dereference is what turned a deep page
  * into a crash. */
 void ui_begin_vstack(uint64_t key) {
-    enter_container(INSTANCE_BOX, key, key != 0);
+    enter_container(INSTANCE_BOX, 1, key, key != 0);
     struct instance *b = cur_box();
     if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
     if (ln) ln->axis = AXIS_COLUMN;
 }
 void ui_begin_hstack(uint64_t key) {
-    enter_container(INSTANCE_BOX, key, key != 0);
+    enter_container(INSTANCE_BOX, 2, key, key != 0);
     struct instance *b = cur_box();
     if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
@@ -723,17 +745,17 @@ static void set_text_on(struct instance_handle h, const char *str) {
 
 void ui_text(const char *fmt, ...) {
     char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, false, &created);
+    bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, 0, false, &created);
     set_text_on(h, buf);
 }
 void ui_text_keyed(uint64_t key, const char *fmt, ...) {
     char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, key, key != 0, &created);
+    bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, key, key != 0, &created);
     set_text_on(h, buf);
 }
 
 void ui_spacer(void) {
-    enter_container(INSTANCE_BOX, 0, false);
+    enter_container(INSTANCE_BOX, 0, 0, false);
     struct instance *b = cur_box();
     struct layout_node *ln = b ? layout_resolve(g_la, b->layout_node) : 0;
     if (ln) { ln->width.mode = SIZE_FLEX; ln->width.flex_grow = 1;
@@ -747,7 +769,7 @@ void ui_spacer(void) {
  * a stable buffer re-renders only when the pointer/dims change (fine for a chart
  * with fixed data drawn into a persistent buffer). */
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px) {
-    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, 0, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
     if (!n) return;
     struct layout_node *ln = layout_resolve(g_la, n->layout_node);
@@ -760,7 +782,7 @@ void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float 
 
 void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                     float width_px, float height_px) {
-    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, 0, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
     if (!n) return;
     struct layout_node *ln = layout_resolve(g_la, n->layout_node);
@@ -778,7 +800,7 @@ void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
  * opened, so a set-on-open-box call would land on its parent container. */
 void ui_image_sized_tinted(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                            float width_px, float height_px, struct color tint) {
-    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, 0, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
     if (!n) return;
     struct layout_node *ln = layout_resolve(g_la, n->layout_node);
@@ -791,7 +813,7 @@ void ui_image_sized_tinted(uint64_t key, const void *pixels, uint32_t iw, uint32
 }
 
 void ui_image_fill(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih) {
-    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, 0, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
     if (!n) return;
     struct layout_node *ln = layout_resolve(g_la, n->layout_node);
@@ -804,7 +826,7 @@ void ui_image_fill(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih) {
 }
 
 static bool button_common(uint64_t key, bool has_key, const char *label) {
-    struct instance_handle b = enter_container(INSTANCE_BOX, key, has_key);
+    struct instance_handle b = enter_container(INSTANCE_BOX, 0, key, has_key);
     ui_text("%s", label);
     exit_container();
     return ui_consume_click(b);   /* click on b or any descendant (the label) */
@@ -881,7 +903,14 @@ bool ui_is_pressed(void) { return g_ptr_down && is_ancestor_or_self(ui_open(), g
  * pressed", which a drag spanning many widgets cannot ask. */
 bool ui_pointer_down(void) { return g_ptr_down; }
 
+/* A number that changes every frame -- for widget code that keeps a little
+ * per-frame state of its own (keyboard focus traversal, in kit.c) and has to
+ * know when a frame boundary passed. */
+static uint64_t g_frame_serial;
+uint64_t ui_frame_serial(void) { return g_frame_serial; }
+
 void ui_frame_begin(void) {
+    g_frame_serial++;
     g_depth_overflowed = 0; g_cursor_over = 0;
     g_cursor_top = -1;
     reset_children_unvisited(g_root);
@@ -892,6 +921,12 @@ void ui_frame_end(void) {
     g_cursor_top = -1;
     /* a press that landed on no focusable widget clears keyboard focus */
     if (g_press_edge && !g_focus_claimed) g_focused = INSTANCE_HANDLE_NULL;
+    /* ...and so does the focused widget NOT BEING THERE: a page changed and
+     * its field was never emitted. Left set, focus would point at nothing and
+     * ui_any_focus() would say yes -- which kept the next page's autofocus
+     * from ever firing. */
+    if (!g_focus_seen && !g_focus_claimed) g_focused = INSTANCE_HANDLE_NULL;
+    g_focus_seen = false;
     g_press_edge = false;
     g_focus_claimed = false;
     g_input_n = 0;                 /* typed queue is consumed within the frame */
@@ -1038,6 +1073,11 @@ void ui_pointer(float x, float y, bool down) {
 
 /* Enqueue a typed character for this frame's focused field. Called by the event
  * loop for each byte from embk_key_poll(). */
+/* The event time of the pointer state fed this frame; see ui_pointer_at_time. */
+static uint64_t g_ptr_time;
+void     ui_pointer_at_time(uint64_t ms) { g_ptr_time = ms; }
+uint64_t ui_pointer_time(void) { return g_ptr_time; }
+
 void ui_input_char(int c) {
     if (c && g_input_n < (int)sizeof(g_input_buf)) g_input_buf[g_input_n++] = (char)c;
 }
@@ -1051,7 +1091,9 @@ int ui_input_take(char *dst, int max) {
 void ui_request_focus(struct instance_handle h) { g_focused = h; g_focus_claimed = true; }
 bool ui_any_focus(void) { return !instance_handle_is_null(g_focused); }
 bool ui_has_focus(struct instance_handle h) {
-    return h.index == g_focused.index && h.generation == g_focused.generation && h.index != 0;
+    bool yes = h.index == g_focused.index && h.generation == g_focused.generation && h.index != 0;
+    if (yes) g_focus_seen = true;
+    return yes;
 }
 
 /* Scroll wheel: the loop feeds this frame's delta; the open box consumes it only

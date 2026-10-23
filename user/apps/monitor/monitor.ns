@@ -1,0 +1,11 @@
+# Activity Monitor namespace manifest (docs/USERSPACE_v2.md UP4).
+#
+# It reads the UI runtime out of the sealed /system and owns a window, and that
+# is the whole of what it needs from the FILESYSTEM -- it never opens a document
+# and has no business being able to. Everything it displays comes from syscalls
+# about the machine (proc_list, meminfo), which are gated by capability and by
+# session, not by what this manifest can name.
+#
+# Note what is absent: the user's home. A monitor that could read your files
+# would be a monitor with a reason to, and there isn't one.
+ro /system

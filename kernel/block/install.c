@@ -2,7 +2,7 @@
 #include "block/block.h"
 #include "block/partition.h"
 #include "fs/embkfs/embkfs.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "boot/boot_protocol.h"
 #include "crypto/hw_random.h"
 #include "include/argv.h"
 #include "include/kmalloc.h"

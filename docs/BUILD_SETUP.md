@@ -10,14 +10,19 @@ first-time setup and the *why*, not day-to-day usage.
 
 ## Which host you are on
 
-The OS is x86_64 and always will be; the machine you BUILD it on is a separate
-question, and two are in use:
+The OS is x86_64 by default, and the machine you BUILD it on is a separate
+question — two hosts are in use. (A second *target*, aarch64, now boots to a
+console: `make ARCH=aarch64`, see the section at the end of this file and
+`docs/ARM64.md`. Keep the two axes apart when reading this file — unless a
+sentence says `ARCH`, it is about the build HOST, not the target architecture.)
 
 | | Linux (x86_64) | macOS (Apple Silicon) |
 |---|---|---|
 | cross toolchain | build it (~30 min, § below) | `brew install x86_64-elf-gcc` |
 | `make` → bootable image | yes | yes |
 | `make run` / QEMU | x86-on-x86 TCG | **cross-arch TCG — slower**, see below |
+| QEMU display backend | `gtk` | `cocoa` (no gtk in Homebrew's qemu) |
+| default dev window | 800x600 (gtk ignores the size hint) | 1280x800 (cocoa honours it) |
 | partitioned / USB images | yes | **no** (`sfdisk` is Linux-only) |
 | UEFI boot (`make run-uefi`) | yes | **no** (needs GNU `objcopy` with `efi-app-x86_64`) |
 
@@ -26,10 +31,12 @@ Everything else — the kernel, every app, every host test (`test-mp3-pcm`,
 work on both.
 
 > **Honesty about this table:** the Linux column is what this repo is built and
-> tested on daily. The macOS column is derived from what the build actually
-> requires, and the portability fixes it needed have been made and verified —
-> but **it has not yet been run end to end on a Mac.** The first person to do
-> that should correct this file rather than work around it.
+> tested on daily. The macOS column has now been run end to end — `make` reaches
+> a bootable `myos.img` + `embkfs.img` on Apple Silicon. Doing that surfaced one
+> class of breakage worth its own section (a newer host compiler, below) and
+> three optional ports that broke the build instead of being skipped; those are
+> fixed in-tree. What is still unverified on the Mac is BOOT and the timing
+> tests — correct this line when you have run those.
 
 ## macOS (Apple Silicon) setup
 
@@ -37,12 +44,62 @@ work on both.
 # 1. host tools. The cross compiler is PREBUILT here, which skips the ~30
 #    minutes step 2 costs on Linux.
 brew install x86_64-elf-gcc x86_64-elf-binutils x86_64-elf-gdb \
-             nasm qemu python3 mtools ffmpeg
+             nasm qemu python3 mtools ffmpeg cryptography
+
+# `cryptography` is NOT optional: tools/embx/pkgsign.py signs pkgprobe's .pkg
+# fixtures, which are part of the base image, so `make` fails without it. It is
+# a brew formula rather than a pip install because Homebrew's python is
+# PEP-668 "externally managed" and plain `pip install` refuses.
 
 # 2. newlib-c99 still has to be rebuilt from source (§ below) -- it is not a
 #    formula, and the reason it exists is our own C99 configuration.
 make NEWLIB_PREFIX=$HOME/cross/newlib-c99
 ```
+
+### The thing that actually breaks first: a NEWER compiler
+
+Homebrew ships `x86_64-elf-gcc` 16; the Linux box was several majors behind.
+That version gap, not macOS, is what produces most "errors we never had on
+Linux", because **gcc 14 promoted three long-standing warnings to errors**:
+
+| now an error | what it caught here |
+|---|---|
+| `-Wimplicit-function-declaration` | four real missing `#include`s that older gcc accepted silently |
+| `-Wincompatible-pointer-types` | `uint64_t (*)(void)` passed where `unsigned long long (*)(void)` was expected — same width on LP64, distinct types |
+| `bool` is a keyword in C23 | gcc 14+ defaults to `-std=gnu23`, so `typedef _Bool bool;` in `kernel/include/types.h` is invalid |
+
+The last one is why `CFLAGS` pins `-std=gnu11` explicitly. **Pin the language,
+do not chase the default** — an unpinned kernel silently changes dialect every
+time someone upgrades a compiler, and C23 also removes unprototyped functions
+and changes `bool`, `true`, `false` and `nullptr`.
+
+None of these were macOS bugs and none were newly-broken code: they were latent
+defects that an older compiler tolerated. Fixing them is strictly correct on
+both hosts. If you hit a new one, fix the code — do not add `-Wno-error=`.
+
+The same gap bites the optional ports, which are third-party and older still:
+QuickJS calls `malloc_usable_size` while only including `<malloc.h>` under
+`#ifdef __linux__`, so on our `x86_64-elf` target the declaration was never
+visible. That is the third hunk in `tools/quickjs/`'s patch.
+
+### Optional ports must be ABSENT, not BROKEN
+
+Three ports were gated wrongly and failed the build on a machine that did not
+have them — the exact promise "Absent means absent, not broken" makes below.
+All three are fixed, and the shape of the bug is worth recognising:
+
+* **zlib** — the Makefile looked for `$(ZLIB_BUILD)/libz.a`, but
+  `build-zlib-emblink.sh` installs to `$(ZLIB_BUILD)/lib/libz.a`. Now `$(ZLIB_A)`,
+  and `gitclone`/`gitpush` drop out of the image when it is missing.
+* **EmbCC** — `mathself.embx` was gated on `embcc` alone but its rule also needs
+  `embld`. A machine with one and not the other broke. Gated on both now.
+* **QuickJS** — `vellum.c` calls `jsdom_*` unconditionally while `VELLUM_JS`
+  expands to nothing without the engine, so the browser failed to LINK over an
+  optional port. `jsdom.h` now supplies no-op stubs unless `HAVE_JSDOM`, and
+  vellum builds either way (with JS: ~2.4M, without: ~1.1M).
+
+`make check-tools` now reports QuickJS alongside the other ports; it was the one
+optional dependency the report never mentioned.
 
 ### The thing that will surprise you: it is slower
 
@@ -79,6 +136,24 @@ Give `-smp` a couple of cores and expect to lengthen `--settle`.
 For either of those, a Linux VM (UTM, Lima, Docker) is the honest answer rather
 than a workaround: they are host-tooling gaps, not OS features that regressed.
 
+**Known, not yet fixed:** macOS ships **GNU Make 3.81** (2006) as `/usr/bin/make`,
+and 3.81 does not understand *grouped targets* (`a b &: deps`, GNU Make 4.3+).
+Two rules use them — `build/pkgprobe.{embx,ns,pkg} &:` and
+`embkfs.img embkfs_tree.img &:` — so on the Mac every build prints:
+
+```
+Makefile:1706: warning: overriding commands for target `&'
+Makefile:913:  warning: ignoring old commands for target `&'
+```
+
+3.81 reads `&` as a literal target name shared by both rules (hence the
+override), and treats the rest as an ordinary multi-target rule, where the
+recipe runs **once per target** instead of once for the group. The build works —
+mkfs is idempotent — but it is doing avoidable work and the warnings are noise
+that trains you to ignore warnings. `brew install make` gives `gmake` 4.x, which
+handles them correctly. Not yet made the default because that would change the
+tool every contributor invokes.
+
 ### Host-tool differences already handled
 
 These were real breakages and are fixed in-tree, listed so nobody re-introduces
@@ -95,6 +170,26 @@ them:
   `cc` by default; both work, and warnings differ slightly.
 * `/usr/bin/time -f` and `nproc` are GNU-only. Neither is in the build; keep it
   that way.
+* **`-display gtk` does not exist on macOS.** Homebrew's qemu lists only
+  `none/curses/cocoa/dbus`, so every interactive target would have died on its
+  display flag. `$(QEMU_DISPLAY)` now picks `cocoa` on Darwin and `gtk`
+  elsewhere; both spell `zoom-to-fit=off` the same way, so the 1:1 pixel intent
+  is unchanged. Override it per run like anything else.
+* **The 800x600 window cap was a GTK workaround, and macOS does not need it.**
+  gtk reports the window/monitor geometry to virtio-gpu and *ignores* the
+  `virtio-vga` xres/yres hint (commit `c207ee1`), so under gtk the in-guest
+  `EMBK_VGPU_CAP_W/H` cap is the only thing deciding the resolution — and it had
+  to stay small or the window opened huge. cocoa honours the hint, so the Mac
+  defaults to the roomier 1280x800 the tree wanted before that workaround, while
+  **Linux keeps 800x600 exactly as before**. This is a per-host DEFAULT, not a
+  per-host feature: either host can pick either size with `make FB_W=… FB_H=…`,
+  and on slow cross-arch TCG dropping back to 800x600 is the cheapest speedup
+  you have (fewer pixels to composite).
+* `FB_W`/`FB_H` reach the kernel as **compile-time** `-D` defines, but
+  `kernel.elf` depends only on sources — so changing them used to rebuild
+  nothing and silently boot the old cap, contradicting the "override per build"
+  note in the Makefile. `build/.fb_cap` now stamps the pair and the kernel hangs
+  off it, so the documented knob actually works.
 
 APFS is **case-insensitive by default**. This repo currently has no filenames
 that differ only by case (checked: `git ls-files | tr A-Z a-z | sort | uniq -d`
@@ -139,6 +234,19 @@ Check it worked: the OS boots to the EmUI desktop. At the serial prompt,
 `test posix` should print `ALL PASS`.
 
 ```sh
+# 4b. OPTIONAL -- a SECOND, position-independent newlib, so apps can be linked
+#     as PIEs (ET_DYN) and loaded at a random address in every process. Same
+#     script, same source tree, same options, plus -fPIC; a separate prefix
+#     because the two libcs must otherwise be identical and -fPIC is not free.
+tools/newlib/build-newlib-emblink.sh --pic ~/cross/src/newlib-4.4.0.20231231
+tools/newlib/build-newlib-emblink.sh --pic ~/cross/src/newlib-4.4.0.20231231 aarch64-elf
+#   Nothing else to configure -- the Makefile finds $HOME/cross/newlib-pic and
+#   $HOME/cross/newlib-aarch64-pic on its own. Check with:
+make pie-check
+#   Without it the tree still builds and boots; apps just stay at 0x400000.
+#   With it, `test pie` (x86) and the aarch64 boot test load a real PIE twice
+#   and require it to land at a different address each time.
+
 # 5. OPTIONAL ports -- each is independent; build only what you want.
 #    Every script takes the SOURCE TREE as an argument and derives the rest.
 
@@ -520,3 +628,121 @@ desktop, and a compile+link that is ~1 s native is tens of seconds here.
   [above](#tcc-needs-our-patch----a-pristine-tcc-silently-produces-crashing-binaries)).
 - **A tcc-built program dies instantly at a nonsense address** — unpatched tcc.
   Rebuild it with `tools/tcc/build-tcc-emblink.sh`.
+
+## Building for aarch64 (`ARCH=aarch64`)
+
+A **second target architecture**, not a second host. Orthogonal to everything
+above: you cross-compile it from the same Linux or macOS box you already build
+x86 on. The campaign, its phasing and its open questions live in
+[ARM64.md](ARM64.md); this section is only how to run it.
+
+Status: **phases A0–A5** — it boots at EL1 on QEMU `virt`, decodes its own
+faults (`ESR`/`FAR`/`ELR`, down to the fault status code) instead of hanging,
+runs in the higher half with the MMU on (memory map from the device tree, the
+shared `kernel/mm/pmm.c` allocating, per-section kernel permissions, no
+identity map), and preemptively switches between kernel threads on a
+GICv3-delivered generic-timer tick, and drops to **EL0** to run a small
+hand-written user program that calls `write` and `exit` and has a bad pointer
+refused at the boundary. There is no libc or ELF loader for it yet (that is
+A6), so `run-arm64` prints its state, deliberately faults four different ways
+and recovers from each, runs three kernel threads against each other for
+400 ms, runs the EL0 probe, and parks.
+
+Note the run targets pass `-M virt,gic-version=3`. Under TCG, `virt` still
+defaults to a GICv2 and this kernel has no GICv2 driver — it detects that case
+and says so rather than failing obscurely.
+
+```sh
+# 1. toolchain  (prebuilt bottle on macOS; ~1 min, not the ~30 the x86 one costs)
+brew install aarch64-elf-gcc            # macOS
+sudo apt install gcc-aarch64-linux-gnu  # Debian/Ubuntu: see AARCH64_PREFIX below
+
+# 2. a libc for the USERLAND. The toolchain above ships NONE -- Homebrew's
+#    aarch64-elf-gcc has no newlib at all -- so this step is not optional if you
+#    want anything to run at EL0. Same script, same options, same source tree as
+#    the x86 libc; only the target argument differs.
+tools/newlib/build-newlib-emblink.sh ~/cross/src/newlib-4.4.0.20231231 aarch64-elf
+#    -> $HOME/cross/newlib-aarch64-c99, which is the Makefile's default for
+#       NEWLIB_PREFIX when ARCH=aarch64. Nothing to set if you use that path.
+
+make ARCH=aarch64 check-tools-arm64     # preflight -- probes the libc by
+                                        # COMPILING an #include, so a missing
+                                        # or wrong newlib is caught here
+
+# 3. build + boot
+make ARCH=aarch64                       # -> build/aarch64/kernel.{elf,img},
+                                        #    the userland, and the root image
+make ARCH=aarch64 run-arm64-desktop     # the OS in a window, all the way to the desktop
+make ARCH=aarch64 run-arm64             # serial on stdio; quit with Ctrl-A X
+make ARCH=aarch64 test-arm64-boot       # headless; asserts every phase's
+                                        # "done when", under every accelerator
+make ARCH=aarch64 run-arm64-hvf         # Apple Silicon: hardware virtualization
+make ARCH=aarch64 clean-arm64
+```
+
+**The run targets attach a disk, a GPU and two input devices** (`ARM_DISK`,
+`ARM_GPU`, `ARM_INPUT` in `arch.mk`). `virt` has no VGA and no firmware
+framebuffer, so without `-device virtio-gpu-pci` the machine simply has no
+screen; without the two `virtio-*-pci` input devices it has no keyboard and no
+pointer. The TABLET rather than `virtio-mouse-pci` on purpose: it reports
+ABSOLUTE coordinates, so the guest cursor tracks the host's 1:1 instead of
+drifting away from it.
+
+**The userland is built from the same sources as x86's.** `user/lib/crt0.c`,
+`user/lib/syscalls.c`, `user/lib/newlib.ld` and `user/lib/embk_syscall.h` are
+one implementation with two branches, and `USER_CC`/`NEWLIB_*` all derive from
+`$(USER_TRIPLE)`. Objects land in `build/aarch64/user/` — `build/crt0.o` cannot
+mean two machines at once. Programs are declared by name in `arch.mk`
+(`ARM_NEWLIB_PROGS`, `ARM_PLAIN_PROGS`); adding one needs no other edit.
+
+Things worth knowing before they cost you an afternoon:
+
+* **`ARCH` defaults to `x86_64` and changes nothing when unset.** The aarch64
+  rules live in `kernel/arch/aarch64/arch.mk`, included at the bottom of the
+  Makefile and *only* for a non-default `ARCH`. Checked, not assumed: `make -n all`
+  emits byte-identical recipes with and without that hook, on both hosts.
+* **The `.img` is what boots; the `.elf` is what gdb reads.** Only the flat image
+  carries the 64-byte arm64 `Image` header, and only that header makes QEMU pass
+  the device-tree pointer in `x0`. Boot the ELF and it comes up fine with `x0 = 0`
+  — a failure that stays invisible until something asks for the memory map.
+* **HVF is the default on Apple Silicon; TCG everywhere else.** Same
+  host-conditional pattern as `QEMU_DISPLAY` and `FB_W`, so the Linux box —
+  where an aarch64 guest cannot be accelerated at all — is unaffected. Measured
+  on the same kernel: identical wall clock for a timer-bound workload (both run
+  in real time) and **~8x the computation per unit of time** for a CPU-bound one.
+  `run-arm64-tcg` forces emulation and `debug-arm64` adds `-d int,unimp`, which
+  HVF has no equivalent for.
+* **`test-arm64-boot` injects real input.** Every other check is a line the
+  kernel prints about itself; input is the one thing the machine cannot test
+  alone, because virtio-input can enumerate both devices, arm its queue and
+  report "polled" while delivering nothing. `tools/arm64_input_probe.py` drives
+  keys and pointer motion over QMP for the whole run, and the test asserts the
+  driver's event COUNTERS are non-zero. It injects continuously rather than once
+  because the kernel's input window is a few seconds somewhere inside the boot:
+  the first version sent four keys at a fixed moment, missed the window, and
+  reported zero against a driver that was working.
+* **`test-arm64-boot` runs under every available accelerator**, not just the
+  default. TCG and HVF disagree, and the disagreements are where the bugs are:
+  an interrupt-ordering error (ending a level-triggered interrupt before the
+  device de-asserted) passed cleanly under TCG for a whole phase and failed
+  immediately under HVF.
+* **A different toolchain prefix:** `make ARCH=aarch64 AARCH64_PREFIX=aarch64-linux-gnu-`.
+  Any bare-metal-capable aarch64 gcc works; the build is `-ffreestanding
+  -nostdlib` and links its own script, so a Linux-targeting cross gcc is fine.
+* **`-mgeneral-regs-only` is mandatory** and is already in `ARM_CFLAGS`. FP/SIMD
+  traps at EL1 until someone enables it, and gcc emits FP registers for ordinary
+  struct copies. Removing that flag produces a hang with no relation to any
+  floating-point code in the source. **It is a KERNEL flag only** — user code is
+  deliberately built without it, because a stock compiler emits `str q0` to copy
+  a 16-byte struct and an EL0 program that never mentions a float would trap on
+  its first `memcpy`. `CPACR_EL1.FPEN` is opened for EL0 for exactly this.
+* **The two newlibs are not configured the same by default, and it matters.**
+  newlib's `configure.host` gives `aarch64-*-*` its own case with
+  `syscall_dir=syscalls` and no `MISSING_SYSCALL_NAMES`, while `x86_64-elf`
+  falls through to the default case which does the opposite. Left alone, libc
+  calls `_write` (which we do not define) and defines `write` (which we do) —
+  ten undefined references and a collision waiting behind them.
+  `tools/newlib/build-newlib-emblink.sh` patches that one case so both targets
+  get the same contract, idempotently, and then VERIFIES it with `nm` rather
+  than trusting the patch. Build the aarch64 libc any other way and expect
+  `undefined reference to _write`.

@@ -1,33 +1,58 @@
+## Laptop integration follow-up (2026-10-23)
+
+- [x] Preserve master ABI/ARM architecture and integrate laptop services into the current desktop.
+- [x] Native UEFI/NVMe regression batch, standalone recovery installation,
+  account/preferences across reboot, lock/password gates and recorded HDA/AC97 output.
+- [ ] Physical AX200 WPA2/DHCP/DNS/page fetch and broader radio transports.
+- [ ] Physical built-in I2C input, panel, HDA routing and native AML/EC firmware acceptance.
+- [ ] Power transition writer freeze/drain, complete page-writeback failure reporting
+  and physical power-loss tests; current upstream shutdown writes back and flushes.
+- [ ] ARM runtime revalidation and port of x86 screen/policy/history services.
+- [ ] Reconcile incoming PCI configuration accesses with the older serialized,
+  exact-width access path; avoid address/data races and status write-one-to-clear hazards.
+- [ ] Suspend/resume, GPU modesetting/acceleration, multi-monitor management,
+  touchpad gestures, audio capture/mixing and OS-image updates/rollback.
+
+Current evidence: [LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md).
+Older sections below remain the broader roadmap.
+
+## malloc in userspace: the lock exists now (2026-09-13)
+
+- [x] ~~newlib is linked with no `__malloc_lock`, so two threads in one process
+      must never be in the allocator at once.~~ -- `user/lib/syscalls.c`
+      provides a real RECURSIVE `__malloc_lock`/`__malloc_unlock`, built on the
+      futex mutex userspace already had. Recursive because newlib's own stub
+      takes a recursive mutex and is right to: the allocator re-enters itself,
+      and a plain mutex there turns a rare crash into a certain deadlock.
+
+      It needed a thread identity to answer "am I already holding this?", which
+      is why `SYS_thread_self` now exists -- it returns the thread_table index,
+      the same number `thread_create` hands back.
+
+      `syscalls.c` is the right home: it is the newlib retargeting layer, the
+      set of stubs the platform must provide, and these are two of them.
+      libc.a's `mlock.o` defines nothing else, so defining them here means it
+      is never pulled in -- no duplicate symbol, no link-order subtlety.
+
+- [ ] **`test mtmalloc` does NOT reproduce the corruption, and that is worth
+      knowing.** Four threads from a barrier, one on megabyte blocks and three
+      on small ones, every block's contents checked before it is freed --
+      80,000 allocations -- and it passes with the lock REMOVED. Three
+      workloads were tried. So the test guards against the lock being BROKEN (a
+      recursive lock done wrong deadlocks on first re-entry, which is worse
+      than the crash it replaces) and is not evidence that the lock is needed.
+
+      The evidence for that is the crash itself: the desktop's screenshot
+      writer faulted in `_free_r` the instant its last write landed, while the
+      render loop allocated mid-frame. Whoever next touches this should either
+      find the workload that reproduces it or leave this bullet alone -- a test
+      that cannot fail must not be quoted as proof.
+
 # EmbLink OS — Known Issues & Improvements
 
 Open items only, grouped by subsystem. Completed work lives in
 PROJECT_STATUS.md (and git history). Keep this file to what's actually
 left to do.
-
----
-
-## Laptop daily-use acceptance
-
-Implemented behavior and reproduction commands are in [DAILY_USE.md](DAILY_USE.md),
-[LAPTOP_ALPHA.md](LAPTOP_ALPHA.md) and [HARDWARE_DRIVERS.md](HARDWARE_DRIVERS.md).
-The remaining acceptance gates are:
-
-- [ ] Validate actual laptop UEFI/NVMe persistence, held keys/clicks, I2C-HID,
-      Wi-Fi RF/WPA2/DHCP/DNS, HDA routing, brightness, battery and power-off/reset.
-      QEMU and protocol models do not establish physical compatibility.
-- [ ] Broaden wireless support beyond the experimental AX200 path; implement
-      pairwise rekey, WPA3/required PMF, roaming and power-saving modes.
-- [ ] Native GPU modesetting, connector/hotplug management and rendering
-      acceleration. Intel Gen9 currently preserves the firmware mode and offers
-      validated PCH PWM; other physical GPU families remain unsupported.
-- [ ] S3/S0ix, coordinated device quiesce/resume and reliable wake restoration.
-      Idle dimming and idle/lid locking do not put the system to sleep.
-- [ ] OS-image updating/rollback, firmware boot-entry management and partition
-      preservation for dual boot. The recovery installer overwrites a whole disk.
-- [ ] Extend integrity checking to snapshot roots, complete allocation-overlap
-      auditing and repair; add retained panic reports and staging-file recovery.
-- [ ] Rich clipboard formats, notification actions/persistence, touchpad gestures,
-      audio mixing/capture and broader service supervision.
 
 ---
 
@@ -171,8 +196,29 @@ missing, roughly in the order a user meets it:
 - [x] ~~No scrollbar~~ -- a thin track beside the text, thumb sized to the
       visible fraction, shown only when there is something to scroll, and
       DRAGGABLE -- the thumb brightens while held.
-- [ ] Undo cannot redo an insert (the pool stores removed text only), and undo
-      is per-document only while that document is bound.
+- [x] ~~Undo cannot redo an insert (the pool stores removed text only), and
+      undo is per-document only while that document is bound.~~ -- BOTH FIXED,
+      and they were two different bugs wearing one bullet point.
+
+      REDO stored nothing to replay. The pool kept the bytes a change REMOVED,
+      which is all undo needs, so `ed_redo` returned 0 for anything that added
+      text and Ctrl+Y after typing did nothing at all -- silently, which is the
+      half of undo people actually use. Both runs are stored now and the two
+      directions are mirror images. Coalesced typing redoes as ONE step with
+      all of its characters, which needed the merge to append to the stored
+      text as well as to the length.
+
+      THE HISTORY now belongs to the DOCUMENT. `ed_init` clears the arena and
+      the editor re-binds one engine per tab switch, so visiting another file
+      and coming back threw the whole history away with nothing on screen to
+      say so. `ed_undo_save`/`ed_undo_load` move it in and out; `struct doc`
+      holds one. Costs ~68 KB per document against the 256 KB its text already
+      takes.
+
+      Six new host tests, and they were checked against the OLD engine first:
+      four fail there (redo of an insert, of a replacement, the caret it
+      leaves, and all-three-back for coalesced typing). A test that only
+      passes the fixed version proves nothing.
 - [ ] No column selection, no multiple carets, no folding, no minimap.
 - [ ] The tab bar does not scroll and caps at 8 documents.
 - [x] ~~Nothing is remembered between runs~~ -- which files were open, which
@@ -305,12 +351,13 @@ web asks for them and how much they change a page:
   reset + retry (3×) a failed INT 13h read before giving up (flaky-USB spin-up).
 - [x] ~~BIOS only — no UEFI support.~~ — **from-scratch UEFI loader** (`boot/uefi/`,
   own PE32+ EFI app, no GNU-EFI) boots to the desktop under OVMF; both firmwares
-  hand the kernel the same `boot_protocol`. `make run-uefi` / `run-uefi-cow`.
+  hand the kernel the same `boot_protocol`. `make run-uefi` / `run-uefi-cow`, and
+  **`make test-uefi`** is the gate: both images, the loader's own COM1 markers,
+  GOP, the memory map, the root mount and the desktop. See the UEFI entries at
+  the end of this file for what a real machine still needs.
 - [ ] **EmbBoot** (UEFI boot manager, [EMBBOOT_Design.md](EMBBOOT_Design.md)):
   M1 (menu) done. Open: M2 `.embfw` payload format + kernel-on-ESP; M3 verify
-  (HMAC v1 → Ed25519 v2); M5 Boot Manager + self-update. Initial M4 read-only
-  Recovery/Diagnostics and a verified whole-disk installer are built; filesystem
-  repair and image rollback remain open ([DAILY_USE.md](DAILY_USE.md)).
+  (HMAC v1 → Ed25519 v2); M4 Recovery + Diagnostics; M5 Boot Manager + self-update.
 - [ ] Hardcoded kernel LBA start (sector 9) still stands for the BIOS path — a
   real filesystem-aware BIOS backend is EmbBoot §11 (stage1.5 / 64-bit core).
 
@@ -363,14 +410,18 @@ web asks for them and how much they change a page:
 ### VMM — page-table location limit (measured)
 - [x] Boots fine at 4 GB. Page tables (~28 KB) + bitmap (160 KB) fit under
   physical 2 MB, so KP2V works.
-- [ ] HARD LIMIT ~32 GB RAM: the PMM bitmap alone (~1 MB at 32 GB) plus page
-  tables pushes allocations past physical 2 MB, where KP2V (kernel mapping is
-  0–2 MB only) faults. 128 GB → ~4 MB bitmap → guaranteed crash.
-  - FIX (when needed): two-phase paging bootstrap.
-    * Phase 1: pre-map the first ~16 MB into the kernel range (bootloader),
-      or build a minimal direct map covering where page tables will live.
-    * Phase 2: build the full direct map using P2V (direct-map access).
-    * Then switch VMM table access from KP2V to P2V.
+- [x] ~~HARD LIMIT ~32 GB RAM~~ **Stale -- retired by measurement (2026-09-11).**
+  The entry predicted a guaranteed crash at 128 GB. Booted with `-m 64G`:
+  2 MB bitmap, 16.7 M pages, `power` at 90 % idle. Booted with `-m 128G`:
+  4 MB bitmap, 33.8 M pages, `test mmap` OK at a random address. The fix the
+  entry asked for -- a two-phase bootstrap, page tables reached through the
+  direct map once it exists -- had already been built: `vmm_table()` in
+  arch/x86_64/mm/vmm.c switches from KP2V to P2V at the CR3 switch, and its
+  comment records the very bug this entry describes. Nobody closed the entry.
+  The REAL constraint is that the kernel image, the bitmap and the early page
+  tables must fit inside stage2's 1 GB identity map, which holds to roughly
+  16 TB of RAM (a 512 MB bitmap). Not measured on aarch64, whose bootstrap is
+  different; say so rather than assume.
 
 ### vmm_map_mmio
 
@@ -468,6 +519,300 @@ web asks for them and how much they change a page:
   (error 0x0C) the first time W^X set NX on the data segment. Consider moving
   the enable into vmm_init/CPU-feature init where it belongs logically.
 
+### mmap — what exists, and what it deliberately does not
+
+`mmap(len, prot, flags)` / `munmap(addr, len)` are real on both architectures
+(`kernel/mm/vma.c`, syscalls 96/97, libc wrappers in `user/lib/syscalls.c`).
+Anonymous private mappings, permissions chosen by the caller, W^X enforced, and
+every page — page tables included — returned on unmap. Measured, not asserted:
+`test mmap` on x86 reads `free pages 1026067 -> 1026048 -> 1026067`, the ARM
+boot self-test `128279 -> 128260 -> 128279`, and `posixdemo` exercises the whole
+surface from ring 3 on both.
+
+Each item below is REFUSED today with a distinct errno rather than
+approximated, which is why none of them is a silent bug waiting to be found:
+
+- [x] **`mprotect`.** DONE (syscall 98). Map writable, emit, flip to
+  executable, run — asserted end to end on both machines by assembling a real
+  function at runtime and calling it, because "the call returned 0" is not the
+  claim. The range is split at both ends, a range with a hole in it is
+  `ENOMEM` for the whole call rather than half-applied, and `PROT_WRITE|
+  PROT_EXEC` is still refused. `PROT_NONE` is real (the frame stays yours and
+  every userspace access faults) rather than rounded to read-only.
+
+  It also uncovered a **latent x86 bug that predates mmap**: an x86 page walk
+  ANDs the permission bits down the levels, and `get_or_create_table()` was
+  installing intermediates with the *leaf's* flags — so a PDPT/PD/PT first
+  created for a data page carried NX, and every executable mapping made
+  underneath it afterwards was silently non-executable. `mprotect(W -> X)`
+  returned 0 and the first instruction fetch took `#PF` error 0x15 at an
+  address whose own PTE said execute was fine. Intermediates are now kept
+  permissive (`table_perms()`) and only ever widened; the leaf is
+  authoritative. aarch64 never had this — its table descriptors carry no
+  restriction bits unless you set them.
+  - [ ] `mprotect` does not stop the KERNEL touching a `PROT_NONE` page on the
+    process's behalf: `copy_to_user` walks the page tables looking for a frame
+    and finds one. Honouring it there means consulting the VMA list on the
+    copy path, which is a cost on every syscall — worth doing when there is a
+    caller that cares.
+- [x] **File-backed mappings (`fd >= 0`).** **Done** -- `vma_mmap_file()` over
+  the unified VM object (`kernel/mm/vm_object.c`), which is the page cache this
+  said it was blocked on. `test mmap` covers it.
+- [x] **`MAP_SHARED` for FILE mappings.** **Done**, over the same VM object:
+  two mappers share the object's resident pages, so a write through one is
+  visible through the other and through `read()`. Shared ANONYMOUS memory is
+  still open (it needs the refcounted anonymous object below). The original
+  note, kept because the reasoning still applies to the anonymous case:
+  Needs a shared anonymous object with a refcount, and
+  for file mappings the page cache again. A MAP_SHARED
+  quietly behaving as MAP_PRIVATE is two processes each believing they see the
+  other's writes.
+- [ ] **`MAP_FIXED` / a caller-chosen address.** The kernel picks. Refusing is
+  cheap and nothing needs it; the plumbing exists in `vma_mmap` behind the flag
+  should that change. Currently `ENOTSUP`.
+- [x] **Demand paging.** **Done** -- `vm_fault()` in `kernel/mm/vma.c` resolves
+  a fault against the VMA list, which is exactly the record this said could
+  answer "not mapped yet, and legitimately yours" from "not yours". Copy-on-
+  write included: a MAP_PRIVATE file page is mapped read-only so the first
+  write faults unambiguously. The original note, for the record:
+  Every mapping is allocated AND ZEROED up front, so a
+  large one costs its full size immediately. Real demand paging needs a fault
+  handler that can tell "not mapped yet, and legitimately yours" from "not
+  yours" — the VMA list is exactly the record that can answer it, which is
+  half the reason it exists — plus a zero page mapped read-only and copied on
+  write.
+- [x] **A page cache.** **DONE**, and built as a *unified* one:
+  `kernel/mm/vm_object.h` defines ONE object per file that owns its resident
+  pages, rather than a block cache under the filesystem and a page cache over
+  it. Two caches of the same bytes can disagree — a program that `mmap`s a file
+  and one that `read`s it would see different data and neither would be wrong
+  on its own terms. Object identity is the FILE, so two independent opens share
+  one set of pages and one authoritative size.
+
+  Measured, `test pagecache`:
+
+  | | before | after |
+  |---|---:|---:|
+  | 512 × 64-byte appends → device writes | 512 transactions | **0** during the loop, one 32 KiB transaction at `fsync` |
+  | re-reading 4 KiB already read | 4 device reads | **0** (8 cache hits) |
+
+  EMBKFS is copy-on-write, so every write that reached it rebuilt the object
+  and committed a new generation — a program appending a line at a time cost
+  one transaction *per line*.
+
+  And `fsync`/`fdatasync` are now **real device flushes** (syscall 100), in the
+  same commit, which is exactly what the standing obligation in
+  `user/lib/syscalls.c` demanded: *"if a write-back cache is ever added, these
+  must become a real device flush the same day, or it turns into the lie the
+  old comment feared."*
+  - [x] ~~**Metadata is still uncached.**~~ **DONE.** `test metacache`:
+
+    | | before | after |
+    |---|---:|---:|
+    | 50 stats of one warm file | 1100 device reads | **0** |
+    | 40 stats round-robin over 2 files | 880 | **0** |
+    | 20 opens of one warm path | 480 | **0** |
+
+    The inode cache existed and reported **0 hits against 15 misses**, because
+    it was one slot *and* three separate call sites did their own B-tree
+    descent instead of asking it: `stat_object`, `lookup`'s directory-inode
+    read, and `inode_dtype` (the type of every path component). Made 32-way,
+    and all three now go through it. A name cache — `(dir, name) -> oid` —
+    covers the other descent per component. And `stat` was calling
+    `seek_object(SEEK_END)`, which walks every extent to re-derive a size the
+    inode was already holding.
+
+    Both caches are keyed on the volume `generation`, so any commit retires
+    every entry: blunt, and correct. Negative lookups are deliberately never
+    cached — "this name does not exist" stops being true the moment somebody
+    creates it, and create-then-open is the most common sequence there is.
+  - [ ] **One lock for the whole cache** — the registry, every object's pages,
+    and the global LRU. Per-object locks plus a separate LRU lock is the right
+    shape eventually; the moment to build it is when a profile shows
+    contention, because a two-lock ordering bug here deadlocks the path every
+    file read takes. **The profile now exists:** `test swap` prints how long
+    the fault path waits for this lock -- **~1.2 s of the 3.4-6 s a paging
+    run spends inside the object (20-35%)**, all of it queued behind the
+    writeback thread's reclaim batches, which hold the lock through their
+    cluster writes. **Built, measured, reverted (2026-09-11).** Two shapes
+    were tried: reclaim dropping the lock across its cluster writes with the
+    batch's pages marked in-flight (faults and teardown wait for them), and
+    then the writeback thread as the ONLY reclaimer with faults waiting on
+    its landing queue. Both were slower than holding the lock -- 7.6/6.8/
+    13.9/14.5 s against 6.2/6.0/8.7/9.0 for the four witness runs, worst
+    single fault up to 2.2 s -- because the wait only moved: the disk is
+    one ATA channel taking one command at a time, so a fault that needs a
+    swap-in queues behind the writer at the DEVICE whether or not it holds
+    the lock, and taking reclaim away from the faulting core removed a
+    second pump that was actually helping. The lock is not the bottleneck;
+    the single command queue is. What would help: concurrent I/O at the
+    device (AHCI/NCQ, or virtio-blk's queue used asynchronously), and
+    priority for reads over the writer's stream. Two things from the
+    attempt stayed: the ATA driver's own lock (below) and the worst-fault
+    metric `test swap` prints.
+  - [ ] **...and the concurrent device queue was then built, measured and
+    reverted too (2026-09-11).** virtio-blk (aarch64's disk) rewritten to keep
+    four requests in flight -- a slot with three descriptors and its own
+    staging buffer each, a counting semaphore for the slots, completion by
+    interrupt (which needed the transport to map virtio's ISR window: this
+    QEMU machine has no ITS, so MSI is unavailable and a legacy INTx, which
+    must be acknowledged or it wedges the machine, is the only interrupt
+    there is) -- and the block layer's one global bounce buffer taken out of
+    the path (`needs_kernel_range = false`, the driver stages per slot). It
+    worked, and it was **slower**: the swap witness 1586 ms against 1172 ms
+    polled, 1330 ms with a spin-then-sleep wait. Two reasons, and the second
+    is the one that matters:
+      1. On a device the host services in tens of microseconds, an interrupt
+         plus a wake plus a context switch each way costs more than the
+         transfer. Polling wins -- which is why the driver polled.
+      2. **Nothing above the driver can issue concurrent I/O.** Every file
+         read goes through EMBKFS's ONE filesystem lock, and all swap traffic
+         goes through the page cache's ONE lock (the entry above, from the
+         other side). Four slots have nothing to overlap: the device queue was
+         never the bottleneck, the locks above it are.
+    So the driver stays as it was, and what to build first is the locking
+    above it -- per-object cache locking, and a filesystem that admits more
+    than one reader. A device queue is worth having the day there is
+    something to put in it.
+  - [x] **The ATA driver had no lock.** Its command path is file-scope state
+    (one PRDT, one bounce, one completion flag per channel) and every caller
+    happened to arrive under some other lock -- the filesystem's, or the
+    page cache's, which swap I/O ran under. A swap-in under the cache lock
+    and a metadata read under the filesystem lock could already meet on the
+    channel; the experiment above made them meet constantly, and a lost
+    completion hung `ata_wait_irq` (its timeout is a million halts). One
+    sleeping lock across each request, in the driver, where the state is.
+  - [ ] **Read-ahead.** A sequential reader still faults one page at a time.
+    The access pattern is trivially detectable from the object's own history.
+  - [x] ~~**The writeback thread polls** because the scheduler has no timer
+    wakeup list.~~ **DONE** — `sched_sleep_ms()` blocks on a timer queue that
+    the scheduler tick drains (`sched_timer_tick()`, called before `schedule()`
+    on both architectures). See the power section below for what that
+    measurement then exposed.
+- [ ] **`msync`.** MAP_SHARED file mappings exist now and writeback covers
+  their durability; a caller asking by name still gets `ENOSYS` rather than a
+  yes that means nothing. Make it `vmo_flush` of the range.
+- [x] **Swap.** See "Memory: swap, and anonymous memory as an object" below.
+  Anonymous mappings live in `vm_object`s and page out to a raw-device store;
+  `make test-swap` is the proof. The page cache also gained a per-object index
+  that doubles with the object and a private pool for its page records --
+  both found by that test, both measured there.
+
+### Power
+
+`kernel/power/power.h`. Shutdown and reboot are real on both architectures
+(PSCI `SYSTEM_OFF`/`SYSTEM_RESET` on aarch64; the PM1a control register at the
+address every mainstream emulator uses on x86, then the 8042 reset line, then a
+deliberate triple fault). A transition flushes the page cache first — a
+shutdown that lost recently written files would make the write-back cache a bug
+rather than a feature. Per-core idle residency is measured continuously and
+`power` reports it: **97% system idle** on an otherwise idle desktop, four
+cores.
+
+The measurement immediately earned itself twice:
+
+1. It first reported **0% idle on a machine that was in fact halted on three of
+   four cores** — because it was instrumenting the per-core idle *kthread*,
+   which never runs. The adopted boot thread in `ap_main` is NORMAL priority
+   and always runnable, so the `PRIORITY_BACKGROUND` idle kthread behind it is
+   a liveness backstop that is never reached in practice. All three places a
+   core can halt are now instrumented.
+2. It showed every periodic thing in the kernel was a yield loop, which is why
+   `sched_sleep_ms` exists at all.
+
+- [x] ~~**A latent race in the block/resume path that four cores expose.**~~
+  **FIXED**, and the fix is four lines in `schedule_locked()`.
+
+  `schedule_locked()` can return WITHOUT switching — when the candidate scan
+  finds nothing runnable on this core. But `sched_block_current_locked()` marks
+  the thread `BLOCKED` and puts it on a wait queue *before* calling it. So on
+  that path the thread was left marked blocked, `running_cpu = -1`, sitting on
+  a queue — **while still physically executing**.
+
+  Another core's waker then finds it on the queue, marks it `READY`, and the
+  candidate scan (which matches on `READY`) dispatches it. It never reached
+  `kernel_ctx_switch`, so it has no saved context: the other core resumes it
+  onto a stale one while the first core is still running it. Two cores, one
+  kernel stack — the garbage `ELR` and the PC-alignment fault at EL1.
+
+  The fix: if we are returning without switching, **undo the block**. Unqueue
+  the thread and put it back to `RUNNING`. Every caller of
+  `sched_block_current_locked` already loops on its own predicate — the code
+  documented `process_wait`'s retry loop as relying on exactly this
+  "returned without switching" case — so a caller that wakes without its
+  condition met simply tries again. What was missing was unwinding the *state*.
+
+  Two supporting changes, each independently right:
+  - The candidate scan now skips any thread with `running_cpu >= 0`. A `READY`
+    thread should always have `-1` by construction; this costs one comparison
+    and catches the case where it does not.
+  - **aarch64 had no per-core idle kthreads.** `process_create_idle_for_cpu`
+    was only ever called from x86's `main.c`, so the "this core always has a
+    legal switch target" invariant `process.h` calls load-bearing was simply
+    absent on ARM — which is *why* the early-return path was reachable there
+    and not on x86. Now created on both.
+
+  `sched_sleep_ms` no longer gates user threads, so a sleeping **app** blocks
+  instead of spinning.
+
+- [x] ~~(superseded entry kept for its history)~~
+  `sched_sleep_ms` gates user threads back to a yield loop, so a sleeping *app*
+  still keeps a core out of idle. Removing the gate kills aarch64 with a
+  PC-alignment fault (garbage `ELR_EL1`) or an undefined-instruction abort at
+  EL1 — a thread resumed onto a context that was not finished being saved.
+
+  **The first diagnosis in this entry was wrong**, and the correction is the
+  useful part. It said "kernel threads take the identical path and are fine, so
+  it is something about the EL0 exception path". Re-tested since:
+
+  | cores | gate removed |
+  |---:|---|
+  | 1 | **passes** |
+  | 2 | **passes** |
+  | 4 | fails |
+
+  So it is not about user threads. It is a race in block/resume that four cores
+  expose, and user threads only make it FREQUENT — the kernel's own sleepers
+  block ten times a second, while every app calling `sleep()` blocks
+  constantly. Kernel threads are not immune, they are rare. The gate is a
+  throttle on a scheduler bug, not a boundary around a broken path.
+
+  One suspect has been ruled out: `sched_timer_tick` used to take
+  `g_sched_lock` on the tick path immediately before `schedule()` took it
+  again, which is genuinely dangerous (the lock is held across a context switch
+  and released by whichever core resumes, so its saved interrupt flags are one
+  slot written by one core and consumed by another). Folding the wake into
+  `schedule()`'s own critical section removed that cycle — a real improvement,
+  and not the cause.
+
+  **Next step:** find what two cores can do to one TCB between
+  `wait_queue_block()` and the end of `kernel_ctx_switch`. **Repro:** delete
+  the `pml4_phys != vmm_get_kernel_pml4()` gate in `sched_sleep_ms`
+  (`kernel/process/process.c`) and run `make ARCH=aarch64 test-arm64-boot`;
+  `ARM_SMP=1` or `ARM_SMP=2` pass, which is the shape of the bug.
+- [ ] **No battery driver**, because the hardware this runs on has none.
+  `power_supply_get()` answers false, which is a fact about the machine and not
+  a stub; the driver interface is there for an ACPI `_BST`, an I2C fuel gauge,
+  or a hypervisor channel to fill. A real ACPI battery needs the AML
+  interpreter below.
+- [ ] **No AML interpreter**, which is what a *general* x86 power-off needs
+  (FADT → PM1a_CNT, and SLP_TYPa for S5 out of the DSDT). Without it, real
+  hardware falls through every mechanism and `power_transition` reports that it
+  could not power the machine off — the truth, and better than halting and
+  looking like a hang.
+- [ ] **No suspend-to-RAM.** Refused by name (`ENOSYS`), not silently ignored:
+  it needs every driver to save and restore its own state, and a driver that
+  silently does not is a machine that wakes up with a dead disk.
+- [ ] **No per-device power states, no thermal, no frequency scaling.** The
+  idle residency counter is the foundation any of those would be judged
+  against.
+- [x] **Tickless idle.** **Done.** An idle core arms its one-shot for the next
+  real deadline instead of 10 ms hence (`sched_idle_next_ms`, capped at 1 s),
+  and a targeted IPI wakes exactly one core rather than broadcasting. Measured
+  by `power`: an idle core takes 5-8 timer interrupts a second, not 100.
+  A busy core now also arms for the next PERIODIC sleeper -- see Process &
+  Scheduling.
+
 ---
 
 ## Interrupts & Timers
@@ -522,7 +867,365 @@ web asks for them and how much they change a page:
 
 ---
 
+## Raspberry Pi 4 (docs/RPI4.md)
+
+P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in order:
+
+- [ ] **P0 + P0b on the real board** (planned Monday 2026-09-28, on a TV). Only
+      QEMU has seen them. `rpi4-sdboot`, HDMI0; the expected screen and the
+      triage are docs/RPI4.md §4. Check that the newest-line bar is BLUE.
+- [x] ~~`fdt_reg()` ignores parent `ranges`~~ -- it translates through every
+      ancestor's `ranges` now, and reads the parent's cell counts (P0b).
+- [x] ~~P1: `irq/gicv2.c`~~ and ~~P2: spin-table SMP~~ -- both pass on QEMU
+      raspi4b (docs/RPI4.md). Real-hardware risks they carry to Monday:
+      interrupt groups (QEMU imitates the firmware's GIC set-up) and the
+      cache cleaning before a spin-table release (QEMU models no caches).
+- [x] ~~The Pi cannot reboot or power off.~~ -- `power_arm.c` falls back to the
+      BCM2835 power-management watchdog when there is no PSCI: reboot is
+      partition 0, "off" is the firmware's halt partition 63. Verified once on
+      QEMU raspi4b with a temporary trigger (QEMU -no-reboot exited on the
+      reset). Not in an automated test: aarch64 has no serial command channel
+      to ask for a reboot, and userland (which has the syscall) needs P3.
+- [x] ~~The "every core is taking interrupts" self-test samples too early on
+      a diskless Pi~~ -- resolved at P3: with the userland running from the
+      SD card, the check passes on raspi4b and test-rpi4-boot claims it.
+- [ ] **EMMC2 is untested anywhere but the real board.** QEMU raspi4b wires
+      its SD card to the older 0x7e300000 controller, and EMMC2's sd-bus is
+      not reachable from the QEMU command line. Its two quirks -- no
+      card-detect, a firmware-owned base clock (QEMU answers the mailbox's
+      clock query with a placeholder 700 MHz) -- are first exercised on
+      Monday's Pi.
+- [ ] **The Pi's SD card has no swap area**, so the swap self-test fails on
+      raspi4b. tools/mkrpi4sd.py could add a third partition with the
+      EMBKSWAP header (tools/mkswap.py) once PIO SD throughput is measured on
+      the real card -- swapping at SD-over-PIO speed may not be worth having.
+- [ ] **x86 build: `$(wildcard build/*.embx)` makes every stale .embx a
+      prerequisite of embkfs.img**, and its rule needs EmbCC's embld -- so
+      while EmbCC is being rebuilt (embld absent), the whole x86 image build
+      fails even though the .embx is optional. Seen 2026-09-26.
+- [ ] **P3: EMMC2.** `drivers/storage/sdhci.c` binds over PCI only; split out
+      a DT attach. Plus an `rpi4-sdcard` target: FAT32 boot partition and
+      EMBKFS root.
+- [x] ~~P4: the desktop on the mailbox framebuffer~~ -- ✅ on QEMU raspi4b.
+- [ ] **P5 on the real board** -- the USB stack, mouse, hubs and DMA remap
+      pass on QEMU `virt` (test-arm64-usb); the BCM2711 PCIe bring-up and the
+      VL805 firmware load have never run (raspi4b has no PCIe), and a
+      high-speed hub's Transaction Translator fields are exercised only by
+      the Pi's own hub. docs/RPI4.md P5 and §4 say what to photograph.
+- [ ] **USB on aarch64 is polled** (~10 ms, from the boot loop). Fine for a
+      keyboard and a mouse; audio or bulk throughput would want the xHCI's
+      interrupt wired through the GIC (virt: INTx/MSI; Pi: the brcmstb
+      controller's own MSI block).
+- [ ] **One interrupt-IN endpoint per USB device.** A composite device -- a
+      wireless receiver that is a keyboard AND a mouse on two interfaces --
+      gets its first boot interface only. The Pi's usual wired keyboard and
+      mouse are two devices and unaffected.
+- [ ] **P6: Ethernet** (GENET v5 + its BCM54213 PHY) -- then NTP sets the
+      clock, which a Pi has no battery-backed RTC to keep.
+- [ ] **aarch64 RAM above 4 GiB is ignored.** boot.S's direct map covers 4 GiB,
+      so `boot_protocol_dtb.c` truncates memory there, loudly, rather than let
+      pmm hand out pages the kernel can't reach. That was a real bug before, not
+      a limit: an 8 GB Pi or `virt -m 5G` would fault. The fix is extending the
+      direct map from the DTB in C once pmm exists (docs/RPI4.md P7).
+- [ ] `fdt_find_compatible()` doesn't examine the root node, so a board's own
+      `compatible` can't be found through it. Worth fixing in the function
+      rather than working around at each caller the way `gicv3.c` does now.
+
 ## Storage
+
+### The installer
+
+### Putting the OS on a disk (2026-09-14)
+
+`user/tools/install/install.c` plus four syscalls -- the first ever gated on
+`EMBK_CAP_RAWDISK`, which `capabilities.h` reserved long before anything could
+use it, saying "each becomes a gate on the day it becomes a syscall".
+
+**Why it copies rather than formats.** The medium it runs from already has the
+right layout: a GPT, an ESP with the loader, an EMBKFS root with the system.
+Reproducing that means writing an equivalent partition table and copying the
+partitions -- no mkfs, no second implementation of EMBKFS's on-disk format to
+drift from the first, and the thing installed is byte-for-byte the thing that
+was tested. Only the BACKUP GPT is rebuilt, because "the end of the disk" is a
+different LBA on a different-sized disk.
+
+**The test is the second boot and nothing before it counts.** An installer that
+writes plausible bytes and reports success has failed in the only way that
+matters if the firmware will not boot the result. `make test-install` installs
+onto a blank disk, then boots that disk **with the source detached** -- leaving
+it attached would let the firmware boot from it and pass with the target empty.
+
+**Still open:**
+
+- [ ] **The root filesystem is not grown.** It comes out the size of the
+      source's, so a 200 MB stick installed onto a 1 TB disk uses 200 MB of it.
+      Growing an EMBKFS volume in place is a real piece of filesystem work.
+- [ ] **It needs a source that already has a GPT.** It cannot create a layout
+      from nothing, so it installs from the USB image and not from, say, a
+      network stream.
+- [ ] **No user interface.** It is a command line: `install sda sdb`. A person
+      installing an operating system should be shown what is about to be
+      destroyed and made to confirm it, and there is no such screen.
+- [ ] **No UEFI boot entry is registered.** It relies on the removable-media
+      path `/EFI/BOOT/BOOTX64.EFI`, which every UEFI machine tries without a
+      boot entry. That works and is what the test proves; a machine with a
+      crowded boot order may still prefer something else, and setting a real
+      entry needs `SetVariable` on `BootXXXX`/`BootOrder` at runtime.
+- [ ] **It will not install onto the disk it booted from**, by design -- but it
+      also cannot install onto a disk that is currently MOUNTED, and it does not
+      check for that. Overwriting a mounted volume's blocks underneath the page
+      cache is a corruption the filesystem cannot see coming.
+
+### A bug this pillar found
+
+`embk_partition_parent()` returns the device ITSELF for a whole disk, not NULL.
+Two places had read that as "non-NULL means partition": the new disk-info
+syscall, which reported every disk on the machine as a partition and left the
+installer refusing to write anywhere, and `automount_attach`, where a whole
+disk matched its own partition filter and would have been mounted a second time
+alongside its partitions.
+
+## Loadable kernel modules
+
+### The loader (2026-09-14)
+
+`kernel/module/` plus `modules/ramdisk/`. A module is an ordinary ELF64
+RELOCATABLE object built with the kernel's own flags -- not a shared library,
+because there is no dynamic linker in the kernel and no reason to invent one.
+The kernel places its sections, resolves undefined symbols against an explicit
+export table, applies the relocations, flips the code to read-only +
+executable, and calls `init`. `make test-modules`.
+
+**Two refusals are the design, not limitations:**
+
+- It will not map a page writable and executable at once. The image is written
+  while non-executable and flipped afterwards -- W^X is not suspended for the
+  convenience of the loader that would otherwise be the easiest thing in the
+  system to abuse. The test reads the leaf page-table entry back and asserts
+  it, because the module runs either way.
+- It will not resolve a symbol the kernel did not deliberately export.
+  `kernel/module/exports.c` IS the contract: 16 symbols today. Letting a
+  module reach every internal function means every module depends on all of
+  them, and the first rename breaks binaries built months ago.
+
+**Where module memory lives is not free choice**, and getting it wrong was the
+first bug: kernel code is built `-mcmodel=kernel`, which promises every address
+is within 2 GiB of every other. Module memory first went in the MMIO window,
+seventy TERABYTES from `kprintf`, and the very first call could not be encoded.
+It is in the kernel's own window now -- 1 GiB above the image on x86, and only
+64 MiB above it on aarch64, whose branch reaches +-128 MiB rather than +-2 GiB.
+
+**Still open:**
+
+- [ ] **Modules are not signed, and they should be.** This tree verifies the
+      loader with Secure Boot and the kernel with a build hash, and then loads
+      arbitrary code into the kernel from a file. `/system/modules` is
+      read-only to every session, so nothing in userspace can write one -- but
+      that is a filesystem permission standing in for a signature. The pieces
+      to fix it exist now (`tools/sbsign.py` builds PKCS#7, the kernel has
+      SHA-256): a detached signature over the .ko, verified against a key
+      compiled into the kernel, is the same shape as the kernel-hash check.
+- [ ] **No symbol versioning.** A module built against one kernel and loaded
+      into another resolves by NAME alone. If the meaning of an exported
+      function changes without its name changing, the module links cleanly and
+      misbehaves. A hash of each exported symbol's prototype is the usual fix.
+- [ ] **No inter-module dependencies.** A module can only call the kernel, not
+      another module. Nothing exports from a module yet, so nothing needs it.
+- [ ] **Unload is not refcounted.** `embk_module_unload` runs `exit` and frees
+      the pages, and it is only safe because nothing may hold a pointer into a
+      module -- no inter-module linking, and a module must remove every
+      callback it registered. That is a real constraint on what a module may
+      do and it is not enforced anywhere.
+- [ ] **Only the relocation types a compiler emits for kernel code.** x86-64
+      has 64/PC32/PLT32/32/32S; aarch64 has ABS64/CALL26/JUMP26. Anything else
+      is refused BY NAME rather than approximated -- notably aarch64's
+      ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC pair, which a module doing anything
+      with large constants will hit.
+- [ ] **`R_X86_64_32` is applied without a range check** where `32S` gets one.
+      Unsigned 32-bit absolute references cannot be satisfied by a kernel
+      address at all; it should refuse rather than truncate.
+
+## Secure Boot
+
+### Signed loader, enrolled keys, and a verified kernel (2026-09-14)
+
+`make test-secureboot`. Three pieces, none of which existed:
+
+- `tools/sbsign.py` computes the Authenticode PE hash and builds the PKCS#7
+  by hand. sbsign/pesign are Linux-only and absent on this host, so this
+  writes the bytes -- the same choice `mkuefidisk.py` and `mkfat32.py` make.
+- `tools/efivars.py` writes PK/KEK/db into a UEFI variable store, because a
+  firmware with no Platform Key is in SETUP MODE and enforces nothing.
+- the loader reads the firmware's `SecureBoot` variable through runtime
+  services and checks the kernel against the hash the build computed, both
+  reported to the kernel in boot protocol v2.
+
+**Four bugs, and every one of them produced the identical symptom** -- the
+firmware says "Access Denied" and nothing else, whether the signature is
+absent, malformed, or perfectly valid over the wrong bytes. Found by turning
+on OVMF's debug console, which says exactly which check failed:
+
+1. `openssl cms` emits SignedData version 3 and wraps the content in an OCTET
+   STRING. Authenticode is PKCS#7 1.5: version 1, content embedded directly.
+   The container is built by hand now; openssl only does the RSA signature.
+2. `SpcString` is `[0] IMPLICIT BMPString` -- PRIMITIVE. Tagged constructed,
+   every parser walks into the UCS-2 and chokes.
+3. The certificate table must start 8-byte aligned, so padding is added to the
+   file -- and that padding is INSIDE the region the Authenticode hash covers.
+   Padding after hashing signs a file that no longer exists.
+4. The messageDigest attribute covers the SpcIndirectDataContent's VALUE, not
+   its TLV: the firmware walks past the SEQUENCE header before handing the
+   bytes to the verifier.
+
+**Still open:**
+
+- [ ] **It boots on a machine that has enrolled OUR key, not on a stock one.**
+      A retail laptop trusts Microsoft's keys. The options are a shim signed by
+      them, or the owner enrolling ours in firmware setup -- and the second is
+      what the test does. Nothing in this tree can change that.
+- [ ] **The signing key is a development key**, generated into `build/sbkeys/`
+      and git-ignored. A release key is a policy about where a private key
+      lives and who can use it, not a build rule.
+- [ ] **No `dbx` handling.** The firmware checks the revocation list itself
+      before ours is consulted, so nothing is bypassed -- but this tree has no
+      way to ship a revocation of its own key.
+- [ ] **The kernel hash is a hash, not a signature, and it is embedded in the
+      loader.** That is exactly right while the kernel is embedded too -- the
+      firmware's signature covers both -- and it is NOT enough once the kernel
+      becomes a separate file on the ESP, which is what the Recovery menu
+      entry needs. A detached signature over the kernel is the next step.
+- [ ] **Nothing is gated on any of it.** The kernel REPORTS secure_boot and
+      kernel_verified and refuses to boot an unverified kernel, but userspace
+      does not yet change behaviour based on how the machine was trusted.
+- [ ] **Boot protocol v1 loaders are accepted**, and must be: the BIOS stage2
+      still writes v1. The capture code zero-fills what a short record lacks
+      and every new field reads as "unknown" -- which had to be IMPLEMENTED,
+      because the version scheme was documented but the code demanded an exact
+      match and would have broken the BIOS path the first time a field was
+      added.
+
+## USB
+
+### Hot-plug and removable media (2026-09-14)
+
+Ports used to be scanned once, during boot. `usb_poll()` now compares each
+controller's ports against the device table every 500 ms; what appeared is
+enumerated through exactly the same code path as boot, and what left is torn
+down. A mass-storage device is partition-scanned and mounted under
+`/media/<device name>` by `kernel/fs/automount.c`, which takes a BLOCK DEVICE
+rather than a USB one so a card reader or a runtime-attached image lands the
+same way. `make test-usb-hotplug` attaches a FAT32 stick over QMP to a running
+machine, requires the guest to read a named file off it, then removes it and
+requires the device, the block device and the mount all to go away.
+
+**Why polling and not the controllers' change interrupts:** EHCI shares its
+port-change interrupt with its companion controller, several of these are
+reached through a legacy INTx line this kernel does not always route, and a
+missed edge is a stick that never appears -- a failure whose only symptom is
+that the machine seems broken. A level read on a timer cannot miss anything,
+it can only be late.
+
+**Still open:**
+
+- [ ] **xHCI has no hot-plug.** It keeps its own enumeration rather than the
+      shared `usb_core` path, so `usb_alloc_device`/`usb_enumerate` are never
+      called on it and the port-tracking this is built on does not exist there.
+      Its `rescan` hook is NULL and skipped. This is the half a recent laptop
+      needs, since USB 3 ports are xHCI.
+- [ ] **No hub support on the hot-plug path.** Only ROOT ports are compared.
+      A device plugged into an external hub after boot is not seen; one
+      present at boot still enumerates through the existing hub code.
+- [ ] **Nothing is flushed on removal, and nothing can be.** A write still
+      buffered when the connector separates is lost. That is what "safely
+      remove" exists to let a person avoid, and there is no UI for it yet --
+      no way to ask for an unmount before pulling the stick.
+- [ ] **The mount point is the kernel's device name, not the volume label.**
+      `/media/sdc1`, not `/media/MYSTICK`. A label is attacker-controlled text
+      from an untrusted medium and putting it straight into a path is how you
+      get a volume called `../../system`; making it safe means a sanitiser and
+      a collision rule, which is a small design rather than a small change.
+- [ ] **One cluster per file in tools/mkfat32.py.** It writes test fixtures,
+      not archives, and refuses anything larger rather than truncating.
+
+## ACPI power (the first slice of the ACPI pillar)
+- [x] **Power-off and reboot the way the machine's own tables say.** The FADT
+      is parsed for PM1a/PM1b control, the SMI command that switches the chipset
+      into ACPI mode, the ACPI 5 hardware-reduced sleep register and the reset
+      register; `\_S5_` is DECODED from the DSDT or any SSDT -- NameOp, name,
+      PackageOp, PkgLength, element count, integers in all six AML encodings --
+      rather than interpreted. Power-off tries that first and the emulator
+      constants only after it; reboot tries the reset register first. Verified
+      by `make test-power` on both QEMU chipsets, which have different DSDTs:
+      PIIX4 (ACPI 1.0 FADT, no reset register -- reboot correctly falls to the
+      8042) and Q35 (reset register 0xCF9 <- 0x0F, NOT the 0x06 a hardcoded
+      guess would have written). The test counts a power-off that only worked
+      through the emulator fallback as a FAILURE.
+- [ ] A `\_S5_` that is a METHOD, not a package, is not handled: that needs
+      the interpreter. Detected and reported, not guessed at.
+- [ ] Sleep (S3), battery (`_BST`), lid (`_LID`), thermal zones, device power
+      states: all of them are AML methods. The interpreter is the rest of this
+      pillar (docs/PILLARS.md).
+
+### NVMe (the disk interface of a modern machine)
+- [x] **NVMe driver, both architectures** (`kernel/drivers/storage/nvme.c`).
+      Until it existed the OS had no disk on a machine that boots from an NVMe
+      SSD, which is most machines built in the last several years -- ATA and
+      AHCI are SATA, virtio-blk exists only in a VM. One admin and one I/O queue
+      pair per controller, polled with interrupts masked at the controller AND
+      at PCI, one command in flight under a sleeping lock, a physically
+      contiguous bounce buffer with the three PRP shapes (one page, two pages,
+      a list). Namespaces found through the ACTIVE list (QEMU's controller
+      declares 256 possible; counting 1..NN would be 256 identify commands).
+      Proven by the witness (`nvmetest.c`, `make test-nvme`, and in every
+      aarch64 boot test): every PRP shape, a transfer split past MDTS, the last
+      blocks of the namespace, that the LBA is honoured, that the end is
+      enforced, flush, and a shutdown notification followed by a restart --
+      at 512- AND 4096-byte block sizes. And by booting the WHOLE OS with its
+      root filesystem on NVMe: x86 (desktop, `test posix` ALL PASS) and aarch64
+      with no virtio disk at all.
+- [x] **Power-off tells the drives.** `power_transition()` now flushes every
+      block device's cache and sends NVMe drives the normal shutdown
+      notification before asking the firmware to cut power -- and, because on
+      real x86 hardware that request can fail today (no AML interpreter; see
+      power_x86.c), RESTARTS them when it does, rather than leave a running
+      machine with disks that refuse every command.
+- [ ] MSI-X and one I/O queue per core. Worth nothing while the filesystem
+      serialises above the driver; worth measuring the day it does not.
+- [ ] Dataset Management (TRIM). An SSD that is never told which blocks are
+      free degrades as it fills. EMBKFS knows exactly which blocks it frees.
+- [ ] Namespaces with per-block metadata (end-to-end protection) are skipped,
+      and so are controllers whose minimum memory page is not 4 KiB. Neither is
+      found on consumer drives; both are refused BY NAME in the boot log.
+- [ ] **4Kn disks have no partitions.** `partition.c` skips any disk whose
+      sector is not 512 bytes, so a 4096-byte-sector NVMe drive with a GPT on it
+      exposes the whole disk and none of its partitions. Whole-disk EMBKFS on a
+      4Kn namespace works (tested). An installer that partitions a 4Kn drive
+      needs this first.
+- [ ] **aarch64 never scans partitions at all** -- `embk_partition_scan_all()`
+      is called from kernel/main.c only. Harmless while every aarch64 disk is a
+      whole-disk image; not harmless on hardware.
+
+### Found on the way (fixed)
+- [x] **EMBKFS mount overflowed on 4096-byte sectors.** The superblock was read
+      as ONE SECTOR into a 512-byte static buffer, so a 4Kn device would have
+      DMA'd 4096 bytes over whatever followed it in .bss. No driver had ever
+      registered such a device; the NVMe driver was the first that could.
+- [x] **`pci_enable_bus_mastering()` never enabled memory decoding.** Its
+      comment said bits 0 and 1; its code set bit 0. Every MMIO device worked
+      because emulator firmware had already set it. Real firmware owes that to
+      no device but the one it booted from.
+
+### Found on the way (open)
+- [ ] **EMBKFS's free-block counter drifts across hard power cuts.** The x86
+      development image, hard-killed by hundreds of test runs, mounts with
+      `allocator built: 19046 used, 13722 free (superblock says 13714) --
+      MISMATCH`: the superblock's counter is 8 blocks off from its OWN tree. A
+      freshly built image mounts with OK (every aarch64 boot test copies one).
+      No data is at risk -- the allocator uses the bitmap rebuilt from the
+      tree, not the counter -- but the counter is written back at every commit,
+      so the drift never heals, and `test embkfs crash` does not check it. Find
+      which commit ordering lets the counter and the tree disagree, then make
+      the crash test assert the counter too.
 
 ### ATA / DMA
 - [x] PRD_EOT had a stray trailing semicolon (`#define PRD_EOT 0x8000;`) in
@@ -961,6 +1664,34 @@ interrupt-driven.
 - [ ] `vfs_mount` duplicate-mount check is a raw strcmp on `at` (not a
   normalized path). Fine for the single "/" mount.
 
+### Symbolic links
+
+Real as of the symlink commit: `symlink`/`readlink`/`lstat` syscalls, following
+in `vfs_walk_from_ex` with an eight-link `ELOOP` limit, and `ln`/`readlink` in
+the shell. EMBKFS needed no format change — it already had `S_IFLNK` and
+`DT_LNK`, and `embkfs_make_object()` already mapped the mode to the right
+directory-entry type. A link is an ordinary object whose content is the target
+text.
+
+- [ ] **Creating a link is TWO commits**, not one: `make_object` then
+  `write_object`. A crash between them leaves an object of the right type with
+  no target. The walker refuses an empty target, so the failure mode is a link
+  that reports `EINVAL` rather than one that points somewhere wrong — but it is
+  still a torn write. One transaction means teaching `make_object` to carry
+  initial content, which is worth doing when something else needs it too.
+- [ ] **No hard links.** `ln` therefore takes no `-s`, and says so.
+- [ ] **No `O_NOFOLLOW`.** `open()` always follows a link in the final
+  position. Nothing needs the other behaviour yet; `lstat` covers the "is this
+  a link" question.
+- [ ] **An absolute link target restarts at the walk's own root**, which is the
+  namespace binding the resolution began at — not a global root. That is what
+  stops a writable directory plus one link from being an escape from every
+  confined namespace. Worth a dedicated test that a link inside a namespace
+  cannot name the machine's real `/`.
+- [ ] **`readlink` reports the FULL length** even when the buffer was short,
+  which is more useful than POSIX's truncated count. The libc wrapper clamps to
+  POSIX's contract; nothing yet uses the extra information.
+
 ### File descriptors
 - [x] ~~fd table is fixed (64), global, per-boot. No per-process fd tables~~ —
   done: `struct fd_entry` moved to `kernel/fs/fd.h` (public) and `struct
@@ -970,10 +1701,23 @@ interrupt-driven.
   existing pre-process `test ring3`/selftest behavior that runs before any
   process exists). Verified via QEMU: two spawned processes opening
   different files see independent fd numbering/state, no cross-talk.
-  Open-file-description sharing (fork / dup / dup2, shared cursor across
-  dup'd fds) is still NOT modeled — each fd entry still owns its own
-  cursor; only isolation between processes was added, not fd aliasing
-  within one.
+  - [x] ~~Open-file-description sharing (dup / dup2, shared cursor across
+    dup'd fds) is still NOT modeled — each fd entry owns its own cursor.~~
+    **DONE.** `struct open_file` (fs/fd.h) is now a real refcounted object
+    holding the vnode and the cursor, and `struct fd_entry` points at one. A
+    descriptor is a NUMBER; what it refers to is the description. dup, dup2,
+    `fcntl(F_DUPFD)` and a spawn-inherited fd all produce a second descriptor
+    onto the SAME one, so a write through either advances one cursor and the
+    vnode reference is released once, when the last descriptor closes.
+
+    This is what `vnode_fd_inherit()` was waiting for. It used to return
+    `ENOSYS` outright, with a comment saying a struct copy would fix the
+    lifetime bug while leaving the CURSOR bug — "an accidental third thing
+    that corrupts silently" — and that the moment to build the real thing was
+    "when something eventually redirects a child's stdout to a FILE". dup2 is
+    that. Asserted the only way that distinguishes a real implementation from
+    a plausible one: write `a` through one descriptor and `b` through the
+    other, and the file must read `ab`, not `b`.
 - [x] ~~g_boot_fds / per-process fds arrays are unlocked mutable state — needs
   a lock once syscalls from the same process can race.~~ **DONE**, and the race
   was already REACHABLE, not hypothetical: the note's "a single process only
@@ -996,7 +1740,7 @@ interrupt-driven.
     effectively single-threaded per fd table, so the lock is never contended.
     A concurrent open/close hammer (N processes, assert no two fds alias one
     slot) is the missing harness.
-    - **The template now exists**: `test blockrace` + `user/bin/ioracer.c` do
+    - **The template now exists**: `test blockrace` + `user/tests/ioracer/ioracer.c` do
       exactly this shape for the block layer — spawn N processes *before*
       waiting on any, then assert on content rather than on return codes, and
       report whether the lock was actually contended so a vacuous pass is
@@ -1070,10 +1814,41 @@ interrupt-driven.
   — write=1, exit=2, yield=3, open=4, close=5, read=6, lseek=7, stat=8,
   readdir=9, spawn=10, wait=11, getpid=12, kill=13. `spawn` returns a
   capability handle (not the raw pid); `wait`/`kill` take one.
-- [ ] Fast path `syscall`/`sysret` deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE,
-  AND swapgs + a per-CPU GS base for the kernel-stack switch (syscall does NOT
-  switch stacks via the TSS). Wants per-CPU/SMP infra. GDT already laid out user
-  data-before-code for it.
+- [x] ~~Fast path `syscall`/`sysret` deferred~~ -- **built.** EFER.SCE +
+  STAR/LSTAR/FMASK per core (`kernel/arch/x86_64/syscall/syscall_fast.c`), the
+  stub in `syscall_entry.asm`. The GDT was already in SYSRET's order.
+  - **No swapgs, and that is the point.** `syscall` does not switch stacks, so
+    the usual answer is a per-CPU pointer behind a swapped GS -- and swapgs
+    across a blocking syscall is the hardest thing in a kernel to get right,
+    because the syscall and interrupt return paths must agree on the swap
+    state. EmbLink finds its per-CPU data by LAPIC ID and reads GS nowhere, so
+    GS.base can hold this core's syscall scratch AT ALL TIMES and the stub
+    needs no swapgs. Ring 3 cannot read it (kernel address, supervisor page)
+    or change it (no arch_prctl, CR4.FSGSBASE off).
+  - FMASK clears IF (a syscall begins with interrupts off, as the interrupt
+    gate did), and TF/DF/NT/IOPL/**AC** -- AC because with SMAP that bit is
+    what says "the kernel may touch user memory", and entering with a caller's
+    AC set would disable the protection for the whole syscall.
+  - `int 0x80` stays installed: prebuilt binaries in the image still use it.
+  - Userland changed by one token per wrapper: the ABI was already written for
+    `syscall` (rcx/r11 declared clobbered, arg 4 in r10, never rcx).
+  - **Two bugs worth recording.** NASM has no `sysretq` mnemonic -- and an
+    unrecognised bare word is a LABEL, so it assembled to *nothing* and the
+    stub fell through into the next function on a user stack (double fault).
+    The spelling is `o64 sysret`; the build now passes `-w+orphan-labels` so
+    this cannot be silent again. And the user RSP was parked in the per-CPU
+    scratch and read back at exit -- correct until a thread is preempted
+    mid-syscall and another on the same core overwrites it, after which the
+    first returns to ring 3 on the wrong stack (it killed the desktop on a
+    push to an unmapped address). It lives on the kernel stack now, which is
+    per thread by construction.
+  - **Measured** (`test syscall`, user/tests/syscallbench/syscallbench.c: 200,000 getpid each
+    way in one process, both agreeing on the pid first): **2735 ns/call via
+    int 0x80, 2500 ns via syscall -- 91%.** Under x86 TCG, where the
+    emulator's dispatch dominates and the IDT walk and TSS stack switch that
+    `syscall` skips are microcode this host never charges for. The hardware
+    gap is larger and is NOT measured here: this machine cannot run x86
+    natively.
 - [x] ~~Syscall table: wire the fd/VFS syscalls~~ — done: `sys_open`,
   `sys_close`, `sys_read`, `sys_lseek`, `sys_stat`, `sys_readdir` (via a
   callback-based `sys_readdir_cb` walking `vfs_readdir`, filling a
@@ -1114,6 +1889,17 @@ interrupt-driven.
 
 ## User Interface (EmUI), Compositor & Userland Runtime
 
+- [x] ~~Six applications share one generic icon.~~ -- every application has its
+      own now, drawn as a rounded tile with a Material glyph in white on a
+      colour that belongs to it. librsvg installed on the build machine (which
+      is what the generator had been asking for all along), eleven masters in
+      `icons/masters/`, and `.app` manifests pointing at them. The dock went
+      from three identical pictures out of five to every icon distinct.
+- [x] **The toolkit reference demos are no longer on the launcher.** A third of
+      the launcher was "V4 Demo", "Editor Demo", "Windows", "Menus", "UI Demo".
+      Launcher entries are now packed only for programs under `user/apps/`; the
+      examples are still built, installed and runnable from the terminal.
+
 Design/usage docs: `docs/EMUI_GUIDE.md` (how to build an app),
 `docs/EMUI_INTERNALS.md` (how the toolkit is built), `docs/BUILD_SETUP.md`
 (newlib + dynamic linking). Open items only — the toolkit itself, the
@@ -1126,7 +1912,7 @@ renders — and since the same day EmbBuild **builds** one from a manifest
 covers the GUI, not just static C. See `docs/PORTS.md` § "The GUI wall, and
 how it came down" and BUILD.md §6.
 
-- [ ] **The menu bar's drag-and-drop is one-directional** (`user/bin/topbar.c`
+- [ ] **The menu bar's drag-and-drop is one-directional** (`user/apps/topbar/topbar.c`
   + `em_dock`). You can drag a status chip to reorder it or pull it out of the
   bar to remove it, but you cannot yet drag a *new* item **into** the bar from
   an external tray — that needs either a same-window chip palette the dock
@@ -1135,7 +1921,7 @@ how it came down" and BUILD.md §6.
   reorder/drag-out half is built and live; the drag-in half is the open piece
   of the user's "drag stuff into it or out of it" request.
 - [ ] **Only ONE EmUI app has a build manifest** (clockw). home/uidemo/wmdemo
-  and the rest of `user/bin/*.c` are still host-built only. This is now
+  and the rest of `user/apps/*/*.c` are still host-built only. This is now
   breadth, not capability — each needs the same three-stanza shape plus its
   own header closure.
 - [ ] **Header inputs in manifests are hand-written and can go silently
@@ -1287,11 +2073,11 @@ how it came down" and BUILD.md §6.
   advance, and for any modal animation).
 - [x] ~~**Adding a new app requires three manual registration points.**~~ —
   done: the build system now auto-discovers apps. A Makefile pattern rule
-  (`build/%.elf` over `$(EMUI_APPS) := $(wildcard user/bin/*.c)` minus the
-  special-linked `init.c`/`hello.c`) builds any `user/bin/*.c` as a
+  (`build/%.elf` over `$(EMUI_APPS) := $(wildcard user/apps/*/*.c)` minus the
+  special-linked `init.c`/`hello.c`) builds any `user/apps/*/*.c` as a
   dynamically-linked EmUI app, and `mkfs_embkfs.py`'s
   `discover_userland_objects()` globs `build/*.elf` and packs them all.
-  Adding an app is now just "drop `user/bin/foo.c` in, `make embkfs.img`" —
+  Adding an app is now just "drop `user/apps/foo/foo.c` in, `make embkfs.img`" —
   verified by dropping a throwaway `probeapp.c` and watching it compile,
   link, and land on the image with zero build-file edits. *(Minor residual:
   deleting an app's `.c` leaves a stale `build/*.elf` that keeps getting
@@ -1322,7 +2108,2243 @@ how it came down" and BUILD.md §6.
 
 ---
 
+## Audio
+
+### The latency floor moved 40 ms -> 15 ms, and what it took
+
+`test audiostress` (`make test-audio-latency`) sweeps how little audio a writer
+can keep queued ahead of the speaker before the sound gets holes in it. That
+number IS the latency: everything queued is delay between deciding to make a
+sound and the sound existing.
+
+| policy | shallowest clean runway | at 20 ms | at 15 ms |
+|---|---|---|---|
+| round-robin, no declaration | 40 ms | 12-19 underruns | 22-28 underruns |
+| deadline, declaring 10/3 ms | **15 ms** | 0 | 0 |
+
+An underrun is the hardware's own report, not an inference: the AC'97 latches
+"reached the end of the list and halted", and `ac97_set_last()` has always had
+to detect that to restart the stream -- it just never counted it.
+
+**Three things had to be built before this could be measured at all**, and each
+was a real gap rather than test scaffolding:
+
+- `audio_position()` -- where the speaker actually is, in frames. The device
+  reports only which descriptor it is on, which wraps and answers nothing. The
+  first version of this test paced off the WALL CLOCK and measured nothing,
+  because the device does not start when you start writing, it starts when the
+  prefill is met -- so a clock estimate runs ahead of the truth by exactly the
+  prefill. This is also the number A/V sync is made of.
+- `audio_latency(ms)` -- the prefill was a fixed ~170 ms, which is a latency
+  floor no scheduler can get under. It is a writer's choice now, floored at
+  10 ms (one tick; below that no scheduler can promise a refill).
+- Per-descriptor lengths in `ac97_fill()`. The driver declared every descriptor
+  a full page and zero-padded a short fill, so the smallest unit of audio the
+  device could be given was 21 ms. The BDL entry has carried a length field the
+  whole time. This also retired the zero-padding and the click it was hiding.
+  (`virtio_snd.c` already did this correctly.)
+
+- [ ] **An app that cannot hold its pace should slow down to one it can.**
+      `em_app_run` measures its frame cost and declines to declare a cadence
+      when a frame costs more than half the pace -- correct, but it stops
+      there. The better behaviour is to raise its own pace to something
+      sustainable (roughly three times the measured cost) and declare THAT: an
+      even 30 fps looks better than a ragged 60, and the toolkit already knows
+      both numbers. Not done because the benefit cannot be measured on this
+      host -- under TCG the frame-interval spread is noise-dominated (75 ms vs
+      40 ms between two runs that both declared nothing), and shipping it on
+      the strength of a plausible story is the thing this project does not do.
+      Measure it on hardware, or under HVF with a cheaper renderer, first.
+
+- [ ] **Only x86 has the underrun count as a hardware fact.** `virtio_snd.c`
+      infers it -- nothing in flight while running, at the moment new audio
+      arrives -- which answers the same question but is an inference. Stated in
+      the code; worth revisiting if virtio-snd grows something better.
+- [ ] The ARM boot self-test does not run `test audiostress`: it needs an
+      `-audiodev` that records, and the ARM target boots with `audiodev none`.
+      The policy half is covered there by the `jitter` A/B; the audio half is
+      x86-only for now.
+- [ ] Nothing in the shipped audio programs calls `embk_audio_latency()` yet.
+      `beep` and `mp3play` are fine deep-buffered -- a song does not care about
+      170 ms -- so lowering it for them would trade safety for nothing. The
+      call exists for what comes next (a synth, a game, video sync), and the
+      right time to wire it is when one of those exists.
+
+## ACPI
+
+### The AML interpreter (2026-09-14)
+
+`kernel/acpi/aml.c` runs the firmware's bytecode: a namespace from every DSDT
+and SSDT, the object model, control methods, and operation regions over system
+memory, I/O ports, PCI configuration space and the embedded controller.
+`kernel/acpi/acpi_dev.c` is what asks it questions. `make test-acpi`.
+
+**What it bought immediately:** PCI interrupt routing from `_PRT`, which is not
+available any other way -- where a PCI pin lands is a property of the board's
+traces, absent from the device, absent from its configuration header, absent
+from every fixed ACPI table, and on QEMU it is 1853 bytes of code that returns
+a different table depending on what the OS said about its interrupt
+controller. Also `\_S5_` by EVALUATION rather than by recognising the byte
+encoding of a package, which is what a machine whose `_S5` is a method needs.
+
+**Three bugs worth remembering, because each produced a plausible wrong
+answer rather than a failure:**
+
+- A declaration inside a method body (`Name(PRR0, ResourceTemplate(){...})`,
+  patched and returned) was treated as "not an executable opcode" and stopped
+  the method at its first byte. The routing table came out with ONE entry and
+  reported OK.
+- PCI-config operation regions took their bus/device/function from the FIELD's
+  position in the namespace. Firmware routinely declares the region inside the
+  device and the fields over it from another scope -- QEMU puts the region at
+  `\_SB.PCI0.S08.P40C` and the `PRQ0-3` fields at `\_SB` -- so every read
+  failed and every interrupt in the machine resolved to line 0.
+- Names in a package were resolved where they were WRITTEN. ACPI resolves
+  names where they are USED, and a `_PRT` near the top of a table routinely
+  names link devices declared near the bottom. All 128 entries were dropped on
+  q35. Unresolved names now keep their text and their scope and resolve later.
+
+**Still open:**
+
+- [ ] **Battery, lid and thermal zone are written and have never run.**
+      `acpi_battery_state()`, `acpi_lid_open()` and `acpi_thermal_temp()` are
+      in acpi_dev.c, and the embedded-controller transactions they depend on
+      (ports 0x62/0x66, commands 0x80/0x81) are specification-derived. QEMU
+      emulates no EC, no battery, no lid and no thermal zone, so none of it has
+      executed once. Needs the target machine. Nothing in the OS calls them
+      yet either -- there is no battery indicator to feed.
+- [ ] **No sleep state below S5 is entered.** `acpi_aml_sleep_typ()` will
+      return S3's SLP_TYP, but suspending means saving and restoring the state
+      of every driver in the system, which is a pillar of its own.
+- [ ] **`IndexField` and `BankField` are skipped, not implemented.** They
+      reach their bits through another field rather than directly; a
+      half-implementation would read the wrong register, so the names are
+      dropped and counted as refusals instead. No machine tested so far uses
+      one for anything this kernel asks about.
+- [ ] **No `Load`/`LoadTable`, no `Unload`.** Tables cannot be added at
+      runtime. Used mainly for hot-plug on servers.
+- [ ] **Mutexes are not real.** `Acquire` always succeeds and `Release` does
+      nothing, because method execution is single-threaded and serialised by
+      being called only from boot paths. A `Serialized` method called from two
+      threads would race; nothing does that yet.
+- [ ] **Names created inside a method persist.** ACPICA creates them in a
+      scope it deletes when the method returns; here they stay under the
+      method node and a second call overwrites them. Correct for every
+      method seen so far, wrong for one that relies on a name being absent on
+      entry.
+- [ ] **`Notify` is logged and dropped.** Nothing subscribes, so a battery
+      changing state or a lid closing reaches no one.
+- [ ] **The interpreter has met two DSDTs.** QEMU's `pc` and `q35`. Real
+      firmware is larger and stranger, and the load pass stops a table at the
+      first opcode it cannot follow rather than guessing -- so a real machine
+      that refuses will say so on the console with a count of what loaded.
+
+### A regression the HDA work caused, and the fix (2026-09-14)
+
+`audio_sample_rate()` used to return AC'97's nominal 48000 whether or not a
+sound card was present -- the old `ac97_sample_rate()` never checked. The
+driver table made it honest (0 with no device), and that broke `test capgate`:
+the audio capability probe uses the sample-rate QUERY, and 0 is neither a rate
+nor an error, so the witness reported a broken probe.
+
+Fixed where the distinction belongs rather than by restoring the lie: the query
+syscall now answers `-ENODEV` when the capability was granted and there is no
+device. PERMITTED BUT ABSENT IS NOT REFUSED, and a caller that cannot tell them
+apart cannot report either correctly. The witness treats ENODEV as granted,
+which is what it is -- the call got past the gate and reached hardware that is
+not there.
+
+### Intel HD Audio (2026-09-13) -- and what it still cannot do
+
+`kernel/drivers/audio/hda.c`, behind the new `struct pcm_driver` table. Proven
+on QEMU's ICH6 `intel-hda`, the later `ich9-intel-hda`, and with an AC'97
+attached at the same time (the table has to choose, and chooses HDA):
+`make test-audio-cards`. `test audiostress` passes on it too, at the same
+15 ms floor as AC'97.
+
+What is NOT done, and each is a real limit rather than a tidy-up:
+
+- [ ] **A descriptor is a fixed 1024 frames (21 ms), and cannot be otherwise.**
+      HDA's DMA engine is cyclic: the buffer's TOTAL length (CBL) is written
+      before the engine runs and cannot be changed while it does, so the
+      per-descriptor length cannot vary the way AC'97's does. `audio.c` holds
+      a short remainder back rather than let the driver pad it (see the
+      staging buffer there and the measurement in its comment), which removes
+      the audible cost -- but `audio_set_latency()` below ~21 ms is still
+      granted in name only on this device. Fixing it properly means choosing
+      the period size when the stream OPENS, which the current
+      one-size-for-the-life-of-the-driver contract does not express.
+- [ ] **No capture.** The codec graph walk finds output paths only; ADCs and
+      input pins are skipped. There is no microphone API above this anyway,
+      so adding it would be a driver with nothing to drive.
+- [ ] **Polled, not interrupt-driven.** Like every other driver here. The IOC
+      bit is left clear and INTCTL's global enable is off; RIRBCTL's response
+      flag IS enabled, but only as a flag -- the controller stops fetching
+      commands until it is acknowledged, which is what made the first version
+      look like "the codec does not answer".
+- [ ] **Multi-codec machines take the first codec with an output path.** A
+      laptop with a separate HDMI audio codec will get the analogue one, which
+      is the right default and not a choice anybody can make yet.
+- [ ] **Jack sensing is not read.** The pin's configuration default says what
+      the board WIRED; it does not say what is plugged in right now, so
+      headphones do not mute the speakers. Needs unsolicited responses, which
+      needs interrupts.
+- [ ] **Untested on real hardware.** Everything above is QEMU. The codec graph
+      on a real machine is bigger and stranger -- amplifiers with several
+      indices, mixers that need the right input unmuted, EAPD on laptops --
+      and the driver prints what it found precisely so the first real machine
+      says which of those it hit.
+
+### A killed writer's WAV reads as silence -- `make test-audio` was failing for that alone
+
+`audio_check.py` believed the RIFF and data lengths. QEMU's wav sink writes them
+as placeholders and patches them on close, and the harness ends the guest with
+SIGTERM, so on this host they stayed zero: an 88 KB file containing a clean
+440 Hz square wave was read as 0.00 s, peak 0, "mostly SILENCE" -- by the
+checker, and by Python's own `wave` module. The OS was correct the whole time.
+
+A zero-length `data` chunk now means "to the end of the file", which is the only
+sensible reading of a truncated one, and the checker says when it does that.
+
+## Security hardening
+
+Scored 3/10 in the 2026-09-10 audit for the right reason: SMEP, SMAP, PAN, ASLR
+and KASLR were all absent. SMEP/SMAP/UMIP (x86) and PAN (aarch64, PXN was
+already there) landed in 24686e4, each proven by a self-test that commits the
+violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
+
+- [x] **A known-answer test for the DRBG.** **Done** -- two NIST CAVP
+      HMAC_DRBG/SHA-256 vectors (no PR, with reseed), emitted into C by a
+      script from Botan's vector file rather than typed, run through the same
+      update/generate primitives the live generator uses on a private state.
+      Both match the second generate's 1024-bit ReturnedBits, which settles
+      the DRBG and the procedure question at once. `test random` runs them
+      first; the structural checks now say less than that line does.
+- [x] **ASLR** for everything the kernel chooses. **Done** -- six windows per
+      process, 22-24 bits each, from the CSPRNG; `test aslr` on both arches.
+      The mmap/shared-surface collision the survey found is fixed by giving
+      surfaces their own window. Surface mappings are STILL not in the VMA
+      list, which is now harmless (disjoint windows) but remains untidy:
+      `vmmap`-style tooling cannot see them.
+- [x] **PIE userland** so the executable itself moves. **The mechanism is done
+      and proven on both architectures; the conversion of the existing apps is
+      not, and is the open half.** What landed:
+      - A seventh ASLR window, `exec_base`: 0x1000_0000_0000, 64 GiB, 24 bits,
+        per process, from the same CSPRNG as the other six. `test aslr` checks
+        it with the rest.
+      - `kernel/loader/elf.c` accepts `ET_DYN` as an executable and loads it at
+        that bias, biasing the entry point and the module's own relocations. A
+        PIE with `DT_NEEDED` gets the existing two-way link against
+        libembk.so with a non-zero app bias; one without gets self-relocation
+        only (RELATIVE against its own bias). `R_*_NONE` is now skipped, which
+        it was not -- ld leaves exactly one in a PIE's .rela.plt, and it was
+        refusing perfectly good binaries.
+      - A PIC libc: `tools/newlib/build-newlib-emblink.sh --pic` builds a
+        second newlib prefix from the SAME script and the same options plus
+        `-fPIC`, and checks the claim (0 truncated absolute relocations, down
+        from 73,166 `R_X86_64_32` on x86). `make pie-check` says which you have;
+        with no PIC libc the PIE targets simply do not exist and the tree still
+        builds and boots.
+      - `user/lib/newlib-pie.ld`: linked at 0, with a PT_DYNAMIC. It shares its
+        whole section list with the fixed-address script through
+        `newlib-body.ld`, so the two cannot drift.
+      - `test pie` (x86 console) and the aarch64 boot test run `pieprobe.elf`
+        twice and require different addresses. The probe checks its own
+        relocated pointers, its constructor, its `__thread` variable and the
+        PIC libc's C99 formats before it answers.
+      Two real bugs fell out of this and are fixed: the TLS geometry was
+      published as SHN_ABS linker numbers, which a load bias corrupts silently
+      (a size comes back biased); and the alignment was floored at 8, so any
+      program whose maximum TLS alignment was smaller -- a single
+      `__thread int` -- built its block at the wrong offset and read zeroes.
+      Both were latent at a fixed address; only the second was reachable there.
+      A third, unrelated to PIE and found by running the crash path for real:
+      the x86 ring-3 backtrace in `dump_fault()` read the user stack with
+      access_ok() alone and no `uaccess_hw_begin()`, so SMAP faulted the read --
+      in the fault handler, in kernel mode, with no recovery point -- and the
+      machine went into a fault loop. It was reachable by ANY ring-3 fault and
+      had never printed a single frame. Fixed with the hardware permission and
+      an armed guard; `test faultkill` now prints the backtrace it was written
+      to print.
+- [ ] **Convert the remaining apps to PIE.** Five are converted and tested on
+      both architectures: `pieprobe`, plus `hello`, `posixdemo`, `ioracer` and
+      `crasher` through `$(NEWLIB_SIMPLE_PROGS)` -- one make define, one shared
+      list, so a program cannot be a PIE on one architecture and not the other.
+      `posixdemo` is the load-bearing one: the whole POSIX suite, including
+      variant-I TLS on aarch64, passes position-independent.
+      What is left is everything with a NON-PIC DEPENDENCY, and that is the
+      blocker rather than the link mode: zlib (`build-zlib`), the TLS library
+      objects, QuickJS, the shell SDK and its tools, and the out-of-tree ports
+      (CPython, git, tcc, NetSurf) which link with their own scripts. Each needs
+      its dependencies rebuilt `-fPIC` first. The EmUI apps are a separate case
+      again: they are ET_EXEC importing from libembk.so and EXPORTING their
+      static newlib back to it, so making them PIE means the app's newlib
+      becomes PIC while the .so still binds to it -- the loader already handles
+      a PIE with DT_NEEDED, but nothing has exercised it.
+- [ ] **KASLR.** NOT STARTED, and deliberately so -- it is the one item of this
+      round left undone, said plainly rather than half-built. The kernel is
+      linked with -mcmodel=kernel at a fixed higher-half address and stage2
+      loads it there. Randomising it needs BOTH halves and neither exists:
+      1. A relocatable kernel image. -mcmodel=kernel assumes the top 2 GiB and
+         folds absolute addresses into instructions; moving the image means
+         either -fPIE plus a relocation pass over a linker-emitted `.rela.dyn`
+         before the first C frame, or keeping the model and emitting a
+         relocation table to apply by hand. The pass itself has to run from
+         position-independent assembly, because it runs before the addresses it
+         is fixing are correct.
+      2. A bootloader that can place it. stage2 loads to a hardcoded physical
+         address and jumps to a hardcoded virtual one; it would have to draw an
+         offset (from RDRAND/RDSEED -- there is no CSPRNG that early), map the
+         higher half at base+offset, and pass the offset on so the kernel can
+         relocate itself and so `ksym` symbolisation still works.
+      Everything that reports a kernel address would follow: the panic
+      backtrace, `EMBDBG`, `info registers` symbolisation against kernel.elf.
+      The userland half of the same idea (PIE) is done above and is worth more
+      per unit of risk, which is why it went first.
+- [x] **Stack canaries in the kernel.** **Done** -- `-fstack-protector-strong`
+      on both builds with a global guard (`lib/canary.c`), seeded by the entry
+      stub before the first C frame exists, low byte zero. `test canary` and
+      the aarch64 boot test both overrun a local on purpose and require
+      `__stack_chk_fail` to fire. Per-CPU canaries (via GS_BASE on x86) are
+      the refinement; a global word already stops the overflow that cannot
+      read.
+- [ ] **Guard pages between kernel heap allocations, and a poisoned free.** Listed
+      under Memory Management already; it is a hardening item too.
+
+## Filesystem: crash consistency (audit gap, closed)
+
+- [x] **A crash-consistency test.** **Done** -- `test embkfs crash` /
+      `make test-embkfs-crash`: 19 commits, 65 device writes, power cut after
+      each one (dropped, then torn), remount, verify the state is exactly the
+      state after some whole number of commits. 130 cuts, 0 inconsistent.
+- [ ] Run it on aarch64. The filesystem code is shared; what is missing is a
+      third virtio-blk in `test-arm64-boot` and a `chk` for the verdict.
+- [ ] Widen the workload: larger files (multi-extent, multi-block), a
+      directory with enough entries to split a leaf, a snapshot taken
+      mid-run, compression on. Each is a different shape of transaction and
+      the sweep is cheap enough (milliseconds per cut) to run them all.
+- [ ] Torn writes are modelled as "first 256 bytes land". A second model --
+      random bytes in the tail, and a cut spanning TWO sectors of one
+      4 KiB block -- would exercise the per-node checksum differently.
+
+## Filesystem: crash consistency on aarch64 too (parity gap, closed)
+
+- [x] The power-cut test ran on x86 only. The aarch64 boot test now attaches
+  the same seed image as a second virtio-blk (a per-run scratch copy, `sdb`)
+  and runs it in the early self-tests: **130 cuts, 0 inconsistent, 0
+  unmountable** under HVF, at the cost of ~12 s more boot-test time. What it
+  took was not the test: the virtio-blk driver was a SINGLETON -- one ring,
+  one bounce buffer, one lock, one block device -- and the PCI scan stopped
+  at the first match, so a second disk on aarch64 could not exist. It is
+  per-instance now (up to 4), which is also what a swap store on aarch64
+  needs.
+  - [x] ~~`make test-swap` has no aarch64 counterpart yet~~ -- it does: the
+    boot test attaches `build/swap.img` as a third virtio-blk (`sdc`), the
+    early boot calls `swap_init()` and runs the witness (mmap and heap; the
+    hot-set A/B is a policy claim made once, on x86) through the same
+    `swap_selftest_run()` the x86 console uses -- the test body moved to
+    `kernel/mm/swaptest.c` for that. **562 MiB over 499 MiB free, 190 MiB
+    out in 3,040 cluster writes, 20,680 of 24,064 pages read ahead, 0 wrong,
+    1.2 s and 0.8 s** under HVF.
+
+## Filesystem: mounting is two calls, and that is a sharp edge
+
+- [x] ~~**`embkfs_mount()` does not produce a write-capable volume.**~~ **Closed:**
+      `embkfs_mount()` is one call now (superblock, root, allocator, sweep; EIO
+      past a good superblock), and the superblock-only half is named for what
+      it is, `embkfs_probe_superblock()`, used by the self-heal and verify-boot
+      probes that must not sweep a live device through a scratch descriptor.
+      The original note: It reads the
+      superblock and finds the root; `embkfs_finish_mount()` (static, embkfs.c)
+      verifies the root node, BUILDS THE ALLOCATOR and sweeps orphans. A volume
+      that has only been through the first has an empty free index and refuses
+      every allocation with `ENOSPC` -- found by the crash-consistency test on
+      a fresh 4 MiB format reporting 1018 free blocks, and mistaken for a size
+      bug for one round. The boot path has always done both. Either
+      `embkfs_mount()` should call `finish_mount` itself for read-write mounts
+      (and `embkfs_init`'s loop drop its own call), or the header should say
+      loudly that a mount is two calls. The first is better; it touches the
+      boot path, so it is a change to make with the boot test running.
+
+## Filesystem: hard links (audit gap, closed)
+
+- [x] **Hard links.** **Done.** The filesystem had them all along
+      (`embkfs_link_name`, exercised by the namespace stress test); what was
+      missing was every layer above: a `link` op in `struct vfs_ops`,
+      `vfs_link_path()` (target resolved WITH symlink following -- a hard link
+      is to the thing, not the pointer; `EXDEV` across mounts; directories
+      refused uniformly with `EPERM` before any fs sees them), `SYS_link`,
+      the libc `link()` stub that had said "no link op yet" for as long as
+      the fs had had one, and a shell `link` verb -- its own word, because the
+      lexer reads a leading `-` as an operator and because it is a different
+      thing from `ln`. `test hardlink` (kernel) and `posixdemo` (both arches)
+      assert the link count 1 -> 2 -> 1 and the bytes surviving the original
+      name's removal.
+- [ ] The shell `link` verb is not covered by a test: the kernel console's
+      `run` does not parse quotes, so a one-line script cannot be driven over
+      serial. It is a 12-line wrapper over a tested syscall. A `test
+      shellscript` case would cover it once `link` can be expressed there.
+- [ ] **Observed once, not reproduced:** the aarch64 boot self-test hung after
+      loading `lockdemo` (the futex test) on one run of the hard-link build,
+      with no exception dump; the identical build passed solo at 9 s
+      immediately after, and has passed ~10 times today. No stray QEMU was
+      found afterwards, but the run followed an x86 TCG run by about a minute.
+      Recorded so that a second occurrence is recognised as a pattern rather
+      than a surprise.
+
+## Memory: swap, and anonymous memory as an object (audit gap, closed)
+
+The audit said: no swap, so running out of RAM was failure rather than
+degradation. Closed in two commits (`feat(mm): a swap store`, `feat(mm):
+anonymous memory is an object, and it pages`). What is built, measured, and
+what it left open:
+
+- [x] **A swap store** (`kernel/mm/swap.{c,h}`, `tools/mkswap.py`): a raw
+  block device found by an `EMBKSWAP` header in block 0, one slot per page,
+  bitmap allocated, written in place. Not a file on EMBKFS: every write there
+  is a copy-on-write transaction, the wrong cost for memory nobody is using.
+  `make test-swap-store`: **158 us/page out, 107 us/page in** (TCG, idle).
+- [x] **Anonymous memory is a `vm_object`** (`vmo_create_anon`), so every
+  mapping has one and reclaim treats file and anonymous pages by one rule: a
+  page whose contents exist elsewhere is dropped, one whose contents exist
+  only here is written first. The object records its ONE mapper (an anonymous
+  object is private by design) because evicting means unmapping first; the
+  page record survives eviction holding the slot, and the fault that next
+  wants the page swaps it back in.
+- [x] **The witness, `make test-swap`** (`user/tests/swapper/swapper.c`, 256 MiB of
+  RAM): maps more than is free, writes a pattern through every page, reads
+  every page back. **229 MiB touched with 170 MiB free: 41,344 pages out
+  (161 MiB) as 2,584 cluster writes, 20,928 back, 0 pages wrong, every slot
+  and frame returned at exit -- 9.2 s, 91 us per fault.** The same run took
+  61.6 s when it first passed. What each step was worth, measured:
+
+  | change | run | what was wrong |
+  |---|---:|---|
+  | first passing run | 61.6 s | I/O under the VMA spinlock: 24,985 `ATA WARN ... IF=0` lines |
+  | IRQs on around `vm_fault`; lock dropped across the wire | 53.9 s | the fault path slept with interrupts off |
+  | clustered page-out (16 pages, one command); file/anon LRUs split | 42.9 s | 49,152 commands -> 3,072; 3.4 M LRU nodes walked -> 49,152 |
+  | per-object page index that doubles | 36.9 s | 16 buckets for a 58,624-page object: 3,600-entry chains |
+  | page records from a pool, not kmalloc | 22.7 s | **224 us per kmalloc** past the heap's 1 MiB slab cap (below) |
+  | word-wide `memset`/`memcpy`/`memmove` | **9.2 s** | byte loops: 69 us to zero a page, and every bounce/cluster copy |
+
+  Every line of that table is printed by `test swap` itself (`[info]` lines:
+  time inside `vm_fault`, wire vs. PTE install, frame/zero/record per fill,
+  reclaim calls and LRU nodes, swap I/O and unmap time), so the next change
+  here starts from a breakdown, not a guess.
+- [x] **A bug this found in the exit path, predating swap:** `vma_destroy_all`
+  freed only the `vm_area` records and let `vmm_destroy_address_space` free
+  every frame it found -- including the page cache's own frames still mapped
+  from a file mapping. A process exiting with a file mapped was freeing cache
+  pages under the cache (or twice). Mappings now let go of their pages before
+  the tables are walked; the object's frames are the object's.
+- [x] **The sbrk heap and every stack are mappings too** (second commit).
+  `malloc`'s memory -- where an ordinary program lives -- is an anonymous
+  object like the rest: demand-paged, zero on first touch, swappable, and a
+  shrink frees pages (the old sbrk never gave memory back). The main stack is
+  one 512 KiB mapping instead of 128 eagerly allocated frames handed over
+  UNZEROED (a frame recycled from another process arrived with that process's
+  data on it -- a leak, closed as a side effect); thread stacks are mappings
+  reclaimed when their thread-table slot is next used. `test swap` runs its
+  witness twice, `mmap` then `heap`: **241 MiB over 179 MiB free, 0 pages
+  wrong, both** -- 6.6 s and 4.9 s. Free memory at idle went UP (lazy stacks).
+- [x] **NOTHING SLEEPS UNDER `vma_lock`**, and this was the bug behind an
+  intermittent hang. The lock is a spinlock taken in the fault path with
+  interrupts off; the page cache's lock is a mutex. The first version created
+  objects, discarded pages and dropped references under it, each of which can
+  block behind a reclaim batch writing to disk -- the holder sleeps with the
+  spinlock held, every other core that faults spins on it with interrupts off.
+  Once every process had heap and stack mappings this stopped being rare: a
+  process hung at its first `sbrk` in two of four runs. Now objects are made
+  BEFORE the lock and the range re-checked after; a mapping being unmapped is
+  flagged `VMA_DYING` and stays on the list (the range cannot be handed out
+  again, a fault there is declined) while its pages are handled outside; the
+  copy-on-write branch drops the lock across the cache like the wire path
+  does. Five consecutive runs since; the earlier observed-once boot stall
+  (below) has the same shape and is kept on the books until a longer soak.
+- [x] **A dead process's address space is torn down by the kworker.** The
+  reap holds the scheduler lock, and letting go of an object's pages takes
+  the cache mutex -- the file-mapping `vmo_put` in `vma_destroy_all` had that
+  latent sleep-under-spinlock all along, unseen because every test process
+  unmapped before exiting. The VMA list is detached under the lock (no
+  `vma_lock`: a process with no threads has nobody walking its list, and the
+  mmap path's order is `vma_lock` -> cache -> scheduler, so the reverse would
+  invert) and the worker unmaps, puts and frees the page tables. The ring
+  grew 64 -> 256 and reports its in-flight job, because `test swap` counts
+  what came back only after the teardown is done.
+- [x] **`vmo_audit_swap`**: every page out on the store names a slot the
+  store holds, no two share one, and the store's count equals the pages out
+  -- all read under one lock, because read separately a reclaim batch moved
+  the numbers by a hundred between two adjacent reads and looked like a leak.
+
+Open, in the order they matter:
+
+- [x] **A kill is a flag, and the thread dies at its next safe point.**
+  `process_kill` used to reap a BLOCKED thread's kernel stack on the spot and
+  abandon a RUNNING one at its core's next `schedule()` -- wherever it was.
+  Measured (`test kill io`, unfixed kernel): the first kill landed inside the
+  witness's `fsync`, the dead thread kept the filesystem lock, and the SECOND
+  witness could not even be loaded from disk; the run timed out. Now
+  `killed` is set, blocked threads are woken, suspended ones unfrozen, and a
+  thread dies at its syscall or fault exit (`in_kernel` counts the paths in
+  flight on its stack), or in the scheduler if the tick found it in user mode;
+  a kernel thread dies at its next `schedule()` as before. A kill implies
+  `cancelled`, so every interruptible sleep returns; accept, channel send and
+  receive, and thread join gained the check they lacked. Eight kills at eight
+  moments inside `fsync`: reaped in 1-70 ms, lock free, file ops work.
+  - [ ] Still delayed rather than interrupted: a thread blocked in `net_wait`
+    or the console's char read re-blocks until its event arrives, then dies.
+    Not a wedge; a wait.
+  - [ ] A killed thread that is BLOCKED on a non-interruptible mutex completes
+    the path -- correct -- but a thread mid-`munmap` (phase 2, no lock held)
+    that is killed simply finishes phase 2 and 3 first, so the `VMA_DYING`
+    double-put concern above is closed by construction.
+- [x] ~~**aarch64 keeps IRQs masked around `vm_fault`**~~ -- **closed, and
+  the cause was elsewhere.** Unmasking hung init every boot (bisected
+  2026-09-11); what the unmask had exposed was the VMA spinlock, under which
+  objects were created and pages discarded -- both sleep on the page cache's
+  mutex -- so the first EL1 preemption of a thread holding it left the other
+  cores spinning on it with interrupts off. With nothing sleeping under that
+  lock, the unmask went back in: seven consecutive ARM boots. The syscall
+  path is unmasked now too, as x86's always was, so a disk-bound syscall no
+  longer holds its core's tick off, and a thread inside a syscall is
+  preemptible like every other. User threads are now preempted at EL1 on
+  aarch64 for the first time; kernel threads always were.
+- [x] ~~**The kernel heap's slab pools cap at 1 MiB**~~ -- **closed.** They
+  capped at `SLAB_MAX_RANGES` 128 x `SLAB_REGION_BYTES` 8 KiB, and past that
+  every small allocation walked the general first-fit heap: **224 us per
+  `kmalloc(80)`** with ~58,000 blocks live. Now 1024 regions of 64 KiB
+  (64 MiB of slab), with the range registry kept sorted and searched by
+  bisection so a `kfree` costs ten compares, not a thousand. `test kheap`
+  allocates 20,000 objects of 96 bytes -- 2.5 MiB, past the old cap --
+  and requires every one to come from the slab: **388 ns each, 445 ns to
+  free** (TCG), 46 regions.
+- [x] ~~**The LRU is fault-order, not access-order.**~~ -- **closed: second
+  chance.** An anonymous page the reclaimer reaches whose accessed bit is set
+  is spared (bit cleared, moved to the head) and evicted only if still
+  unreferenced when the walk comes round again -- CLOCK, folded into the LRU
+  walk. x86 reads and clears the hardware bit without a flush (the usual
+  imprecision); aarch64's access flag is software-managed, so the clear
+  drops the TLB entry and the next touch takes an access-flag fault the
+  handler resolves by setting it (a new fault class, exercised by the ARM
+  boot test's mmap block). `test swap` runs a hot-set witness both ways: a
+  quarter of 61,440 pages re-read every round while cold pages stream past
+  -- **swapped in 77,183 times in fault order, 61,846 with second chance:
+  once per page**, at equal wall time. The switch (`vmo_set_second_chance`)
+  exists for that A/B.
+  - [ ] File pages that are mapped are wired and never candidates; unmapped
+    file pages are ordered by `vmo_read`/`vmo_write` touches, which is a
+    real LRU already. A mapped file page's accessed bit is not consulted.
+- [x] ~~**Swap-in is one page per command.**~~ -- **closed: read-ahead.**
+  After a page comes back, its neighbours in the object (8 each way, one
+  cluster in all) that are also out on the store are fetched too, one
+  command per run of contiguous slots -- the pages that left together sit in
+  consecutive slots -- and are simply resident when their faults arrive.
+  Never reclaims to do it: only when free memory is above the fault path's
+  reserve plus a window, which the reserve was retuned (128/64 -> 256/512)
+  to leave. `test swap`: **16,635 of 19,303 pages read ahead in 2,093
+  cluster reads; faults that waited on the disk 18,445 -> 2,668; swap I/O
+  6.7 s -> 2.1 s** (mmap run), heap run 48 us per fault.
+- [ ] **One shootdown per evicted page** (x86: an IPI broadcast and a CR3
+  reload on every core). Measured at 8.7 us each, 0.4 s of the run -- not
+  worth batching yet; would be once a batch API exists (clear N PTEs, one
+  shootdown).
+- [ ] **The swap slot is freed on swap-in.** A page read back and never
+  written again could keep its slot and be dropped for free the next time.
+- [ ] **Shared anonymous memory** (`MAP_SHARED|MAP_ANONYMOUS`) is refused:
+  the anonymous object has one mapper by design, and sharing needs a reverse
+  map to unmap every mapper before eviction. No consumer without `fork`.
+- [ ] **The copy-on-write allocation** in `vm_fault` still calls
+  `pmm_alloc_page` directly under the VMA lock, so a COW fault under real
+  pressure declines instead of reclaiming. Route it through the object's
+  reserve once COW pages are objects too.
+- [x] ~~**The ARM boot harness reads markers from a console two processes
+  write at once.**~~ **Closed at the cause:** `console_fd_write` looped
+  `console_putchar` per byte with no lock across the write, so a process
+  preempted while the UART FIFO drained let another's bytes into its line
+  (`home: desktop re` + TopBar + `ady`). A mutex now makes one `write()` to
+  the console one write. kprintf keeps its own path and can still land
+  inside a user line -- a kernel choosing to speak, not a tear.
+- [x] **PRIORITY AGING WAS A ONE-WAY RATCHET, and the pinned shell could not
+  age at all** (audit finding, closed). Aging lowered a waiting thread's band
+  toward REALTIME, but dispatch never restored the base: under sustained load
+  every runnable thread ended in band 0 for good, and the bands meant
+  nothing. And `rr_tick` exempted every PINNED thread from aging -- meant for
+  the per-core idles, but the kernel shell is pinned too. `test thread smp`
+  (eight spinning kthreads) starved the shell: READY, band 2, dispatchable,
+  age 0, unpicked for 19 s (measured by a hog printing the shell's state).
+  Now `base_priority` is recorded wherever a priority is set and restored on
+  dispatch, and only threads flagged `is_idle` are exempt. Five runs in a
+  row where the first attempt hung before.
+- [x] **The x86 console harness reports where every core is on a hang**:
+  `tools/console_test.py` opens a QMP socket and, on any timeout, samples
+  each vCPU's RIP/RFLAGS five times and symbolizes them against
+  `kernel/kernel.elf`. It is how the above was found in one run.
+- [x] **A joined thread's stack is reclaimed at the join**, in the joiner's
+  process context; a thread nobody joins keeps its slot's stack until reuse
+  or exit, as documented at `thread_create_user`.
+- [ ] **Observed twice, not reproduced since:** an x86 boot (256 MiB, swap
+  disk) stalled after `init: authenticated session` -- `ELF dynlink` never
+  printed; later, twice, the swap witness hung right after its dynlink line
+  without a first `sbrk` completing. The second pair was the sleep-under-
+  `vma_lock` hazard above, and it has not recurred since that was removed
+  (five runs). The first has the same shape -- a process starting under
+  memory pressure -- and is presumed the same. Kept until a longer soak.
+- [ ] **The heap's first growth makes an object of the growth's size and
+  every later growth extends the mapping**, so the object's `size` stays at
+  the first `sbrk`. Nothing reads it for an anonymous object today (fills are
+  zero, wires ignore it); if anything ever does, set it on extension.
+
+## Sessions: more than one user (audit gap)
+
+EmbLink has no uid, and is not getting one: authority is the namespace and the
+capability set. What a multi-user machine needed on top was IDENTITY -- which
+person a process runs for -- so the few places a process can reach beyond
+what it was handed can ask "is that one of yours".
+
+- [x] **Kernel sessions.** `struct process` carries `session_id`,
+  `session_user` and `session_leader`, inherited by every child and never
+  changeable from inside. A session is opened only by a spawn with
+  `SPAWN_ACTION_NEW_SESSION`, which needs the new `EMBK_CAP_SESSION` (init and
+  the kernel hold it) and which the kernel strips from the child: a session
+  can never open another. Usernames only (`[a-z0-9_-]`, 1-31) -- the kernel
+  checks it, it does not trust the caller to have. Session 0 is the system.
+- [x] **A session ends with its leader.** When the leader's last thread dies,
+  the kworker stops everything still in the session. Before this, logging
+  out (the desktop exiting) left every app it had started running, orphaned,
+  into the next user's session. `SYS_session_end` (114) is logout: the
+  caller's own session, or any with `CAP_SESSION`; the leader dies last with
+  `EMBK_EXIT_LOGOUT` so its waiter can tell a logout from a crash.
+- [x] **The single-user concessions are gated by session** -- each was
+  documented in the code as exactly that:
+  - `SYS_proc_kill` (kill by pid, the shell's `kill`): your own session's
+    processes only, never a kernel thread (the writeback thread or the
+    kworker killed is a machine that hangs later).
+  - The clipboard: per session. A copy is invisible to other sessions and
+    wiped -- zeroed -- when its session ends. (User A's copied password was
+    pasteable by user B.)
+  - The console's ^C slot: cannot be taken or cleared while it points into
+    another session.
+- [x] **Found on the way: `console_interrupt_route(0)` meant "myself" -- and
+  0 is also a process's FIRST spawn handle.** A shell routing ^C to its first
+  child routed it to itself, so the ^C meant for the child cancelled the
+  shell. SELF is -2 now (`EMBK_INTR_ROUTE_SELF`). `test ctrlc` (primtest's
+  delegation to its first child) could not pass that way, by inspection; it
+  had never been run by the console harness, which could not send a key --
+  `tools/console_test.py` now sends `sendkey ctrl-c` when a test prints
+  `(send ^C now)`, and it passes.
+- [x] `whoami` asks the kernel (`SYS_session_info`, 113) instead of reading
+  `$USER`, which is whatever the parent put in the environment. `ps` has a
+  `sess` column; `session` returns `{id, user, leader}`.
+- [x] `test session` (`user/tests/sessprobe/sessprobe.c`): identity and inheritance; no
+  minting (NEW_SESSION and asking for the cap back, both refused); a
+  non-username refused; kill-by-pid gated three ways; the ^C slot; clipboard
+  isolation, wipe on end; logout from outside and from inside
+  (`EMBK_EXIT_LOGOUT`, nothing left); a leader that just exits takes its
+  session with it.
+- [x] **init opens sessions.** The desktop is spawned with `NEW_SESSION`;
+  a logout (`EMBK_EXIT_LOGOUT`) returns to the greeter, a crash restarts the
+  session under the development auto-login and returns to the greeter
+  otherwise. The auto-login no longer survives a logout -- logging out has to
+  mean something, and it is how even a development image reaches the real
+  setup and greeter. `make AUTOLOGIN=0` builds a production init. The greeter
+  and setup run in the system session with FILESYSTEM|GPU only -- not the
+  network, audio, the debugger, or `CAP_SESSION`.
+- [x] **A privilege escalation, closed.** init granted the session namespace
+  from `/home/<user>/user.ns` -- a file in the user's own writable home --
+  unclamped. One line (`rw /etc`) and the next session could rewrite the
+  account store; `rw /home` and it read everyone's files. Profiles live in
+  `/etc/sessions/<user>.ns` now (out of every session's reach), and init
+  clamps every line anyway (`user/lib/session_policy.h`): /system and
+  /data/apps read-only, the user's own home, /run; /data for administrators;
+  never /etc, never another home, compared component by component. A refused
+  line is logged and dropped. `make test-login` plants a hostile profile and
+  watches init refuse it at a real sign-in.
+- [x] **The account store** (`user/lib/auth.c`): PBKDF2-HMAC-SHA256 at
+  210,000 iterations (was 4,096), with the HMAC pads precomputed -- the old
+  code recomputed them every iteration, four compressions where two do, half
+  the work factor paid by the owner and not the attacker. A weaker stored
+  hash is rehashed on the next successful login. The store is read at its
+  real size (the old fixed 8 KiB buffer silently dropped the ~40th account),
+  and every change is written to `.new`, synced and renamed into place (one
+  filesystem commit). New: change password (old one required), an
+  administrator's reset, remove (never the last administrator), an
+  administrator role (the first account; gid 10), uids above every one used
+  (not a line count, which reissued a removed account's uid). **163 ms per
+  verify at native speed (aarch64/HVF), 1.7 s under x86 emulation.**
+- [x] **The greeter manages accounts**: sign in; change password; an
+  administrator's name and password unlock create (optionally as an
+  administrator), reset and remove. Wrong passwords are throttled across all
+  of it -- free for two, then 1 s doubling to 30 s -- without blocking the
+  screen, and refusals are logged to the console by name.
+- [x] **The toolkit became keyboard-usable for forms**: Tab moves to the next
+  text field (with whatever was typed after it in the same frame) and wraps;
+  `em_field_autofocus()` opens a form ready to type; Return in a PASSWORD
+  field is reported at all -- the DSL never read that edge, so a sign-in form
+  could not be finished with Return and the unread edge leaked into the next
+  text field. Focus is let go when its field leaves the screen, which had
+  kept a new page's autofocus from ever firing. `make kit-test` (host).
+- [x] **Tests**: `test accounts` (`user/tests/authtest/authtest.c`, on both
+  architectures): 22 claims -- every store operation, the last-administrator
+  rule, the upgrade of a standard PBKDF2 record made by Python's hashlib,
+  atomic rewrites, the throttle, 20 policy judgements. `make test-login`
+  (x86, real keystrokes, 13 steps): logout is not auto-login; setup typed with
+  Tab and Return; a wrong password refused and logged; the right one opens an
+  administrator's session; a planted hostile profile clamped; the kernel lists
+  the session under the right name; logout returns to the greeter.
+- [x] A "Log Out <user>" item in the top bar's system menu.
+
+Open:
+
+- [ ] **One session at a time.** Sessions are sequential: one display, one
+  console, and the desktop's `/run` endpoint names are machine singletons.
+  Fast user switching needs per-session endpoint namespaces and a compositor
+  that knows whose windows are whose.
+- [ ] **Files a session leaves in /run are not scrubbed.** Endpoints die with
+  their owners, but a plain file written to /run by session A is readable by
+  session B.
+- [ ] **The account-management page is proven at the library level only.**
+  `test accounts` covers every operation the page calls; `make test-login`
+  cannot reach the page's buttons -- buttons take no keyboard focus, and the
+  test VM's PS/2 mouse is relative. A USB tablet in the test VM, or keyboard
+  focus for buttons, closes it.
+- [ ] **Buttons are not keyboard-reachable** (Tab traverses text fields only).
+- [ ] **The throttle lives in the greeter process**; a greeter crash resets
+  the count. Persisting it (per account, in the store) would survive that.
+- [ ] **`make` does not track `AUTOLOGIN`**: after changing it,
+  `touch user/system/init/init.c`.
+
 ## Process & Scheduling
+
+- [x] **The deadline policy switched itself off, intermittently, for whole
+      runs.** `dl_pick()` treats a declared-thread count of 0 as "nobody asked
+      for deadlines" and hands every decision to round-robin. The count is
+      recomputed on each declaration and that recount SKIPS zombies -- but
+      `thread_reap_slot()` DECREMENTED it for any thread that still carried a
+      period. So: thread A declares, A exits (zombie), thread B declares
+      (recount = 1, correct), A's slot is reaped, count = 0, and B runs its
+      entire life without the policy it asked for. Purely a question of whether
+      the reap landed before or after the next declaration.
+      MEASURED, with a detector on the old code that logged the moment a reap
+      drove the count to 0 under a live declaration:
+
+      | 12 boot tests, old code | result |
+      |---|---|
+      | detector silent | 11 runs, deadline lateness 0 ms |
+      | detector fired | 1 run, deadline lateness 44 ms (round-robin's own 44) |
+
+      Twelve runs of the fixed code: 0 ms every time. The reap RECOUNTS now --
+      a decrement cannot know whether the last recount counted that thread, and
+      a recount is right by construction.
+- [x] **The assertion that missed it, tightened.** `deadline <= round-robin`
+      passed that 44-vs-44 run. Working, the policy is 0-1 ms against 42-52 on
+      aarch64 and 4 ms against 115 on x86, so both tests now require the
+      deadline run to be at least FOUR TIMES better. A tie is a failure.
+- [x] **One boot hung inside the deadline test -- EXPLAINED AND FIXED,
+      2026-09-12.** Two bugs, both of them older and wider than this test.
+
+      **1. `exit()` ended one thread, not the process.** `process_exit_self()`
+      zombied the calling thread and left every sibling running. jitter starts
+      six workers and, when one fails to start, exits -- leaving the others
+      spinning in user space with no syscall and no fault ever again. Nothing
+      marked them killed, so the tick's scheduler had no reason to stop them
+      (`schedule_locked()` ends a KILLED thread it finds in user mode, and they
+      were not killed), the process never reached zero live threads, and the
+      boot's `process_wait()` never returned. Not architecture-specific and not
+      about jitter: any program whose main() returns while a worker runs did
+      this. `process_exit_self()` now ends every thread of the process, through
+      the same path `process_kill_code()` uses (both now call
+      `end_every_thread_locked()`); `thread_exit_self()` still ends only its own
+      thread, which is what that call is for.
+
+      **2. A never-joined thread leaked its slot and its kernel stack until
+      reboot.** A joinable thread that exits with siblings alive is deliberately
+      kept for a later `thread_join()`. If nobody ever joins it -- which is what
+      a thread pool does, and what jitter does -- nothing reaped it. Six slots
+      per jitter run out of MAX_THREADS (256). The aarch64 boot runs jitter
+      twice, so a boot leaked twelve and nobody noticed. `process_reap_slot()`
+      now reaps them: at that moment the process is being reclaimed, every
+      thread of it is dead, so no joiner can exist. It SKIPS any thread another
+      core has queued for deferred reap -- without that check the slot is freed,
+      `thread_alloc()` hands it to a new thread, and the stale pointer reaps a
+      live one (observed immediately: "a thread of pid 20 is not a zombie
+      (state=1), refusing", then a four-core `spin_lock` hang).
+
+      **The measurement.** `early.c` patched to run the deadline A/B 25 times
+      per boot with 20 cycles: before, thread creation started failing around
+      rep 20 ("jitter: could not start hog 2" -- 25 x 2 x 6 = 300 slots against
+      256, the arithmetic matches) and the boot hung with all four cores in
+      `spin_lock`. After: 25/25 reps, "6 unjoined thread slot(s) reclaimed" per
+      run, and the boot finished with 0 failures.
+- [x] **The original report, kept for the trail.** A boot
+      stopped after `jitter: 6 hog thread(s) ... sched_period -> 0` (the second,
+      deadline run) and made no progress for over two minutes; the whole boot
+      normally takes ~25 s. Once, in a batch of four, on 2026-09-11, before the
+      count fix -- and not seen in the ~40 boots since. It may have been the
+      same bug wearing a worse face, or starvation under a deadline thread plus
+      six hogs. SEEN AGAIN AFTER THE COUNT FIX (2026-09-12), at exactly the
+      same point -- so it is a second, separate bug, not that one wearing a
+      worse face. Roughly 2 in 45 boots. x86 does not show it: 8 consecutive
+      `test deadline` runs in one boot were clean, so it is aarch64-specific.
+      `python3 tools/arm64_hang_capture.py 25` boots until it happens and
+      photographs every vCPU's PC twice, 200 ms apart, symbolized -- identical
+      PCs mean a stuck core, moving ones a livelock.
+
+      **CAUGHT IN THE ACT, 2026-09-12** (run 2 of a 30-boot soak): ALL FOUR
+      cores spinning in `spin_lock`, PCs moving within the spin loop, at exactly
+      that point. Four spinners and no holder running means somebody took a lock
+      and never gave it back. Ruled out while looking: `spin_lock` masks IRQs
+      before spinning, so a core cannot deadlock against its own interrupt
+      handler; every exit of `sched_declare_period()` unlocks; and both
+      first-run trampolines already release the lock a new thread inherits
+      (their comments describe this very deadlock). The lock now RECORDS ITS
+      HOLDER -- `holder_lr` in kernel/include/spinlock.h, written by the winner
+      and cleared on release -- and the capture tool reads and symbolizes it out
+      of the hung guest, so the next occurrence names the call site. That
+      capture is what the two fixes above were found from: the holder read
+      `schedule+0x20`, and the serial log ended at the thread-creation failure.
+
+      **AND A THIRD CAUSE, FOUND 2026-09-27** by the Raspberry Pi's boot, where
+      it hit about one boot in six (docs/RPI4.md P3). The line above -- "both
+      first-run trampolines already release the lock a new thread inherits" --
+      is true and was not enough: `kernel_ctx_prepare()` gave every new thread
+      `DAIF = 0`, so interrupts came on at CTX_LOAD's `msr daif`, SEVERAL
+      INSTRUCTIONS BEFORE the trampoline's release. A timer IRQ pending at the
+      switch fired in that window, its `schedule()` spun on the lock its own
+      core held, and the other three piled up. Caught with all four cores in
+      `spin_lock`, `holder_lr` = `schedule()`, and two backtraces ending at the
+      trampoline's `mov x29, xzr`. New contexts now start fully masked, as
+      x86's do; the trampolines enable interrupts after the release, and the
+      bring-up self-test threads got a wrapper that does. 0 hangs in 20 boots
+      after, against ~3 in 17 before.
+- [x] **A core woken from tickless idle kept the idle loop's timer -- FIXED
+      2026-09-27** (both architectures; shared code). The idle loop arms up to
+      SCHED_IDLE_CAP_MS (1 s) and halts; a reschedule IPI or device IRQ that
+      wakes it early switches to real work from inside the interrupt, and that
+      thread then ran up to a second unpreempted. Four cores kicked awake to
+      run a burst of new threads meant nothing ran schedule() at all: the
+      deadline test's periodic thread measured 807 and 1567 ms worst lateness
+      on `virt,gic-version=2` (TCG), 2 runs in 5. schedule_locked() now re-arms
+      TIMER_QUANTUM_MS when it dispatches on a core g_idle_cpus says was idle.
+- [x] **A second aarch64 failure at the same point -- EXPLAINED AND FIXED,
+      2026-09-27.** The exception RETURN path loaded ELR_EL1 and SPSR_EL1 and
+      ran `eret` with interrupts ENABLED whenever the handler returned with
+      them on, which every system call does. An IRQ between the two `msr`s
+      overwrote ELR with the address of `msr spsr_el1`; the nested return
+      restored that, and the outer `eret` then jumped back to `msr spsr_el1`
+      in the mode its SPSR named:
+        * returning to EL1, it re-ran the tail with the frame's registers
+          already reloaded, wrote a thread's x1 into SPSR, and took ILLEGAL
+          EXECUTION STATE at `msr spsr_el1` -- exactly the report below, packed
+          small integers and all;
+        * returning to EL0, it entered USER mode at a kernel address: an
+          instruction abort from EL0 at `exc_common`, and the program killed.
+          That is how the Raspberry Pi's boot caught it (docs/RPI4.md P3),
+          after `home: desktop ready`, with ELR = FAR = `msr spsr_el1`.
+      `exc_common` now masks everything (`msr daifset, #0xf`) before touching
+      ELR/SPSR, and so does `aarch64_eret_to_el0`, which a new thread reaches
+      straight from its trampoline's unlock. The `eret` restores the returning
+      context's own DAIF from SPSR. The original report, for the trail:
+
+      A second aarch64 failure at the same point, from a desktop run on
+      2026-09-12: an ILLEGAL EXECUTION STATE exception (ESR EC 0x0E) taken at
+      `exc_common+0x80`, which is exactly `msr spsr_el1, x1` in the exception
+      RETURN path, on the static boot stack, with x30 = 0x5ca and a register
+      file full of packed small integers. PSTATE.IL is set by an ERET whose
+      SPSR is illegal -- on Apple silicon anything with M[4] set (AArch32) is --
+      and the reported ELR is then the address that ERET jumped to. So a frame
+      was restored whose saved PSTATE was garbage while its saved PC was intact.
+      Nothing in C ever writes `frame->spsr` (only the assembly save does), so
+      this is corruption of a frame, or a restore from a wrong SP. Whether it is
+      the same bug as the spin above is not yet known.
+
+      **WHAT WAS DONE ABOUT IT, 2026-09-12.** The cause is still not proven, but
+      two things changed.
+
+      A REAL CORRUPTION SOURCE WAS FOUND AND FIXED on the way: the aarch64
+      kernel-stack VA allocator was an UNLOCKED bump pointer
+      (`kstack_va_next`, pagetable.c), while x86's equivalent has always taken
+      `vmm_lock`. Two cores spawning at the same moment read the same VA, both
+      map a stack there, and the second mapping replaces the first: two threads
+      on one kernel stack, each overwriting the other's exception frames. That
+      produces exactly this signature -- a restored SPSR that is another
+      context's data -- needs SMP, and is rare. The MMIO and kmap windows in the
+      same file had the same hole and now share one `va_lock`. Whether it is
+      THIS crash cannot be claimed without catching it again.
+
+      AND THE CRASH CAN NOW NAME ITSELF. `exc_common`'s epilogue checks the
+      frame's SPSR before the `eret` (`M[4:0] > 0b00101`, or IL already set) and
+      calls `aarch64_bad_exception_return()` instead of executing an illegal
+      return. This matters beyond tidiness: an illegal `eret` does not fault --
+      the architecture sets PSTATE.IL, jumps to ELR anyway, and the next fetch
+      takes an EC 0x0E exception that reports only ITSELF. Worse, its own frame
+      carries IL forward, so the return from the report re-enters the same
+      state. That is why the dump above says so little. The check costs four
+      instructions on every exception return and prints the offending frame at
+      the moment it is known to be bad.
+
+      Also fixed while reading that path: `vmm_free_kernel_stack(0, ...)` --
+      an adopted thread (the boot context, each secondary's) records
+      `kstack_top = 0` -- computed `base = 0 - KSTACK_SIZE`, wrapped to the top
+      of the address space, and would have unmapped and freed whatever is
+      mapped there. Guarded on both architectures. Nothing reaps those threads
+      today, which is the only reason it never fired.
+
+### The key stream speaks Unicode now (done 2026-09-12)
+
+- [x] **AZERTY ships, and é è ç à ù type.** The driver used to refuse the
+      layout outright, and was right to: the char stream was 7-bit, so an
+      "AZERTY" on it could only have been QWERTY-with-letters-moved and silent
+      holes where the accents belong. What changed, end to end:
+
+      * layouts are tables of CODEPOINTS, not chars (the US and Dvorak tables
+        did not change one entry -- `'a'` is as valid a uint32_t initialiser);
+      * DEAD KEYS: `^` then `e` is `ê`, 46 pairings covering the Latin-1 set,
+        and a dead key pressed twice types itself so `^` stays reachable;
+      * ALTGR as a real third level -- without it a French keyboard cannot type
+        `@`, `{`, `[`, `|`, `\` or `€`, which means it cannot write an email
+        address or C;
+      * the char stream carries UTF-8. ASCII is byte-for-byte what it was, so
+        every existing reader (tty, shell, `embk_key_poll`, `ui_input_char`)
+        kept working untouched;
+      * `TextField` and `TextEditor` walk whole characters -- one backspace
+        removes one é, not half of one -- and accept bytes >= 0x80, which the
+        old `c < 127` bound silently dropped;
+      * `SYS_kbd_layout` + a Keyboard pane in Settings, applied by the shell at
+        login, so the preference survives a reboot.
+
+      Measured by `test keymap` (18/18): the exact UTF-8 bytes for é è ç à ù at
+      their real French key positions, ê from the dead key, `@ [ €` from AltGr,
+      digits from Shift, and US unchanged.
+
+      BOTH KEYBOARDS. The PS/2 driver (x86) and virtio-input (aarch64) share one
+      set of layout tables -- evdev numbers the main block the same way set 1
+      does, which is what let them share in the first place -- so the ARM path
+      got the same three levels, the same dead keys and the same UTF-8. It had
+      been truncating a codepoint into a `char`: é came out as a lone 0xE9,
+      which is not even valid UTF-8 and draws as a replacement box.
+
+      The rendering half needed nothing: `font_utf8_decode` has decoded UTF-8
+      since the font backend was written. It was only the INPUT half of the OS
+      that could not spell.
+
+      **One place still cannot draw it**, and it is worth naming rather than
+      discovering: the KERNEL's own framebuffer console (`fb_draw_string`, the
+      8x16 bitmap font used for panics, the boot log and the kernel `test`
+      commands) indexes glyphs by byte, so an é typed there shows as two boxes.
+      Every path a user actually types into -- the graphical Terminal, every
+      EmUI text field and the editor -- goes through the TTF renderer and is
+      correct. Giving the bitmap console Latin-1 glyphs is a small, separate
+      piece of work.
+- [x] **`test keyboard` reports a verdict a machine can read.** It printed
+      `[cmd] test keyboard: 6/6 checks` BEFORE its 8-second live capture -- and
+      that shape is the verdict line a scripted run reads, so the harness judged
+      the test before it had finished and recorded a permanent FAIL for a test
+      whose automated half passes. One verdict per command, at the end, and
+      SKIP when nobody typed (the live half needs a person; the keymap itself is
+      checked without one by `test keymap`).
+
+- [ ] **`test ctrlc2` cannot be run by tools/console_test.py, and costs 400s to
+      discover that.** It spawns a shell running `primtest.elf spin`, which
+      loops forever and prints nothing, and waits for a person at the console to
+      press ^C -- "completion IS the pass". The harness types a ^C only when it
+      sees the marker `(send ^C now)`, which `spin` never prints, so the test
+      hangs to the full timeout and takes the rest of the run down with it (the
+      harness stops at the first command with no verdict, by design).
+
+      Either give the spin role that marker so the harness can drive it, or have
+      the test say SKIP when nobody is at the console, the way `test keyboard`
+      now does. Until then it is an INTERACTIVE test and does not belong in a
+      scripted list. `test ctrlc` beside it is fully scripted and passes.
+
+### The services layer, and the first service (started 2026-09-12)
+
+- [x] **An application can ask the user for a file.** Until now the OS had
+      exactly ONE service endpoint -- `/run/emlink.desktop`, which the top bar
+      "calls" by connecting and hanging up, because there was no convention for
+      sending a message. There is one now (user/lib/emsvc.h): a service listens
+      at `/run/emlink.<name>`, a call is one request and one reply, and the
+      connection closing ends the transaction.
+
+      The first service is the Open/Save panel (user/system/filepanel), a
+      SEPARATE PROGRAM rather than a library, so every app gets the same picker
+      and improving it improves all of them without rebuilding one. The text
+      editor now has Open and Save As; it previously could only edit the file
+      it was handed on the command line.
+
+      MANIFESTS PACK BESIDE THEIR BINARY NOW, in BOTH image builders. Each
+      only wrote `<name>.ns` / `<name>.caps` for programs under /data/apps,
+      which silently dropped them for anything sealed in /system/bin -- and the
+      first program that needed one there was the panel, whose authority is the
+      most important in the session. The x86 builder was fixed first and the
+      aarch64 one was not, so the ARM boot log kept saying "filepanel.ns not
+      found" while x86 was clean: the same bug, twice, in two copies of the
+      same idea.
+
+- [x] **Notifications (user/system/notifyd).** The second service, and the
+      other one every app needs: a program can now say something from outside
+      its own window. The desktop's "could not start that app" used to go to
+      fd 1 and nowhere else -- a serial cable nobody has plugged in on the
+      machine this OS is for -- so clicking an app that cannot start looked
+      exactly like clicking one that does nothing. It posts a banner now.
+
+      Two threads, because a service has to wait for callers and a window has
+      to be drawn: the accept thread answers each caller IMMEDIATELY (a program
+      that has just failed to save your file must not then block for six
+      seconds telling you so) and the main thread owns the window. The window
+      exists ONLY while there is something to show -- a translucent window
+      parked in the corner would swallow every click that landed on it.
+
+      A CAPABILITY LESSON, recorded because the failure was so quiet: notifyd
+      was first declared with `gpu` and nothing else, which looks like the
+      careful choice for a program that only draws. It came up, drew its banner
+      frames, and rendered NOT ONE CHARACTER -- empty rounded boxes in the
+      corner. Every EmUI program opens /system/fonts/font.ttf at startup, and
+      without `filesystem` that open fails. The capability system did exactly
+      what it promised; the declaration was wrong. Narrowing the manifest to a
+      read-only /system/fonts binding, so the grant matches the one file it
+      really needs, is the proper fix and is still open.
+
+      Also caught here: `.glass` overrides fill AND border (em_apply_box), so a
+      `.border_color` passed beside it is silently discarded -- the level
+      colour went to the glass material's own pale outline on every banner
+      whatever the urgency. The level is a child stripe now, which a parent's
+      material cannot override.
+
+- [ ] **The panel should hand back a HANDLE, not a path.** This is the version
+      that matters in a capability system: the panel holds the authority to
+      browse, and an app with no filesystem namespace of its own could open
+      exactly the file the user pointed at -- and nothing else. `embk_chan_send`
+      already carries ancillary handles, and `struct emfile_rep` already has the
+      field reserved, so the protocol does not move. What is missing is in the
+      kernel: `kernel/ipc/handle.h` knows SURFACE, CHANNEL, ENDPOINT and PIPE,
+      and there is no FILE kind to wrap an open file in, nor an fd_install for
+      one. Until then the panel returns a path and the caller needs the
+      namespace to open it.
+
+- [ ] **The shared panel is poorer than Note++'s private one.** Note++ built
+      its own picker with something this one lacks: it probes whether a
+      directory is WRITABLE by creating a file there and removing it, and says
+      so before you commit to a save (user/apps/notepp/notepp.c, dir_writable).
+      That is a better answer than a refusal after the fact. The shared panel
+      should grow it -- and only then should Note++ switch over, because
+      replacing a richer picker with a poorer shared one would be a downgrade
+      for that app and for the idea.
+
+### A USB tablet attached to the x86 guest moves nothing
+
+- [ ] **QEMU's `usb-tablet` on a `qemu-xhci` controller produced no pointer
+      motion at all.** Observed 2026-09-12 while building tools/shell_shot.py:
+      booting the x86 image with `-device qemu-xhci,id=xhci -device
+      usb-tablet,bus=xhci.0` and sending QMP `input-send-event` abs events left
+      the cursor at its boot position (516, 390) for an entire run, while every
+      click landed on whatever was under that point.
+
+      The kernel has the code for this: `usb_tablet_process_report()` decodes
+      QEMU's 6-byte report and feeds `mouse_set_absolute()` (kernel/drivers/usb/
+      usb_core.c), and xhci.c, ehci.c and uhci.c are all built for x86. So the
+      driver exists and something between the controller and the report is not
+      happening -- which of the three was not investigated.
+
+      NOT A TEST-ONLY PROBLEM. A USB mouse is not optional on a real machine,
+      and this is the only path an external pointing device has: the PS/2 mouse
+      is emulated hardware that a physical laptop does not have. Worth finding
+      before the machine does.
+
+      The repro is one line: attach the two devices to any x86 boot and move
+      the pointer over QMP. tools/app_shot.py takes `tablet=True` for exactly
+      this. Until it works, tools/shell_shot.py aims with paced relative PS/2
+      motion, which is what its move() explains at length.
+
+### The window list (done 2026-09-12)
+
+- [x] **Anything can now ask what windows exist.** `embk_win_list` returns pid,
+      window id, flags (minimized, focused) and TITLE, front-most first --
+      and the title is the point: a process in this system is named by handle
+      and stores no path, so the compositor's window title is the only name an
+      application has that a person would recognise. That is why the call lives
+      in the compositor rather than beside process_list().
+
+      SCOPED TO THE CALLER'S SESSION, in the syscall rather than the
+      compositor: a window title says what someone is working on -- often the
+      name of a file -- and sessions are a process-model idea the compositor
+      has no business knowing about. `embk_win_raise(pid)` is the other half
+      and carries the same rule: you may raise what you were allowed to see.
+      (Distinct from `embk_win_restore`, which takes a SPAWN HANDLE and so only
+      works for a child you started -- the dock's click-to-restore. A switcher
+      knows pids, not handles.)
+
+      The top bar uses it for the thing a menu bar is actually for: naming the
+      application you are looking at, with a menu of everything else open that
+      switches to it. That space used to hold File / Edit / View -- three menus
+      belonging to no app, doing nothing, because the bar had no way to find
+      out whose window was in front.
+
+      WORTH KNOWING WHEN TESTING: a program started with `run` at the KERNEL
+      console is a child of the kernel and lives in session 0, not the user's
+      session -- so it is correctly absent from this list, and the bar stays
+      silent about it. The first capture of this feature showed two apps on
+      screen and no name in the bar, and the filter was right both times.
+      Launch from the dock to see it.
+
+### The text field has a caret (done 2026-09-12)
+
+- [x] **You can edit the middle of a text field.** Before this, a field in this
+      system could only be APPENDED to: typing went on the end, backspace came
+      off the end, and what was drawn as a caret was a 2px box emitted after the
+      whole string -- so it was not a cursor, it was a decoration sitting where
+      the next character would go. Fixing a typo three characters back meant
+      deleting everything after it, in every filename box in the Open/Save
+      panel, every search box, every setting.
+
+      Left / Right / Home / End move it, Backspace takes the character before
+      and Delete the one after (a key that previously did nothing at all),
+      typing inserts at the caret, and clicking in the text places it between
+      the two characters you pointed between -- nearest boundary, so the right
+      half of a letter means after it.
+
+      CHARACTERS, NOT BYTES, throughout. The stream is UTF-8 since the keyboard
+      work, so one Left steps over the whole of an é and one Backspace removes
+      both its bytes; the caret is kept on a character boundary even when the
+      app rewrites the buffer underneath it (the file panel does, when you click
+      a file). The value is drawn as two runs with the caret box between them,
+      which costs no measurement -- the layout already knows how wide the first
+      run is.
+
+      ONE CARET, anchored to the BUFFER rather than to the widget's instance
+      handle: a field is identified by the text it edits, which is stable across
+      frames by construction and survives the field moving in the tree. Exactly
+      one field is focused, so exactly one caret is needed. Focusing a field
+      puts it at the end of that field's text.
+
+      Paste stopped mangling text in the same change: em_app's replay dropped
+      every byte outside 0x20..0x7E, so you could TYPE é into a field and then
+      not paste it, in the same field, on the same machine.
+
+      Proved twice, because the two halves need different instruments.
+      ui/kit/kit_test.c drives the real widget through the real declare/layout
+      stack on the host -- insert at front, mid-string backspace, Delete, arrows
+      over multi-byte characters -- in about a second. tools/caret_shot.py does
+      what the host cannot: it types at a REAL keyboard and clicks with a REAL
+      pointer in Settings' "Try it" field, and judges by INK COLUMNS (for each
+      x, is there writing there), which distinguishes an insert at the front
+      from an append without reading text off a screenshot.
+
+- [x] **And a selection, and a clipboard that any field can reach** (done
+      2026-09-12). Shift+Left/Right/Home/End extend a selection, GUI+A selects
+      all, GUI+C copies, GUI+X cuts, GUI+V pastes, typing or backspace over a
+      selection replaces it, and a plain arrow collapses it to the edge it moves
+      toward. The highlight is a property of the text RUN (`ui_set_text_bg`, a
+      facility that existed for this and had never been used), so it lands where
+      layout put the words and needs no measurement to stay there.
+
+      **THE MODIFIER IS THE GUI KEY, NOT CTRL, and that is now a standing rule
+      of this system.** Ctrl+C cannot be copy here: 0x03 is intercepted in
+      keyboard_deliver() and routed at the console's interrupt target, so in a
+      text field it would cancel whatever the terminal is running rather than
+      reach the field. That is correct -- ^C is an interruption
+      (docs/INTERRUPTION.md) and stays one. So: **Ctrl belongs to the terminal,
+      the GUI key belongs to the interface**, which is the separation macOS
+      makes between Ctrl and Cmd and for the same reason. Ctrl+V still pastes,
+      so nothing that worked stopped working.
+
+      DELIVERED IN THE SAME BYTE STREAM AS THE TEXT, at 0xF8..0xFF -- byte
+      values that can never occur in valid UTF-8 at any position. One ordered
+      queue, which is the point: a paste between two typed characters has to
+      land between them, and two queues cannot promise that. The driver decides
+      them, because the driver is where the modifier state is known at the
+      instant the key went down -- exactly as it already decides Ctrl+letter is
+      a C0 code.
+
+      A masked field refuses to copy its text. The caret and the selection work
+      in one; only the clipboard is declined, since a clipboard is a place a
+      password would appear.
+
+      The kit takes the clipboard as TWO FUNCTION POINTERS
+      (`ui_clipboard_provider`), because it is built and unit-tested on the host
+      where there is no kernel to ask. ui/dsl/em_app.c installs the real one;
+      kit_test installs its own, which is how copying is tested on the host at
+      all. 35 claims in kit-test, 0 failures.
+
+      `t.selection` is a new theme token at 42% accent, not `accent_soft` at
+      18%: a soft plate says "this row is the current one" and may whisper, but
+      a selection is what the next keystroke is about to destroy.
+
+- [x] **The MULTI-LINE editor too, and a host test for the DSL at last** (done
+      2026-09-12). `em_text_editor` -- the editor every EmUI application uses --
+      got the same selection, copy, cut and paste. Its line renderer now cuts
+      each line at every boundary that matters (syntax span end, selection edge,
+      caret) and emits each piece with the colour and highlight in force there,
+      rather than nesting "is the caret in this span" against "is the selection
+      in this span".
+
+      It pastes ITSELF rather than taking the runtime's app-wide replay, because
+      that replay flattens newlines to spaces -- right for a terminal, where a
+      pasted newline would execute something, and wrong for an editor, where it
+      silently collapses a pasted block onto one line.
+
+      THIS FIXED A REGRESSION THE SAME CHANGE CREATED. The editor's default
+      branch inserts any byte >= 0x80, which is how é and € arrive -- so the
+      moment the driver began sending commands at 0xF8..0xFF, GUI+C in Note++
+      would have typed a garbage character into the document instead of copying.
+      Every command is now an explicit case AND the insert branch is bounded
+      below 0xF8.
+
+      That bug is why ui/dsl/em_test.c exists: em.c compiles standalone on the
+      host (it knows nothing about the kernel), so `make em-test` drives the
+      real editor through the real layout stack in a second, where before it
+      could only be exercised by booting a machine and typing. 11 claims. It was
+      MUTATION-CHECKED rather than trusted for passing first time: removing the
+      0xF8 bound and one command's case makes three of its claims fail.
+
+      Note++ and Vellum learned the GUI keys as well. Both had their own Ctrl+C,
+      which works only while nothing has routed an interrupt -- so copying from
+      a page or a document silently did nothing whenever a terminal was running
+      a job. Their Ctrl shortcuts are untouched; the GUI ones are the reliable
+      half beside them.
+
+- [x] **And the MOUSE can place and select it** (done 2026-09-12). Keyboard
+      selection is not how anyone selects text; dragging is. A press in a field
+      or the editor plants the caret and a drag extends the selection from it.
+
+      The multi-line editor had NO click-to-place at all -- a click focused it
+      and left the caret wherever it happened to be, so the only way to reach a
+      line in a code editor was to arrow to it. `te_hit()` maps a point to a
+      byte: the line from the pitch, the column with the renderer's own decoder
+      through `ui_text_width_n`, the nearest boundary rather than the character
+      landed in, so the right half of a letter means after it.
+
+      DRAGGING USES POINTER CAPTURE (`ui_is_active`), not "is this widget
+      pressed": capture stays with the widget the press landed on even once the
+      pointer has left it, so dragging past the end of a field or the bottom of
+      a document keeps extending instead of stopping dead at the edge.
+
+      Two measurement bugs found while testing, both in the TEST rather than the
+      code, and both worth remembering because each looked exactly like a
+      product failure:
+        * a drag whose PRESS started outside the field selected nothing, and
+          correctly so -- the press is what captures the pointer;
+        * a calibration loop that cleared the buffers but not the clipboard
+          reported a selection at every y, because it was reading a stale copy
+          from an earlier round.
+
+      Both host suites were MUTATION-CHECKED afterwards: disabling the drag in
+      each makes exactly its own drag claims fail, and restoring makes all 37
+      (kit) and 18 (em) pass. On the machine, a real PS/2 drag changed 68% of
+      the pixels it crossed.
+
+      Line geometry also stopped ignoring the app's own text scale
+      (`em_set_text_scale`): the pitch is now the size the text is actually
+      DRAWN at, so hit-testing and the auto-scroll agree with the glyphs at any
+      scale rather than only at 1.0.
+
+- [x] **Double-click takes a word, a third click takes the lot** (done
+      2026-09-12). It wanted a CLOCK the widget kit did not have -- it had
+      `ui_frame_serial()` and nothing else, and counting frames is no
+      substitute, because this is a retained-mode loop that SKIPS frames when
+      nothing moves: the quiet gap between two deliberate clicks can be fewer
+      frames than a fast double-click, which gets the answer exactly backwards.
+
+      So `ui_clock_provider`, beside the clipboard one: em_app fills it with
+      `embk_uptime_ms`, the host tests fill it with a clock they wind by hand,
+      which is what makes any of this testable off a machine.
+
+      A word is letters, digits and underscore, or a run of punctuation -- so
+      `foo_bar(baz)` gives `foo_bar` and double-clicking the `(` gives the
+      punctuation. Every byte >= 0x80 is a word byte, so `café` is not cut in
+      two. A third click takes the whole field, or in the multi-line editor the
+      LINE: selecting a whole document from a triple-click would be a nasty
+      surprise in a file. Bounded by TIME and DISTANCE both -- two fast clicks
+      at opposite ends of a line are two clicks, not a double.
+
+      A drag deliberately does NOT move the caret while a multi-click owns the
+      selection. Without that the drag block -- which runs on the press frame
+      too, because the button is down -- re-collapsed the caret onto the pointer
+      and the word a double-click had just selected survived no frames at all.
+
+      **IT DID NOT WORK ON A REAL MACHINE UNTIL THE INPUT PATH WAS FIXED**, and
+      the host tests could not have told anyone: they feed the toolkit directly.
+      Three separate faults, found by instrumenting the guest rather than by
+      guessing -- two guesses were wrong first:
+
+        1. The compositor held a press an app was too busy to see in a SINGLE
+           slot, and the next press overwrote it. Two rapid clicks reached the
+           application as one. It is a queue now (four deep -- a triple-click is
+           three), and a press arriving full is dropped rather than evicting an
+           older one, because the queued clicks are the ones made FIRST.
+
+        2. Even queued, replayed clicks are delivered one per poll, so their
+           arrival times measure the APP'S FRAME RATE, not the hand. Settings
+           reports "a frame costs 77 ms"; two clicks 130 ms apart arrived 3.4
+           SECONDS apart, far outside any sane window. So each queued press now
+           carries the millisecond it was actually made
+           (`compositor_win_input`'s new `when`, through `struct
+           embk_win_input`, `ui_pointer_at_time()`, to the click counter).
+
+        3. The timestamp was first wired into the wrong loop. em_app.c has TWO
+           pointer pumps -- one feeding `ui_pointer` directly (the widget
+           runner) and one going through `em_feed_pointer` (`em_app_run`, which
+           is what every application uses) -- and the first attempt fitted the
+           one applications do not run. The symptom was an event time of zero
+           reaching the toolkit while clicks plainly arrived.
+
+      Measured on the machine before and after: a double-click changed 28% of
+      the pixels around it (that is the CARET moving, and nothing else) and now
+      changes 74% (the word, highlighted). tools/caret_shot.py's threshold was
+      0.05, which passed throughout the broken period -- it is 0.45 now, between
+      what the feature does and what its absence does. A threshold below the
+      noise floor is decoration, not a test.
+
+- [ ] **Double-click works about 2 runs in 3, and the remaining third is not
+      yet explained.** Three faults in this chain are fixed (below); measured
+      progress on the machine, three runs each time: 0/3 passing, then 1/3 after
+      the driver counted press EDGES, then 2/3 after each press carried the time
+      it actually happened. `tools/caret_shot.py` reports this one rather than
+      failing on it until it is reliable.
+
+      THE FOURTH FAULT IS FIXED, and it was in the TOOLKIT, not the kernel --
+      after three kernel-side fixes, which is a lesson about where to look next
+      time. `ui_consume_click()` answers a YES/NO, and the declare layer's
+      `g_clicked` remembers only the LAST instance pressed: two clicks that both
+      land between two build frames are one `true`, so a double-click made
+      faster than the app renders was counted as a single click. Every layer
+      below carried the pair faithfully -- the driver queues press events, the
+      compositor queues clicks, each stamped with the time it happened -- and
+      this was where the second one was dropped. `ui_take_press_edges()` is the
+      count that layer had kept for exactly this reason, unused by the field.
+
+      Confirmed by instrumenting rather than by reasoning: the guest now logs
+      `EDGES 2` where it had logged one click, and the measurement went from 28%
+      (a caret moving) to 74% (a word highlighted).
+
+      STILL 2 RUNS IN 3, and that is the honest state. The logic is right and
+      demonstrably works; what remains is timing in emulation, where the pair
+      sometimes lands far enough apart that the window legitimately rejects it.
+      caret_shot reports the measurement rather than failing on it. Before
+      changing anything else here, instrument and read the log on a FAILING run
+      -- that is what found all four faults, and guessing found none of them.
+
+      THE EARLIER LEADING SUSPECT WAS TRIED AND REVERTED. `compositor_win_input()`
+      drops a queued press whenever exactly ONE is waiting and the button is
+      physically down, inferring "the live path is already delivering this".
+      That inference could not be wrong with a single latch slot and looks
+      wrong with a queue: after the first of two rapid clicks is consumed the
+      count falls to 1, and a button still down at that moment would discard
+      the SECOND click.
+
+      Replacing it with an explicit once-per-down-cycle claim of the NEWEST
+      queued press (`live_claimed`) did two things, both informative:
+        * it left double-click at 2 runs in 3 -- no improvement at all;
+        * it BROKE aarch64: `test-arm64-boot` went from 0 FAILs to 1, "the
+          launcher button did nothing". Confirmed mine by stashing the change
+          and re-running (0 FAILs), which is the only way to be sure.
+
+      So claiming a press for the live path optimistically LOSES clicks
+      somewhere the reasoning did not predict -- most likely because the
+      aarch64 pointer arrives through `mouse_set_absolute` (virtio-input) and
+      the `g_ptr_win`/`g_ptr_pid` bookkeeping the claim tests against does not
+      hold there the way it does for PS/2. The change is reverted; the old rule
+      stands.
+
+      WHAT TO DO NEXT, and it is not another guess: instrument `ui_click_note`
+      and read the serial log on a FAILING run to see whether both presses
+      arrive at all, and if they do, what their `ev` times are. That is how all
+      three fixed faults were found. Guessing found none of them, and has now
+      cost a regression as well.
+
+      The three already fixed, kept here because each was a separate lesson:
+
+- [x] **Fast clicks were lost in the mouse driver** (fixed 2026-09-12). A KERNEL
+      defect, not a toolkit one, and it bounded how fast anyone could click:
+
+      `mouse_get_state()` reports the CURRENT button state -- the IRQ handler
+      keeps `g_buttons` up to date -- and `compositor_pointer_tick()` finds a
+      press by diffing it against the previous tick. So a complete
+      down-up-down-up that happens BETWEEN two ticks shows the same state at
+      both ends and yields ZERO edges. The second click does not arrive late;
+      it never existed as far as the system is concerned.
+
+      That is exactly what the measurements say. With ~130 ms between the two
+      presses the pair sometimes survived and sometimes did not (74%, 28%, 74%
+      across three runs). Speeding the pair up to ~50 ms made it fail every time
+      -- three runs, all 28%. Faster clicking losing MORE clicks is the
+      signature of sampling, not of a timeout.
+
+      FIXED by giving the driver a press EVENT QUEUE instead of a state. The IRQ
+      handler already sees every packet, so it records each left-button DOWN
+      transition as it arrives and `compositor_pointer_tick` drains them
+      (`mouse_take_press`). A burst of two clicks between ticks now yields two
+      press edges, which is what the compositor's click queue was built to
+      carry. Both arches in the same lines: the PS/2 packet path and
+      `mouse_set_absolute`, which is how aarch64 gets a pointer at all.
+
+- [x] **...and each press had to carry its OWN time** (fixed 2026-09-12). The
+      first version of the fix counted presses but let the compositor stamp them
+      with the time of the TICK that noticed. Two presses noticed on different
+      ticks then look as far apart as the ticks are, which on a busy kernel loop
+      is wider than any double-click window -- so counting alone moved the
+      machine from 0 runs in 3 to only 1 in 3. The press's own time is known in
+      the driver and nowhere else, so it is taken there and carried through.
+
+- [x] **Shift-click extends a selection** (done 2026-09-12). It needed the
+      MODIFIER STATE at the moment of the press, and the kit had no way to ask:
+      the char stream carries no modifiers, which is why the DRIVER decides what
+      Shift+Left means before sending it -- but a click has no byte to decide
+      about. So `ui_mods_provider`, the third of the pattern after the clipboard
+      and the clock, filled by the runtime with `embk_key_mods`.
+
+      A shift-click is deliberately NOT counted toward a double-click: it is a
+      second click somewhere else on purpose, and counting it would turn an
+      extend into a word-select.
+
+- [x] **Right-clicking text opens a menu** (done 2026-09-12). The `ContextMenu`
+      primitive had existed for a while with nothing ever pointing it at a text
+      field. Undo, Redo, Cut, Copy, Paste, Select All, with their ⌘ shortcuts
+      shown.
+
+      ITS ITEMS DO NOT REACH INTO THE FIELD. They push the same command bytes
+      the keyboard sends, so there is exactly one implementation of cut, copy,
+      paste, select-all and undo and the menu cannot drift away from what ⌘X
+      does -- and it works on the multi-line editor for free.
+
+      Only the FOCUSED field draws it, which is also the only field whose rect
+      the kit knows (`ui_focused_field_rect`), so a window of ten fields emits
+      one menu and not ten. The right-click is PEEKED and only taken if it
+      landed inside -- `em_right_clicked()` consumes, so the first field asked
+      would otherwise swallow a click meant for the third.
+
+### A ScrollView showed no scrollbar (done 2026-09-12)
+
+- [x] **Every scrolling view in the OS scrolled blind.** The wheel worked and
+      nothing else did: no way to tell how long a list was, where you were in
+      it, or that it scrolled at all. Files, Settings, the file panel, the
+      browser, the launcher, the music list -- all of them.
+
+      The bar is sized from the SAME content/viewport extents `ui_scroll_end`
+      already used to clamp the scroll, so it cannot disagree with the thing it
+      describes: the thumb is as much of the track as the viewport is of the
+      content, and sits as far down as the scroll is through its range. Below
+      28px it stops shrinking, because a one-pixel thumb on a long document is
+      a bar you can see and not grab. It is draggable, with pointer capture so
+      a drag that wanders off it keeps scrolling -- the same rule the text
+      selection follows.
+
+      THE GUTTER IS ALWAYS RESERVED, overlay rejected. A bar that appears only
+      when the content outgrows the view makes the content REFLOW the moment a
+      list gains a row, and a list that shuffles sideways as it fills is worse
+      than a few pixels of empty margin.
+
+      The view became an HStack of [content column | track], and the OUTER box
+      stays the one the caller's props land on -- `em_scroll_` applies them
+      right after `ui_scroll_begin` returns, so a `ScrollView(..., .grow = 1)`
+      still grows. The clip and the scroll offset moved to the inner column.
+
+      Six claims in kit-test, checked by GEOMETRY rather than by eye (walk the
+      tree, read the thumb's rect) and mutation-checked both ways: pinning the
+      thumb's offset fails "it moves DOWN", and drawing it when the content fits
+      fails "content that fits shows no thumb".
+
+### The machine could not be turned off from its own interface (done 2026-09-12)
+
+- [x] **Restart and Shut Down, in the EmbLink menu.** The kernel could always
+      take the machine down -- `power_transition`, and `make test-power` proves
+      the ACPI S5 path is real -- and nothing in userspace could ask. The only
+      way to stop an EmbLink machine was to cut its power, which is not a
+      shutdown, it is a crash you performed on purpose.
+
+      `SYS_power` (118), gated on a NEW CAPABILITY CLASS, `EMBK_CAP_POWER`.
+      A class of its own because it is unlike every other one here: the rest
+      gate what a process may TOUCH, and this ends every process on the machine
+      at once. The desktop shell holds it by inheritance from init; an
+      application that declares a narrower set does not.
+
+      No confirmation dialog, deliberately. Closing a window now ASKS each
+      application to go and a shutdown does the same to all of them, so the
+      work a confirmation would protect is already protected by the thing above
+      it in this file.
+
+      TWO BUGS FOUND BY THE TEST, both silent:
+
+        * `EMBK_CAP_MAX_ID` was still 11, so `EMBK_CAP_ALL` -- the set init is
+          rooted at -- did not include the new bit 12. Every call returned
+          -EPERM and the menu item did nothing at all, with nothing logged. A
+          capability ceiling that does not move when a capability is added
+          fails exactly this quietly.
+        * `CAP_NAMES` in user/lib/appauth.c had stopped at "debug" (10) while
+          the ids ran to 11, so a manifest asking for `session` already printed
+          "?" before this change. A name table that silently falls behind the
+          enum it names is worse than no names. Both 11 and 12 are named now.
+
+      Measured by tools/power_shot.py, which is the one test here that does not
+      judge by pixels: a frozen picture and a powered-off machine look
+      identical. It asks QMP for the run state and reads the kernel's own
+      flush on the serial line -- the second is what distinguishes an ORDERLY
+      shutdown from a halt.
+
+        qemu run state 'shutdown'; kernel reported an orderly flush: yes
+        power: 2 block device cache(s) flushed
+        power: ACPI S5 via PM1a_CNT 0x604 (SLP_TYPa 0)
+
+      The first version of that tool waited for QEMU'S PROCESS to exit, which
+      it never does here: this harness runs with -no-shutdown, so a guest that
+      powers itself off leaves a paused emulator behind. And its first aim at
+      the menu guessed a row pitch and clicked BELOW the menu entirely, which
+      looks exactly like a shutdown that did not work.
+
+- [ ] **`test power` cannot be run by tools/console_test.py**, for the same
+      reason as `test ctrlc2`: it powers the machine off, so no verdict line
+      can follow it and the harness waits out its full timeout. `make
+      test-power` is its target and it passes. Worth a SKIP-style guard or a
+      note in the test list; until then, do not put it in a scripted run.
+
+- [x] **"About EmbLink" said nothing.** It had been sitting in the menu doing
+      literally nothing -- a dead item, which is the same class of dishonesty as
+      the File/Edit/View menus that were removed earlier. It reports the
+      architecture, the screen size and the uptime through the notifier now,
+      which is the way any program here speaks from outside its own window.
+
+### The bar can say whether the machine is online (done 2026-09-12)
+
+- [x] **`SYS_net_status` (119), and a network indicator in the top bar.** The
+      stack has known its link, lease, address, router, DNS and MAC since it
+      came up (`struct netif`) and userspace could open sockets without ever
+      being able to ask any of it -- so nothing could show it, and a machine
+      that cannot tell you it is offline looks broken when it is merely not
+      plugged in.
+
+      CAP_NETWORK-gated like the rest of the socket surface. Reading the link
+      state is not using the network, but the address is the machine's identity
+      on it, and an application with no business on the network has none with
+      that either.
+
+      A DOT WHEN THERE IS A LINK AND A DASH WHEN THERE IS NOT, rather than a
+      word: the bar is read at a glance, and "Offline" spelled out is a sentence
+      sitting permanently in the corner of a machine that is simply unplugged.
+      The address lives in the menu behind it, because that is a thing you look
+      UP rather than monitor.
+
+      PROVED BOTH WAYS, which is the whole point -- a test that only ever boots
+      without a NIC would pass an indicator hard-wired to say "offline".
+      tools/net_shot.py boots twice, and the bar reads "Not connected" with no
+      device and "IP 10.0.2.15 / Router 10.0.2.2 / DNS 10.0.2.3 / Configured by
+      DHCP" with QEMU's user-mode stack.
+
+      Its own bug is worth keeping: shell_shot tracks the pointer in a MODULE
+      GLOBAL so it can move relatively without re-homing, and across two
+      separate guests that position is a fiction -- the second run aimed by a
+      delta from a machine that no longer existed, clicked nothing, and looked
+      exactly like an indicator that does not work.
+
+- [x] **`test dhcp` and `test dns` were permanently red under console_test.py**
+      (fixed 2026-09-12) -- and not because anything was broken. That harness
+      never gave the guest a NIC, so both failed for want of a device, which is
+      indistinguishable from a broken stack when you are reading a list of
+      results. `NET=1` now adds the same virtio-net the Makefile's run targets
+      have always appended, and both pass.
+
+### aarch64 has a NIC attached and cannot yet use it (2026-09-13)
+
+- [x] **The run targets attach one.** `ARM_NET` in kernel/arch/aarch64/arch.mk
+      puts QEMU's user-mode stack on every `run-arm64*` target, matching what
+      x86 has had since M1. `virtio_net.c` was already compiled for this arch
+      and had simply never been given a device.
+
+- [ ] **But `net_init()` is NOT called on this arch, because turning it on
+      trades "no network" for "halts after a minute".** Everything works right
+      up until it does not: the NIC probes ("virtio-net: up, MAC
+      52:54:00:12:34:56"), DHCP leases (`ip 10.0.2.15 gw 10.0.2.2 dns
+      10.0.2.3`), and the desktop comes up -- and then the kernel dies on a
+      translation fault whose faulting instruction resolves inside EXC_COMMON
+      itself (vectors.S:169). A fault while taking a fault: a thread ran off its
+      32 KiB kernel stack and the handler could not even report it.
+
+      TWO POSITIONING LESSONS ON THE WAY THERE, both already paid for:
+
+        * The first attempt called net_init() beside mouse and sound init,
+          where PCI is enumerated and the SCHEDULER IS NOT YET LIVE. kernel/
+          main.c states the requirement plainly and the ARM path ignored it.
+          process_create_kthread wrote through a null scheduler structure and
+          the machine died writing to 0x378 -- a NULL pointer plus a field
+          offset. Moved down beside the first process_create, it gets past that.
+        * The acceptance test blew its 120 s budget (43 failures, every one a
+          test that never ran) because net_init leases SYNCHRONOUSLY and this
+          arch has tick-driven RX. `-nic none` on that target now, and it is
+          NOT redundant: qemu's `virt` attaches a DEFAULT NIC when none is
+          named, so removing the explicit device changed nothing and cost a run
+          to notice.
+
+      WHAT TO DO NEXT: find which thread overflows. The RX poll kthread is the
+      obvious suspect since it is new to this arch, but the boot thread is
+      equally plausible -- net_init runs a whole DHCP exchange on whatever
+      stack calls it, and by that point in early.c that stack has been through
+      the entire init sequence. Print SP at entry to net_init and at the top of
+      net_rx_thread before guessing.
+
+      THE REAL FIX UNDERNEATH: net_init should not block boot on a lease at
+      all. x86 gets away with it because the exchange is fast there; that is
+      luck, not design.
+
+- [x] **`test power` and the `Network controller` witness.** The A7 assertion
+      "PCIe enumeration found no virtio device" greped the log for a NETWORK
+      controller -- a device that target never attached, so it had been passing
+      on qemu's default NIC. The moment the default was turned off it failed
+      with nothing wrong. It witnesses the DISPLAY controller now, which
+      `ARM_GPU` attaches on every one of these runs and which cannot disappear
+      behind a default.
+
+- [ ] **Still no battery indicator.** The power subsystem has a
+      `power_supply_driver` interface designed for exactly this -- ACPI's _BST
+      on a laptop, an I2C fuel gauge on a board -- and NOTHING HAS EVER
+      REGISTERED ONE, so `power_supply_get()` always returns false and the OS
+      cannot tell whether it is on mains. The interface is not the hard part: a
+      real battery driver needs an AML interpreter for _BST/_BIF, and QEMU has
+      no battery to test one against, so it wants a real machine or a
+      hypervisor channel to be worth writing.
+
+### Drag and drop between applications (2026-09-13)
+
+- [x] **The mechanism, and it is proven end to end.** `SYS_drag_begin` (120)
+      and `SYS_drop_take` (121), with a session-scoped payload exactly like the
+      clipboard: what one person drags, another session cannot see, and a drop
+      whose payload belongs to a different session is not delivered.
+
+      THE COMPOSITOR RESOLVES THE TARGET, and it has to. A press CAPTURES the
+      pointer -- every later motion routes to the window the press landed on,
+      which is right for a slider and for selecting text and means the window
+      you drop ON never sees the pointer at all. So the capture stays (the
+      source needs the motion to draw what it is holding) and the drop is
+      resolved separately, at the release edge, by asking which window was
+      under the pointer.
+
+      Traced working: Files publishes `/home/yves/readme.txt`, the compositor
+      finds pid 12's window at the release point, and Note++'s
+      `embk_drop_take` answers `r=1 type=path len=21`.
+
+- [x] **And the target reacts. IT ALWAYS DID** -- the previous note here said
+      it did not, and that was wrong. One instrumented run answered all three
+      possibilities at once:
+
+        NP drop r=1 type=[path] len=21
+        NP doc_open(/home/yves/readme.txt) -> 1
+        NP notify=-2
+
+      The document had been opening correctly the whole time. Two things hid
+      it: Note++'s content area was BEHIND the window the file was dragged out
+      of, so the change was real and off-screen; and the banner it posts to say
+      so failed with -ENOENT.
+
+      THE BANNER WAS A CAPABILITY ANSWER, not a bug. Note++ declares
+      `ro /system` and `rw $HOME` and nothing else, so /run -- where the
+      service endpoints live -- was not in its namespace and `embk_notify`
+      could not reach the notifier. The namespace IS the authority here, and an
+      application that never asked to reach a service cannot. Its manifest now
+      says `ro /run`, which is the app declaring what it needs rather than the
+      service becoming ambient.
+
+      The lesson is about the TEST, not the code: three runs were spent looking
+      for a change in the one region of the screen where it could not appear.
+      Instrumenting the app answered it immediately, as it has every other time
+      this session.
+
+- [x] **Files opened a file on PRESS, so you could not pick one up.** The
+      toolkit fires `.clicked()` on the press edge, which is right for a button
+      and wrong for a file: every attempt to drag one also launched it, and the
+      drag arrived behind a window that had just opened. A click is a press that
+      did not move, so the open happens on RELEASE now and only when no drag
+      started. This was found because the first drag test PASSED for that
+      reason -- the file opened, the pixels changed, and nothing had been
+      dropped anywhere.
+
+### GUI+Q quits the application (done 2026-09-13)
+
+- [x] **Distinct from GUI+W, which closes one window.** An application with
+      three windows loses one to GUI+W and keeps running; GUI+Q asks every
+      window the same process owns, so the program ends. On a machine whose
+      apps mostly have one window the two look identical, which is exactly why
+      it is worth being right about before they diverge. Asks, like every other
+      close here, with the same grace timer behind it.
+
+## Files' grid shifted after any navigation -- FIXED (2026-09-13)
+
+- [x] ~~Navigate away and back and the listing sits 32 px lower.~~ -- the
+      listing was inheriting the EMPTY-FOLDER PLACEHOLDER's padding.
+
+      `EmptyState` sets `ui_set_padding(sp6, sp5, sp6, sp5)` = 32 and 24. The
+      placeholder and the listing occupy the SAME SLOT of the same stack, and
+      the reconciler matches by position -- so the node that had been an
+      EmptyState came back as the first row of the grid and kept that padding.
+      The measured shift was 32 px down and 24 px right. Those are the numbers,
+      exactly, and the horizontal one is what finally identified it: a vertical
+      shift alone has many explanations, `(+24, +32)` has one.
+
+      Fixed by keying the three branches -- `files-placeholder`, `files-list`,
+      `files-grid` -- so they can never share an instance. Measured after:
+      fresh 193, after a view toggle 193, after one round trip 193, after two
+      193. It was 225 for every case but the first.
+
+      WHY IT LOOKED LIKE "ANY NAVIGATION DOES IT": the session namespace cannot
+      read `/`, so the sidebar's Root shows the placeholder too. Every
+      navigation in every test went through an EmptyState, including the ones
+      chosen specifically to avoid one. And toggling Grid/List -- which never
+      shows a placeholder -- never reproduced it, which at the time looked like
+      evidence AGAINST a reconciler problem and was the opposite.
+
+      Three wrong answers were published on the way to this one, each corrected
+      in its own commit: "a row keeps a height" (the row does, but that is a
+      symptom), "the layout is right and the pixels are wrong" (they were both
+      wrong -- I had compared rects and screenshots from DIFFERENT BOOTS), and
+      two theories about the cell. The method error that produced two of them
+      was measuring in one run and photographing in another.
+
+- [x] ~~THE GENERAL BUG: a reused instance keeps properties the new occupant
+      never sets.~~ -- FIXED IN THE TOOLKIT, and it took two changes because
+      the first one only moved the damage.
+
+      **A container's stacking axis is part of its identity.** Every container
+      was `INSTANCE_BOX`, so a VStack and an HStack in the same slot matched
+      each other and the second inherited whatever the first had declared --
+      `ui_shadow` only fires a mutation when a declared value DIFFERS, so an
+      unset property is not "the default", it is "whatever was there".
+      `struct instance` carries a `box_axis` now and `match_or_create` compares
+      it. Verified with NO keys in Files: 193 fresh, 193 after a view toggle,
+      193 after one navigation round trip, 193 after two. It was 225 for every
+      case but the first.
+
+      **And `is_overlay` is cleared on every container entry.** Making matching
+      stricter exposed the same rule wearing a worse property: a node that had
+      been a dialog's dismiss scrim was reused without anyone restating
+      `is_overlay`, stayed OUT OF FLOW, and was therefore never laid out and
+      never hit-tested. Files' sidebar stopped navigating after a confirmation
+      dialog -- measured by ink in the path field: 260 -> 403 without the axis
+      change, and no change at all with it, through two clicks and a click on
+      empty space between them. Instrumenting the handler showed the click
+      never arrived at all.
+
+      `is_overlay` is set by exactly two callers and both do it immediately
+      after entering their container, so clearing it on entry costs them
+      nothing. Out-of-flow is declared every frame now, never inherited. That
+      is the property whose staleness removes a control from the input path
+      rather than merely putting it in the wrong place, which is why it was
+      invisible until something moved.
+
+- [ ] **The rule still holds for every OTHER box property.** Padding, corner,
+      border, shadow, background and alignment are all applied only `if (p.x)`,
+      so two elements that can occupy one slot still exchange them -- the axis
+      check makes that much rarer (it takes two containers of the SAME axis
+      now) but does not remove it. The honest fix is for `em_apply_box` to
+      write every box property every frame with a documented default, which
+      means the containers that set their own defaults first (Card, Section,
+      EmptyState) have to express them as props instead.
+
+## The dock cannot move, and the reason is one missing z-band (2026-09-13)
+
+Two obvious Settings switches are missing and both are blocked on the same
+thing, so they are written down together rather than attempted twice:
+
+- [ ] **Dock position (bottom / left / right).**
+- [ ] **Automatically hide and show the dock.**
+
+WHY NEITHER IS A PREFERENCE YET. The dock is drawn by the DESKTOP window,
+which the compositor pins at z = 0 -- behind every application window. Today
+that works only because app windows are CONSTRAINED never to overlap the dock's
+band (`oscfg_dock_band`, read by home.c and em_app.c). Move the dock to a screen
+edge, or hide it and reveal it over a window, and it is behind whatever is in
+front: invisible, and its clicks go to the app on top. The failure looks exactly
+like a dead dock.
+
+WHAT IT NEEDS. The compositor already has bands -- desktop at 0, widgets at
+1..WIDGET_Z_TOP, applications above -- so this is a third one ABOVE
+applications, for panels. Two pieces:
+
+1. A `band` field compared before `z` everywhere z is compared (about a dozen
+   sites in compositor.c: the painter's ordering, topmost_at, front_window,
+   raise, the switcher). Raising the base of a reserved high band instead is
+   tempting and wrong -- `g_next_z` only ever increments, so "high enough"
+   is a number that expires.
+2. The dock moving OUT of home.c into its own process, the way the menu bar
+   already is. It is the same argument the menu bar settled: a panel is not
+   part of the desktop, it sits over it.
+
+Until then the dock stays at the bottom and always visible, which is at least
+a dock that works. Note the menu bar has the same latent problem -- it is a
+normal window, not an always-on-top one, and nothing today makes a fullscreen
+app cover it correctly either.
+
+## The first NIC for real silicon: Intel e1000 (2026-09-13)
+
+`kernel/net/e1000.c` drives the Intel PRO/1000 legacy descriptor interface --
+the 8254x, the 8257x, and QEMU's `e1000` (82540EM) and `e1000e` (82574L).
+`make test-e1000` runs DHCP, DNS, TCP, `test net` and `test netudp` against
+BOTH parts, because a driver that works on one generation and not the other is
+a driver that got lucky.
+
+The three-function driver contract used to be spelled `virtio_net_*` and called
+from four places. It is `struct net_driver` now, and `net_init` takes the first
+whose probe succeeds -- virtio first, because a machine offering it is a virtual
+machine and its emulated e1000 is the slower path to the same wire.
+
+- [ ] **Realtek r8169**, the other half of wired machines.
+- [ ] **Intel PCH (I217/I218/I219)**, in most laptops since about 2013. They
+      split the MAC from the PHY across an internal bus and need a different
+      bring-up: a separate driver, not an extension of this one.
+- [ ] **The e1000 driver is deliberately plain** and should stay that way until
+      something measures a need: no TSO, no checksum offload, no MSI-X, no
+      multiple queues, and TX waits for Descriptor Done rather than completing
+      asynchronously. Every one of those is a separate way to be subtly wrong,
+      and the first thing a NIC on new hardware has to be is correct.
+- [ ] **It matches on vendor 0x8086 + class 02:00, not a device-id table.** A
+      table is a list of the parts somebody had on their desk, and the failure
+      mode of missing one is a machine with no network and nothing in the log
+      saying why. If a non-compatible Intel ethernet part ever appears, it will
+      fail the station-address check and say so -- but it will have been reset
+      first.
+- [ ] **`test httpd` cannot run under console_test.py**, on any NIC: it serves
+      one connection and waits for a host client through a SLIRP `hostfwd` the
+      harness does not set up. Verified the same on virtio-net before blaming
+      the new driver.
+
+## aarch64 networking -- diagnosed, measured, and NOT turned on (2026-09-13)
+
+An entire architecture still has no network. The old note here said turning it
+on caused a KERNEL STACK OVERFLOW. **That was wrong**, and the way it was wrong
+matters: it was a guess read off a fault whose ELR landed inside `exc_common`,
+and nobody had measured a stack.
+
+**Kernel stacks are now painted at allocation** (`KSTACK_PAINT`,
+`thread_kstack_used`), so "how deep has this thread ever been" is a number you
+can read instead of infer. The deepest thread on this machine has ever been is
+**12,960 of 32,768 bytes -- 39%** -- on both architectures, with and without a
+NIC. It was never close. `test stacks` on x86 and a line in the aarch64 desktop
+phase check it every boot, and both FAIL past three quarters, because a guard
+page is the right answer to an overflow that already happened and no answer at
+all to one that is coming.
+
+### What actually happens
+
+`virt` has no MSI-X, so every virtio device sits on a LEVEL-triggered shared
+SPI, and a virtio device drops its line only when its **ISR status register is
+read**. That register was never mapped, by any driver, on either architecture
+-- harmless for as long as x86 (which uses MSI-X, an edge, with nothing to
+deassert) was the only arch with a NIC.
+
+Measured with a counter in the NIC's handler:
+
+| uptime | NIC interrupts |
+|-------:|---------------:|
+| t=645  |             46 |
+| t=845  |        395,618 |
+| t=1045 |        804,349 |
+
+About **204,000 interrupts a second** on a machine doing nothing but showing a
+desktop, until a thread died running on a stack pointer that was not its own.
+The device the NIC shares SPI 5 with is the GPU, which is why acking only the
+NIC is not enough -- tried, and it hangs in `gic_enable` instead.
+
+### The fix, which works and cannot be turned on yet
+
+Mapping the ISR window in `virtio_pci_attach` and acknowledging every attached
+device from one bus-wide INTx handler fixes it completely: **2 interrupts
+instead of 804,349**, DHCP leases 10.0.2.15, the desktop comes up and holds
+focus, stacks stay at 39%, and two of three runs finished with **zero**
+failures. That work is written and was reverted, deliberately, because it makes
+a SECOND bug reachable:
+
+- [ ] **`uaccess_arm()`'s recovery longjmps OUT of an exception handler.** The
+      guard is `kernel_ctx_save`/`kernel_ctx_restore`, and the fault handler
+      restores straight to the saved context -- abandoning the exception frame
+      it was called on. For a synchronous fault with no interrupt active that
+      is fine, which is why it has always worked. Connect INTx for the other
+      virtio devices and an interrupt CAN be active at that moment; its EOI is
+      never written, the CPU interface stays busy at that priority, and the
+      core goes deaf. That is the `FAIL(A9): a core is online but INERT -- no
+      timer` failure, and the boot hangs in the user-copy fault-recovery
+      self-test. Reproducible: it passed with the connect disabled and failed
+      twice in a row with it enabled.
+
+      **Fix this first.** Networking on aarch64 is one revert-of-a-revert away
+      afterwards, and nothing else is known to be in the way.
+
+- [x] ~~The aarch64 acceptance test greps for log LINES that other subsystems
+      can interleave into.~~ -- FIXED at the source rather than in the test.
+      kprintf was atomic against other kprintfs and against nothing else, so a
+      kernel line could land inside a line a USER process was writing to the
+      same port: one boot reported `FAIL(A6): init never spawned the session`
+      on a machine where it plainly had, because the log read
+      `init: desktop seEMBKFS: sda: ... not found`.
+
+      `console_fd_write` now holds kprintf's lock A LINE AT A TIME. Not the
+      whole write -- a program dumping a megabyte must not own the serial port
+      for the duration of it, and the line is the unit that has to arrive
+      whole. The two locks nest in one order only (the user path takes the
+      console mutex then kprintf's spinlock; kprintf never takes the mutex), so
+      there is no cycle.
+
+      HONEST ABOUT THE EVIDENCE: this is a structural fix, not a measured
+      before/after. The failure was seen ONCE in roughly fifteen aarch64 runs,
+      and a scan of all 85 serial logs in build/ finds no split line either
+      side of the change -- so "it stopped happening" is not something a
+      handful of runs can show. What is checked is that the detector works: fed
+      the exact line that was observed it reports a split, and fed
+      `[ ok ] compositor: focused pid 19` -- a tag legitimately mid-line -- it
+      does not.
+
+- [ ] **The deadline-scheduler self-test is FLAKY, NIC or no NIC.** First seen
+      as "touchier with a NIC attached" (one run in three failed `worst
+      lateness`, and one core took an illegal-execution-state fault during it),
+      but it has since failed on a run with `-nic none` and no kernel change at
+      all -- `round-robin 42 ms, deadline -1 ms` -- and passed on the immediate
+      re-run. So it is not the NIC, and a gate that fails for reasons unrelated
+      to the change under test is a gate people learn to re-run instead of
+      read. Diagnose the jitter measurement itself before trusting it: a
+      `deadline -1 ms` reading is a negative lateness, which is the measurement
+      admitting something is wrong with the measurement.
+
+- [ ] The acceptance test runs `-nic none` and should grow a networking
+      variant once the above is fixed -- today nothing in any gate would catch
+      the storm coming back.
+
+### The keyboard layout, and a path with no coverage (2026-09-13)
+
+- [x] **`test kbdlayout` covers the syscall.** It spawns primtest with a
+      `kbdlayout` role, which calls `embk_kbd_layout("azerty", ...)`, checks the
+      call is ACCEPTED, checks the name READS BACK, and puts the layout back so
+      a test does not leave the machine typing French. It passes:
+      "azerty accepted, read back, and restored".
+
+      This is the path that had none. `test keymap` beside it calls
+      `keyboard_set_layout()` directly inside the kernel -- it tests the
+      driver's tables, not the way anything reaches them -- so it went on
+      passing for as long as sys_kbd_layout rejected every name with -EFAULT.
+      A test that goes around the thing it is meant to protect is worse than no
+      test, because it also reports green.
+
+- [x] **Found it, and it was not the control.** The suspicion recorded here --
+      that Segmented might not be clickable, which would have broken the theme,
+      the text size, the layout and Files' Grid/List -- was WRONG, and a host
+      test settled it in seconds where six QEMU runs had not: a press on a
+      segmented control selects the segment, in order, and stays.
+
+      The real fault is one line of the DSL's contract. An element is STAGED,
+      not emitted -- that is what lets `.caption().grow()` chain after a call --
+      so a widget handed a pointer writes through it at the NEXT flush, not on
+      the line you called it. Settings' Keyboard pane read `pick` on the very
+      next line, so the `if` never fired and the layout could not be changed
+      however correct the syscall below it was. Theme and Interface-size look
+      identical and work only because their Segmented sits inside an HStack
+      whose closing brace flushes first.
+
+      Worse than a stale read: a brace-scoped container is a `for` loop, so the
+      body's locals die BEFORE the closing `em_end_()` runs -- the flush wrote
+      through a pointer to a dead stack slot. `Sync()` fixes both at once, and
+      em-test now states the contract in both directions.
+
+      The dock-size slider had the same bug and the same fix: `Slider(&f)` then
+      `int want = ...` on the next line. Dragging it moved nothing.
+
+- [x] **Demonstrated end to end at last, by a different pane.**
+      tools/wallpaper_shot.py launches Settings FROM THE DOCK, clicks a
+      Segmented control with a real pointer, and then checks all three parties:
+      the pane's preview changes (widget -> value), the stored file says the new
+      index (value -> preference), and the desktop behind the window repaints
+      (preference -> shell). It passes. The keyboard pane uses the identical
+      idiom, so the junction that was unproven is now proven.
+
+- [ ] **Still not demonstrated end to end specifically: the KEYBOARD pane.** Both halves are now covered -- the syscall by
+      `test kbdlayout`, the widget-to-app idiom by em-test -- and the fix makes
+      the second half identical to the panes that already work. What no test
+      touches is the two together, driven by a pointer, in a live desktop.
+      The harness that would do it was flaky at NAVIGATING Settings (one run in
+      six never reached the pane), so that is the piece to make reliable first,
+      not the clicking.
+
+### A string could not be passed to two syscalls at all (fixed 2026-09-13)
+
+- [x] **`copy_string_from_user` returns the string's LENGTH on success, and
+      `EMBK_OK` is 0.** Two callers tested `!= EMBK_OK`, which is true for every
+      string that is not empty -- so both rejected every real argument with
+      -EFAULT. Every other caller in syscalls.c already takes the length into an
+      int and tests for negative.
+
+      The one that matters: **`sys_kbd_layout`**. The keyboard layout could not
+      be changed by anything in userspace -- Settings' AZERTY/Dvorak switch and
+      the saved keymap the desktop applies at login both failed silently, on an
+      OS that ships three layouts and a Settings pane to pick them with. Found
+      while debugging drag-and-drop, because the new drag syscall had copied the
+      same wrong idiom from it.
+
+### The window switcher the window list was built for (done 2026-09-12)
+
+- [x] **GUI+Tab switches windows; GUI+W closes one.** `embk_win_list` and
+      `embk_win_raise` were built so a switcher could exist and then nothing
+      ever bound a key to it.
+
+      "Next" is the window BEHIND the front one, and raising it sends the old
+      front to the back of the cycle. That is not the same as swapping the top
+      two, which is what the naive version gives you and is a trap: pressing the
+      shortcut repeatedly then flips between the same pair forever and a third
+      window can never be reached. The test asserts exactly this -- two tabs
+      over two windows must come back to the start.
+
+      THEY ARE SYSTEM SHORTCUTS AND ARE SWALLOWED, never delivered to an
+      application. An app that could see the switcher could decline it, and a
+      machine where window switching works only in the apps that bothered to
+      implement it has no window switcher. The same reasoning as ^C, which the
+      driver consumes rather than passing on.
+
+      DECIDED IN THE IRQ, PERFORMED IN THE MAIN LOOP. The keyboard knows the
+      modifiers at the instant the key goes down, but the compositor takes a
+      plain spinlock and repaints, which an interrupt handler must not do -- so
+      the driver records a SYSKEY_* and both kernels' main loops act on it, the
+      same arrangement `compositor_pointer_tick` already uses. Wired on BOTH
+      arches: a switcher that worked only on x86 is one nobody could rely on.
+
+- [x] **Closing a window ASKS the application, instead of killing it**
+      (done 2026-09-12). The close light -- and GUI+W when it first landed --
+      called `process_kill` the moment you clicked, so an editor with an hour of
+      unsaved work in it simply vanished. Both now set a request the app runtime
+      answers by taking itself down the ordinary way, the same path
+      `em_app_request_exit` and Escape use: main() returns, files close, the
+      window is destroyed by its owner.
+
+      THE KILL IS STILL THERE as a backstop, after four seconds -- a window you
+      cannot close is worse than an app that loses a moment of state. When it
+      fires the compositor takes the window off the screen ITSELF, and that line
+      is load-bearing: a killed process never runs its teardown, and the reap
+      path frees memory without repainting, so the first version left a frozen
+      picture of an application that no longer existed. Measured as 0% of those
+      pixels changing, which is how it was found.
+
+      A reused window slot clears the request, or it would inherit a stale one
+      and be killed for a close somebody asked of its predecessor.
+
+      PROVED GRACEFUL, not merely proved to work: the test closes Settings --
+      an app with no child process -- and measures INSIDE the grace period, so
+      the window being gone means the app took itself down rather than being
+      shot. 87% of the window's area changed within 2.5s of a 4s grace.
+
+      The terminal is a poor subject for that check and the reason is worth
+      keeping: it closes its shell's stdin and waits for the shell to exit
+      before returning, which under TCG takes longer than the grace period, so
+      it is killed rather than closing itself. That is its own shutdown being
+      slow, not the request going unheard -- the shell does exit, which only
+      happens along the path the old kill skipped entirely.
+
+      Measured by tools/switch_shot.py, which opens two apps from the dock and
+      reads the TOP BAR's application name -- the window list's first payoff,
+      now used to check the window list's second. Comparing a strip of pixels
+      rather than recognising glyphs keeps the test out of that business:
+      8% of the strip changes on each tab and 0% after cycling back around.
+
+### Undo, in every text field (done 2026-09-12)
+
+- [x] **`GUI+Z` undoes and `GUI+Shift+Z` redoes, toolkit-wide.** Every text
+      field in the system could be typed into and none could be undone. Note++
+      has a stack of its own, so the OS's own editor was fine and every OTHER
+      place text is entered -- the Open/Save filename, a search box, any setting
+      -- had nothing: one stray keystroke over a selection and the text was
+      simply gone.
+
+      RECORDED BY DIFFING, not by instrumenting each edit. The field mutates its
+      buffer in eight or nine places (typing, backspace, delete, cut, paste,
+      replacing a selection) and a log that has to be TOLD about each one is a
+      log that will silently miss the next one added. The frame remembers the
+      text before the keys are applied and compares afterwards: one place, and
+      every mutation path is covered by construction, including ones written
+      later.
+
+      A record is a SPLICE -- at `pos`, `n_del` bytes went and `n_ins` arrived,
+      with both kept -- so one record runs in either direction and redo is undo
+      with the two swapped. A continuing run of typing or of backspacing folds
+      into the record before it, because typing "hello" is ONE thing the person
+      did and five undos to remove it is four too many; a pause of ~900 ms, a
+      move, or a change of direction ends the run.
+
+      An edit too big for a record (a large paste) DROPS THE HISTORY rather than
+      being skipped: an undo that stepped over one edit and applied the one
+      before it would put the buffer into a state that never existed, which is
+      worse than not being able to go back that far.
+
+      THE COMMAND BYTES WERE NEARLY OUT, and the earlier note that eight of them
+      was "either elegant or a warning" turned out to be the warning. It was
+      also too pessimistic: THIRTEEN byte values can never appear in valid UTF-8
+      (0xC0, 0xC1 and 0xF5..0xFF), not eight -- lead bytes stop at 0xF4 because
+      U+10FFFF encodes as F4 8F BF BF, and 0xC0/0xC1 would be overlong ASCII.
+      Undo and redo took 0xF6/0xF7; 0xF5, 0xC0 and 0xC1 remain.
+
+      Proved on the host (58 claims in kit-test) and on the machine: select all,
+      type one character, GUI+Z, and the restored text matches the original
+      column for column -- 0% of ink columns differ.
+
+      A MUTATION FOUND A WEAK TEST HERE, which is the reason to keep mutating
+      them. "A whole run of typing undoes at once" passed with coalescing
+      disabled, because the test fed six characters in ONE frame -- a single
+      diff, one record either way. Typing one key per frame, as a person does,
+      makes it fail properly when coalescing is off.
+
+- [x] **The multi-line `TextEditor` has undo too** (done 2026-09-12). It shares
+      the kit's log rather than growing a second one -- two undo stacks in one
+      toolkit is one more than anyone wants to reason about when they disagree.
+      The log moved from fixed 64-byte payloads to a 16 KB ARENA, which is what
+      made sharing possible: pasting a block is exactly the edit you most want
+      back and was exactly the one the old records could not hold. The editor
+      snapshots its document to diff it, which sounds expensive and is not --
+      only when keys arrived, and 32 KB of memcpy is microseconds against a
+      frame costing tens of milliseconds.
+
+      ~~Superseded:~~ The field's approach
+      does not carry over unchanged: it snapshots the buffer each frame to diff
+      it, which is fine for a 256-byte path and not for the edit app's 32 KB
+      document, and a record holds 64 bytes of payload, so pasting a paragraph
+      would drop the history exactly when it is most wanted. It needs either a
+      larger payload with an arena, or recording at the mutation sites
+      (`te_insert` / `te_backspace` / `te_delete` / the selection drop), which
+      are few and already centralised. Note++ is unaffected -- it draws and
+      edits its own text and has its own undo.
+
+### A host UI test could not measure text at all (fixed 2026-09-12)
+
+- [x] **Nothing loaded a font, so every width was zero -- and zero agrees with
+      any expectation.** `ui/kit/kit_test.c` drove the real widget through the
+      real layout stack, but with no font `ui_text_width_n` returned 0 for every
+      string, so every x mapped to the same caret position. A zero-width string
+      does not fail loudly; it fails plausibly.
+
+      That was not hypothetical: the field's drag-selection test passed against
+      a fontless kit for the RIGHT ANSWER BY THE WRONG ROUTE -- with all widths
+      zero, a drag from inside the field to far outside still produced caret 0
+      and caret len, having measured nothing.
+
+      `ui/testfont.h` is the fix: a synthetic TTF, every glyph blank, every
+      advance 500/1000 em, so each character is exactly half the text size wide
+      and a test can SAY where the caret should land. Extracted from the one
+      `ui/layout/layout_test.c` had been carrying privately. Both kit-test and
+      em-test now load it and aim at computed columns.
+
+### Two host UI tests have rotted (found 2026-09-12)
+
+- [ ] **`make font-test` does not compile, and `make backend-test` fails 2.**
+      Both predate the text-editing work -- verified by stashing that work and
+      re-running, which is the only honest way to tell a red test you caused
+      from one you inherited.
+
+      `font-test` calls `be->draw_text(&rt, 4, 40, "AAA", fh, 50.0f, white,
+      1.0f)` with 8 arguments where the backend now takes 11: the vtable grew
+      and the test was never updated, so it has not built for some time.
+
+      `backend-test` fails "blurred region averages toward the checkerboard
+      mean" and "ungrouped overlap is measurably darker (seam present)" -- both
+      compositing claims. Either the blur/group behaviour changed deliberately
+      and the assertions were never revisited, or something regressed unnoticed.
+      Those two possibilities need telling apart before either is touched.
+
+      Neither test is in any scripted run, which is exactly how they got here.
+
+### The dock tells the truth about what is running (done 2026-09-12)
+
+- [x] **A running app the dock did not start now lights its tile.** The desktop
+      used to light a socket purely from its OWN record of spawns (`g_running[]`
+      in user/apps/home/home.c, keyed by spawn handle), so an app started from
+      the shell -- or by another app -- left its tile dark with its window in
+      plain view. The redesigned dock made that more visible than the old 4px
+      dot did, because the socket IS the tile.
+
+      It reads the window list now, and keeps the spawn handles as well: the
+      handles cover the half-second between a click and the app's first window,
+      where there is nothing on screen yet and a dark socket reads as a click
+      that did not work. Sampled every 500 ms rather than per frame -- the dock
+      repaints on every pointer move over it, and a syscall per mouse event to
+      answer a question that changes when an app opens is not a trade worth
+      making.
+
+      **Matched on the binary's basename, never on the window title.** An app
+      rewrites its title the moment you open a document in it, so a dock that
+      recognised apps by title would light a tile only until the app was
+      actually used. `struct process::exec_name` records the basename at spawn;
+      `sys_win_list` annotates the compositor's snapshot with it (the same
+      layer that applies the session filter, for the same reason -- the
+      compositor knows windows, not the process model).
+
+      That name CARRIES NO AUTHORITY and nothing consults it to decide
+      anything; a process's rights here remain its namespace and its capability
+      set. It is a basename and not a path on purpose: the path would hand
+      anything that can see a window list a free map of the filesystem.
+
+      Clicking a lit tile the dock did not launch now RAISES that app instead of
+      spawning a second copy -- with a fall-through to launching it if the
+      sample has gone stale and there is nothing to raise. A shortcut carrying a
+      start directory (Files at /data while Files is open at /home) still spawns
+      its own instance, which is the point of such a shortcut.
+
+      Measured by tools/dock_truth.py, which clicks the dock's Terminal tile and
+      then types `settings` into the TERMINAL -- a grandchild of the desktop, in
+      the user's session, which the dock did not start. It photographs each
+      socket against ITSELF across three shots (nothing running / Terminal /
+      Terminal + Settings), because each socket holds a different icon and their
+      mean colours differ by more than lighting one ever moves them.
+
+- [x] **`ps` names what it lists.** The kernel console's `ps` and the shell's
+      `ps` builtin were columns of bare pids: you could sort and filter the list
+      but not read it, and the only way to find out what a process was, was to
+      kill it. Both carry the binary's basename now (`-` for kernel threads),
+      from the same field, for reading only.
+### The sleep wake is quantised to the timer tick -- and it is now the dominant
+### source of lateness
+
+Measured while building the deadline policy (`test deadline`), three boots, a
+16 ms periodic thread against six threads that never sleep:
+
+| policy | worst lateness | mean | periods missed (of 150) |
+|---|---|---|---|
+| round-robin | 75 / 75 / 114 ms | 19.4 / 20.8 / 30.0 ms | 70 / 78 / 94 |
+| deadline | 13 / 13 / 13 ms | 4.6 / 5.8 / 6.0 ms | **0 / 0 / 0** |
+
+aarch64 agrees (60 periods, inside the boot self-test, both HVF and TCG):
+round-robin 51-55 ms worst, deadline **6 ms** worst, 0 missed, mean 1.7-2.2 ms.
+
+The deadline policy misses nothing. What is left is the MEAN.
+
+A sleeping thread only becomes runnable inside `wake_expired_locked()`, which
+runs inside `schedule()`. On a machine with more runnable work than cores no
+core is idle, so nothing re-enters `schedule()` until the next tick. The thread
+is not late because the wrong thread was picked; it is late because it was not
+yet a candidate when the decision was made. **No scheduler policy can fix
+this** -- by the time `pick()` is asked, its answer is already right.
+
+- [x] Arm the per-core one-shot timer for the next sleeper's deadline on BUSY
+      cores. **Done.** Mean lateness 4.33/5.24 ms -> 1.09/1.47 ms, worst
+      13 ms -> 3/4 ms, still zero periods missed; aarch64 4-5 ms -> 0-6 ms.
+      Only for threads that DECLARED a period -- the first version woke a core
+      for any sleeper and tripled idle scheduler-lock spins for nothing, since
+      a poll loop asking for 100 ms does not care about five of them.
+
+      Note the residual is 4.6-6.0 ms on x86 and 1.7-2.2 ms on aarch64 while
+      BOTH tick at 100 Hz, so "half a tick" is the x86 arithmetic working out
+      and not a derivation. The mechanism (a sleeper only becomes runnable
+      inside `schedule()`) is read off the code and is certain; the constant
+      evidently depends on how much else is competing. Fixing the mechanism is
+      what would settle it, on both.
+- [ ] Preempt-on-wake was written for this and **removed** because it did not
+      measure. (Still open, and now testable: the timer arming above landed,
+      which is the condition this said to reconsider it after.)
+      Original note: IPI-ing the core running the least urgent thread when a
+      deadline thread wakes moved the mean by less than run-to-run noise
+      (5.79 ms with it; 4.62 and 5.96 ms without it on the boots either
+      side). It could not have helped --
+      the thread is not READY at the instant the IPI would fire. Reconsider it
+      only AFTER the timer arming above, where it could finally be visible,
+      and only if it measures then.
+- [x] The deadline policy is the default. **Done.** It had to be made free
+      first: the empty scan cost 13.2 us of a 97 us scheduling decision, and a
+      `sched_declared_count()` short-circuit took that to 3.9 us -- inside the
+      run-to-run spread of the round-robin measurement itself. With nothing
+      declared the decision is byte-for-byte the old one. `test policycost`
+      guards it. The UI toolkit declares while an app animates and an audio
+      writer declares to hold a shallow buffer, so it is not a no-op.
+- [ ] Admission control refuses past 700 permille, and the bound ignores
+      BLOCKING time: a deadline thread waiting on a lock held by a
+      budget-spent thread can still miss, and there is no priority
+      inheritance on the futex to stop it. This is why the policy is
+      documented as "punctual under CPU contention" and not as real-time.
+
 
 Full phased spec, comparative analysis (Linux/Windows/BSD/XNU), and every bug
 below in detail: `docs/architecture/process-and-scheduling.md`. Current
@@ -1559,6 +4581,30 @@ substantially complete.
 
 ---
 
+
+### Two theories about the uaccess hang, both DISPROVED (2026-09-13)
+
+Turning the bus-wide INTx acknowledgement on makes the boot hang in the
+user-copy fault-recovery self-test. Two explanations were written down here
+before being checked; both are wrong, and they are recorded so the next attempt
+does not spend the time again:
+
+- **"The recovery longjmps out of an IRQ handler and the EOI is never
+  written."** It cannot: `exception.c` already restricts `uaccess_fault_recover`
+  to `EXC_EL1H_SYNC` with EC 0x25/0x21, so an IRQ never reaches it. The comment
+  there says so explicitly -- "an IRQ is not a fault at all".
+
+- **"The longjmp leaves interrupts masked, so the core goes deaf."** It does
+  not: `kcontext.S` saves DAIF at offset 104 (`mrs x9, daif`) and restores it
+  (`msr daif, x9`). The restored context carries the interrupt state the
+  guard was armed with.
+
+So the mechanism is still unknown. Whoever picks this up should start by
+re-applying the transport INTx work (it was reverted -- see the git history for
+`virtio_pci.c`'s ISR window and `virtio_pci_intx`) and instrumenting the
+user-copy test itself, rather than reasoning about the recovery path: two
+plausible stories about it have now been wrong.
+
 ## Core / Library
 
 - [x] ~~Refactor: kprintf + snprintf share one `format_string` core~~ — done
@@ -1582,6 +4628,348 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
+  - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
+    available and confirmed working). **Phases A0-A5 are done** — `make ARCH=aarch64`
+    boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
+    decodes its own faults (ESR/FAR/ELR down to the fault status code) and
+    recovers from them, runs in the higher half with the MMU on with its memory
+    map read from the device tree and `kernel/mm/pmm.c` allocating, and
+    **preemptively switches between kernel threads** on a GICv3-delivered
+    generic-timer interrupt. Verified by `make ARCH=aarch64 test-arm64-boot`,
+    which runs every available accelerator (HVF and TCG on a Mac) because the
+    two disagree in ways that find bugs. **A4 landed on x86:** the syscall
+    handlers no longer read machine registers, and 2,019 of the 6,479 lines
+    that `arch/x86_64/` was credited with have moved out of it. **A5 reached
+    EL0:** an aarch64 user program runs, calls `write` and `exit`, and has an
+    unmapped pointer refused at the boundary. **A6 now runs a real newlib
+    program at EL0 off the real filesystem** — `hello.elf`, built from the same
+    `user/lib` sources as the x86 userland, doing printf/malloc/snprintf/time
+    and creating and joining a second EL0 thread, exiting with a status the
+    kernel reads back. What is left of A6 is `libembk.so` and a dynamically
+    linked EmUI app, which need A7's compositor first. The audit there says the discipline largely held —
+    `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
+    logic — with **one** real exception: the 89 syscall handlers in
+    `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct
+    `r->rdi`/`r->rsi`/… accesses. Neutralising that (ARM64.md §2.4, phase A4) is
+    the one refactor that lands on x86 *before* any ARM code exists.
+  - **Known gaps left by A2**, each deliberate, each recorded rather than
+    discovered later. None affects `-M virt` with <= 4 GiB of RAM, which is why
+    they are debt and not bugs:
+    - [ ] **The direct map covers only the first 4 GiB of physical space**, and
+      the kernel window only the first 2 GiB. `boot.S` builds four 1 GiB blocks
+      because there is no allocator yet when it runs. On a machine with more
+      RAM, that RAM is reported by the device tree, counted by `pmm`, handed
+      out — and then faults on first touch through `P2V`. Fix: after
+      `pmm_init`, walk the memory map and extend the direct map with
+      `vm_map_range`; the C page-table code already does everything needed.
+      **Do this before anyone runs `-m 8G`.**
+    - [ ] **`fdt_reg_cells()` uses the ROOT node's `#address-cells` /
+      `#size-cells` for every node.** Correct for every node this kernel reads
+      today (all of them are children of the root) and wrong for anything
+      deeper — wrong SILENTLY, because a mismatched cell count halves or
+      doubles an address rather than failing. Needs parent tracking in the
+      walker. First likely victim: PCIe `ranges` in A7.
+    - [ ] **`fdt_find_compatible()` searches two levels only** (root children
+      and their children). Enough for `virt`'s flat tree; will quietly miss a
+      device behind a deeper bus.
+    - [x] **`vm_unmap_page()` does not free page tables that become empty.**
+      DONE, on BOTH architectures. `vmm_unmap_in()` records the table at each
+      level on the way down and, after clearing the leaf, walks back up freeing
+      every level it just emptied, stopping at the first one a neighbouring
+      mapping still uses. The order is clear, then flush, then free -- a table
+      page handed back to the PMM can be reallocated immediately, and a core
+      still holding a cached walk of it would be translating through somebody
+      else's data; the invalidation has to cover the whole 2 MiB/1 GiB span the
+      removed entry described, not just the one VA. On x86 the reclamation is
+      restricted to PML4 slots 0-255: slots 256-511 are copies of the kernel's
+      own entries, so the tables beneath them are shared by every address space
+      in the system. The leak was theoretical until mmap() existed; the boot
+      self-test then measured it exactly -- munmap gave back 16 of the 19 pages
+      an mmap had taken, the missing 3 being the L1/L2/L3 tables. It is now a
+      round trip: `free pages 128281 -> 128262 -> 128281`.
+    - [x] **No TLB shootdown between CPUs, and SMP now makes that REAL.**
+      DONE, and the two architectures needed opposite fixes. aarch64 never had
+      the hole: `tlbi ... is` broadcasts across the inner-shareable domain in
+      hardware, so the work here was the ORDERING around it (clear the entry,
+      `dsb`, invalidate, `dsb; isb`) and widening the invalidate to the whole
+      span when an intermediate table is removed. x86 DID have the hole, from
+      the day it gained a second core: `invlpg` invalidates the issuing core's
+      TLB and says nothing to the rest, so a page unmapped on one core stayed
+      live on the others until something evicted it -- a use-after-free the
+      hardware performs for you, on memory the allocator has already handed to
+      somebody else. `vmm_flush_tlb()` now broadcasts `IPI_TLB_SHOOTDOWN` and
+      every receiving core reloads CR3. Deliberately blunt: the IPI carries no
+      payload naming the page, so a mailbox and a handshake would narrow it --
+      the right change once a shootdown is frequent enough to measure, which
+      it is not.
+    - [x] **No SGIs, so there is no way to interrupt another core.**
+      DONE. `kernel/arch/aarch64/irq/ipi.c` sends SGIs through `ICC_SGI1R_EL1`
+      (IRM=1, all-but-self); x86's equivalent is `kernel/arch/x86_64/irq/ipi.c`
+      on vectors 0xF0-0xF2. Both meet the same seam, `kernel/include/arch_ipi.h`
+      + `kernel/mm/ipi.c`, with three reasons: `IPI_TLB_SHOOTDOWN`,
+      `IPI_RESCHEDULE` and `IPI_HALT`. The acceptance test asserts every core
+      is actually REACHABLE by one, which is what the old wording ("the GIC
+      driver configures SGIs but nothing sends one") was really about -- a
+      configured-but-unused path is indistinguishable from a broken one.
+    - [ ] **aarch64 has its own `mm/pagetable.c` alongside x86's `mm/vmm.c`.**
+      Intentional per ARM64.md §2.3 — the shared interface is factored from two
+      WORKING implementations, and the aarch64 one is not finished until A5
+      shows what user address spaces need. Do not merge them early.
+    - [ ] **The boot protocol's framebuffer, boot-disk and ACPI fields are zero
+      on aarch64.** `virt` has no firmware framebuffer and no BIOS drive; A7
+      fills the framebuffer fields from virtio-gpu. Each field already has a
+      documented "unknown" value, so this is honest rather than missing.
+    - [ ] **`MAX_MMAP` is 32 ranges** in the device-tree producer. Overflow
+      warns loudly and drops rather than corrupting, but a NUMA machine could
+      plausibly exceed it.
+  - **Known gaps left by A3.** The first one is not debt, it is a scheduled
+    deletion, and it is the most important line in this list:
+    - [ ] **DELETE `kernel/arch/aarch64/sched/bringup.c`.** Scheduled for
+      A5 and still here at the end of A9. It is the stand-in scheduler the
+      A3 preemption self-test still runs on; the REAL scheduler
+      (process.c) is what everything after it uses, and early.c switches
+      the GIC's post-EOI hook from one to the other mid-boot. Deleting it
+      means rewriting that self-test against process.c's kthreads, which
+      is worth doing and is not a portability gap.
+    - [x] ~~**`kernel_ctx_switch()` saves no FP/SIMD state on aarch64.**~~ —
+      it always did. The defect was the BUFFER: struct thread::fpu_state was
+      512 bytes (the x86 FXSAVE image) where aarch64 needs 528, so FPSR and
+      FPCR were written past its end. See the KCONTEXT_FPU_SIZE entry above.
+    - [ ] **`kernel/arch/x86_64/irq/irq.h` cannot describe a GIC.** It is
+      shaped for the 8259: `irq_register(uint8_t irq, ...)` with a 16-line
+      table. The GIC has 1020 INTIDs and needs the handler to know which line
+      fired. aarch64 therefore uses its own `gic_register()` rather than
+      forcing itself into that interface. Widen the shared one when the IRQ
+      seam is factored (A5+), the same way `arch_pmm_reserve_fixed()` was
+      factored — do not widen it speculatively now.
+    - [ ] **`drivers/timer/timer.h` names its high-resolution clock `tsc_*`.**
+      x86 nomenclature in a shared header. aarch64 implements it faithfully
+      (`tsc_read()` reads `CNTVCT_EL0`, `tsc_calibrate()` is a genuine no-op
+      because `CNTFRQ_EL0` states the frequency). Rename to something neutral
+      when the timer seam is factored.
+    - [ ] **Every interrupt runs at one GIC priority, so none can nest.**
+      Deliberate: nesting needs a stack per priority level and there is exactly
+      one IRQ stack. Revisit only if something genuinely needs a
+      higher-priority line, and add the stacks in the same change.
+    - [x] ~~**No SGIs / inter-processor interrupts.**~~ — folded into the
+      TLB-shootdown entry above, which is what would use them.
+    - [ ] **GICv2 is not supported**, and `-M virt` under TCG still defaults to
+      it — the run targets pass `gic-version=3` explicitly. `gic_init()`
+      detects a v2 and says so rather than failing obscurely. Adding a v2
+      driver is only worth it for a specific board that needs it.
+    - [ ] **`find_redistributor()` assumes a 0x20000 redistributor stride.**
+      Correct for GICv3; GICv4 adds VLPI frames and makes it 0x40000. The
+      `GICR_TYPER.VLPIS` bit says which, and nothing reads it yet.
+  - **Known gaps left by A4** (the `sysargs` refactor):
+    - [ ] **`kernel/process/debug.h` still includes
+      `arch/x86_64/syscall/syscall.h`,** for `struct regs`. This one is
+      LEGITIMATE, not laziness: `stopped_frame` is the *debuggee's* saved
+      register frame and `debug_on_exception()` is called from the exception
+      path, so a debugger that exposes machine registers is machine-specific by
+      definition. It is the only arch include left in `kernel/process/`. When
+      A5 factors the exception seam, the register-exposing part of debug.c
+      should move under `arch/` (or gain an arch-neutral register view) and the
+      seven *handlers* — already converted to `struct sysargs` — stay put.
+    - [ ] **`SYS_*` numbers are defined in `kernel/syscall/syscalls.c`** and
+      mirrored by hand in `user/lib/embk.h`. Two lists that must agree and
+      nothing checks that they do. They belong in one header both sides
+      include; it was left alone here because A4 was meant to be a mechanical
+      move that the desktop boot could vouch for, and renumbering the ABI in
+      the same change would have made a boot failure ambiguous.
+    - [x] ~~**`kernel/syscall/syscalls.c` is not compiled for aarch64 yet.**~~ —
+      it is, and a user program reaches it: `hello.elf`'s printf lands in the
+      real `sys_write`, its malloc in the real `sys_sbrk`.
+  - **Known gaps left by A6** (the userland):
+    - [x] ~~**No `libembk.so` and no dynamically-linked app on aarch64.**~~ —
+      `uidemo.elf` loads, relocates and presents a frame. The loader needed no
+      aarch64-specific line, exactly as this entry predicted.
+    - [x] ~~**The aarch64 userland is FOUR programs**~~ — it is THIRTY, and
+      `ARM_UI_PROGS` is now DERIVED from the x86 `$(EMUI_APP_SRCS)`
+      auto-discovery rather than retyped, so a new app appears on both
+      architectures the moment it is dropped in `user/bin`. Two subtractions
+      are named in `arch.mk` (`beep` is static-newlib, `primtest` is
+      freestanding) because x86 encodes those facts in explicit rules that
+      shadow its generic pattern.
+    - [x] ~~**Twelve programs still do not build for aarch64**~~ — all of
+      them do. QuickJS, zlib and git cross-build for the target (their port
+      scripts take TARGET= now), and the emlibc family, the shell and its
+      tools are wired in. 54 programs against x86's 52; the difference is
+      emlibc_embxapp and mathself, which x86 builds through EmbCC into .embx.
+    - [x] ~~**`posixdemo` needs real work, not a build fix.**~~ — ported and
+      PASSING, all of it, including a variant-I TLS block (TPIDR_EL0, TLS
+      above the thread pointer, past a 16-byte TCB) that nothing else
+      checked. Its x86 inline asm is now one branch of two.
+    - [ ] **`getentropy()` returns ENOSYS on aarch64.** The architectural
+      equivalent of RDRAND is FEAT_RNG's `RNDR`, which EL0 may execute but only
+      when it exists — and the feature bit is in `ID_AA64ISAR0_EL1`, which EL0
+      may NOT read (an MRS of an ID register from EL0 traps to EL1, and this
+      kernel does not emulate those the way Linux does). So there is no way to
+      ASK before executing, and executing it on a part without it is UNDEFINED.
+      Two ways out, both kernel-side: emulate the ID registers for EL0, or add
+      an entropy syscall and let EL1 read `RNDR`. Deliberately NOT faked from a
+      clock — the x86 path refuses that too, and for the same reason.
+    - [ ] **No aarch64 `tcc`, so nothing compiles ON the OS there.** The
+      on-OS toolchain (`/system/abi`'s libc.a + headers, `libtcc1.o`,
+      `emlink_dynstubs.o`, EmbBuild) is x86-only, and `mkfs_arm64.py` packs
+      none of it. `embk_syscall.h`'s `__TINYC__` branch is x86-only too — the
+      place an aarch64 one would go is marked.
+    - [ ] **The aarch64 root image is a SEPARATE, minimal one**
+      (`build/aarch64/embkfs-arm64.img`, `tools/embkfs_mkfs/mkfs_arm64.py`)
+      rather than a second output of `mkfs_embkfs.py`. That is right today —
+      three-quarters of the x86 image is x86 machine code or desktop content —
+      and it will stop being right once the aarch64 side has a desktop. The two
+      already share the FORMATTER (`make_image`/`build_root_items`), so the
+      on-disk format cannot drift; only the file list is duplicated.
+    - [ ] **`VMM_EXEC` fixed the direction of ONE flag, not the header.**
+      `VMM_PRESENT`/`VMM_WRITABLE`/`VMM_NX` are still x86 page-table bit
+      positions wearing interface names, and `VMM_NX` is still inverted — which
+      is why the x86 kernel heap is still W+X. The rename is still open; what
+      is closed is that a caller can now ask for execution positively, and the
+      shared ELF loader does.
+    - [ ] **`SP_EL0` is saved in the exception frame, but `TPIDR_EL0` is
+      restored from `thread::fs_base` on every switch** — which means EL0 CAN
+      write its own thread pointer (unlike x86, where FSGSBASE is off and the
+      instruction faults) and the write survives only until the next
+      preemption. crt0 goes through the syscall, so nothing is broken; but
+      "userspace can write it and the kernel silently overrides it" is a sharp
+      edge that x86 does not have. Either trap it or document it as the ABI.
+
+  - **Known gaps left by A5** (EL0 and `svc`):
+    - [x] ~~**DELETE `kernel/arch/aarch64/syscall/bringup_syscalls.c` AT
+      A6.**~~ — deleted. syscall/ holds only syscall.c, the real arch entry
+      point, and the 95 shared handlers run behind it.
+    - [x] ~~**One user address space, and it is the global
+      `boot_l0_ttbr0`.**~~ — per-process L0 tables since A5, with a TTBR0_EL1
+      write on every switch. The prediction in the old entry held exactly:
+      that IS the whole switch here, because kernel mappings live in TTBR1
+      and are never copied into a process. With ASIDs it does not even flush.
+    - [x] ~~**No ASIDs.**~~ — one per address space, allocated and released
+      with the space, and the context switch no longer flushes. Note the nG
+      claim in the old entry was WRONG: nG was set only for PT_USER, so
+      kernel-only mappings in the user half were global. That is fixed too.
+    - [ ] **`copy_from_user`/`copy_to_user` validate then `memcpy`, and SMP
+      makes that a real hole.** The old entry said "correct while nothing can
+      unmap a page concurrently (one CPU, no demand paging)". aarch64 now
+      runs four cores, so the first half of that condition is gone: another
+      core can unmap between the check and the copy. Same shape on x86, which
+      has had SMP longer and papers it with a retry loop. Both want a
+      fault-fixup table -- an exception handler that resumes at a recovery
+      address -- which is the honest fix and is not architecture-specific.
+    - [x] ~~`kernel/process/process.c` is the gate~~ — **done.** All 3,700
+      lines compile for aarch64 with zero inline assembly, behind six named
+      seams in `kernel/include/arch_thread.h` plus `timer_sched_ticks()`.
+    - [ ] **`kernel/main.c` and `kernel/selftests.c`** are the last two shared
+      files that do not compile, and neither blocks anything. With the loader,
+      per-CPU and MMIO seams done, THE PORTABILITY WORK IS FINISHED: everything
+      left is hardware. `main.c` is a
+      bring-up ORDER (GDT, IDT, PIC, LAPIC — and which of those exist at all
+      differs), so it wants splitting into a shared sequence plus a per-arch
+      `arch_early_init()`, not a hook per line. `selftests.c` follows it.
+    - [x] ~~the address-space half of `kernel/mm/vmm.h` is x86-only~~ —
+      **done.** `mm/pagetable.c` implements create/destroy/switch/map_in/
+      unmap_in/get_phys_in and guarded kernel stacks, with isolation and
+      leak-free teardown both checked by `test-arm64-boot`.
+    - [x] ~~`process.c` compiles but does not link~~ — **it links.** All 64
+      shared files link against the aarch64 tree; `process.c`, `syscalls.c`,
+      `fs/`, `ipc/`, `gfx/`, `net/`, `block/` and the loaders resolve
+      completely.
+    - [x] ~~`pci_*` (9 symbols)~~ — **done.** `drivers/bus/pci.c` needed three
+      seams (`arch_pci_cfg_read32`, `arch_pci_cfg_write32`,
+      `arch_pci_msi_message`) and is now portable; aarch64 reaches config space
+      over ECAM. The bus enumerates and BARs are assigned from the device
+      tree's window, because there is no firmware to do it.
+    - [x] ~~**The virtio drivers cannot come up on aarch64 until the
+      scheduler runs.**~~ — blk, gpu, input and snd are all up.
+    - [x] ~~**No MSI on aarch64.**~~ — the GIC ITS is implemented
+      (arch/aarch64/irq/its.c) and proves itself at boot by translating and
+      delivering a software-triggered interrupt. HVF exposes no ITS at all,
+      and the INTx fallback is what covers it; the test asserts both.
+    - [x] ~~undefined driver symbols~~ — **the whole shared kernel links and
+      runs on aarch64, and mounts a real EMBKFS image over virtio-blk.**
+      virtio-blk (new, shared, polled) gives it a disk; a real PL031 driver
+      gives it a wall clock; `arch/aarch64/drivers/absent.c` answers "no such
+      device" for the PS/2 keyboard and mouse, AC'97 and bochs VGA.
+    - [x] ~~**Replace `absent.c` entry by entry as virtio drivers land**~~ —
+      the keyboard and mouse entries are GONE and virtio-input answers instead.
+      What remains there is AC'97 and bochs VGA, and both stay: virtio-snd is
+      not written, and virtio-gpu is already the display path.
+    - [x] ~~**No virtio-snd, so aarch64 has no audio.**~~ — it has sound.
+      drivers/audio/virtio_snd.c implements the same nine ac97_* functions
+      the shared audio layer calls, and the boot test pushes a real buffer
+      through audio_open/audio_write and waits for the device to retire it.
+    - [x] ~~**The three older virtio drivers still carry their own PCI
+      capability walk.**~~ — all three migrated to drivers/bus/virtio_pci.c.
+      274 lines deleted, 128 added, exactly one copy of the walk left.
+    - [x] ~~**No FP/SIMD state is saved across a context switch on
+      aarch64**~~ — it always was (FP_SAVE/FP_LOAD, whole file plus FPSR and
+      FPCR). The real defect was struct thread::fpu_state being 512 bytes
+      when this architecture needs 528, so those two words were written PAST
+      the buffer over kstack_top and entry_point. KCONTEXT_FPU_SIZE now.
+    - [x] ~~**virtio-input's status queue is unused, so the lock LEDs do
+      nothing.**~~ — the keyboard sets up queue 1 and kbd_set_leds() sends
+      EV_LED events, at the same moment the PS/2 path sends its 0xED.
+    - [x] ~~**virtio-input translates the US layout only.**~~ — it uses the
+      SAME layout tables the PS/2 path does. A Linux evdev keycode IS an AT
+      set-1 make code for the main key block, so `keyboard_set_layout dvorak`
+      applies to a virtio keyboard with no code of its own.
+    - [x] ~~**aarch64 has no `init.elf` session**~~ — it runs the same pid 1
+      x86 does: init authenticates, builds a confined namespace
+      (`ro /system, ro /data/apps, rw /home/yves, rw /run`) and spawns
+      `home.elf`, which spawns TopBar. The desktop is init's child.
+    - [ ] **virtio-blk is polled and sets `VRING_AVAIL_F_NO_INTERRUPT`.** Fine
+      at one outstanding request; an interrupt-driven version needs a wait
+      queue and buys nothing until requests overlap.
+    - [x] ~~**The virtio-PCI capability walk is now written THREE times**~~ —
+      it is written ONCE, in drivers/bus/virtio_pci.c, and all four drivers
+      use it.
+    - [ ] **A diagnostic must not arm anything.** The boot-time PCI routing
+      check used to register a do-nothing handler on every device's line; once
+      virtio-blk was configured it asserted a level-triggered INTx that nothing
+      cleared, and the kernel wedged in an interrupt storm before the scheduler
+      ran once. `arch_pci_irq_line()` (resolve) is now separate from
+      `arch_pci_irq_connect()` (arm). Keep them separate.
+    - [x] ~~28 undefined symbols remain, and every one is a device driver~~ —
+      every one now has a real driver: virtio-input for the keyboard and
+      mouse, virtio-snd for AC'97, virtio-blk, PL031 for the RTC. The
+      checkbox simply never got ticked when the text was struck through.
+    - [ ] **TLS relocations are the one ELF family the two architectures
+      genuinely disagree about** — x86 counts down from the thread pointer,
+      aarch64 counts up. Still no `ELF_RELOC_TLS` in `elf.h`, and still
+      correctly so: A6 handled the disagreement in **crt0**, which builds the
+      static TLS block for both variants itself (variant II below the thread
+      pointer, variant I above it, with the 16-byte TCB that binutils'
+      `elfNN_aarch64_tpoff_base()` assumed). No program has yet needed a TLS
+      RELOCATION resolved at load time. Add it when one does.
+    - [x] ~~**No ASIDs, so `vmm_switch_address_space` flushes the whole
+      TLB.**~~ — an ASID per address space, and the switch is now one
+      register write with no flush. It exposed a latent bug: nG was tied to
+      PT_USER rather than to the address HALF, so kernel-only mappings in the
+      user half were GLOBAL and matched in every address space.
+    - [x] ~~`kernel/mm/vmm.c` does not compile for aarch64~~ — it was never
+      supposed to. 817 lines of PML4 walking counted as a *shared* file that
+      failed; it is now `kernel/arch/x86_64/mm/vmm.c`, next to its aarch64
+      counterpart. `kernel/mm/vmm.h` remains shared and aarch64 implements the
+      part of it that shared code calls.
+    - [~] **`kernel/mm/vmm.h`'s flags are x86 page-table bits wearing
+      interface names.** The concrete HARM is fixed: VMM_EXEC exists, the
+      shared ELF loader asks for execution positively, and the kernel heap
+      is W^X on both machines (it was writable AND executable on x86 for as
+      long as kheap.c said only VMM_WRITABLE). What remains is cosmetic --
+      VMM_PRESENT/WRITABLE/NX are still bit positions 0, 1 and 63, and
+      VMM_NX is still inverted. vmm.h now states the rule for new code:
+      VMM_EXEC to run code, VMM_NX to forbid it, silence is not a policy.
+    - [ ] **NINE legacy x86 device drivers do not compile, and must not.**
+      PIT, RTC, ATA, AC97, UHCI, bochs VBE, the 16550, port-CF8 PCI, and
+      `drivers/timer/timer.c`'s x86 glue. ARM64.md §2.6: absent, not ported.
+      Was ELEVEN: the PS/2 keyboard and mouse came OFF this list, not by
+      being ported but by being SPLIT -- their hardware halves are behind
+      `#if defined(__x86_64__)` and their policy halves are shared, which is
+      what let virtio-input reuse them instead of duplicating them.
+    - [ ] **`hlt` is still written inline in `main.c`, `selftests.c` and
+      `process.c`** (about a dozen sites) rather than through
+      `arch_cpu_idle()`. Left alone deliberately: those files fail for other
+      reasons too, so converting them now would be churn no compiler could
+      check. Convert each as part of making its file build.
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),
@@ -1641,7 +5029,7 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 
 - [x] ~~**PK1** — the package manifest format + local `pkg install`.~~ **DONE,
   metal-proven (`test pkg`).** Manifest (§3) parser + EMBX reader/`build_id`
-  verifier in `user/pkg/`; `pkg verify|install|run|list` (`user/bin/pkg.c`).
+  verifier in `user/pkg/`; `pkg verify|install|run|list` (`user/tools/pkg/pkg.c`).
   `install` recomputes the EMBX `build_id` (SHA-256 with `build_id`+`header_checksum`
   zeroed) and matches it to the header *and* the manifest, cross-checks the
   manifest `caps:` against the EMBX cap table + `abi`, presents the declared
@@ -1668,7 +5056,7 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 - [x] ~~**PK2b** — on-device package generation.~~ **DONE, metal-proven
   (`test pkgbuild`).** `user/pkg/embxgen.c` is a C EMBX writer (repackage a linked
   ELF → EMBX with a cap table) — a faithful port of `mkembx.py`, host-verified
-  BYTE-IDENTICAL, so the build_id matches. `user/bin/pkgbuild.c` reads ONE
+  BYTE-IDENTICAL, so the build_id matches. `user/tools/pkgbuild/pkgbuild.c` reads ONE
   `.pkgspec` + an ELF and emits all three views (EMBX/`.ns`/manifest) ON THE OS.
   On-device builds are unsigned, so `pkg install --local` adopts a dev build (a
   present signature is still verified; caps/build_id/re-negotiation still apply).
@@ -1753,7 +5141,7 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 
 ### T5 — the consumers
 - [x] ~~**Install a real PyPI package over HTTPS.**~~ **DONE via `pkgfetch`**
-  (commit `f476790`): a native installer (`user/bin/pkgfetch.c` + our own
+  (commit `f476790`): a native installer (`user/tools/pkgfetch/pkgfetch.c` + our own
   `user/lib/inflate.c` DEFLATE + `user/lib/unzip.c`) fetches a package's PEP-503
   index + wheel over authenticated libtls and unpacks it into
   `/data/py/site-packages`. `test pkgfetch` installs `six` from pypi.org /
@@ -4009,6 +7397,12 @@ The project is now built from two machines. The core build was made portable
 (see docs/BUILD_SETUP.md); these are the parts that are not, and they are host
 TOOLING gaps rather than anything wrong with the OS.
 
+- [x] ~~`mkfs.vfat` + `mcopy` are Linux-only, so `fat32.img` could not be built
+      on macOS and `test fat32` could not run there.~~ `tools/mkfat32.py` writes
+      the volume itself -- boot sector and backup, FSInfo, both FATs, and a root
+      directory -- the same approach `tools/mkuefidisk.py` already took for the
+      EFI system partition. `make fat32.img` works on both hosts now, and the
+      USB hot-plug test uses the same builder for its stick.
 - [ ] `sfdisk` is Linux-only, so partitioned + USB images cannot be built on
       macOS: `tools/mkbootdisk.sh`, `make run-usb`, `run-usb-ide`, and the
       partition-table tests. A replacement would have to write the MBR/GPT
@@ -4016,11 +7410,64 @@ TOOLING gaps rather than anything wrong with the OS.
       docs/PORTS.md and the GPT+EBR work), so writing them is not research.
       Doing that would remove the dependency on BOTH hosts, which is the
       better outcome than special-casing one.
-- [ ] UEFI (`make run-uefi`) needs a GNU `objcopy` that supports
-      `efi-app-x86_64`. Homebrew's binutils does not provide that target.
-      Our own EFI app is ELF until that step, so emitting the PE/COFF wrapper
-      ourselves is the durable fix -- and we already write an ELF loader, a
-      packfile writer and an EMBX emitter, so a PE header is in scope.
+- [x] ~~UEFI (`make run-uefi`) needs a GNU `objcopy` that supports
+      `efi-app-x86_64`.~~ It does: `x86_64-elf-objcopy --info` lists
+      `pei-x86-64`, and the build now uses the CROSS objcopy rather than the
+      host's (macOS ships none at all). The image itself is built by
+      `tools/mkuefidisk.py` -- protective MBR, both GPTs with their three
+      CRC32s, and a hand-written FAT32 ESP -- replacing a shell script that
+      needed mkfs.vfat, mmd, mcopy, sfdisk and GNU `stat`, none of which exist
+      here. OVMF's path is per host now too. VERIFIED: the firmware finds the
+      GPT, reads the FAT32, and launches /EFI/BOOT/BOOTX64.EFI.
+- [x] ~~**The UEFI loader crashes before it reaches the kernel, and the last
+      step is not understood.**~~ **It was understood, and the fix was already
+      in the tree when this entry was written.** `-shared` -> `-pie` (a3acc29)
+      was the whole story: with `-shared` this linker relaxes a cross-file
+      global read into an ABSOLUTE address -- `mov $0xef030,%rax`, the
+      link-time address -- and emits NO relocation for it, so crt0's fixup loop
+      between `__rela_start` and `__rela_end` has nothing to apply and every
+      global is read from low memory that is not the image. That is why `ST`
+      read back as `ffffffffffffffff` one call after `con_init` stored it.
+      `-pie` makes the same linker, script and objects emit `lea 0x...(%rip)`.
+      The note saying "it is NOT the whole story" was written mid-investigation
+      and never corrected; the loader had been booting all the way to the
+      desktop since that commit and nobody had looked.
+
+      **THE LESSON IS THE ENTRY, not the bug.** A pillar was recorded as broken
+      for weeks because the doc was a scratchpad and the thing had no test. It
+      has one now: `make test-uefi` boots both images under OVMF and asserts
+      the loader's own COM1 markers, the menu, a real GOP framebuffer, the
+      kernel agreeing it was booted by UEFI, a plausible memory map, the root
+      mount, and the desktop. It was verified to FAIL by putting `-shared`
+      back, which reproduced the historical symptom exactly (markers 1-2-3-4
+      present, first ConOut call dead).
+
+      Found while doing that: `build/uefi_loader.so` did not depend on the
+      Makefile, so changing that very flag rebuilt nothing -- for one run the
+      new test reported OK on a binary it had not built. Fixed.
+
+### UEFI: what is still missing for a real machine
+
+- [ ] **Secure Boot.** An unsigned `BOOTX64.EFI` is refused by a machine with
+      it enabled, which is the default on most retail hardware. Today the
+      answer is "turn it off in firmware setup", and the menu's "Secure Boot
+      Verification" entry is a placeholder. Real support means a signed loader
+      and either enrolling our own key or shipping a shim.
+- [ ] **The kernel is embedded in the EFI binary** (`boot/uefi/kernel_blob.S`),
+      so `BOOTX64.EFI` is ~1 MB and a kernel update rewrites it. That is
+      atomic and simple, and it is also why the "Recovery" menu entry cannot
+      do anything yet -- there is only ever one kernel on the ESP. Loading the
+      kernel from a FILE on the ESP is what that entry needs.
+- [ ] **The menu's other five entries are placeholders** -- Recovery,
+      Diagnostics, Firmware Update, Boot Manager, Secure Boot Verification all
+      show "(soon)" and return.
+- [ ] **No real machine has booted it.** Everything above is OVMF. The loader
+      writes its progress to COM1 precisely because a real machine that dies
+      mid-handoff shows nothing on screen; the letters are documented in
+      `boot/uefi/loader.c` and asserted by the test.
+- [ ] **aarch64 has no UEFI path at all.** The ARM machine boots by its own
+      route; a real ARM laptop or server would want this too.
+
 - [ ] Re-baseline the TIMING-dependent tests on the Mac: `make test-audio`
       durations, `tools/app_shot.py --settle`, the MP3 player's queue depth
       (QUEUE_AHEAD). Cross-architecture TCG is slower than x86-on-x86 TCG and
@@ -4028,3 +7475,168 @@ TOOLING gaps rather than anything wrong with the OS.
 - [ ] Keep the tree free of case-only filename collisions -- APFS is
       case-insensitive by default, so a collision is invisible on macOS and
       breaks Linux. Check: `git ls-files | tr A-Z a-z | sort | uniq -d`.
+
+### The hardware pass: what was left undone, deliberately
+
+Sections A, B and C of [HARDWARE_GAPS.md](HARDWARE_GAPS.md) are implemented.
+These are the edges each driver stopped at, recorded so the absence reads as a
+decision rather than an oversight. The four items no emulator here can reach
+at all (I²C-HID, CDC-ECM, the TPM, virtio-mem/vhost-vsock) are in that doc's
+closing table instead.
+
+**USB**
+
+- [x] ~~OHCI enumerates a stick and cannot read its filesystem.~~ Fixed: it
+      built one descriptor per 64-byte packet, so a 4 KiB read needed 64 of
+      them and the controller gave up partway through with
+      UnrecoverableError. One descriptor per transfer instead. `make
+      test-usb-all` compares all four controllers so this cannot come back
+      unnoticed.
+- [ ] **xHCI's hot-plug is polled, like the other three.** The controller
+      reports connect and disconnect as Port Status Change events on the event
+      ring, which would be immediate and free; the driver reads PORTSC every
+      500 ms instead. Correct, and slower than the hardware offers.
+- [ ] **A hot-plugged xHCI device silences the interrupter while it
+      enumerates.** Necessary -- the enumeration busy-polls the event ring and
+      the interrupt handler would consume its completions -- but it means HID
+      reports from an already-attached keyboard are deferred for the length of
+      a plug. A command mailbox the handler fills would remove the need.
+
+**Storage**
+
+- [ ] **SD/eMMC is PIO only** (`drivers/storage/sdhci.c`). 128 register reads
+      per 512-byte block. SDMA and ADMA2 are what make this fast, and they are
+      a change to that one file -- the command sequence, which is where an SD
+      driver is actually wrong or right, is already correct and tested.
+- [ ] **UAS issues one command at a time** (`drivers/usb/usb_uas.c`). The tag
+      is on the wire and the device would accept a queue; what is missing is
+      anything asynchronous ABOVE the driver to produce one.
+- [ ] **No El Torito.** `fs/iso9660.c` reads a disc; nothing boots from one.
+- [ ] **The installer cannot CREATE a layout, only copy one.** It needs a
+      source that already carries a GPT, and source and target must have the
+      same logical block size -- copying a 512-byte-sector stick onto a 4Kn
+      disk is not a block copy at all, and it is refused rather than
+      attempted. Partitioning a bare disk from nothing is the missing piece.
+- [ ] **The installer has no interface beyond the command line.**
+- [ ] **No removal path for hot-added memory.** `pmm_add_region()` grows; the
+      allocator cannot vacate a range that is in use, so `pc-dimm` ejection
+      and virtio-mem unplug are both refused rather than half-done.
+
+**Protection**
+
+- [ ] **Every IOMMU here installs an IDENTITY MAP and protects nothing.**
+      Intel VT-d, AMD-Vi and virtio-iommu all attach every device to one
+      domain that can reach the low 4 GiB. What would actually contain a
+      hostile device is a per-driver map/unmap around each DMA buffer, so that
+      a device can reach the buffer it was given and nothing else. That is a
+      change to every driver's DMA path, not to the IOMMU drivers.
+- [ ] **Intel VT-d shares one context table across all buses**
+      (`drivers/iommu/intel_iommu.c`). Safe only while every device is in the
+      same domain with the same page table, which is true today and stops
+      being true the moment domains differ.
+- [ ] **AMD-Vi's device table covers requester ids 0..0x7FF** (buses 0-7). A
+      full table is 2 MiB. A device above bus 7 is refused, not passed
+      through -- which is the safe direction, and still wrong.
+- [ ] **virtio-iommu's event queue is not read.** Translation faults are
+      reported there and would name the offending device; today a fault is
+      only visible as a transfer that did not happen.
+- [ ] **The TPM has never executed** (`drivers/tpm/tpm.c`) and there is no
+      sealing. TPM2_Create/Load/Unseal under a PCR policy is what would let
+      the EMBKFS key be bound to a boot state; PCR extend and read are
+      written, unrun, and are the foundation for it.
+
+**Crash reporting**
+
+- [x] ~~Nothing writes an ERST record on an actual panic.~~ Done:
+      `kernel/lib/crashlog.c`, called from the fault handler before pvpanic is
+      told (a host acting on that notification can stop the machine between
+      the two). `make test-crash`.
+- [ ] **One crash is kept, not a history.** The record is written to a fixed
+      identifier and overwritten. Choosing which old crash to evict is
+      bookkeeping, and bookkeeping on a broken machine is how a report gets
+      lost -- but a boot loop currently overwrites the first failure with the
+      second, which is the one case where the history would matter most.
+- [ ] **aarch64 has nowhere to put a crash record.** ERST is an ACPI
+      mechanism and that machine boots from a device tree. A fault there still
+      prints to the serial port and is still lost when the power goes.
+- [ ] **No persistent syslog for USERSPACE.** `user/lib/syslog.h` is still a
+      declaration-only stub, deliberately. The kernel's own log now survives a
+      crash; a program's does not.
+- [x] ~~Kernel panic symbols are off on this host.~~ Fixed: `~/EmbCC` was
+      there, only its `embdbg` binary was missing (`make embdbg` builds it),
+      and the tool shelled out to a bare `readelf` that macOS does not have --
+      which did not fail, it emitted zero line rows. It honours `$READELF`
+      now and the Makefile passes the cross one, so a panic reads
+      `selftests_handle_command+0xaada (selftests.c:3849)`. **That change is
+      in the EmbCC repository, not this one.**
+- [x] ~~aarch64 has no panic symbols.~~ Fixed: `arch.mk` emits one with
+      `aarch64-elf-readelf`, `mkfs_arm64.py` stages it, and `early.c` loads it
+      -- the file had to be built, packed AND read, and none of the three
+      existed. 2328 funcs, 60149 line rows, and the read costs 0 ms.
+- [ ] **`test-arm64-boot`'s A7 (the launcher click) is close to its wall-clock
+      budget.** It failed once at the default 120 s and then passed three times
+      running, twice at that same default. A UI click sequence judged against a
+      fixed window on a machine whose load varies is a test people learn to
+      ignore; the fix is a marker the harness waits FOR rather than a duration
+      it waits THROUGH.
+
+**Offload**
+
+- [ ] **Nothing uses virtio-crypto.** EMBKFS still encrypts in software. The
+      device's AES is checked against ours (`make test-crypto`); choosing it
+      when present is a filesystem policy change and belongs in a commit about
+      the filesystem.
+- [ ] **Persistent memory is mapped uncacheable** (`virtio_pmem.c`,
+      `nvdimm.c`), which is correct and slow. A cached mapping needs explicit
+      cache-line writeback before each flush; a persistence guarantee that is
+      nearly right is worse than a slow one that is right.
+
+**The session**
+
+- [ ] **The screen lock has no idle timer.** It locks when you choose Lock
+      Screen, which is the half a person controls; the half that protects a
+      machine its owner walked away from without thinking about it is a timer,
+      and a preference saying how long. The pieces that are missing are an
+      idle measure the desktop can read (last input, which the compositor
+      already knows) and one more key in `user/lib/oscfg.h`.
+- [ ] **A locked session's applications keep running, and are supposed to.**
+      The lock is the answer to "someone walked past this machine", not a
+      privilege boundary inside the session: every process in it still holds
+      its files open and could draw on the screen if it tried. Anything
+      stronger means the compositor refusing to composite a session's windows
+      while it is locked, which is a compositor change and a different claim.
+- [ ] **A time zone change reaches applications only when they next start.**
+      The desktop hands TZ to every process it spawns, and a running one keeps
+      what it was given -- the Date & Time pane says so. Changing it live means
+      a way to tell a process its environment moved, which nothing in this
+      system has.
+
+**Real hardware -- written to the specification, not yet run on silicon**
+
+`make test-laptop` boots the stick the way a laptop does and catches what an
+emulator can show. These are the parts it cannot, because QEMU offers nothing
+for them to run against:
+
+- [ ] **xHCI scratchpad buffers and the firmware handoff** (`xhci.c`). QEMU's
+      controller asks for zero scratchpad pages and has no USB Legacy Support
+      capability, so both paths are dead code under test. Real Intel and AMD
+      controllers use both. The init ORDER fix (Run last) is exercised by every
+      xHCI test.
+- [ ] **TSC from CPUID 0x15/0x16.** TCG reports zeros there, so every test has
+      measured against the ACPI PM timer (or the HPET) instead. A real Intel
+      part will take the CPUID path first.
+- [ ] **TSC-deadline LAPIC timer** is switched OFF (`LAPIC_TRY_TSC_DEADLINE`)
+      until it has been seen working once; the one-shot LVT timer, which every
+      boot has used, runs instead.
+- [ ] **The loader must be running below 4 GiB when it switches page tables.**
+      The tables it builds identity-map 0-4 GiB only. Firmware that loads
+      BOOTX64.EFI higher would reset the machine right after "exiting boot
+      services + jumping to kernel..." -- which is at least a recognisable
+      symptom.
+- [ ] **The early on-screen log is lost when a graphics driver changes mode.**
+      Only VMs do that (Bochs, virtio-gpu); a laptop's firmware framebuffer
+      stays. The panic screen follows the mode change (`rawcon_adopt`).
+- [ ] **`test posix` reported FAIL once while posixdemo printed ALL PASS**, in
+      a long sequential run; the rerun passed. The harness missed the verdict
+      line rather than the program failing -- but that is an inference, not a
+      measurement.

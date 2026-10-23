@@ -20,12 +20,12 @@ def digest(path):
     return h.hexdigest()
 
 class Guest:
-    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False):
+    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None):
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
         shutil.copyfile(firmware/'OVMF_VARS_4M.fd',out/'vars.fd')
         cmd=['qemu-system-x86_64','-cpu','max','-m','1024','-smp','2','-accel','tcg,thread=multi',
-             '-display','none','-vga','none','-device','virtio-vga,xres=800,yres=600','-nic','none',
+             '-display','none','-vga','none','-device',f'virtio-vga,xres={resolution[0]},yres={resolution[1]}','-nic','none',
              '-drive',f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE_4M.fd"}',
              '-drive',f'if=pflash,format=raw,file={out / "vars.fd"}',
              '-serial',f'unix:{out / "serial.sock"},server=on,wait=off',
@@ -38,6 +38,11 @@ class Guest:
         if target:
             cmd+=['-drive',f'format=raw,file={target},if=none,id=target',
                   '-device','nvme,drive=target,serial=EMBLINKINSTALL']
+        if audio:
+            cmd+=['-device','intel-hda','-device','hda-output,audiodev=snd0',
+                  '-audiodev',f'wav,id=snd0,path={out / "audio.wav"}']
+        if acpi:
+            cmd+=['-acpitable',f'file={acpi}']
         self.err=(out/'qemu.log').open('wb');self.log=(out/'serial.log').open('wb')
         self.p=subprocess.Popen(cmd,cwd=ROOT,stdout=self.err,stderr=self.err)
         self.serial=socket.socket(socket.AF_UNIX)
@@ -116,7 +121,7 @@ def main():
     try:
         guest.wait(b'init: no account found; first-boot setup started')
         guest.wait(b'EmbLink OS Setup: first frame presented')
-        assert b'NVMe: namespace 1 ->' in guest.seen,'installed disk did not boot through native NVMe'
+        assert re.search(rb'nvme: sd\w+ = .*namespace 1:',guest.seen),'installed disk did not boot through native NVMe'
         guest.command('mounts',b'embkfs')
         guest.command('recovery check',b'integrity OK',240)
         assert b'-- MISMATCH' not in guest.seen

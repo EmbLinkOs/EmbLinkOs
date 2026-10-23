@@ -5,6 +5,8 @@
 #include "fs/vfs.h"
 #include <stdint.h>
 
+struct vm_object;   /* mm/vm_object.h -- the file's resident pages */
+
 /* Opaque forward declaration -- fd.h can't include process.h (process.h
  * itself includes fd.h, to embed struct fd_entry fds[] in struct process;
  * including it back here would be circular). Without this, every TU that
@@ -123,13 +125,43 @@ struct fd_ops {
 #define POLLHUP  0x0010
 #define POLLNVAL 0x0020
 
+/* AN OPEN FILE DESCRIPTION -- POSIX's name for it, and a separate object from
+ * the descriptor on purpose.
+ *
+ * A file descriptor is a NUMBER in one process's table. What it refers to is
+ * this: the vnode, and the CURSOR. dup(), dup2() and a spawn-inherited fd all
+ * produce a second descriptor onto the SAME description, which is what makes
+ *
+ *     write(1, "a", 1); write(dup(1), "b", 1);
+ *
+ * append rather than overwrite, and what makes a shell's `>>` behave. Two
+ * descriptors with independent cursors onto one file is neither dup nor a
+ * fresh open -- it is an accidental third thing that corrupts silently, which
+ * is precisely why vnode_fd_inherit() used to refuse rather than approximate.
+ *
+ * `refs` counts descriptors, across every process. The vnode's own reference
+ * is released once, when the last of them goes. */
+struct open_file {
+    struct vnode vn;
+    uint64_t pos;
+    int refs;                   /**< descriptors pointing here; atomic */
+
+    /* The file's PAGES. Not "a cache this fd keeps" -- the one object every
+     * descriptor onto this file shares, so a write through one is visible to a
+     * read through another without either touching the device. NULL for a
+     * backing the cache does not serve (before the scheduler exists, or a
+     * filesystem with no read op), in which case I/O falls through to the
+     * filesystem directly. See mm/vm_object.h. */
+    struct vm_object *obj;
+};
+
 struct fd_entry {
     bool used;
     enum fd_backing backing;    /**< selects which fd_ops table applies */
     const struct fd_ops *ops;   /**< per-backing dispatch (NULL when unused) */
     int flags;
     union {
-        struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
+        struct { struct open_file *of; } file;           /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
         struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
         struct { int us; } udp;                          /**< FD_BACKING_UDP (UDP socket index) */
@@ -148,19 +180,43 @@ int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read);
 int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
-int vfs_fd_sync(int fd);   /* validate fd and propagate filesystem/device errors */
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */
 int vfs_fd_poll(int fd, int events);          /* ready POLL* bits for one fd */
 int vfs_fd_get_flags(int fd);                 /* O_ACCMODE | O_NONBLOCK, or -errno */
 int vfs_fd_set_nonblock(int fd, bool on);     /* set/clear O_NONBLOCK; 0 or -errno */
 int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
 int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */
-int vfs_rename_path(const char *old_path, const char *new_path);
-int vfs_rename_noreplace(const char *old_path, const char *new_path);
+int vfs_rename_noreplace(const char *,const char *);
+int vfs_rename_path(const char *old_path, const char *new_path); /* atomic replacement */
 int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs preserves the type bits */
 int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
+int vfs_fd_fsync(int fd);    /* push this file's dirty pages to the device NOW */
+
+/* The page object behind an open fd, with a NEW reference taken for the
+ * caller (mmap holds one for the life of the mapping). NULL if the fd is not
+ * a cached file -- a pipe, a socket, the console. */
+struct vm_object *vfs_fd_object(int fd);
+
+/* Symbolic links, by path. `target` is stored verbatim and never validated --
+ * a link may name something that does not exist, which is the normal case in
+ * every build system that uses them. readlink/lstat act on the LINK itself. */
+int vfs_symlink_path(const char *target, const char *linkpath);
+int vfs_link_path(const char *oldpath, const char *newpath);   /* hard link */
+int vfs_readlink_path(const char *path, char *buf, size_t cap, size_t *out_len);
+int vfs_lstat_path(const char *path, struct vfs_stat *out);
 int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
+
+/* dup / dup2 / fcntl(F_DUPFD).
+ *
+ * `newfd < 0` means "the lowest free descriptor at or above `min_fd`" (dup is
+ * min_fd 0, F_DUPFD is min_fd = the caller's argument). Otherwise `newfd` is
+ * the exact slot, and whatever it held is closed first -- that is dup2, and it
+ * is the mechanism behind every shell redirect.
+ *
+ * Both descriptors share ONE open file description: the same cursor, the same
+ * vnode reference. Closing either leaves the other fully working. */
+int vfs_fd_dup(int oldfd, int newfd, int min_fd);
 
 /* Install one end of a pipe onto target_fd in `target` -- the fd-layer half
  * of the INSTALL_OBJ spawn action (pipe_fd_ops is private to fd.c, so the

@@ -1,7 +1,7 @@
 #include "include/kprintf.h"
+#include "lib/klog.h"
 #include "drivers/char/serial.h"
-#include "drivers/video/console.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include <stdint.h>
 #include "include/types.h"   // for size_t
 
@@ -42,13 +42,36 @@ struct out_sink {
     size_t written;  // total chars the format produced (for return value)
 };
 
-// Serial sink: write straight to COM1
+/* Where kernel log output goes.
+ *
+ * The serial port is the FLOOR: it exists from the first line of boot, on
+ * every architecture, and it is the only thing still working when the
+ * graphics stack is what broke. Anything better registers itself.
+ *
+ * This used to call console_is_ready()/console_putchar() directly, which made
+ * the log path -- the thing you need when everything else is broken -- carry a
+ * hard link dependency on the framebuffer console, and through it on the font
+ * data, the compositor and the video drivers. On x86 that was merely
+ * distasteful; on a second architecture it is fatal, because kprintf() is
+ * needed by the memory manager long before there is a display of any kind. */
+static void (*log_secondary_put)(char);
+static bool (*log_secondary_ready)(void);
+
+void kprintf_set_secondary(bool (*ready)(void), void (*put)(char)) {
+    log_secondary_put   = put;
+    log_secondary_ready = ready;
+}
+
 static void sink_serial_put(struct out_sink *s, char c) {
-    if (console_is_ready()) {
-        console_putchar(c);
-    } else {
+    /* AND KEEP IT. Both destinations above are gone the moment the machine
+     * stops -- a crashed laptop has no serial cable attached and its screen
+     * shows whatever was there before. The ring is what the crash record
+     * carries into storage that survives a power cycle. */
+    klog_putc(c);
+    if (log_secondary_ready && log_secondary_ready() && log_secondary_put)
+        log_secondary_put(c);
+    else
         serial_write_char(c);
-    }
     s->written++;
 }
 
@@ -96,8 +119,19 @@ static void emit_padding(struct out_sink *s, uint8_t n, char ch) {
     while (n--) s->put(s, ch);
 }
 
-static uint8_t strnlen_u8(const char *p) {
-    uint8_t n = 0;
+/* THE LENGTH IS NOT A BYTE, AND THE COUNTER MUST NOT BE EITHER.
+ *
+ * This counted into a uint8_t. At 255 the counter wrapped to zero and started
+ * again, so any %s argument with no terminator in its first 256 bytes looped
+ * FOREVER -- a hang, in the one function a broken kernel uses to say what
+ * went wrong. It went unnoticed for as long as nothing printed a long string;
+ * the first one to do so was the crash report printing the kernel log that
+ * led up to a fault, which is about as bad a place to discover it as exists.
+ *
+ * The PADDING width stays a byte, because that is what the format parser
+ * accepts and a field wider than 255 is not expressible anyway. */
+static uint32_t str_len(const char *p) {
+    uint32_t n = 0;
     while (p[n]) n++;
     return n;
 }
@@ -105,11 +139,11 @@ static uint8_t strnlen_u8(const char *p) {
 static void emit_string(struct out_sink *s, const char *string,
                         uint8_t width, uint8_t left_justify) {
     if (!string) string = "(null)";
-    uint8_t len = strnlen_u8(string);
+    uint32_t len = str_len(string);
     uint8_t pad = (width > len) ? (uint8_t)(width - len) : 0;
 
     if (!left_justify) emit_padding(s, pad, ' ');
-    for (uint8_t i = 0; i < len; i++) s->put(s, string[i]);
+    for (uint32_t i = 0; i < len; i++) s->put(s, string[i]);
     if (left_justify) emit_padding(s, pad, ' ');
 }
 
@@ -268,6 +302,24 @@ static void format_string(struct out_sink *s, const char *fmt, va_list arg) {
 // ============================================================
 //  Public API — thin wrappers over the core
 // ============================================================
+
+/* THE SAME LOCK, FOR SOMEBODY ELSE'S BYTES.
+ *
+ * kprintf is atomic against other kprintfs and was atomic against nothing
+ * else, so a kernel line could land in the middle of a line a USER process was
+ * writing to the same serial port. That is not only ugly: the aarch64
+ * acceptance test greps for whole lines, and one boot reported
+ * "FAIL(A6): init never spawned the session" on a machine where it plainly
+ * had -- the log read `init: desktop seEMBKFS: sda: ... not found`. A gate
+ * that fails for reasons unrelated to the change under test is a gate people
+ * learn to re-run instead of read.
+ *
+ * Exposed rather than made automatic because the console write path holds it
+ * for ONE LINE at a time, not for a whole write: a program dumping a megabyte
+ * must not own the port for the duration, and a line is the unit that has to
+ * arrive whole. */
+void kprintf_line_begin(void) { spin_lock(&kprintf_lock); }
+void kprintf_line_end(void)   { spin_unlock(&kprintf_lock); }
 
 void kprintf(const char *fmt, ...) {
     struct out_sink s = { .put = sink_serial_put, .written = 0 };

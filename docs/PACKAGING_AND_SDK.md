@@ -35,7 +35,7 @@ and EmbBuild.*
 > widening, and consented widening. *Remaining:* an EMBKFS-snapshot-backed
 > variant of update (a future optimization once a snapshot syscall exists) and
 > PK4 the git registry.
-> **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+> **PK2b — on-device package generation.** `pkgbuild` (`user/tools/pkgbuild/pkgbuild.c` +
 > `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns ONE
 > `.pkgspec` + a linked ELF into the three views (EMBX cap table, `.ns`, manifest)
 > ON THE OS ITSELF -- authority declared as part of building on the device. On-OS

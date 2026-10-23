@@ -6,7 +6,9 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "block/block.h"
-#include "drivers/timer/pit.h"
+#include "fs/automount.h"
+#include "net/usb_net.h"
+#include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
 
 // ---------------------------------------------------------------------------
 // Device table
@@ -35,11 +37,60 @@ struct usb_device *usb_alloc_device(const struct usb_hcd_ops *ops,
 }
 
 void usb_free_device(struct usb_device *dev) {
-    if(dev && dev->hid_active && dev->hid_kind==USB_HID_KEYBOARD) {
-        uint8_t released[8]={0};
-        keyboard_hid_boot_report(dev->prev_keys,&dev->prev_modifiers,released,sizeof released);
-    }
     if (dev) dev->in_use = false;
+}
+
+/* A PORT THAT HAS SOMETHING ON IT WE CANNOT ENUMERATE.
+ *
+ * Without this the rescan retries it every half second forever: a full reset
+ * sequence, seventy milliseconds of delay in the main loop, and a line of log,
+ * over and over, for a device that is never going to work. The machine does
+ * not break, it just gets quietly slower and noisier the longer it runs -- and
+ * the cause looks like nothing at all.
+ *
+ * The mark is cleared when the port reads DISCONNECTED, so pulling the thing
+ * out and putting it back is a fresh attempt. That is the only retry a person
+ * can ask for and it is the one they will try. */
+#define USB_DEAD_PORTS 16
+static struct { void *hc; uint8_t port; bool used; } g_dead[USB_DEAD_PORTS];
+
+bool usb_port_is_dead(void *hc, uint8_t port) {
+    for (uint32_t i = 0; i < USB_DEAD_PORTS; i++)
+        if (g_dead[i].used && g_dead[i].hc == hc && g_dead[i].port == port)
+            return true;
+    return false;
+}
+
+void usb_port_mark_dead(void *hc, uint8_t port) {
+    if (usb_port_is_dead(hc, port)) return;
+    for (uint32_t i = 0; i < USB_DEAD_PORTS; i++) {
+        if (g_dead[i].used) continue;
+        g_dead[i].hc = hc; g_dead[i].port = port; g_dead[i].used = true;
+        kprintf("USB: port %u has something this kernel cannot enumerate -- "
+                "not retrying until it is unplugged\n", (unsigned)port);
+        return;
+    }
+}
+
+void usb_port_clear_dead(void *hc, uint8_t port) {
+    for (uint32_t i = 0; i < USB_DEAD_PORTS; i++)
+        if (g_dead[i].used && g_dead[i].hc == hc && g_dead[i].port == port)
+            g_dead[i].used = false;
+}
+
+struct usb_device *usb_device_on_port(void *hc, uint8_t port) {
+    for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
+        struct usb_device *d = &g_usb_devices[i];
+        if (d->in_use && d->hc == hc && d->port == port) return d;
+    }
+    return NULL;
+}
+
+uint32_t usb_device_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < USB_MAX_DEVICES; i++)
+        if (g_usb_devices[i].in_use) n++;
+    return n;
 }
 
 const struct usb_ep_info *usb_find_ep(struct usb_device *dev,
@@ -131,7 +182,27 @@ static void usb_tablet_process_report(const uint8_t *report, int len) {
 static void usb_hid_process_report(struct usb_device *dev,
                                    const uint8_t *report, int len) {
     if (dev->hid_kind == USB_HID_TABLET) { usb_tablet_process_report(report, len); return; }
-    keyboard_hid_boot_report(dev->prev_keys,&dev->prev_modifiers,report,len);
+    if (len < 3) return;
+    uint8_t modifiers = report[0];
+    bool shift = (modifiers & 0x22) != 0;   // L/R shift
+
+    // Edge-detect: inject only keys not present in the previous report.
+    for (int i = 2; i < 8 && i < len; i++) {
+        uint8_t usage = report[i];
+        if (usage == 0 || usage >= 128) continue;
+        bool was_down = false;
+        for (int j = 0; j < 6; j++) {
+            if (dev->prev_keys[j] == usage) { was_down = true; break; }
+        }
+        if (was_down) continue;
+        char ch = shift ? g_usb_hid_ascii_shift[usage] : g_usb_hid_ascii[usage];
+        if (!ch) ch = g_usb_hid_ascii[usage];
+        if (ch) keyboard_inject_char(ch);
+    }
+
+    for (int j = 0; j < 6; j++) {
+        dev->prev_keys[j] = (2 + j < len) ? report[2 + j] : 0;
+    }
 }
 
 static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
@@ -347,7 +418,7 @@ static bool usb_msc_attach(struct usb_device *dev) {
         memset(cdb, 0, sizeof(cdb));
         cdb[0] = 0x03; cdb[4] = 18;             // REQUEST SENSE
         usb_msc_bot(m, cdb, 6, true, 18);
-        pit_delay_ms(10);
+        timer_delay_ms(10);
     }
 
     // READ CAPACITY(10)
@@ -386,7 +457,52 @@ static bool usb_msc_attach(struct usb_device *dev) {
             m->blk.name,
             (unsigned int)m->blocks, (unsigned int)m->block_size,
             (unsigned int)((m->blocks * m->block_size) >> 20));
+
+    /* AND MAKE IT REACHABLE. Registering a block device used to be the end of
+     * the story, which is correct for a disk the boot code knows how to find
+     * and useless for one somebody just pushed into a socket: the point of
+     * plugging a stick in is to read what is on it. */
+    automount_attach(&m->blk);
     return true;
+}
+
+/* THE STICK CAME OUT.
+ *
+ * ORDER IS THE WHOLE THING HERE, and it is the reverse of attach:
+ *
+ *   1. unmount, so the VFS stops dispatching reads at a volume whose medium
+ *      has left. Doing this after the block device is gone means every
+ *      in-flight path walk goes through a freed registration.
+ *   2. unregister the block device, so nothing new can find it.
+ *   3. release the slot.
+ *
+ * Note what is NOT done: no attempt to flush. There is nothing to flush TO.
+ * A write that was still buffered when the connector separated is lost, and
+ * pretending otherwise by issuing SCSI to an absent device would hang the
+ * poll loop for the length of every timeout. That loss is what "safely
+ * remove" exists to let a person avoid, and saying so is more useful than a
+ * flush that cannot work. */
+static void usb_msc_detach(struct usb_device *dev) {
+    for (uint32_t i = 0; i < USB_MSC_MAX_DEVS; i++) {
+        struct usb_msc *m = &g_usb_msc[i];
+        if (!m->used || m->dev != dev) continue;
+
+        automount_detach(&m->blk);
+        embk_block_unregister(&m->blk);
+        kprintf("USB MSC: %s removed\n", m->blk.name);
+        m->used = false;
+        m->dev = NULL;
+    }
+}
+
+void usb_device_gone(struct usb_device *dev) {
+    if (!dev || !dev->in_use) return;
+    kprintf("USB: device %04x:%04x on port %u disconnected\n",
+            (unsigned)dev->vid, (unsigned)dev->pid, (unsigned)dev->port);
+    usb_msc_detach(dev);
+    usb_uas_detach(dev);
+    dev->hid_active = false;
+    usb_free_device(dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,11 +522,26 @@ static void usb_parse_config(struct usb_device *dev,
         if (dlen == 0 || off + dlen > len) break;
 
         if (dtype == USB_DESC_INTERFACE && dlen >= 9) {
-            if (in_first_iface) break;      // second interface: stop
-            in_first_iface = true;
-            dev->if_class = cfg[off + 5];
-            dev->if_subclass = cfg[off + 6];
-            dev->if_protocol = cfg[off + 7];
+            /* EVERY INTERFACE'S ENDPOINTS, not just the first one's.
+             *
+             * This used to stop at the second interface, which is correct for
+             * a keyboard and wrong for anything built out of more than one.
+             * A USB ethernet adapter is the case that forced it: CDC splits a
+             * device across a CONTROL interface (class 2, where the class
+             * triple is) and a DATA interface (class 0x0A, where both bulk
+             * endpoints are). Parsing only the first found a device with one
+             * interrupt endpoint and no way to move a frame -- "no bulk
+             * endpoints", from a device that has two.
+             *
+             * The CLASS TRIPLE still comes from the first interface only, so
+             * every existing dispatch decision is unchanged. */
+            if (!in_first_iface) {
+                in_first_iface = true;
+                dev->if_class = cfg[off + 5];
+                dev->if_subclass = cfg[off + 6];
+                dev->if_protocol = cfg[off + 7];
+            }
+            dev->num_ifaces++;
         } else if (dtype == USB_DESC_ENDPOINT && dlen >= 7 && in_first_iface) {
             if (dev->num_eps < USB_MAX_ENDPOINTS) {
                 struct usb_ep_info *ep = &dev->eps[dev->num_eps++];
@@ -418,7 +549,15 @@ static void usb_parse_config(struct usb_device *dev,
                 ep->attr = cfg[off + 3];
                 ep->mps = (uint16_t)(cfg[off + 4] | (cfg[off + 5] << 8)) & 0x7FF;
                 ep->interval = cfg[off + 6];
+                ep->pipe_id = 0;
             }
+        } else if (dtype == 0x24 && dlen >= 4 && dev->num_eps) {
+            /* A class-specific descriptor that FOLLOWS an endpoint describes
+             * that endpoint. For UAS this is the pipe usage descriptor and it
+             * is the only thing that distinguishes four otherwise identical
+             * bulk pipes -- see usb_uas.c. Attaching it to the most recently
+             * parsed endpoint is what "follows" means in a descriptor blob. */
+            dev->eps[dev->num_eps - 1].pipe_id = cfg[off + 2];
         }
         off += dlen;
     }
@@ -497,14 +636,14 @@ static void usb_hub_clear_port_feature(struct usb_device *hub, uint8_t port, uin
 // instead of the HC's native port registers.
 static void usb_hub_port_attach(struct usb_device *hub, uint8_t port) {
     usb_hub_set_port_feature(hub, port, USB_PORT_FEAT_POWER);
-    pit_delay_ms(20);   // bPwrOn2PwrGood is in 2 ms units; 20 ms covers any real hub
+    timer_delay_ms(20);   // bPwrOn2PwrGood is in 2 ms units; 20 ms covers any real hub
 
     uint16_t status, change;
     if (!usb_hub_get_port_status(hub, port, &status, &change)) return;
     if (!(status & (1 << USB_PORT_FEAT_CONNECTION))) return;   // nothing plugged in
 
     usb_hub_set_port_feature(hub, port, USB_PORT_FEAT_RESET);
-    pit_delay_ms(50);
+    timer_delay_ms(50);
 
     if (!usb_hub_get_port_status(hub, port, &status, &change)) return;
 
@@ -575,7 +714,7 @@ int usb_enumerate(struct usb_device *dev) {
         return -1;
     }
     dev->addr = addr;
-    pit_delay_ms(5);   // address settle time (spec: 2 ms)
+    timer_delay_ms(5);   // address settle time (spec: 2 ms)
 
     // 3) Full device descriptor.
     rc = usb_get_descriptor(dev, USB_DESC_DEVICE, 0, buf, 18);
@@ -630,9 +769,21 @@ int usb_enumerate(struct usb_device *dev) {
                dev->if_protocol == 0x02) {
         kprintf("USB: HID boot mouse detected (relative; no driver)\n");
     } else if (dev->if_class == 0x08) {
-        usb_msc_attach(dev);
+        /* UAS FIRST, BOT AS THE FALLBACK. Protocol 0x62 is USB Attached SCSI;
+         * a device that speaks it still answers Bulk-Only Transport, so a
+         * failed UAS attach loses nothing but speed. */
+        if (dev->if_protocol != 0x62 || !usb_uas_attach(dev))
+            usb_msc_attach(dev);
     } else if (dev->if_class == 0x09) {
         usb_hub_attach(dev);
+    } else if (dev->if_class == 0x02 || dev->if_class == 0x0A ||
+               dev->if_class == 0xFF) {
+        /* Communications, CDC data, or vendor-specific -- a USB ethernet
+         * adapter appears as any of the three depending on whether its
+         * descriptors were written for the standard or for Windows. The
+         * driver decides; a device that is none of these returns false and
+         * nothing is lost. */
+        usb_net_attach(dev);
     }
 
     return 0;

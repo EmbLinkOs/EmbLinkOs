@@ -2,9 +2,15 @@
 """audio_test.py -- boot the OS, make it play a tone, measure what came out.
 
 The whole loop in one command, because a test that takes three manual steps is
-a test that stops being run. It boots QEMU headless with an AC'97 attached and
-`-audiodev wav`, drives the kernel's serial console to issue `test audio`, and
-hands the resulting file to audio_check.py.
+a test that stops being run. It boots QEMU headless with a sound card attached
+and `-audiodev wav`, drives the kernel's serial console to issue `test audio`,
+and hands the resulting file to audio_check.py.
+
+WHICH CARD is an argument now (AUDIO_CARD, or `make test-audio-hda`). The
+driver table picks at runtime, so the same kernel has to make the same tone
+come out of an AC'97, an Intel HDA controller on the ICH6 and one on the ICH9 --
+and the WAV is the same file whichever answered, which is the whole point of
+putting a table underneath.
 
 The serial is a UNIX SOCKET rather than a file: the harness has to WRITE the
 command, and `-serial file:` is output only -- which is the small thing that
@@ -32,6 +38,38 @@ MIN_SECONDS = os.environ.get("AUDIO_MIN_SECONDS", "0.4")
 # proves the whole stack -- a program asking for the speaker, the capability
 # check, the syscalls, and the same hardware underneath.
 CMD = os.environ.get("AUDIO_CMD", "test audio")
+# WHETHER THE WAV IS THE VERDICT. It is, for every test of "did the sound come
+# out". It is NOT for the latency sweep, which deliberately makes holes in the
+# sound in order to find where they start -- there the guest's own comparison
+# is the result and a WAV checker would fail a run that worked perfectly.
+CHECK = os.environ.get("AUDIO_CHECK", "1") != "0"
+PLAY_WAIT = int(os.environ.get("AUDIO_PLAY_WAIT", "140"))
+# HOW MANY CORES. One by default, deliberately: the tone tests want the driver
+# under the least favourable conditions and a single core is where a streaming
+# bug shows. The latency sweep wants the opposite -- it is measuring the
+# SCHEDULER, so it needs a machine with enough cores for the scheduler to have
+# a decision to make, and on one emulated core its ten runs take twelve
+# minutes.
+SMP = os.environ.get("AUDIO_SMP", "1")
+# WHICH SOUND CARD QEMU attaches. "hda" is an ICH6-era Intel HD Audio
+# controller with a codec on its link; "ich9-hda" is the later controller, same
+# codec; "ac97" is the 2004 part. The point of running all three is that one
+# kernel drives them without being rebuilt.
+CARD = os.environ.get("AUDIO_CARD", "ac97")
+
+CARDS = {
+    "ac97":     ["-device", "AC97,audiodev=snd0"],
+    # hda-OUTPUT, not hda-duplex: the duplex codec opens a capture stream too
+    # and `-audiodev wav` has no input, so QEMU refuses the whole machine. The
+    # difference is invisible to the driver -- it walks the codec graph and
+    # finds one output path either way.
+    "hda":      ["-device", "intel-hda", "-device", "hda-output,audiodev=snd0"],
+    "ich9-hda": ["-device", "ich9-intel-hda", "-device", "hda-output,audiodev=snd0"],
+    # BOTH AT ONCE, which is the case the old build-time seam could not even
+    # express: the table has to choose, and it has to choose the modern one.
+    "both":     ["-device", "AC97,audiodev=snd0",
+                 "-device", "intel-hda", "-device", "hda-output,audiodev=snd0"],
+}
 
 
 def boot():
@@ -44,13 +82,16 @@ def boot():
         "qemu-system-x86_64", "-cpu", "max",
         "-drive", "format=raw,file=myos.img,if=ide,index=0",
         "-drive", "format=raw,file=%s,if=ide,index=1" % SCRATCH,
-        "-device", "AC97,audiodev=snd0",
         "-audiodev", "wav,id=snd0,path=%s" % OUT,
         "-vga", "none", "-device", "virtio-vga,xres=800,yres=600", "-display", "none",
         "-serial", "unix:%s,server,nowait" % SOCK,
-        "-no-reboot", "-no-shutdown", "-m", "521m", "-smp", "1",
+        "-no-reboot", "-no-shutdown", "-m", "521m", "-smp", SMP,
         "-accel", "tcg,thread=multi",
     ]
+    if CARD not in CARDS:
+        raise SystemExit("audio-test: unknown AUDIO_CARD %r (have %s)"
+                         % (CARD, ", ".join(sorted(CARDS))))
+    argv += CARDS[CARD]
     log = open(os.path.join(ROOT, "build", "audio-qemu.log"), "wb")
     return subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=log)
 
@@ -89,10 +130,10 @@ def drive(cmd, boot_wait, play_wait):
 
 
 def main():
-    print("=== test-audio: booting with an AC'97 and a WAV sink")
+    print("=== test-audio: booting with %s and a WAV sink" % CARD)
     q = boot()
     try:
-        out = drive(CMD, 75, 140)
+        out = drive(CMD, 75, PLAY_WAIT)
     finally:
         q.terminate()
         try:
@@ -101,8 +142,17 @@ def main():
             q.kill()
 
     for line in out.splitlines():
-        if "audio" in line.lower() or "ac97" in line.lower() or "[cmd]" in line:
+        low = line.lower()
+        if "audio" in low or "ac97" in low or "hda" in low or "[cmd]" in line:
             print("  guest: %s" % line.strip())
+
+    if not CHECK:
+        # The guest measured it. Echo its verdict and adopt it.
+        for line in out.splitlines():
+            if "audiostress" in line or "runway" in line or "[ok]" in line \
+               or "[FAIL]" in line:
+                print("  %s" % line.strip())
+        return 0 if "test audiostress: OK" in out else 1
 
     if "PLAYED" not in out and "played" not in out:
         print("=== test-audio: FAIL -- the guest did not report playing")
@@ -110,6 +160,7 @@ def main():
         return 1
 
     # The guest saying PLAYED is NOT the result. This is.
+    print("=== test-audio (%s): the guest played; the WAV decides" % CARD)
     return subprocess.call([sys.executable,
                             os.path.join(ROOT, "tools", "audio_check.py"),
                             OUT, "--hz", str(HZ),

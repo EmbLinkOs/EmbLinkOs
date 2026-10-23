@@ -137,7 +137,10 @@ uint16_t net_l4_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                          const void *seg, uint32_t seg_len);
 
 /* ---- stack entry points ------------------------------------------------- */
-void net_init(void);                          /* bring up the NIC + static config */
+void net_service_lock(void);
+void net_service_unlock(void);
+void net_init(void);
+void net_address_ready(void);                          /* bring up the NIC + static config */
 void net_rx(const uint8_t *frame, uint32_t len);   /* driver -> stack (one Ethernet frame) */
 
 /* eth: build+send a frame carrying `payload` to `dst_mac` with `ethertype`. */
@@ -147,7 +150,6 @@ int  net_tx_eth(const uint8_t dst_mac[ETH_ALEN], uint16_t ethertype,
 /* ARP: resolve `ip` (HOST order) to a MAC, sending a request and waiting up to
  * a bounded number of poll cycles. Returns true and fills mac on success. */
 bool arp_resolve(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
-void arp_reset(void); /* caller holds net_lock, e.g. an interface/address change */
 
 /* IPv4: send `payload` (an ICMP/UDP/... message) to `dst_ip` (HOST order). */
 int  net_send_ip(uint32_t dst_ip, uint8_t proto, const void *payload, uint32_t len);
@@ -161,10 +163,10 @@ int  net_send_udp(uint32_t src_ip, uint16_t src_port,
 /* DHCP: run DISCOVER/OFFER/REQUEST/ACK and, on success, configure g_netif
  * (ip/netmask/gateway/dns) and set g_netif.dhcp. Returns true on a lease. */
 bool net_dhcp(void);
-/* Lease clock for the Wi-Fi connection worker; caller holds net_lock. */
-uint64_t net_dhcp_renew_after_ms(void);
-uint64_t net_dhcp_lease_remaining_ms(void);
 void net_dhcp_forget_lease(void);
+uint64_t net_dhcp_lease_remaining_ms(void);
+uint64_t net_dhcp_renew_after_ms(void);
+void arp_reset(void);
 
 /* DNS: resolve `name` to an IPv4 address (HOST order) via the DHCP-learned
  * resolver (g_netif.dns), UDP/53. Returns true and fills *out_ip on the first
@@ -255,25 +257,76 @@ void icmp_send_unreachable(uint32_t dst_ip, const uint8_t *orig_ip_pkt, uint32_t
 /* UDP single-slot receive capture, driven by DHCP/DNS: arm on a local port,
  * then poll (bounded) for the reply. */
 void udp_arm(uint16_t port);
-void udp_arm_peer(uint16_t port,uint32_t peer_ip,uint16_t peer_port);
+void udp_arm_peer(uint16_t port,uint32_t peer,uint16_t peer_port);
 int  udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip);
-/* Kernel DHCP/DNS serialize their capture ownership; caller holds net_lock.
- * A waiting service yields that full monitor while ordinary RX keeps running. */
-void net_service_lock(void);
-void net_service_unlock(void);
 
-/* ---- driver interface (virtio_net.c) ------------------------------------ */
-bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */
-int  virtio_net_tx(const void *frame, uint32_t len);   /* send one Ethernet frame */
-void virtio_net_poll(void);                        /* drain the RX ring -> net_rx() */
-bool pci_net_init(uint8_t mac_out[ETH_ALEN]);
-int pci_net_tx(const void *frame, uint32_t len);
-void pci_net_poll(void);
-int net_send_frame(const void *frame, uint32_t len);
-void net_poll(void);
+/* ---- the NIC drivers, and how the stack reaches one ----------------------
+ *
+ * Three functions is the whole contract. It was spelled virtio_net_* and called
+ * directly from four places, which was fine while a hypervisor was the only
+ * thing this OS had ever talked to -- and exactly wrong the moment a second
+ * card existed. The stack now asks net_dev_*, and net_init picks the driver
+ * whose probe succeeds.
+ *
+ * The ORDER matters and is not alphabetical: virtio first, because a machine
+ * that offers it is a virtual machine and its emulated e1000 (if any) is the
+ * slower path to the same wire. */
+struct net_driver {
+    const char *name;
+    bool (*init)(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */
+    int  (*tx)(const void *frame, uint32_t len);   /* send one Ethernet frame */
+    void (*poll)(void);                        /* drain the RX ring -> net_rx() */
+    /* IS THE CABLE IN. 1 up, 0 down, -1 the card cannot say.
+     *
+     * Separate from "the driver initialised", which is what net_status used to
+     * report as `up` -- so the menu bar's indicator lit the moment a NIC
+     * existed and stayed lit with the cable on the floor. A card that cannot
+     * answer returns -1 and is treated as up, because refusing to work when
+     * the hardware will not tell you is worse than believing it. */
+    int  (*link)(void);
+};
 
+int  net_dev_tx(const void *frame, uint32_t len);
+void net_dev_poll(void);
+const char *net_dev_name(void);            /* "" when no card was found */
+int  net_dev_link(void);                   /* 1 up, 0 down, -1 unknown */
 
-/* Called under net_lock for a validated unicast IPv4 Ethernet frame. */
-void arp_learn_ipv4_neighbor(uint32_t src, const uint8_t mac[ETH_ALEN]);
+bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);
+int  virtio_net_tx(const void *frame, uint32_t len);
+void virtio_net_poll(void);
+int  virtio_net_link(void);
+
+/* Intel PRO/1000 (8254x/8257x) -- the first card a real machine might have. */
+bool e1000_init(uint8_t mac_out[ETH_ALEN]);
+int  e1000_tx(const void *frame, uint32_t len);
+void e1000_poll(void);
+int  e1000_link(void);
+
+/* Intel 82575/82576 and after -- advanced descriptors, a separate driver from
+ * e1000.c because the descriptor format is genuinely different. */
+bool igb_init(uint8_t mac_out[ETH_ALEN]);
+int  igb_tx(const void *frame, uint32_t len);
+void igb_poll(void);
+int  igb_link(void);
+/* Which PCI device ids igb claims -- e1000.c asks so the two do not fight
+ * over the same function. */
+bool igb_owns_device(uint16_t device_id);
+
+/* Intel PRO/100 (82557..82559, 8255x) -- a linked list of command blocks
+ * rather than a descriptor ring. The card in every desktop of that decade. */
+bool i8255x_init(uint8_t mac_out[ETH_ALEN]);
+/* Which PCI device ids the PRO/100 driver claims -- e1000.c asks, so that
+ * driver does not map a 4 KiB window and read past the end of it. */
+bool i8255x_owns_device(uint16_t device_id);
+int  i8255x_tx(const void *frame, uint32_t len);
+void i8255x_poll(void);
+int  i8255x_link(void);
+
+/* Realtek RTL8139 -- the second vendor, and what makes the table above a seam
+ * rather than a shape drawn around one implementation. */
+bool rtl8139_init(uint8_t mac_out[ETH_ALEN]);
+int  rtl8139_tx(const void *frame, uint32_t len);
+void rtl8139_poll(void);
+int  rtl8139_link(void);
 
 #endif /* __NET_H__ */

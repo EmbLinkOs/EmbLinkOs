@@ -1,22 +1,16 @@
 #include <assert.h>
 #include <stdio.h>
-#define _start emblink_init_test_entry
-#include "../../user/bin/init.c"
-#undef _start
+#include "session_policy.h"
 int main(void){
-    const char *home="/home/alex";
-    assert(profile_path_allowed(home,EMBK_NS_RW,home));
-    assert(profile_path_allowed("/home/alex/Documents",EMBK_NS_RW,home));
-    assert(profile_path_allowed("/system/bin",EMBK_NS_RO,home));
-    assert(profile_path_allowed("/run",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/etc",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/system",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/data/apps",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/home/alexander",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/home/.live-guest",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/home/alex/../../etc",EMBK_NS_RW,home));
-    assert(!profile_path_allowed("/system/./bin",EMBK_NS_RO,home));
-    assert(!profile_path_allowed("/system//bin",EMBK_NS_RO,home));
-    puts("session profiles: home/component boundaries, traversal, read-only system and isolated live home OK");
+    assert(embk_session_grant_ok("alex",0,"/home/alex",0));
+    assert(embk_session_grant_ok("alex",0,"/home/alex/Documents",0));
+    assert(embk_session_grant_ok("alex",0,"/system/bin",1));
+    assert(embk_session_grant_ok("alex",0,"/run",0));
+    const char *bad[]={"/","/etc","/home/alexander","/home/guest","/home/alex/../../etc","/system/./bin","/system//bin"};
+    for(unsigned i=0;i<sizeof bad/sizeof bad[0];i++)assert(!embk_session_grant_ok("alex",0,bad[i],0));
+    assert(!embk_session_grant_ok("alex",0,"/system",0));
+    assert(!embk_session_grant_ok("alex",0,"/data/apps",0));
+    assert(embk_session_grant_ok("alex",1,"/data/apps",0));
+    assert(!embk_session_grant_ok("alex",1,"/etc",0));
+    puts("session profiles: native user/admin clamp, home boundaries, traversal and read-only system OK");
 }

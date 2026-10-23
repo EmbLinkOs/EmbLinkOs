@@ -13,6 +13,7 @@ compile_and_run ec tests/drivers/ec_protocol_test.c kernel/drivers/platform/ec_p
 compile_and_run designware tests/drivers/designware_test.c kernel/drivers/i2c/designware_protocol.c
 compile_and_run hid tests/drivers/hid_report_test.c kernel/drivers/input/hid_report.c
 compile_and_run i2chid tests/drivers/i2c_hid_test.c kernel/drivers/i2c/hid_protocol.c
+compile_and_run acpi-i2c tests/drivers/acpi_i2c_test.c
 compile_and_run wpa2 tests/drivers/wpa2_crypto_test.c kernel/net/wifi/wpa2_crypto.c kernel/crypto/sha1.c kernel/crypto/aes.c
 compile_and_run wifi-security tests/drivers/wifi_security_test.c kernel/net/wifi/wpa2.c kernel/net/wifi/ccmp.c kernel/net/wifi/wpa2_crypto.c kernel/crypto/sha1.c kernel/crypto/aes.c
 compile_and_run wifi-station tests/drivers/wifi_station_test.c kernel/net/wifi/station.c kernel/net/wifi/wpa2.c kernel/net/wifi/ccmp.c kernel/net/wifi/wpa2_crypto.c kernel/crypto/sha1.c kernel/crypto/aes.c

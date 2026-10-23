@@ -1,42 +1,66 @@
 #include "include/kstring.h"
 
-void *memcpy(void *dest, const void *src, size_t n) {
+/* WORD-WIDE, and it matters more than it looks. These three were byte loops,
+ * and a byte loop is what every page zeroed, every page copied to the swap
+ * store and every block bounced through the block layer paid for: measured at
+ * 69 us per 4 KiB page under TCG -- 4.1 s of a 22 s paging run spent zeroing.
+ * Eight bytes at a time once the destination is aligned, a tail of bytes.
+ *
+ * memcpy/memmove go word-wide only when BOTH sides can: aligning the
+ * destination leaves the source aligned exactly when the two started congruent
+ * mod 8, which is every page, block and buffer copy in the kernel. Anything
+ * else stays a byte loop -- an unaligned word access is fine on x86 and on
+ * aarch64 Normal memory, and a fault on aarch64 Device memory, and these
+ * functions do not know which they were handed.
+ *
+ * The attribute keeps GCC from recognising a loop as the very idiom the
+ * function implements and turning it into a call to itself. */
+#define NO_LOOP_IDIOMS __attribute__((optimize("no-tree-loop-distribute-patterns")))
+typedef uint64_t __attribute__((may_alias)) word_t;
+
+NO_LOOP_IDIOMS void *memset(void *dest, int value, size_t n) {
+    uint8_t *d = (uint8_t *)dest;
+    uint8_t  b = (uint8_t)value;
+    while (n && ((uintptr_t)d & 7)) { *d++ = b; n--; }
+    word_t w = 0x0101010101010101ULL * b;
+    while (n >= 8) { *(word_t *)d = w; d += 8; n -= 8; }
+    while (n) { *d++ = b; n--; }
+    return dest;
+}
+
+NO_LOOP_IDIOMS void *memcpy(void *dest, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dest;
     const uint8_t *s = (const uint8_t *)src;
-    for (size_t i = 0; i < n; i++) {
-        d[i] = s[i];
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {
+        while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+        while (n >= 8) { *(word_t *)d = *(const word_t *)s; d += 8; s += 8; n -= 8; }
     }
+    while (n) { *d++ = *s++; n--; }
     return dest;
 }
 
-void *memset(void *dest, int value, size_t n) {
-    uint8_t *d = (uint8_t *)dest;
-    for (size_t i = 0; i < n; i++) {
-        d[i] = (uint8_t)value;
-    }
-    return dest;
-}
-
-void *memmove(void *dest, const void *src, size_t n) {
+NO_LOOP_IDIOMS void *memmove(void *dest, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dest;
     const uint8_t *s = (const uint8_t *)src;
-    if (d == s || n == 0) {
-        return dest; // No action needed
+    if (d == s || n == 0)
+        return dest;
+    /* Forward is safe when dest is below source (each store trails the load
+     * that fed it) or when the ranges do not overlap at all. */
+    if (d < s || d >= s + n)
+        return memcpy(dest, src, n);
+    /* dest inside [src, src+n): copy backwards so nothing is clobbered before
+     * it is read. */
+    d += n; s += n;
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {
+        while (n && ((uintptr_t)d & 7)) { *--d = *--s; n--; }
+        while (n >= 8) { d -= 8; s -= 8; *(word_t *)d = *(const word_t *)s; n -= 8; }
     }
-    // If regions overlap, copy backwards to prevent overwriting source data
-    // Clobbering source data before it's copied to destination.
-
-    if (d < s) {
-        for (size_t i = 0; i < n; i++) {
-            d[i] = s[i];
-        }
-    } else {
-        for (size_t i = n; i > 0; i--) {
-            d[i - 1] = s[i - 1];
-        }
-    }
+    while (n) { *--d = *--s; n--; }
     return dest;
 }
+
+
+
 
 int memcmp(const void *s1, const void *s2, size_t n) {
     const uint8_t *p1 = (const uint8_t *)s1;

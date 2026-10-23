@@ -1,8 +1,9 @@
 #include "fs/embkfs/embkfs.h"
+#include "drivers/timer/timer.h"
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
 #include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
-#include "arch/x86_64/boot/boot_protocol.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
+#include "boot/boot_protocol.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
 #include "include/kprintf.h"
 #include "include/errno.h"
@@ -76,16 +77,13 @@ static struct wait_queue g_fs_wq;       /* zero-init = empty */
  * `wait_us` is the wall time they spent blocked. */
 static struct embkfs_lockstat g_lockstat;
 
-/* Same shape as block.c's blk_now_us: the HPET is the only wall clock here,
- * and a machine without one just reports 0 rather than a fabricated number. */
+/* Same shape as block.c's blk_now_us, and for the same reason it changed: this
+ * wants MICROSECONDS, not an HPET. drivers/timer/timer.h's clock is the TSC on
+ * x86 and the architectural counter on aarch64, and a machine without one
+ * reports 0 rather than a fabricated number. */
 static uint64_t fs_now_us(void)
 {
-    if (!hpet_available()) return 0;
-    uint64_t pf = hpet_period_fs();
-    if (!pf) return 0;
-    uint64_t tpus = 1000000000ULL / pf;
-    if (tpus == 0) tpus = 1;
-    return hpet_read_counter() / tpus;
+    return time_get_us();
 }
 
 void embkfs_lockstat_get(struct embkfs_lockstat *out) { if (out) *out = g_lockstat; }
@@ -120,6 +118,10 @@ void embkfs_lock(void)
     g_fs_depth = 1;
     sched_unlock();
 }
+
+/* Is the filesystem lock held right now? For `test kill io`: after a process
+ * is killed inside the filesystem, this must be false once it has died. */
+bool embkfs_lock_is_held(void) { return g_fs_busy != 0; }
 
 void embkfs_unlock(void)
 {
@@ -1022,6 +1024,9 @@ static int embkfs_snapshot_find_free_slot(struct embkfs_volume *vol, uint32_t *o
  *   (b) find the entry whose key offset == CRC32C(name)
  *   (c) confirm the STORED name — a 32-bit hash match is only a candidate
  */
+static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
+                               struct embk_inode_item *out);
+
 static int embkfs_lookup(struct embkfs_volume *vol, uint64_t dir_oid,
                          const char *name, uint64_t *out_oid)
 {
@@ -1029,19 +1034,40 @@ static int embkfs_lookup(struct embkfs_volume *vol, uint64_t dir_oid,
     size_t name_len = strlen(name);
     static uint8_t buf[4096];                  /* node buffer, reused across descents */
 
-    /* (a) directory inode — descend for {dir_oid, INODE, 0} */
-    const struct embk_item_header *di =
-        embkfs_find_item(vol, dir_oid, EMBK_TYPE_INODE, 0, buf, sizeof buf);
-    if (!di) { kprintf("EMBKFS: %s: dir object %lu has no inode\n", dev, dir_oid); return -EMBK_ENOENT; }
-    const struct embk_inode_item *dino = embk_item_data(buf, vol->block_size, di, sizeof *dino);
-    if (!dino) { kprintf("EMBKFS: %s: object %lu inode truncated\n", dev, dir_oid); return -EMBK_EINVAL; }
-    if ((dino->mode & EMBKFS_S_IFMT) != EMBKFS_S_IFDIR) {
+    /* (a) directory inode -- THROUGH THE CACHE. A path walk asks for the same
+     * directory inodes over and over ("/system" on the way to every file in
+     * it), and this descent was doing the full B-tree read every time. It is
+     * the same question embkfs_inode_cached exists to answer. */
+    struct embk_inode_item dino_c;
+    int drc = embkfs_inode_cached(vol, dir_oid, &dino_c);
+    if (drc != EMBK_OK) { kprintf("EMBKFS: %s: dir object %lu has no inode\n", dev, dir_oid); return drc; }
+    if ((dino_c.mode & EMBKFS_S_IFMT) != EMBKFS_S_IFDIR) {
         kprintf("EMBKFS: %s: object %lu is not a directory\n", dev, dir_oid); return -EMBK_ENOTDIR;
     }
-    /* dino consumed (mode checked) before the next descent reuses buf */
 
-    /* (b) dir entry — descend for {dir_oid, DIR_ENTRY, hash(name)} */
+    /* (b) dir entry -- the cache first.
+     *
+     * The NAME compare is authoritative, not the hash: two names can share a
+     * crc32c, and serving the wrong file because of a collision would be
+     * silent and catastrophic. The hash only picks the slot and rejects most
+     * mismatches cheaply. Names longer than the slot are simply not cached --
+     * they still resolve, they just pay the descent. */
     uint32_t hash = embk_crc32c(name, name_len, 0);
+    unsigned nslot = (unsigned)((dir_oid ^ hash) %
+                                (sizeof vol->ncache / sizeof vol->ncache[0]));
+    if (name_len < sizeof vol->ncache[0].name &&
+        vol->ncache[nslot].valid &&
+        vol->ncache[nslot].gen == vol->generation &&
+        vol->ncache[nslot].dir_oid == dir_oid &&
+        vol->ncache[nslot].hash == hash &&
+        vol->ncache[nslot].name_len == (uint8_t)name_len &&
+        memcmp(vol->ncache[nslot].name, name, name_len) == 0) {
+        vol->ncache_hits++;
+        *out_oid = vol->ncache[nslot].oid;
+        return EMBK_OK;
+    }
+    vol->ncache_misses++;
+
     const struct embk_item_header *de =
         embkfs_find_item(vol, dir_oid, EMBK_TYPE_DIR_ENTRY, hash, buf, sizeof buf);
     if (!de) { kprintf("EMBKFS: %s: \"%s\" (hash 0x%08X) not found\n", dev, name, hash); return -EMBK_ENOENT; }
@@ -1058,6 +1084,18 @@ static int embkfs_lookup(struct embkfs_volume *vol, uint64_t dir_oid,
         if (rec->name_len == name_len &&
             memcmp((const char *)rec + sizeof *rec, name, name_len) == 0) {
             *out_oid = rec->target_object_id;
+            /* Remember the ANSWER, never the absence -- see the ncache comment
+             * in embkfs.h. The full name is stored so the hit above can do an
+             * authoritative compare rather than trusting a hash. */
+            if (name_len < sizeof vol->ncache[0].name) {
+                vol->ncache[nslot].dir_oid  = dir_oid;
+                vol->ncache[nslot].hash     = hash;
+                vol->ncache[nslot].name_len = (uint8_t)name_len;
+                memcpy(vol->ncache[nslot].name, name, name_len);
+                vol->ncache[nslot].oid      = rec->target_object_id;
+                vol->ncache[nslot].gen      = vol->generation;
+                vol->ncache[nslot].valid    = true;
+            }
             return EMBK_OK;
         }
         p += rec_len; remaining -= rec_len;
@@ -1503,7 +1541,16 @@ static bool embkfs_unlock_volume(struct embk_block_device *dev, struct embkfs_vo
  * pointer into the metadata tree.
  */
 
-int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
+/* THE SUPERBLOCK HALF of a mount, and no more: read and verify the
+ * superblock -- the format's root of trust -- and fill `vol` from it. On its
+ * own this does NOT produce a usable volume: no root node read, no allocator
+ * built, no orphans swept, and a volume left here refuses every allocation
+ * with ENOSPC. That is why it is no longer the function called `mount`. It
+ * exists by name for the tests that probe superblock acceptance on a live
+ * device through a scratch descriptor (self-heal, verify-boot), which must
+ * not sweep or allocate on that device's behalf. Everything else calls
+ * embkfs_mount(). */
+int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume *vol)
 {
     if (!dev || !vol) {
         return -EMBK_EINVAL;
@@ -1519,10 +1566,21 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     }
     uint64_t sb_lba = EMBKFS_SB_OFFSET / dev->block_size;
 
-    /* The 160-byte superblock fits in one 512-byte sector. Read both copies
-     * (primary + backup) and use the newest VALID one. */
-    static uint8_t sb_primary[512] __attribute__((aligned(8)));
-    static uint8_t sb_backup[512] __attribute__((aligned(8)));
+    /* The 160-byte superblock fits in one sector. Read both copies (primary +
+     * backup) and use the newest VALID one.
+     *
+     * ONE SECTOR IS dev->block_size BYTES, not 512, and these buffers are sized
+     * for the largest sector a registered device can have. They were 512, and
+     * every read below asks for ONE SECTOR: on a device formatted with 4096-byte
+     * sectors -- an NVMe namespace in 4Kn format, which is a normal thing to buy
+     * -- that is a 4096-byte DMA into a 512-byte static buffer, over whatever
+     * .bss happened to follow it. Nothing here had ever registered such a
+     * device; the NVMe driver is the first that can. */
+    if (dev->block_size < 512 || dev->block_size > 4096) {
+        return -EMBK_EINVAL;                 /* no driver registers these */
+    }
+    static uint8_t sb_primary[4096] __attribute__((aligned(8)));
+    static uint8_t sb_backup[4096] __attribute__((aligned(8)));
 
     bool primary_valid = false;
     bool backup_valid  = false;
@@ -1628,8 +1686,7 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
                 dev->name, sb->feature_incompat);
         return -EMBK_EINVAL;
     }
-    bool read_only = boot_recovery_mode() ||
-        (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
+    bool read_only = boot_recovery_mode() || (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
 
     /* Version backstop: a newer major could mean anything. */
     if (sb->version_major > EMBKFS_MAX_KNOWN_MAJOR) {
@@ -1707,8 +1764,17 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->ecache_verified = NULL;
     /* Inode cache: icache_valid is the gate, so it MUST be seeded -- a garbage
      * true here would serve a stale/garbage inode on the very first read. */
-    vol->icache_valid = false; vol->icache_oid = 0; vol->icache_gen = 0;
+    vol->icache_clock = 0;
+    for (unsigned i = 0; i < sizeof vol->icache / sizeof vol->icache[0]; i++) {
+        vol->icache[i].valid = false;
+        vol->icache[i].oid = 0;
+        vol->icache[i].gen = 0;
+        vol->icache[i].lru = 0;
+    }
     vol->icache_hits = 0; vol->icache_misses = 0;
+    for (unsigned i = 0; i < sizeof vol->ncache / sizeof vol->ncache[0]; i++)
+        vol->ncache[i].valid = false;
+    vol->ncache_hits = 0; vol->ncache_misses = 0;
     /* Read-ahead window: wcache_buf is the gate (NULL = unallocated), same shape
      * as rcache/ecache, so a garbage pointer here would be read as a live cache. */
     vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
@@ -1768,6 +1834,8 @@ void embkfs_stat_get(struct embkfs_stat *out)
         g_efs_stat.rcache_bypass = g_embkfs_live->rcache_bypass;
         g_efs_stat.icache_hit   = g_embkfs_live->icache_hits;
         g_efs_stat.icache_miss  = g_embkfs_live->icache_misses;
+        g_efs_stat.ncache_hit   = g_embkfs_live->ncache_hits;
+        g_efs_stat.ncache_miss  = g_embkfs_live->ncache_misses;
     }
     *out = g_efs_stat;
 }
@@ -2359,6 +2427,7 @@ static int embkfs_commit(struct embkfs_volume *vol,
     vol->root        = *new_root;
     vol->generation  = new_gen;
     vol->free_blocks = new_free;
+    g_efs_stat.commits++;
     return EMBK_OK;
 }
 
@@ -3872,13 +3941,19 @@ int embkfs_object_put(struct embkfs_volume *vol, uint64_t oid)
             g_open_refs[i].vol = NULL;
             g_open_refs[i].oid = 0;
 
-            /* Last handle closed. Read the AUTHORITATIVE on-disk link count. */
-            const struct embk_item_header *ti =
-                embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
-            if (!ti) return EMBK_OK;                /* inode already gone */
-            const struct embk_inode_item *tino =
-                embk_item_data(probe, vol->block_size, ti, sizeof *tino);
-            if (!tino) return -EMBK_EINVAL;
+            /* Last handle closed. Read the AUTHORITATIVE on-disk link count --
+             * through the cache, which does not weaken that word. The cache is
+             * keyed on `generation`, and an unlink is a COMMIT: it bumps the
+             * generation and retires every entry. So a hit can only be served
+             * when nothing has been committed since the entry was made, which
+             * is exactly when the cached value and the on-disk value are the
+             * same number. A stale one is not reachable.
+             *
+             * It was the last device read an open/close pair cost. */
+            struct embk_inode_item tino_c;
+            int trc = embkfs_inode_cached(vol, oid, &tino_c);
+            if (trc != EMBK_OK) return EMBK_OK;     /* inode already gone */
+            const struct embk_inode_item *tino = &tino_c;
             if (tino->links == 0)
                 return embkfs_destroy_object(vol, oid);
             return EMBK_OK;                         /* still linked: keep it */
@@ -4350,14 +4425,17 @@ int embkfs_dir_is_empty(struct embkfs_volume *vol, uint64_t dir_oid,
     return EMBK_OK;
 }
 
+/* THE THIRD BYPASS. Every path component's type is asked for here, right after
+ * the lookup that just found it -- and this did its own B-tree descent, like
+ * stat and like the lookup's own directory-inode read did before them. Three
+ * places asking the same question three different ways, with a cache in front
+ * of none of them. */
 static int embkfs_inode_dtype(struct embkfs_volume *vol, uint64_t oid, uint8_t *out_type)
 {
-    static uint8_t probe[4096];
-    const struct embk_item_header *ii =
-        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
-    if (!ii) return -EMBK_ENOENT;
-    const struct embk_inode_item *ino = embk_item_data(probe, vol->block_size, ii, sizeof *ino);
-    if (!ino) return -EMBK_EINVAL;
+    struct embk_inode_item ino_c;
+    int rc = embkfs_inode_cached(vol, oid, &ino_c);
+    if (rc != EMBK_OK) return rc;
+    const struct embk_inode_item *ino = &ino_c;
 
     uint32_t mode = ino->mode & EMBKFS_S_IFMT;
     if (mode == EMBKFS_S_IFDIR) *out_type = EMBKFS_DT_DIR;
@@ -4673,6 +4751,64 @@ int embkfs_mkdir_name(struct embkfs_volume *vol, uint64_t dir_oid,
     return embkfs_mkdir(vol, dir_oid, name, out_oid);
 }
 
+/* A symlink is an object holding TEXT. Two steps and no new machinery: create
+ * it with the link mode (make_object already turns that into a DT_LNK
+ * directory entry), then write the target as its content.
+ *
+ * NOT ATOMIC, and worth saying so: the create and the write are two commits,
+ * so a crash between them leaves an EMPTY link -- an object of the right type
+ * with no target. The walker refuses one (an empty target is not a path), so
+ * the failure mode is a link that reports EINVAL rather than one that points
+ * somewhere wrong. Making it one transaction means teaching make_object to
+ * carry initial content, which is worth doing when something else needs it
+ * too. Recorded in docs/TODO.md. */
+int embkfs_symlink(struct embkfs_volume *vol, uint64_t dir_oid,
+                   const char *name, const char *target)
+{
+    if (!vol || !name || !target) return -EMBK_EINVAL;
+    size_t tlen = strlen(target);
+    if (tlen == 0) return -EMBK_EINVAL;          /* a link to nowhere is not a link */
+    if (tlen > 1024) return -EMBK_ENAMETOOLONG;
+
+    uint64_t oid = 0;
+    int rc = embkfs_make_object(vol, dir_oid, name,
+                                EMBKFS_S_IFLNK | EMBKFS_PERM_LNK, &oid);
+    if (rc != EMBK_OK) return rc;
+
+    rc = embkfs_write_object(vol, oid, (const uint8_t *)target, (uint64_t)tlen);
+    if (rc != EMBK_OK) {
+        /* Undo the name rather than leave a link with no target. Best effort:
+         * if this fails too, the walker still refuses the empty link. */
+        (void)embkfs_unlink(vol, dir_oid, name);
+        return rc;
+    }
+    return EMBK_OK;
+}
+
+int embkfs_readlink(struct embkfs_volume *vol, uint64_t oid,
+                    char *buf, uint64_t cap, uint64_t *out_len)
+{
+    if (!vol || !buf || !out_len) return -EMBK_EINVAL;
+
+    struct embk_inode_item ino;
+    int rc = embkfs_stat_object(vol, oid, &ino);
+    if (rc != EMBK_OK) return rc;
+    if ((ino.mode & EMBKFS_S_IFMT) != EMBKFS_S_IFLNK) return -EMBK_EINVAL;
+
+    /* The FULL length is reported even when the buffer is short, so a caller
+     * can tell a truncated answer from a complete one instead of silently
+     * acting on half a path. */
+    *out_len = ino.size;
+    uint64_t want = ino.size < cap ? ino.size : cap;
+    if (want == 0) return EMBK_OK;
+
+    uint64_t got = 0;
+    rc = embkfs_read_object_at(vol, oid, 0, (uint8_t *)buf, want, &got);
+    if (rc != EMBK_OK) return rc;
+    if (got < want) *out_len = got;
+    return EMBK_OK;
+}
+
 int embkfs_mkdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                       const char *path, uint64_t *out_oid)
 {
@@ -4730,13 +4866,42 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
 
     if (!vol || !out) return -EMBK_EINVAL;
 
-    if (vol->icache_valid && vol->icache_oid == oid &&
-        vol->icache_gen == vol->generation) {
-        vol->icache_hits++;
-        *out = vol->icache_ino;
-        return EMBK_OK;
+    /* Mix before choosing a SET -- see the icache comment in embkfs.h. The
+     * constant is the 64-bit Fibonacci ratio: it spreads the high bits of a
+     * sequential id into the low ones. It chooses a set now, not a slot, and
+     * the four ways of the set are what absorb the collisions mixing cannot
+     * prevent. */
+    unsigned set  = (unsigned)(((oid * 0x9E3779B97F4A7C15ULL) >> 40) %
+                               EMBKFS_ICACHE_SETS);
+    unsigned base = set * EMBKFS_ICACHE_WAYS;
+
+    for (unsigned w = 0; w < EMBKFS_ICACHE_WAYS; w++) {
+        unsigned i = base + w;
+        if (vol->icache[i].valid && vol->icache[i].oid == oid &&
+            vol->icache[i].gen == vol->generation) {
+            vol->icache_hits++;
+            vol->icache[i].lru = ++vol->icache_clock;
+            *out = vol->icache[i].ino;
+            return EMBK_OK;
+        }
     }
     vol->icache_misses++;
+
+    /* The victim: a dead way first (never used, or from an earlier
+     * generation, which cannot be served anyway and is costing nothing to
+     * evict), and only then the least recently used live one. Choosing an LRU
+     * victim while a stale way sits in the same set would throw away a live
+     * answer to keep a dead one. */
+    unsigned slot = base;
+    uint32_t oldest = UINT32_MAX;
+    for (unsigned w = 0; w < EMBKFS_ICACHE_WAYS; w++) {
+        unsigned i = base + w;
+        if (!vol->icache[i].valid || vol->icache[i].gen != vol->generation) {
+            slot = i;
+            break;
+        }
+        if (vol->icache[i].lru < oldest) { oldest = vol->icache[i].lru; slot = i; }
+    }
 
     const struct embk_item_header *ii =
         embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe_i, sizeof probe_i);
@@ -4745,10 +4910,11 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
         embk_item_data(probe_i, vol->block_size, ii, sizeof *ino);
     if (!ino) return -EMBK_EINVAL;
 
-    vol->icache_ino   = *ino;          /* copy: probe_i is reused by the next call */
-    vol->icache_oid   = oid;
-    vol->icache_gen   = vol->generation;
-    vol->icache_valid = true;
+    vol->icache[slot].ino   = *ino;    /* copy: probe_i is reused by the next call */
+    vol->icache[slot].oid   = oid;
+    vol->icache[slot].gen   = vol->generation;
+    vol->icache[slot].lru   = ++vol->icache_clock;
+    vol->icache[slot].valid = true;
     *out = *ino;
     return EMBK_OK;
 }
@@ -4763,20 +4929,15 @@ int embkfs_write_object(struct embkfs_volume *vol, uint64_t oid,
  * copy, not a live pointer into the read buffer) -- size/mode/links/
  * timestamps/generation, everything a `stat`-style caller needs. Read-
  * only, takes no lock beyond whatever a single tree lookup needs. */
+/* stat used to do its OWN descent, bypassing the inode cache entirely -- which
+ * is why the cache reported 0 hits against 15 misses while `stat` was the most
+ * frequent metadata call in the system. It answers the same question the cache
+ * exists for, so it asks the cache. */
 int embkfs_stat_object(struct embkfs_volume *vol, uint64_t oid,
                        struct embk_inode_item *out)
 {
-    static uint8_t probe[4096];
     if (!vol || !out) return -EMBK_EINVAL;
-
-    const struct embk_item_header *ii =
-        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
-    if (!ii) return -EMBK_ENOENT;
-    const struct embk_inode_item *ino = embk_item_data(probe, vol->block_size, ii, sizeof *ino);
-    if (!ino) return -EMBK_EINVAL;
-
-    *out = *ino;
-    return EMBK_OK;
+    return embkfs_inode_cached(vol, oid, out);
 }
 
 int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,
@@ -5129,14 +5290,14 @@ int embkfs_rmdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
     return embkfs_rmdir(vol, parent, leaf);
 }
 
-static int embkfs_rename_name_impl(struct embkfs_volume *vol,
+int embkfs_rename_name(struct embkfs_volume *vol,
                        uint64_t old_dir_oid, const char *old_name,
                        uint64_t new_dir_oid, const char *new_name)
 {
     return embkfs_rename(vol, old_dir_oid, old_name, new_dir_oid, new_name);
 }
 
-static int embkfs_rename_path_impl(struct embkfs_volume *vol, uint64_t start_dir_oid,
+int embkfs_rename_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                        const char *old_path, const char *new_path)
 {
     char old_leaf[256], new_leaf[256];
@@ -6436,7 +6597,7 @@ static int embkfs_run_timestamp_selftests_impl(void)
      * would make "did the parent's mtime advance" indistinguishable from
      * "did nothing happen" by timestamp alone. Same reasoning as the delay
      * before the write step further down. */
-    pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500);
+    timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500);
 
     rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstts/f", &file_oid);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: timestamps: create failed: %s\n", vol->dev->name, embk_strerror(rc)); return rc; }
@@ -6476,7 +6637,7 @@ static int embkfs_run_timestamp_selftests_impl(void)
 
     /* Wait out the RTC's own 1-second resolution, then write real content. */
     if (ok) {
-        pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500);
+        timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500);
         static const uint8_t data[] = { 'h', 'i' };
         rc = embkfs_write_object(vol, file_oid, data, sizeof data);
         if (rc != EMBK_OK) { kprintf("EMBKFS: %s: timestamps: write failed: %s\n", vol->dev->name, embk_strerror(rc)); ok = false; }
@@ -6775,7 +6936,7 @@ static int embkfs_run_selfheal_selftests_impl(void)
      * volume from an automated (non-interactive) test run. */
     struct embkfs_volume *scratch = kmalloc(sizeof *scratch);
     if (!scratch) { kfree(primary_snapshot); kfree(corrupted); return -EMBK_ENOMEM; }
-    rc = embkfs_mount(dev, scratch);
+    rc = embkfs_probe_superblock(dev, scratch);
     if (rc != EMBK_OK) {
         kprintf("EMBKFS: selfheal: FAIL remount after corrupting backup: %s\n", embk_strerror(rc));
         ok = false;
@@ -6799,7 +6960,7 @@ static int embkfs_run_selfheal_selftests_impl(void)
         struct embkfs_volume *scratch2 = kmalloc(sizeof *scratch2);
         if (!scratch2) { ok = false; }
         else {
-            rc = embkfs_mount(dev, scratch2);
+            rc = embkfs_probe_superblock(dev, scratch2);
             if (rc != EMBK_OK) {
                 kprintf("EMBKFS: selfheal: FAIL remount after repair: %s\n", embk_strerror(rc));
                 ok = false;
@@ -7166,7 +7327,7 @@ static int embkfs_run_verifyboot_selftests_impl(void)
         struct embkfs_volume *scratch = kmalloc(sizeof *scratch);
         if (!scratch) { ok = false; }
         else {
-            rc = embkfs_mount(dev, scratch);
+            rc = embkfs_probe_superblock(dev, scratch);
             if (rc != EMBK_OK) {
                 kprintf("EMBKFS: verifyboot: FAIL mount with a CORRECT hmac was refused: %s\n", embk_strerror(rc));
                 ok = false;
@@ -7189,7 +7350,7 @@ static int embkfs_run_verifyboot_selftests_impl(void)
         struct embkfs_volume *scratch = kmalloc(sizeof *scratch);
         if (!scratch) { ok = false; }
         else {
-            rc = embkfs_mount(dev, scratch);
+            rc = embkfs_probe_superblock(dev, scratch);
             if (rc == EMBK_OK) {
                 kprintf("EMBKFS: verifyboot: FAIL mount with a TAMPERED root was accepted\n");
                 ok = false;
@@ -7224,6 +7385,13 @@ static int embkfs_run_namespace_selftests_impl(void)
     int rc = EMBK_OK;
     bool ok = true;
     uint64_t oid = 0;
+    /* WHICH CHECK FAILED. This used to report "FAIL (rc=0)" and nothing else,
+     * which is close to the least useful thing a test can say: rc=0 means the
+     * step that failed SUCCEEDED at something, so the one number printed was
+     * the one number guaranteed not to explain it. Each check now names what
+     * it was checking, and the first failure is the one reported. */
+    const char *failed = NULL;
+#define NS_FAIL(why) do { if (!failed) failed = (why); ok = false; } while (0)
 
     static const uint8_t payload[] = { 'N', 'S', 'D', 'A', 'T', 'A' };
     char linkbuf[64];
@@ -7253,99 +7421,126 @@ static int embkfs_run_namespace_selftests_impl(void)
 
     /* Must reject moving a directory into its own subtree. */
     rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/a", "/tstns/a/sub/a");
-    if (rc != -EMBK_EINVAL) ok = false;
+    if (rc != -EMBK_EINVAL) NS_FAIL("moving a directory into its own subtree was not refused");
 
     /* Hard-linking a directory must be denied. */
     if (ok) {
         rc = embkfs_link_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/a", "/tstns/a_link");
-        if (rc != -EMBK_EPERM) ok = false;
+        if (rc != -EMBK_EPERM) NS_FAIL("hard-linking a directory was not refused");
     }
 
     rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f", &oid);
     if (rc == -EMBK_EEXIST) {
         rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f", &oid);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not find a file that said it already existed");
     } else if (rc != EMBK_OK) {
-        ok = false;
+        NS_FAIL("could not create /tstns/f");
     }
 
     if (ok) {
         rc = embkfs_write_object(vol, oid, payload, sizeof payload);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not write the payload");
     }
 
     /* Hardlink should preserve object and readability after original unlink. */
     if (ok) {
         rc = embkfs_link_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f", "/tstns/f2");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not hard-link a file");
     }
     if (ok) {
         rc = embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not unlink the original name");
     }
     if (ok) {
         uint64_t f2 = 0;
         rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f2", &f2);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("the second link vanished with the first");
         if (ok) {
             memset(rbuf, 0, sizeof rbuf);
             nread = 0;
             rc = embkfs_read_object(vol, f2, rbuf, sizeof rbuf, &nread);
-            if (rc != EMBK_OK || nread != sizeof payload || memcmp(rbuf, payload, sizeof payload) != 0) ok = false;
+            if (rc != EMBK_OK || nread != sizeof payload || memcmp(rbuf, payload, sizeof payload) != 0) {
+                kprintf("EMBKFS: ns: read through the surviving link: rc %d, %llu bytes (want %u)\n",
+                        rc, (unsigned long long)nread, (unsigned)sizeof payload);
+                NS_FAIL("the data did not survive unlinking the original name");
+            }
         }
     }
 
     /* Symlink create/readlink/rename roundtrip. */
     if (ok) {
         rc = embkfs_symlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l", "/tstns/f2", &oid);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not create a symlink");
     }
     if (ok) {
         memset(linkbuf, 0, sizeof linkbuf);
         l = 0;
         rc = embkfs_readlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l", linkbuf, sizeof linkbuf, &l);
-        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) ok = false;
+        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) NS_FAIL("readlink did not return the target it was given");
     }
     if (ok) {
         rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l", "/tstns/l2");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not rename a symlink");
     }
     if (ok) {
         memset(linkbuf, 0, sizeof linkbuf);
         l = 0;
         rc = embkfs_readlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l2", linkbuf, sizeof linkbuf, &l);
-        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) ok = false;
+        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) NS_FAIL("a renamed symlink lost its target");
     }
 
-    /* Replacement keeps the source object and bytes, removes its old name,
-     * and discards the destination in the same transaction. */
-    uint64_t rename_source = 0;
+    /* RENAME OVER AN EXISTING NAME REPLACES IT, ATOMICALLY.
+     *
+     * This check used to assert the opposite -- that the rename was REFUSED
+     * with EEXIST -- and it was written before EMBKFS v2.3 made atomic replace
+     * "the one real semantic addition" (docs/EMBKFS_spec_v2.3.md §1). git's
+     * lockfile protocol is built on renaming a temporary onto the real name,
+     * and `mv` means the same thing to every person who has ever typed it. The
+     * filesystem was right; this test had drifted, and reported only
+     * "FAIL (rc=0)" for it -- which is how it stayed wrong for so long.
+     *
+     * The replacement claim is stronger than the old refusal, and it is
+     * asserted in full: the old name is gone, the new name resolves to the
+     * SOURCE's object, and reading it gives the source's bytes -- not the
+     * destination's old ones. */
+    uint64_t x_oid = 0, y_old_oid = 0;
+    static const uint8_t xdata[] = { 'X', 'X' };
+    static const uint8_t ydata[] = { 'Y', 'Y', 'Y' };
     if (ok) {
-        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &rename_source);
-        if (rc == EMBK_OK)
-            rc = embkfs_write_object(vol, rename_source, payload, sizeof payload);
-        if (rc != EMBK_OK) ok = false;
+        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &x_oid);
+        if (rc == -EMBK_EEXIST) rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &x_oid);
+        if (rc != EMBK_OK) NS_FAIL("could not create /tstns/x");
+        if (ok && embkfs_write_object(vol, x_oid, xdata, sizeof xdata) != EMBK_OK)
+            NS_FAIL("could not write /tstns/x");
     }
     if (ok) {
-        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &oid);
-        if (rc != EMBK_OK && rc != -EMBK_EEXIST) ok = false;
+        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &y_old_oid);
+        if (rc == -EMBK_EEXIST) rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &y_old_oid);
+        if (rc != EMBK_OK) NS_FAIL("could not create /tstns/y");
+        if (ok && embkfs_write_object(vol, y_old_oid, ydata, sizeof ydata) != EMBK_OK)
+            NS_FAIL("could not write /tstns/y");
     }
     if (ok) {
         rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", "/tstns/y");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("rename onto an existing name did not replace it (v2.3 §1)");
     }
     if (ok) {
-        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &oid);
-        if (rc != -EMBK_ENOENT) ok = false;
-        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &oid);
-        if (rc != EMBK_OK || oid != rename_source) ok = false;
+        uint64_t gone = 0;
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &gone);
+        if (rc != -EMBK_ENOENT) NS_FAIL("the old name still resolves after a rename");
     }
     if (ok) {
-        memset(rbuf, 0, sizeof rbuf);
-        nread = 0;
-        rc = embkfs_read_object(vol, oid, rbuf, sizeof rbuf, &nread);
-        if (rc != EMBK_OK || nread != sizeof payload || memcmp(rbuf, payload, sizeof payload) != 0)
-            ok = false;
+        uint64_t now_y = 0;
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &now_y);
+        if (rc != EMBK_OK) NS_FAIL("the new name does not resolve after a rename");
+        else if (now_y != x_oid) NS_FAIL("the new name resolves to something other than the source object");
+        else {
+            memset(rbuf, 0, sizeof rbuf);
+            nread = 0;
+            rc = embkfs_read_object(vol, now_y, rbuf, sizeof rbuf, &nread);
+            if (rc != EMBK_OK || nread != sizeof xdata || memcmp(rbuf, xdata, sizeof xdata) != 0)
+                NS_FAIL("the replaced name reads the destination's OLD bytes, not the source's");
+        }
     }
 
     embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f");
@@ -7359,8 +7554,10 @@ static int embkfs_run_namespace_selftests_impl(void)
     embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/b");
     embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns");
 
+#undef NS_FAIL
     if (!ok) {
-        kprintf("EMBKFS: %s: namespace stress: FAIL (rc=%d)\n", vol->dev->name, rc);
+        kprintf("EMBKFS: %s: namespace stress: FAIL -- %s (rc=%d)\n",
+                vol->dev->name, failed ? failed : "(unnamed check)", rc);
         return (rc == EMBK_OK) ? -EMBK_EINVAL : rc;
     }
 
@@ -7491,7 +7688,7 @@ static bool embkfs_finish_mount(struct embkfs_volume *vol)
             vol->dev->name, (unsigned int)h->level,
             h->level == 0 ? "LEAF" : "internal", (unsigned int)h->nritems);
 
-    if (embkfs_alloc_init(vol) != EMBK_OK) return false;
+    embkfs_alloc_init(vol);
 
     int sweep_rc = embkfs_mount_orphan_sweep(vol);
     if (sweep_rc != EMBK_OK) {
@@ -7502,10 +7699,30 @@ static bool embkfs_finish_mount(struct embkfs_volume *vol)
     return true;
 }
 
+/*
+ * Mount: the superblock, then the root node, the allocator and the orphan
+ * sweep -- ONE call, and the volume it returns is usable. It used to be two
+ * (embkfs_mount then a static embkfs_finish_mount), and a caller that made
+ * only the first got a volume that reported free blocks and refused every
+ * allocation with ENOSPC; the crash-consistency test lost a round to exactly
+ * that. A mount that gets past the superblock and fails after it is EIO: the
+ * device is readable, the volume on it is not usable.
+ */
+int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
+{
+    int rc = embkfs_probe_superblock(dev, vol);
+    if (rc != EMBK_OK)
+        return rc;
+    if (!embkfs_finish_mount(vol))
+        return -EMBK_EIO;
+    return EMBK_OK;
+}
+
 void embkfs_init(void)
 {
     kprintf("\n=== EMBKFS init ===\n");
 
+    struct embk_block_device *boot_disk=embk_partition_boot_disk();
     g_embkfs_live = NULL;
     g_embkfs_volume_count = 0;
 
@@ -7522,7 +7739,6 @@ void embkfs_init(void)
      * main.c) -- so index 0 (the primary, aliased by g_embkfs_live) is
      * deterministically "whichever EMBKFS volume was found earliest in
      * boot", normally the internal disk. */
-    struct embk_block_device *boot_disk = embk_partition_boot_disk();
     for (uint32_t i = 0; i < embk_block_count() && g_embkfs_volume_count < EMBKFS_MAX_VOLUMES; i++) {
         struct embk_block_device *d = embk_block_get(i);
         /* Skip a whole disk that carries a partition table: its filesystems live
@@ -7532,13 +7748,9 @@ void embkfs_init(void)
          * bogus "primary superblock" by WRITING over the MBR / boot code. */
         if (embk_block_is_partitioned(d))
             continue;
-        if (boot_recovery_mode() &&
-            ((boot_disk && embk_partition_parent(d) != boot_disk) || g_embkfs_volume_count))
-            continue;
+        if(boot_recovery_mode() && ((boot_disk && embk_partition_parent(d)!=boot_disk) || g_embkfs_volume_count))continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
-            continue;
-        if (!embkfs_finish_mount(slot))
             continue;
         g_embkfs_volume_count++;
     }
@@ -7558,11 +7770,20 @@ void embkfs_init(void)
      * unchanged. Preserves the "slot 0 == primary" invariant below by SWAPPING
      * rather than repointing, so main.c's per-volume /sdX registration (which
      * treats index 0 as embk_live) needs no change. */
-    if (g_embkfs_volume_count > 1 && boot_disk) {
+    uint32_t boot_sig;
+    if (g_embkfs_volume_count > 1 && (boot_disk || bootinfo_boot_disk_sig(&boot_sig))) {
         for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
             struct embk_block_device *disk =
                 embk_partition_parent(g_embkfs_volumes[i].dev);
-            if (disk != boot_disk) continue;
+            uint8_t mbr[4096];
+            if (!disk || embk_block_read(disk, 0, 1, mbr) != EMBK_OK)
+                continue;
+            uint32_t sig =  (uint32_t)mbr[0x1B8]
+                         | ((uint32_t)mbr[0x1B9] << 8)
+                         | ((uint32_t)mbr[0x1BA] << 16)
+                         | ((uint32_t)mbr[0x1BB] << 24);
+            if (boot_disk?disk!=boot_disk:sig!=boot_sig)
+                continue;
             /* Every pointer in the struct targets the heap (bitmap / free_ext /
              * rcache bufs), never the struct itself, so a byte move keeps them
              * valid; nothing outside holds a &volume yet (vfs registration runs
@@ -7983,6 +8204,300 @@ int embkfs_run_timestamp_selftests(void)
     return rc;
 }
 
+/* ==========================================================================
+ * POWER LOSS, SIMULATED AT EVERY WRITE -- the crash-consistency test.
+ *
+ * EMBKFS is copy-on-write with a checksummed tree and a commit that is one
+ * superblock write: the claim is that the volume on disk is ALWAYS the state
+ * after some whole number of commits, never a state between two. That claim
+ * had never had power cut on it. This cuts it at every write.
+ *
+ * THE TARGET IS RAM. A block device backed by a kmalloc'd copy of the small
+ * tree image (embkfs_tree.img, attached as the third disk and read exactly
+ * once as the pristine seed). Every iteration restores the copy from the
+ * seed, so the disk is never written and no per-run image copy is needed.
+ * It also makes a sweep of ~150 remounts take milliseconds each.
+ *
+ * THE CUT. The device counts writes and, after the N-th, silently drops
+ * them -- it returns success and changes nothing, which is what the medium
+ * does when the power goes: the OS believes the write landed. Reads see the
+ * bytes that actually landed. A second sweep TEARS the cut write instead:
+ * its first 256 bytes land and the rest do not, the shape of a sector
+ * interrupted mid-transfer, which is what the checksums exist to catch.
+ *
+ * THE INVARIANT. The workload is 19 commits whose expected on-disk state
+ * after each prefix is known: mkdir, eight creates, eight writes with
+ * distinct content, a rename, an unlink. After a cut and a fresh mount from
+ * the surviving bytes, the directory is listed and every file read; that
+ * observation must EQUAL the expected state after some k in 0..19, byte for
+ * byte. A file that is present with the wrong length, a name that should
+ * not coexist with another, a node that fails its checksum on the walk --
+ * any of those is a state no sequence of commits produces, and a FAIL.
+ * Errors DURING the workload after the cut are expected and ignored: that is
+ * the system failing, and what matters is what a fresh mount sees.
+ * ========================================================================== */
+
+struct crash_ram {
+    uint8_t *data, *pristine;
+    uint64_t bytes;
+    uint64_t writes, cut, dropped, torn;
+    int      tear;               /* 0 = drop the cut write, 1 = tear it */
+};
+
+static int crash_ram_read(struct embk_block_device *dev, uint64_t lba, uint32_t count, void *buf) {
+    struct crash_ram *r = dev->driver_data;
+    uint64_t off = lba * dev->block_size, len = (uint64_t)count * dev->block_size;
+    if (off + len > r->bytes) return -EMBK_EINVAL;
+    memcpy(buf, r->data + off, len);
+    return EMBK_OK;
+}
+static int crash_ram_write(struct embk_block_device *dev, uint64_t lba, uint32_t count, const void *buf) {
+    struct crash_ram *r = dev->driver_data;
+    uint64_t off = lba * dev->block_size, len = (uint64_t)count * dev->block_size;
+    if (off + len > r->bytes) return -EMBK_EINVAL;
+    r->writes++;
+    if (r->cut && r->writes > r->cut) { r->dropped++; return EMBK_OK; }   /* power is gone */
+    if (r->cut && r->writes == r->cut && r->tear) {
+        memcpy(r->data + off, buf, len < 256 ? len : 256);                 /* torn sector */
+        r->torn++;
+        return EMBK_OK;
+    }
+    memcpy(r->data + off, buf, len);
+    return EMBK_OK;
+}
+static int crash_ram_flush(struct embk_block_device *dev) { (void)dev; return EMBK_OK; }
+
+/* The workload: 19 commits. Errors after the cut are expected. */
+#define CRASH_NFILES 8
+#define CRASH_NOPS   19
+static uint8_t crash_content_byte(int i) { return (uint8_t)(0x30 + i); }
+static uint32_t crash_content_len(int i)  { return (uint32_t)(64 * (i + 1)); }
+
+/* The first failure, if any, so a silent workload is not a mystery: the
+ * first version of this ignored every return code and reported "0 device
+ * writes" with nothing to say about why. Cleared per run. */
+static int         crash_first_rc;
+static const char *crash_first_op;
+#define CRASH_OP(what, call) do { int _rc = (call); \
+        if (_rc != EMBK_OK && !crash_first_op) { crash_first_op = (what); crash_first_rc = _rc; } } while (0)
+
+static void crash_workload(struct embkfs_volume *vol) {
+    uint64_t oid;
+    char path[32];
+    static uint8_t buf[64 * CRASH_NFILES];
+    crash_first_op = 0; crash_first_rc = 0;
+    CRASH_OP("mkdir /crash", embkfs_mkdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash", &oid));
+    for (int i = 0; i < CRASH_NFILES; i++) {
+        snprintf(path, sizeof path, "/crash/f%d", i);
+        CRASH_OP("create", embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, path, &oid));
+    }
+    for (int i = 0; i < CRASH_NFILES; i++) {
+        snprintf(path, sizeof path, "/crash/f%d", i);
+        if (embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, path, &oid) != EMBK_OK) continue;
+        memset(buf, crash_content_byte(i), crash_content_len(i));
+        CRASH_OP("write", embkfs_write_object(vol, oid, buf, crash_content_len(i)));
+    }
+    CRASH_OP("rename", embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash/f3", "/crash/g3"));
+    CRASH_OP("unlink", embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash/f5"));
+}
+
+/* What the directory must contain after exactly k commits. Returns the
+ * number of entries; fills names and lengths. -1 = no directory at all. */
+struct crash_expect { char name[8]; uint32_t len; };
+static int crash_expected(int k, struct crash_expect *e) {
+    if (k < 1) return -1;
+    int n = 0;
+    for (int i = 0; i < CRASH_NFILES; i++) {
+        if (k < 2 + i) continue;                        /* not created yet */
+        if (i == 5 && k >= 19) continue;                /* unlinked          */
+        snprintf(e[n].name, sizeof e[n].name, (i == 3 && k >= 18) ? "g%d" : "f%d", i);
+        e[n].len = (k >= 10 + i) ? crash_content_len(i) : 0;
+        n++;
+    }
+    return n;
+}
+
+/* Observe: list /crash and read every entry. Any read/checksum failure is an
+ * inconsistency in itself. */
+struct crash_seen { char name[8]; uint32_t len; uint8_t byte; int bad; };
+struct crash_obs  { struct crash_seen s[CRASH_NFILES + 2]; int n; int overflow; struct embkfs_volume *vol; };
+static int crash_list_cb(uint64_t oid, uint8_t type, const char *name, uint8_t name_len, void *ctx) {
+    struct crash_obs *o = ctx;
+    (void)type;
+    if (o->n >= (int)(sizeof o->s / sizeof o->s[0])) { o->overflow = 1; return EMBK_OK; }
+    struct crash_seen *x = &o->s[o->n++];
+    memset(x, 0, sizeof *x);
+    size_t l = name_len < 7 ? name_len : 7;
+    memcpy(x->name, name, l); x->name[l] = 0;
+    static uint8_t rb[64 * CRASH_NFILES + 64];
+    uint64_t got = 0;
+    int rc = embkfs_read_object(o->vol, oid, rb, sizeof rb, &got);
+    if (rc != EMBK_OK) { x->bad = 1; return EMBK_OK; }
+    x->len = (uint32_t)got;
+    if (got) {
+        x->byte = rb[0];
+        for (uint64_t i = 1; i < got; i++) if (rb[i] != rb[0]) { x->bad = 1; break; }
+    }
+    return EMBK_OK;
+}
+
+/* Which k, if any, the observation equals. -2 = none (INCONSISTENT). */
+static int crash_match(struct embkfs_volume *vol, int *mount_ok) {
+    struct crash_obs o; memset(&o, 0, sizeof o); o.vol = vol;
+    uint64_t dir;
+    int rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash", &dir);
+    if (rc == -EMBK_ENOENT) return 0;                    /* state k=0: no dir */
+    if (rc != EMBK_OK) { *mount_ok = 0; return -2; }
+    if (embkfs_list_dir(vol, dir, crash_list_cb, &o) != EMBK_OK || o.overflow) return -2;
+    for (int i = 0; i < o.n; i++) if (o.s[i].bad) return -2;
+
+    for (int k = 1; k <= CRASH_NOPS; k++) {
+        struct crash_expect e[CRASH_NFILES];
+        int n = crash_expected(k, e);
+        if (n != o.n) continue;
+        int all = 1;
+        for (int i = 0; i < n && all; i++) {
+            int found = 0;
+            for (int j = 0; j < o.n; j++) {
+                if (strcmp(e[i].name, o.s[j].name) != 0) continue;
+                found = 1;
+                if (o.s[j].len != e[i].len) all = 0;
+                else if (e[i].len && o.s[j].byte != crash_content_byte(e[i].name[1] - '0')) all = 0;
+                break;
+            }
+            if (!found) all = 0;
+        }
+        if (all) return k;
+    }
+    return -2;
+}
+
+static int embkfs_run_crash_selftests_impl(struct embk_block_device *seed)
+{
+    if (!seed) return -EMBK_ENODEV;
+    uint64_t bytes = seed->block_count * seed->block_size;
+    if (bytes == 0 || bytes > (32u << 20)) {
+        kprintf("EMBKFS: crash: seed device is %llu bytes; want a small image (<= 32 MiB)\n",
+                (unsigned long long)bytes);
+        return -EMBK_EINVAL;
+    }
+
+    struct crash_ram *r = kmalloc(sizeof *r);
+    struct embkfs_volume *vol = kmalloc(sizeof *vol);
+    uint8_t *data = kmalloc(bytes), *pristine = kmalloc(bytes);
+    if (!r || !vol || !data || !pristine) { kfree(r); kfree(vol); kfree(data); kfree(pristine); return -EMBK_ENOMEM; }
+    memset(r, 0, sizeof *r);
+    r->data = data; r->pristine = pristine; r->bytes = bytes;
+
+    /* The pristine seed, read once, in chunks the driver can DMA. */
+    for (uint64_t lba = 0; lba < seed->block_count; lba += 64) {
+        uint32_t n = (uint32_t)((seed->block_count - lba) < 64 ? (seed->block_count - lba) : 64);
+        if (seed->read(seed, lba, n, pristine + lba * seed->block_size) != EMBK_OK) {
+            kprintf("EMBKFS: crash: could not read the seed image at lba %llu\n", (unsigned long long)lba);
+            kfree(r); kfree(vol); kfree(data); kfree(pristine); return -EMBK_EIO;
+        }
+    }
+
+    struct embk_block_device dev;
+    memset(&dev, 0, sizeof dev);
+    snprintf(dev.name, sizeof dev.name, "crashram");
+    dev.block_count = seed->block_count; dev.block_size = seed->block_size;
+    dev.read = crash_ram_read; dev.write = crash_ram_write; dev.flush = crash_ram_flush;
+    dev.driver_data = r; dev.dma_max_phys = UINT64_MAX; dev.needs_kernel_range = false;
+
+    kprintf("\n[embkfs crash] %llu KiB image in RAM; %d commits per run\n",
+            (unsigned long long)(bytes >> 10), CRASH_NOPS);
+
+    /* 0. No cut: count the writes, and prove the verifier sees the full state. */
+    memcpy(data, pristine, bytes);
+    memset(vol, 0, sizeof *vol);
+    r->writes = 0; r->cut = 0;
+    /* MOUNT IS TWO CALLS. embkfs_mount() reads the superblock and finds the
+     * root; embkfs_finish_mount() verifies the root node, BUILDS THE
+     * ALLOCATOR, and sweeps orphans. A volume that has only been through the
+     * first has an empty free index and refuses every allocation with ENOSPC
+     * -- which is what the first version of this test found on a fresh 4 MiB
+     * format with 1018 free blocks, and mistook for a size bug. The boot path
+     * has always done both; so does every mount here. */
+    if (embkfs_mount(&dev, vol) != EMBK_OK) { kprintf("  [FAIL] the seed image does not mount\n"); goto fail; }
+    kprintf("  mounted: read_only=%d generation=%llu free_blocks=%llu block_size=%u\n",
+            (int)vol->read_only, (unsigned long long)vol->generation,
+            (unsigned long long)vol->free_blocks, (unsigned)vol->block_size);
+    crash_workload(vol);
+    if (crash_first_op)
+        kprintf("  first failing op in the UNCUT run: %s -> %d (%s)\n",
+                crash_first_op, crash_first_rc, embk_strerror(crash_first_rc));
+    uint64_t total_writes = r->writes;
+    memset(vol, 0, sizeof *vol);
+    int mok = 1, k0 = -2;
+    if (embkfs_mount(&dev, vol) == EMBK_OK) k0 = crash_match(vol, &mok);
+    kprintf("  [%s] uncut: %llu device writes, remount sees the state after all %d commits (k=%d)\n",
+            k0 == CRASH_NOPS ? "ok" : "FAIL", (unsigned long long)total_writes, CRASH_NOPS, k0);
+    if (k0 != CRASH_NOPS) goto fail;
+
+    int fails = 0;
+    for (int tear = 0; tear <= 1; tear++) {
+        int hist[CRASH_NOPS + 1]; memset(hist, 0, sizeof hist);
+        int inconsistent = 0, unmountable = 0, backup = 0, first_bad = -1;
+        for (uint64_t cut = 1; cut <= total_writes; cut++) {
+            memcpy(data, pristine, bytes);
+            memset(vol, 0, sizeof *vol);
+            r->writes = 0; r->cut = cut; r->tear = tear; r->dropped = 0; r->torn = 0;
+            if (embkfs_mount(&dev, vol) != EMBK_OK) { unmountable++; continue; }
+            r->writes = 0;                           /* the cut counts WORKLOAD writes, not mount's */
+            crash_workload(vol);
+
+            /* The power is off. Everything the FS believed is gone with it;
+             * only the bytes in `data` survive. */
+            memset(vol, 0, sizeof *vol);
+            r->cut = 0;                              /* the remount's own writes (none expected) land */
+            uint64_t w_before = r->writes;
+            /* The remount after the crash: superblock, root, allocator, and the
+             * orphan sweep -- whose writes are RECOVERY and are counted below
+             * as self-heal, not hidden. */
+            if (embkfs_mount(&dev, vol) != EMBK_OK) {
+                unmountable++;
+                if (first_bad < 0) first_bad = (int)cut;
+                continue;
+            }
+            if (vol->generation) { /* the mount log says "using newer backup superblock" when it happened */ }
+            int m_ok = 1;
+            int k = crash_match(vol, &m_ok);
+            if (k < 0) { inconsistent++; if (first_bad < 0) first_bad = (int)cut; }
+            else hist[k]++;
+            if (r->writes != w_before) backup++;     /* the mount repaired something */
+        }
+        kprintf("  --- %s the cut write, cut at each of %llu writes ---\n",
+                tear ? "TEARING" : "DROPPING", (unsigned long long)total_writes);
+        kprintf("      recovered to k = ");
+        for (int k = 0; k <= CRASH_NOPS; k++) if (hist[k]) kprintf("%d:%d ", k, hist[k]);
+        kprintf("\n");
+        kprintf("  [%s] every surviving state is the state after some whole number of commits "
+                "(%d inconsistent, %d unmountable%s%s)\n",
+                (inconsistent == 0 && unmountable == 0) ? "ok" : "FAIL",
+                inconsistent, unmountable,
+                first_bad >= 0 ? " -- first bad cut at write " : "",
+                first_bad >= 0 ? "" : "");
+        if (first_bad >= 0) kprintf("      first bad cut: write #%d\n", first_bad);
+        if (backup) kprintf("      (%d mount(s) wrote to the device while recovering -- self-heal)\n", backup);
+        if (inconsistent || unmountable) fails++;
+    }
+
+    kfree(r); kfree(vol); kfree(data); kfree(pristine);
+    return fails ? -EMBK_EINVAL : EMBK_OK;
+fail:
+    kfree(r); kfree(vol); kfree(data); kfree(pristine);
+    return -EMBK_EINVAL;
+}
+
+int embkfs_run_crash_selftests(struct embk_block_device *seed)
+{
+    embkfs_lock();
+    int rc = embkfs_run_crash_selftests_impl(seed);
+    embkfs_unlock();
+    return rc;
+}
+
 int embkfs_run_multivol_selftests(void)
 {
     embkfs_lock();
@@ -8043,28 +8558,6 @@ int embkfs_run_namespace_selftests(void)
 {
     embkfs_lock();
     int rc = embkfs_run_namespace_selftests_impl();
-    embkfs_unlock();
-    return rc;
-}
-
-/* Rename uses shared probe buffers and commits a new tree root. Protect the
- * whole operation, including both path resolutions, against readers as well
- * as writers. The VFS bridge delegates here without taking its own lock. */
-int embkfs_rename_name(struct embkfs_volume *vol,
-                       uint64_t old_dir_oid, const char *old_name,
-                       uint64_t new_dir_oid, const char *new_name)
-{
-    embkfs_lock();
-    int rc = embkfs_rename_name_impl(vol, old_dir_oid, old_name, new_dir_oid, new_name);
-    embkfs_unlock();
-    return rc;
-}
-
-int embkfs_rename_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
-                       const char *old_path, const char *new_path)
-{
-    embkfs_lock();
-    int rc = embkfs_rename_path_impl(vol, start_dir_oid, old_path, new_path);
     embkfs_unlock();
     return rc;
 }

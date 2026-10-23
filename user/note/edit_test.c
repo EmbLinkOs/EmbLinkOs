@@ -223,6 +223,79 @@ int main(void) {
       r = ed_wrap_line("", 0, 10, b, 16);
       ok(r == 1, "an empty line is still one row"); }
 
+    /* --- REDO, which for a long time could not replay anything you typed ---
+     *
+     * The undo pool stored the REMOVED bytes and nothing else, so ed_redo
+     * returned 0 for any change that added text: type, undo, redo -> the redo
+     * did nothing and said nothing. Undo's own tests all passed, because undo
+     * was never the broken half. */
+    start("");
+    ed_insert_text(&E, "hello", 5);
+    ok(textis("hello"), "redo: text is typed");
+    ok(ed_undo(&E) && textis(""), "redo: undo takes it away");
+    ok(ed_can_redo(&E), "redo: ...and redo is offered");
+    ok(ed_redo(&E) && textis("hello"), "redo: REDO PUTS IT BACK");
+    ok(E.cursor == 5, "redo: and leaves the caret after what it replayed");
+
+    /* A replace -- both halves at once, which is the case that needs the two
+     * stored runs to be kept apart. */
+    start("one two");
+    E.cursor = 0; E.anchor = 3;                 /* select "one" */
+    ed_insert_text(&E, "ONE", 3);
+    ok(textis("ONE two"), "redo: a selection is replaced");
+    ok(ed_undo(&E) && textis("one two"), "redo: undo restores the replaced text");
+    ok(ed_redo(&E) && textis("ONE two"), "redo: redo re-applies the replacement");
+
+    /* A pure delete still redoes -- the one case that used to work, kept
+     * honest so a fix for the others cannot quietly break it. */
+    start("abcdef");
+    E.cursor = 0; E.anchor = 3;
+    ed_delete_sel(&E);
+    ok(textis("def"), "redo: a deletion happens");
+    ok(ed_undo(&E) && textis("abcdef"), "redo: undo restores it");
+    ok(ed_redo(&E) && textis("def"), "redo: and redo deletes again");
+
+    /* Coalesced typing redoes as ONE step, all of it. The merge appends to the
+     * previous record, and if the stored text is not appended with it, redo
+     * replays only the first character. */
+    start("");
+    ed_insert_char(&E, 'a'); ed_insert_char(&E, 'b'); ed_insert_char(&E, 'c');
+    ok(textis("abc"), "redo: three characters typed");
+    ok(ed_undo(&E) && textis(""), "redo: one undo removes all three");
+    ok(ed_redo(&E) && textis("abc"), "redo: one redo brings ALL THREE back");
+
+    /* Redo is discarded by a new edit, which is what makes undo a history and
+     * not a toggle. */
+    start("x");
+    ed_insert_char(&E, 'y');
+    ed_undo(&E);
+    ed_insert_char(&E, 'z');
+    ok(!ed_can_redo(&E), "redo: a new edit after an undo drops the redo branch");
+
+    /* --- the history survives being unbound ---
+     *
+     * The multi-document editor re-binds one engine per tab switch, and
+     * ed_init clears the arena -- so a history that lived only in the engine
+     * was thrown away every time you looked at another file, silently, and the
+     * first Ctrl+Z after coming back did nothing. */
+    {
+        static struct ed_undo_state SAVED;
+        start("");
+        ed_insert_text(&E, "kept", 4);
+        ok(textis("kept") && ed_can_undo(&E), "history: an edit is made and undoable");
+        ed_undo_save(&E, &SAVED);
+
+        /* Whatever a tab switch does to the engine, it starts with ed_init. */
+        ed_init(&E, BUF, sizeof BUF);
+        ed_set_text(&E, "kept");
+        ok(!ed_can_undo(&E), "history: re-binding the engine clears its arena");
+
+        ed_undo_load(&E, &SAVED);
+        ok(ed_can_undo(&E), "history: ...and loading the document's own brings it back");
+        ok(ed_undo(&E) && textis(""), "history: the restored undo actually undoes");
+        ok(ed_redo(&E) && textis("kept"), "history: and redo still works through it");
+    }
+
     printf("=== edit_test: %s (%d failure%s) ===\n",
            g_fail ? "FAILED" : "OK", g_fail, g_fail == 1 ? "" : "s");
     return g_fail != 0;

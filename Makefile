@@ -1,4 +1,9 @@
+# -w+orphan-labels: NASM treats an unrecognised bare word as a LABEL, so a
+# mistyped mnemonic assembles to nothing and the code falls through to
+# whatever follows. `sysretq` (not a NASM mnemonic; the spelling is
+# `o64 sysret`) did exactly that, and the fall-through double-faulted.
 ASM       = nasm
+ASMFLAGS  = -w+orphan-labels
 ASM_FLAGS = -f bin
 # --- host portability -------------------------------------------------------
 # This repo is developed on Linux and on macOS (Apple Silicon), and the two
@@ -9,6 +14,10 @@ ASM_FLAGS = -f bin
 #   truncate: GNU coreutils only, and `-s %1M` (round UP to a multiple) is a
 #             GNU extension on top of that. python3 is already required, does
 #             it in one line, and behaves identically on both.
+#   qemu display: Linux has gtk, macOS has cocoa and NOT gtk -- see
+#             $(QEMU_DISPLAY) and the FB_W/FB_H note below, where that choice
+#             also decides whether the guest has to cap its own scanout.
+UNAME_S := $(shell uname -s)
 STATSZ := $(shell stat -c%s Makefile >/dev/null 2>&1 && echo 'stat -c%s' || echo 'stat -f%z')
 # Round $(1) up to a whole number of MB, never down -- see the boot image rule.
 PADMB = python3 -c "import os,sys;p=sys.argv[1];m=1<<20;s=os.path.getsize(p);n=max(m,-(-s//m)*m);f=open(p,'r+b');f.truncate(n);f.close()"
@@ -20,17 +29,50 @@ CC = x86_64-elf-gcc
 # including file itself lives -- the standard approach and what keeps a move
 # like this one from being fragile.
 # Dev VM display size. FB_W/FB_H both (a) hint the virtio-vga host mode and
-# (b) hard-cap the guest virtio-gpu scanout, so the QEMU window can't open
-# bigger than this even when -display gtk ignores the xres/yres hint. virtio-gpu
-# is VM-only, so real hardware (UEFI GOP / bochs / VBE) is unaffected. Override
-# per build: `make FB_W=640 FB_H=480` (then re-run run-embkfs-cow).
+# (b) hard-cap the guest virtio-gpu scanout. virtio-gpu is VM-only, so real
+# hardware (UEFI GOP / bochs / VBE) is unaffected. Override per build:
+# `make FB_W=640 FB_H=480` (then re-run run-embkfs-cow).
+#
+# WHY THE DEFAULT DIFFERS BY HOST. The small default is a GTK workaround, not a
+# taste: -display gtk reports the WINDOW/MONITOR geometry to virtio-gpu and
+# ignores the -device virtio-vga xres/yres hint (commit c207ee1), so under gtk
+# the guest cap is the only thing that decides the resolution -- and it had to
+# be small or the window opened huge. macOS has no gtk at all; -display cocoa
+# HONOURS the hint, so the window is whatever we ask for and the cap is merely
+# redundant at the same value. That is why the Mac gets the roomier default the
+# tree wanted before the workaround, and then some.
+#
+# WHY THE MAC NUMBER IS BIG. -display cocoa with zoom-to-fit=off draws one guest
+# pixel per PHYSICAL pixel, and Mac laptop panels are Retina -- so on a 3024x1964
+# display a 1280x800 guest fills only ~640x400 points and looks half-size. The
+# guest resolution has to roughly double to LOOK normal. 1920x1200 is the chosen
+# middle: visibly bigger, and 2.25x the pixels of 1280x800 rather than the 4x a
+# full 2560x1600 would cost -- and pixels are exactly what cross-arch TCG is slow
+# at. If it feels sluggish, drop it; that is the cheapest speedup available:
+#     make FB_W=1280 FB_H=800 run-embkfs-cow      # or 800x600
+#
+# Keep both columns honest: this is a per-HOST default, not a per-host feature.
+# Either number works on either machine -- a Linux dev who wants the bigger
+# desktop can `make FB_W=1920 FB_H=1200` and gtk will honour it through the cap.
+ifeq ($(UNAME_S),Darwin)
+FB_W ?= 1920
+FB_H ?= 1200
+else
 FB_W ?= 800
 FB_H ?= 600
+endif
 
+# -std=gnu11 is pinned, not incidental. GCC 14+ defaults to gnu23, where `bool`,
+# `true` and `false` are keywords -- which makes kernel/include/types.h's
+# `typedef _Bool bool;` a hard error. Pinning the language keeps the build
+# identical across host toolchains (Linux's older gcc vs. Homebrew's gcc 16 on
+# macOS) instead of tracking whatever the newest compiler defaults to. gnu11,
+# not c11: the kernel uses GNU extensions.
 CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-         -mcmodel=kernel \
-         -Ikernel -Ithird_party/uacpi/include -DUACPI_USE_BUILTIN_STRING \
+         -mcmodel=kernel -std=gnu11 \
+         -fstack-protector-strong -mstack-protector-guard=global \
+         -Ikernel \
          -Iuser/lib/tls/crypto \
          -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
          -g -O0
@@ -40,6 +82,32 @@ DISK = disk.img
 # All intermediate build artifacts (assembled .o, the AP trampoline .bin) land
 # here, out of the source tree.
 BUILD = build
+
+# FB_W/FB_H reach the kernel as COMPILE-TIME defines (-DEMBK_VGPU_CAP_*), but
+# $(KERNEL_ELF)'s prerequisites are source files only -- so `make FB_W=640` would
+# rebuild nothing and silently boot the OLD cap, contradicting the "override per
+# build" note where those are defined. Stamp the pair into a file whose mtime
+# moves only when the values actually change, and hang the kernel off it.
+# Evaluated at parse time so the stamp is already correct before any rule runs.
+FB_STAMP := $(BUILD)/.fb_cap
+$(shell mkdir -p $(BUILD); \
+        want='$(FB_W)x$(FB_H)'; \
+        [ -f '$(BUILD)/.fb_cap' ] && [ "$$(cat '$(BUILD)/.fb_cap')" = "$$want" ] \
+          || printf '%s' "$$want" > '$(BUILD)/.fb_cap')
+
+# --- target architecture -----------------------------------------------------
+# ARCH selects the TARGET architecture, not the build host (that is $(UNAME_S)
+# above, and the two are independent -- an x86 kernel is cross-compiled on an
+# Apple Silicon Mac every day here).
+#
+# x86_64 is the default and stays the default: with ARCH unset, NOTHING below
+# behaves differently than it did before this line existed, and `make` on a
+# Linux box produces the same bytes it always has. That is docs/ARM64.md §2.9,
+# and it is a rule, not an aspiration.
+#
+# The second architecture is carried in a per-arch FRAGMENT, included at the
+# bottom of this file -- see the include and its note there. docs/ARM64.md §6.4.
+ARCH ?= x86_64
 
 # Userland rules appear before `all`, so pin the default goal explicitly.
 .DEFAULT_GOAL := all
@@ -67,14 +135,6 @@ AP_TRAMPOLINE_BLOB_ASM = kernel/arch/x86_64/smp/ap_trampoline_blob.asm
 AP_TRAMPOLINE_BLOB_OBJ = $(BUILD)/ap_trampoline_blob.o
 
 KERNEL_SRC = kernel/main.c \
-             kernel/ipc/notify.c \
-             kernel/power/policy.c \
-             kernel/power/cpu.c \
-             kernel/drivers/video/intel_display.c \
-             kernel/process/session.c \
-             kernel/block/install.c \
-             kernel/block/install_protocol.c \
-             kernel/fs/embkfs/check.c \
              kernel/selftests.c \
              kernel/arch/x86_64/irq/isr.c \
              kernel/arch/x86_64/irq/pic.c \
@@ -84,36 +144,63 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/irq/lapic.c \
              kernel/arch/x86_64/cpu/gdt.c \
              kernel/arch/x86_64/cpu/percpu.c \
+             kernel/arch/x86_64/cpu/arch_thread.c \
+             kernel/arch/x86_64/cpu/kcontext.c \
+             kernel/arch/x86_64/drivers/pci_arch.c \
              kernel/arch/x86_64/cpu/fpu.c \
+             kernel/arch/x86_64/cpu/cpu_features.c \
              kernel/arch/x86_64/cpu/spinlock.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
              kernel/arch/x86_64/boot/boot_protocol.c \
              kernel/arch/x86_64/boot/fw_cfg.c \
+             kernel/block/install.c kernel/block/install_protocol.c kernel/fs/embkfs/check.c \
              kernel/arch/x86_64/syscall/syscall.c \
+             kernel/arch/x86_64/syscall/syscall_fast.c \
+             kernel/syscall/syscalls.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
-             kernel/arch/x86_64/syscall/elf.c \
-             kernel/arch/x86_64/syscall/embx.c \
+             kernel/loader/elf.c \
+             kernel/loader/embx.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
              kernel/process/debug.c \
 			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
-             kernel/acpi/host.c \
-             kernel/acpi/ec.c \
-             kernel/drivers/platform/ec_protocol.c \
-             kernel/drivers/i2c/designware.c \
-             kernel/drivers/i2c/designware_protocol.c \
-             kernel/drivers/i2c/hid_protocol.c \
-             kernel/drivers/i2c/hid_i2c.c \
-             kernel/drivers/input/hid_report.c \
-             kernel/acpi/runtime.c \
-             kernel/acpi/power.c \
-             $(wildcard third_party/uacpi/source/*.c) \
+             kernel/acpi/aml.c \
+             kernel/acpi/acpi_dev.c \
+             kernel/acpi/hotplug.c \
+             kernel/acpi/erst.c \
              kernel/drivers/char/serial.c \
+             kernel/drivers/char/virtio_rng.c \
+             kernel/drivers/char/virtio_console.c \
+             kernel/drivers/misc/virtio_balloon.c \
+             kernel/drivers/misc/virtio_mem.c \
+             kernel/drivers/storage/sdhci.c \
+             kernel/drivers/storage/atapi.c \
+             kernel/drivers/storage/megasas.c \
+             kernel/drivers/storage/pvscsi.c \
+             kernel/drivers/storage/mptsas.c \
+             kernel/drivers/storage/esp.c \
+             kernel/drivers/storage/lsi53c895a.c \
+             kernel/drivers/storage/ufs.c \
+             kernel/drivers/storage/virtio_pmem.c \
+             kernel/drivers/storage/nvdimm.c \
+             kernel/drivers/crypto/virtio_crypto.c \
+             kernel/drivers/iommu/virtio_iommu.c \
+             kernel/drivers/iommu/intel_iommu.c \
+             kernel/drivers/iommu/amd_iommu.c \
+             kernel/drivers/tpm/tpm.c \
+             kernel/fs/iso9660.c \
+             kernel/drivers/char/platform_misc.c \
+             kernel/drivers/i2c/smbus.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
+             kernel/drivers/video/intel_display.c \
+             kernel/acpi/display.c kernel/acpi/power.c \
+             kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
+             kernel/drivers/i2c/designware.c kernel/drivers/i2c/designware_protocol.c \
+             kernel/drivers/i2c/hid_i2c.c kernel/drivers/i2c/hid_protocol.c kernel/drivers/input/hid_report.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
              kernel/drivers/audio/ac97.c \
@@ -121,6 +208,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/audio/audio.c \
              kernel/drivers/video/font_8x16.c \
              kernel/drivers/video/console.c \
+             kernel/drivers/video/rawcon.c \
              kernel/drivers/video/bootanim.c \
              kernel/drivers/timer/timer.c \
              kernel/drivers/timer/hpet.c \
@@ -128,35 +216,12 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
+             kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \
+             kernel/drivers/bus/virtio_pci.c \
              kernel/net/net.c \
-             kernel/net/virtio_net.c \
-             kernel/net/pci_net.c \
-             kernel/net/ethernet/eth.c \
-             kernel/net/ethernet/arp.c \
-             kernel/net/ip/ipv4.c \
-             kernel/net/ip/icmp.c \
-             kernel/net/udp/udp.c \
-             kernel/net/dhcp/dhcp.c \
-             kernel/net/dns/dns.c \
-             kernel/net/tcp/tcp.c \
-             kernel/drivers/usb/usb.c \
-             kernel/drivers/usb/usb_core.c \
-             kernel/drivers/usb/xhci.c \
-             kernel/drivers/usb/ehci.c \
-             kernel/drivers/usb/uhci.c \
-             kernel/drivers/usb/ohci.c \
-             kernel/drivers/storage/ata.c \
-             kernel/drivers/storage/ahci.c \
-             kernel/drivers/storage/nvme.c \
-             kernel/block/block.c \
-             kernel/block/partition.c \
-             kernel/mm/pmm.c \
-             kernel/mm/vmm.c \
-             kernel/mm/kheap.c \
-             kernel/mm/kmalloc.c \
-             kernel/crypto/sha256.c \
              kernel/crypto/sha1.c \
+             kernel/crypto/hw_random.c \
              kernel/net/wifi/wpa2_crypto.c \
              kernel/net/wifi/wpa2.c \
              kernel/net/wifi/ccmp.c \
@@ -165,9 +230,53 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/wifi/ax200.c \
              kernel/net/wifi/profile.c \
              kernel/net/wifi/control.c \
-             kernel/acpi/display.c \
              kernel/net/wifi/wifi.c \
-             kernel/crypto/hw_random.c \
+             kernel/net/virtio_net.c \
+             kernel/net/e1000.c \
+             kernel/net/igb.c \
+             kernel/net/i8255x.c \
+             kernel/net/rtl8139.c \
+             kernel/net/usb_net.c \
+             kernel/net/ethernet/eth.c \
+             kernel/net/ethernet/arp.c \
+             kernel/net/ip/ipv4.c \
+             kernel/net/ip/icmp.c \
+             kernel/net/udp/udp.c \
+             kernel/net/dhcp/dhcp.c \
+             kernel/net/dns/dns.c \
+             kernel/net/ntp/ntp.c \
+             kernel/net/tcp/tcp.c \
+             kernel/drivers/usb/usb.c \
+             kernel/drivers/usb/usb_core.c \
+             kernel/drivers/usb/usb_uas.c \
+             kernel/drivers/usb/xhci.c \
+             kernel/drivers/usb/ehci.c \
+             kernel/drivers/usb/uhci.c \
+             kernel/drivers/usb/ohci.c \
+             kernel/drivers/storage/ata.c \
+             kernel/drivers/storage/ahci.c \
+             kernel/drivers/storage/nvme.c \
+             kernel/drivers/storage/virtio_scsi.c \
+             kernel/drivers/storage/nvmetest.c \
+             kernel/block/block.c \
+             kernel/block/scsi.c \
+             kernel/block/partition.c \
+             kernel/mm/pmm.c \
+             kernel/mm/uaccess_guard.c \
+             kernel/mm/vma.c \
+             kernel/mm/vm_object.c \
+             kernel/process/futex.c \
+             kernel/process/sched.c \
+             kernel/process/sched_rr.c \
+             kernel/process/sched_deadline.c \
+             kernel/power/power.c \
+             kernel/arch/x86_64/power/power_x86.c \
+             kernel/mm/ipi.c \
+             kernel/arch/x86_64/irq/ipi.c \
+             kernel/arch/x86_64/mm/vmm.c \
+             kernel/mm/kheap.c \
+             kernel/mm/kmalloc.c \
+             kernel/crypto/sha256.c \
              kernel/crypto/hmac.c \
              kernel/crypto/pbkdf2.c \
              kernel/crypto/aes.c \
@@ -183,6 +292,10 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
              kernel/fs/vfs.c \
+             kernel/fs/automount.c \
+             kernel/fs/ninep.c \
+             kernel/module/module.c \
+             kernel/module/exports.c \
              kernel/fs/namespace.c \
              kernel/fs/epfs.c \
              kernel/ipc/handle.c \
@@ -195,7 +308,14 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/compositor.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
+             kernel/lib/random.c \
+             kernel/lib/canary.c \
+             kernel/mm/swap.c \
+             kernel/mm/swaptest.c \
+             kernel/loader/pietest.c \
              kernel/lib/ksym.c \
+             kernel/lib/klog.c \
+             kernel/lib/crashlog.c \
              kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld
@@ -214,6 +334,8 @@ KERNEL_ELF  = kernel/kernel.elf
 # sections; PT_LOAD offsets and e_entry are untouched, so load_elf parses it
 # identically. Keep kernel.elf (with symbols) for gdb + the .embdbg producer.
 STRIP       = x86_64-elf-strip
+# The UEFI loader is an x86_64 PE whatever ARCH the rest of the build targets.
+UEFI_OBJCOPY ?= $(shell python3 tools/find_efi_objcopy.py)
 KERNEL_BIN  = kernel/kernel.strip.elf
 
 # The kernel's own .embdbg panic-symbol sidecar (EMBDBG_Specification.md §7),
@@ -223,36 +345,101 @@ KERNEL_BIN  = kernel/kernel.strip.elf
 # present the build still proceeds (an empty file -> symbolizer disabled, the
 # panic dump falls back to hex, exactly as before).
 EMBDBG      ?= $(HOME)/EmbCC/embdbg
+# WHICH readelf embdbg SHOULDS SHELL OUT TO for the line table. It decodes the
+# DWARF with binutils rather than parsing DWARF 5 itself, and a host that
+# cross-compiles need not have a NATIVE readelf at all -- macOS ships none, and
+# the one installed for this target is named for it. Without this the tool does
+# not fail: it emits functions and ZERO line rows, so a panic names a function
+# and never a line, with nothing to say why.
+EMBDBG_READELF ?= x86_64-elf-readelf
 build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
 	@if [ -x "$(EMBDBG)" ]; then \
-	   echo "  EMBDBG   $@"; $(EMBDBG) $< emit-kernel $@; \
+	   echo "  EMBDBG   $@"; READELF=$(EMBDBG_READELF) $(EMBDBG) $< emit-kernel $@; \
 	 else echo "  (embdbg tool absent -> no kernel panic symbols)"; : > $@; fi
 
 
 # ---- Userland ---------------------------------------------------------------
 # Layout: user/lib/ is the shared userland library -- the EmbLink SDK (embk.h,
 # embk_syscall.h), the newlib retargeting layer (crt0.c, syscalls.c), and the
-# linker scripts. user/bin/ holds the actual programs. Built artifacts (.o,
-# .elf) go to $(BUILD), out of the source tree. -Iuser/lib lets a program in
-# user/bin include the SDK as "embk.h". See user/README.md.
-USER_CC      = x86_64-elf-gcc
-ASM_GAS      = x86_64-elf-as   # GNU as for the dynstubs (.set/.weak)
-USER_LD      = x86_64-elf-ld
-USER_INC     = -Iuser/lib
+# linker scripts. Other user/<topic>/ directories are shared component
+# libraries several programs draw on (user/web's decoders are used by both the
+# browser and the photo viewer, for instance).
+#
+# THE PROGRAMS live one per directory under four category folders, and the
+# CATEGORY IS THE CLASSIFICATION -- there is no second list anywhere saying
+# what a thing is:
+#
+#   user/apps/<name>/      applications with a user interface
+#   user/system/<name>/    what makes the machine boot and log in
+#   user/tools/<name>/     command-line programs
+#   user/tests/<name>/     witnesses the kernel's self-tests spawn
+#   user/examples/<name>/  reference programs the toolkit guide points at
+#
+# A program's directory holds everything that belongs to it: the source, its
+# declared namespace (.ns), its capability manifest (.caps), its launcher entry
+# (.app), its build manifest (.build.ebm). They were all in one flat user/bin/
+# before -- 107 files, five kinds, no way to tell an application from a test
+# fixture without grepping the Makefile.
+#
+# Built artifacts (.o, .elf) go to $(BUILD), out of the source tree.
+# -Iuser/lib lets any program include the SDK as "embk.h". See user/README.md.
+
+# The ONE place that turns a program's NAME into its source path. Everything
+# that builds a program by name -- this file's generated rules and the aarch64
+# fragment's -- goes through it, so a program can be moved between categories
+# by moving its directory and nothing else.
+USER_PROG_DIRS := user/apps user/system user/tools user/tests user/examples
+USER_PROG_SRCS := $(wildcard $(addsuffix /*/*.c,$(USER_PROG_DIRS)))
+USER_SRC        = $(firstword $(foreach d,$(USER_PROG_DIRS),$(wildcard $(d)/$(1)/$(1).c)))
+#
+# THE USERLAND IS BUILT FOR $(ARCH), like the kernel. Everything below derives
+# from $(USER_TRIPLE) rather than naming x86_64-elf, because user/lib is ONE
+# implementation for both machines: embk_syscall.h has an `svc #0` branch beside
+# the `int $0x80` one, crt0.c has an aarch64 _start and variant-I TLS beside the
+# x86 ones, and nothing else in user/ knows which machine it is on.
+# docs/ARM64.md phase A6.
+#
+# The x86 flag lists are written out IN FULL per architecture rather than
+# assembled from a shared part plus an arch part. That is deliberate: -mno-sse
+# and -fno-stack-protector are interleaved in the x86 list, so factoring the
+# common flags out would REORDER them, and `make -n` would stop being
+# byte-identical to what it produced before this change. §2.9 says the x86 build
+# must not be taxed by the second architecture; a diff in every compile line is
+# a tax, even when the flags mean the same thing.
+ifeq ($(ARCH),aarch64)
+USER_TRIPLE  = aarch64-elf
+# No -mno-red-zone: the AAPCS has no red zone, so there is nothing below SP for
+# an interrupt to clobber. No -mno-sse/-mno-mmx: those are x86 spellings, and
+# the aarch64 equivalent (-mgeneral-regs-only) is deliberately NOT used here --
+# the kernel is built with it so a stray FP instruction faults loudly, but USER
+# code must be allowed FP, because a stock compiler emits `str q0` to copy a
+# 16-byte struct. CPACR_EL1.FPEN is opened for EL0 at A5 for exactly this.
+USER_CFLAGS  = -MMD -MP -MF $@.d -ffreestanding -nostdlib -fno-pic \
+               -fno-stack-protector -O2 $(USER_INC)
+else
+USER_TRIPLE  = x86_64-elf
 # Freestanding programs (init.elf, primtest.elf): own _start, no libc, no SSE.
 USER_CFLAGS  = -MMD -MP -MF $@.d -ffreestanding -nostdlib -fno-pic -mno-red-zone \
                -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2 $(USER_INC)
+endif
+
+USER_CC      = $(USER_TRIPLE)-gcc
+ASM_GAS      = $(USER_TRIPLE)-as   # GNU as for the dynstubs (.set/.weak)
+USER_LD      = $(USER_TRIPLE)-ld
+USER_INC     = -Iuser/lib
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
-build/init.o: user/bin/init.c | $(BUILD)
+# Authentication is the default. UI tests select explicit live mode through
+# EmbBoot or QEMU's opt/emblink/live file, without changing the init binary.
+build/init.o: user/system/init/init.c user/lib/session_policy.h | $(BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 build/init.elf: build/init.o user/lib/user.ld
 	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
 
 # The native-primitive self-test (formerly init.elf); `test ring3 threads`.
-build/primtest.o: user/bin/primtest.c | $(BUILD)
+build/primtest.o: user/tests/primtest/primtest.c | $(BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 build/primtest.elf: build/primtest.o user/lib/user.ld
@@ -270,7 +457,15 @@ build/primtest.elf: build/primtest.o user/lib/user.ld
 # long-long into this user-owned prefix; pointing -L/-isystem here uses that
 # fuller libc.a instead. Set NEWLIB_PREFIX= (empty) to fall back to the stock
 # toolchain newlib (and re-lose %z/%ll). See user/README.md.
+#
+# Per TARGET architecture: the two libcs are built from the SAME source by the
+# SAME script (tools/newlib/build-newlib-emblink.sh) with the same options, and
+# they live in separate prefixes because they are separate machine code.
+ifeq ($(ARCH),aarch64)
+NEWLIB_PREFIX ?= $(HOME)/cross/newlib-aarch64-c99
+else
 NEWLIB_PREFIX ?= $(HOME)/cross/newlib-c99
+endif
 
 # Let scripts ask the Makefile where newlib is, so NEWLIB_PREFIX stays the ONE
 # source of truth and tools/tcc/build-tcc-emblink.sh cannot drift from the build.
@@ -308,6 +503,7 @@ check-tools:
 	echo; echo "OPTIONAL -- language ports (absent => that port is simply skipped, no error):"; \
 	if [ -x "$(USER_CXX)" ]; then printf '  [ ok ]  C++\n'; else printf '  [ -- ]  C++    (CXX_PREFIX=$(CXX_PREFIX))\n'; fi; \
 	if [ -x "$(EMBCC_ROOT)/embcc" ] && [ -x "$(EMBCC_ROOT)/embld" ]; then printf '  [ ok ]  EmbCC\n'; else printf '  [ -- ]  EmbCC  (EMBCC_ROOT=$(EMBCC_ROOT))\n'; fi; \
+	if [ -n "$(HAVE_QJS)" ]; then printf '  [ ok ]  QuickJS\n'; else printf '  [ -- ]  QuickJS (source absent: $(QJS_SRC)) -- vellum builds, without JS\n'; fi; \
 	for pair in "Python:$(PY_SRC)" "git:$(GIT_SRC)" "tcc:$(TCC_SRC)"; do \
 	  n=$${pair%%:*}; p=$${pair#*:}; \
 	  if [ -e "$$p" ]; then printf '  [ ok ]  %s\n' "$$n"; else printf '  [ -- ]  %-6s (source absent: %s)\n' "$$n" "$$p"; fi; \
@@ -315,8 +511,12 @@ check-tools:
 	echo; \
 	if [ $$miss -gt 0 ]; then echo "==> $$miss REQUIRED item(s) MISSING -- see docs/BUILD_SETUP.md, then re-run: make check-tools"; exit 1; \
 	else echo "==> all required tools present.  Build + boot:  make && make run-embkfs"; fi
-NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
-NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
+	@echo; echo "SECOND TARGET -- aarch64 (docs/ARM64.md, phase A0: boots to a serial console):"; \
+	if command -v aarch64-elf-gcc >/dev/null 2>&1; then \
+	  printf '  [ ok ]  aarch64-elf-gcc   -- make ARCH=aarch64 && make ARCH=aarch64 run-arm64\n'; \
+	else printf '  [ -- ]  aarch64-elf-gcc  (absent => the x86 build is unaffected; brew install aarch64-elf-gcc)\n'; fi
+NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include,)
+NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/$(USER_TRIPLE)/lib,)
 # -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
 # in depth against uninitialized-read UB -- and the concrete fix for a git-over-
 # HTTPS heisenbug where libtls's ECDSA verify (user/lib/tls/crypto/ecdsa.c) read
@@ -332,12 +532,123 @@ NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 # out flex containers wrongly on the metal and correctly on the host, because
 # the host harness does not link jsdom at all. Nothing about that symptom
 # points at a Makefile.
+ifeq ($(ARCH),aarch64)
+NEWLIB_CFLAGS = -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+else
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+endif
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
 # rebuilt libc.a wins over the stock one.
-NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld $(NEWLIB_LIB)
+#
+# -z max-page-size=0x1000 on aarch64: ld's aarch64 emulation defaults to a 64KB
+# max page, so it aligns each LOAD segment -- and pads the FILE -- to 64KB. This
+# kernel is 4KB-granule only (ARM64.md §5), so the padding buys nothing and
+# costs 60KB in every binary on an image we care about the size of. The x86 side
+# does not need the flag: its default is already 4KB.
+#
+# -L user/lib is NOT a library path here, it is where ld looks for the INCLUDEd
+# newlib-body.ld: a linker script's INCLUDE is searched in the current directory
+# and the -L paths, and NOT in the directory of the script doing the including.
+# Anything that links with -T .../newlib.ld from another working directory (the
+# tcc, CPython, git and NetSurf port scripts all do) needs the same -L.
+ifeq ($(ARCH),aarch64)
+NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld -L user/lib \
+                 -Wl,-z,max-page-size=0x1000 $(NEWLIB_LIB)
+else
+NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld -L user/lib $(NEWLIB_LIB)
+endif
+
+# Every rule that links with a script depends on BOTH files -- editing the
+# shared body must relink, and a prerequisite list naming only the wrapper would
+# not notice.
+NEWLIB_LDSCRIPT     = user/lib/newlib.ld user/lib/newlib-body.ld
+NEWLIB_PIE_LDSCRIPT = user/lib/newlib-pie.ld user/lib/newlib-body.ld
+
+# --- POSITION-INDEPENDENT userland --------------------------------------------
+# The same programs, linked ET_DYN, loaded at a per-process random bias by
+# kernel/loader/elf.c. Two things have to be true for that to work and they are
+# both here:
+#
+#   1. -fPIC EVERYWHERE, libc included. A PIE cannot contain an absolute
+#      relocation into text (R_X86_64_32), and the stock newlib is full of them
+#      -- 73,166 in the x86 libc.a this tree used to link. So there is a SECOND
+#      newlib prefix built with CFLAGS_FOR_TARGET="-O2 -fPIC"
+#      (tools/newlib/build-newlib-emblink.sh --pic), and PIE apps link that one.
+#      The non-PIC prefix stays exactly where it was; nothing that works today
+#      changes toolchain.
+#
+#   2. -pie and newlib-pie.ld, which is newlib.ld linked at 0 with a PT_DYNAMIC
+#      so the loader can find .rela.dyn.
+#
+# If the PIC newlib is not installed, PIE_OK is empty and every PIE target falls
+# back to the fixed-address link -- the tree still builds and boots, it just
+# does not randomise app text. `make pie-check` says which you have.
+ifeq ($(ARCH),aarch64)
+NEWLIB_PIC_PREFIX ?= $(HOME)/cross/newlib-aarch64-pic
+else
+NEWLIB_PIC_PREFIX ?= $(HOME)/cross/newlib-pic
+endif
+PIE_OK := $(if $(wildcard $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib/libc.a),yes,)
+
+NEWLIB_PIC_INC = -isystem $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/include
+NEWLIB_PIC_LIB = -L $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib
+
+# -fPIC on every object of a PIE app, and the PIC libc's headers so a PIE app
+# cannot half-link against the other newlib's.
+NEWLIB_PIE_CFLAGS = $(filter-out $(NEWLIB_INC),$(NEWLIB_CFLAGS)) $(NEWLIB_PIC_INC) -fPIC
+
+ifeq ($(ARCH),aarch64)
+NEWLIB_PIE_LDFLAGS = -nostartfiles -pie -T user/lib/newlib-pie.ld -L user/lib \
+                     -Wl,-z,max-page-size=0x1000 $(NEWLIB_PIC_LIB)
+else
+NEWLIB_PIE_LDFLAGS = -nostartfiles -pie -T user/lib/newlib-pie.ld -L user/lib $(NEWLIB_PIC_LIB)
+endif
+# --hash-style=sysv: DT_HASH is the one hash table the kernel's loader reads.
+# --no-dynamic-linker: there is no ld.so; the kernel is the loader.
+NEWLIB_PIE_WL = -Wl,--no-dynamic-linker -Wl,--hash-style=sysv
+
+# ONE RULE PAIR for a single-source newlib console program -- compile and link,
+# position-independent when a PIC libc is available and at the fixed 0x400000
+# when it is not. Used by the programs that CAN be PIE today: one .c, crt0 and
+# the syscall stubs, and no third-party library. (The ones that cannot are the
+# ones with a non-PIC dependency -- zlib, the TLS objects, QuickJS, the shell
+# SDK, the out-of-tree ports; see docs/TODO.md.)
+#
+# A DEFINE, not two rules per program, because the two link modes must stay the
+# same program. Written out per app, the PIE line is the one somebody forgets to
+# update, and the failure is silent: the app keeps building, at a fixed address,
+# with nothing to say it stopped moving.
+define NEWLIB_SIMPLE_PROG
+ifeq ($$(PIE_OK),)
+build/$(1).o: $$(call USER_SRC,$(1)) | $$(BUILD)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) -c $$< -o $$@
+build/$(1).elf: build/$(1).o build/crt0.o build/syscalls.o $$(NEWLIB_LDSCRIPT)
+	$$(USER_CC) $$(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/$(1).o -lc -lgcc -o $$@
+else
+build/$(1).o: $$(call USER_SRC,$(1)) | $$(BUILD)
+	$$(USER_CC) $$(NEWLIB_PIE_CFLAGS) -c $$< -o $$@
+build/$(1).elf: build/$(1).o build/crt0_pic.o build/syscalls_pic.o $$(NEWLIB_PIE_LDSCRIPT)
+	$$(USER_CC) $$(NEWLIB_PIE_LDFLAGS) $$(NEWLIB_PIE_WL) \
+	    build/crt0_pic.o build/syscalls_pic.o build/$(1).o -lc -lgcc -o $$@
+	@t=$$$$($$(USER_TRIPLE)-readelf -h $$@ | awk '/Type:/{print $$$$2}'); \
+	 if [ "$$$$t" != "DYN" ]; then echo "$(1).elf is $$$$t, not DYN -- PIE_OK is set but it did not link PIE"; exit 1; fi
+endif
+endef
+
+# The programs built this way. Adding a name here makes it a PIE; it must have
+# exactly one source file and no non-PIC dependency.
+NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher
+
+.PHONY: pie-check
+pie-check:
+	@if [ -n "$(PIE_OK)" ]; then \
+	  echo "PIE userland: ON  (PIC newlib at $(NEWLIB_PIC_PREFIX))"; \
+	else \
+	  echo "PIE userland: off (no $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib/libc.a)"; \
+	  echo "  build it:  tools/newlib/build-newlib-emblink.sh --pic"; \
+	fi
 
 # --- C++ (optional toolchain) -------------------------------------------------
 # The stock /usr/local/cross gcc is `--enable-languages=c` only, so there is no
@@ -368,18 +679,18 @@ cxx-check:
 	fi
 .PHONY: cxx-check
 
-# cxxdemo.elf -- the first C++ program (user/bin/cxxdemo.cc). A .cc extension,
-# so the user/bin/*.c EmUI auto-discovery leaves it alone. Statically linked
+# cxxdemo.elf -- the first C++ program (user/tests/cxxdemo/cxxdemo.cc). A .cc extension,
+# so the user/apps/*/*.c EmUI auto-discovery leaves it alone. Statically linked
 # like shell.elf; the g++ driver pulls in libstdc++/libsupc++ (which
 # function-local statics need for __cxa_guard_acquire). CXX_APPS is EMPTY when
 # no C++ toolchain is installed, so the whole tree still builds without one.
 ifeq ($(HAVE_CXX),yes)
 CXX_APPS = build/cxxdemo.elf
 
-build/cxxdemo.o: user/bin/cxxdemo.cc | $(BUILD)
+build/cxxdemo.o: user/tests/cxxdemo/cxxdemo.cc | $(BUILD)
 	$(USER_CXX) $(CXXFLAGS_EMBK) -c $< -o $@
 
-build/cxxdemo.elf: build/cxxdemo.o build/crt0.o build/syscalls.o user/lib/newlib.ld
+build/cxxdemo.elf: build/cxxdemo.o build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
 	$(USER_CXX) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/cxxdemo.o \
 	    -lstdc++ -lsupc++ -lc -lgcc -o $@
 else
@@ -406,6 +717,9 @@ HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
 GIT_SRC  ?= $(HOME)/cross/git-2.49.1
 GIT_BIN  ?= $(GIT_SRC)/git
 ZLIB_BUILD ?= $(HOME)/cross/build-zlib
+# tools/zlib/build-zlib-emblink.sh installs <outdir>/include/*.h and
+# <outdir>/lib/libz.a -- the archive is under lib/, not at the top level.
+ZLIB_A ?= $(ZLIB_BUILD)/lib/libz.a
 GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
 
 # TCC -- a C compiler that RUNS ON the OS. Chosen because it is compiler +
@@ -510,36 +824,54 @@ build/emlink_dynstubs.o: user/lib/emlink_dynstubs.s | $(BUILD)
 build/libtcc1.o: $(TCC_SRC)/lib/libtcc1.c | $(BUILD)
 	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $< -o $@
 
-build/hello.o: user/bin/hello.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+# hello.elf, posixdemo.elf, ioracer.elf and crasher.elf are built by
+# NEWLIB_SIMPLE_PROG above -- one source file each, so each is a PIE when a PIC
+# libc is present. hello.o's dependency on embk.h is recovered by -MMD.
+$(foreach p,$(NEWLIB_SIMPLE_PROGS),$(eval $(call NEWLIB_SIMPLE_PROG,$(p))))
 
-build/hello.elf: build/crt0.o build/syscalls.o build/hello.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/hello.o -lc -lgcc -o $@
+# --- the PIE witness ----------------------------------------------------------
+# crt0 and the syscall stubs, compiled -fPIC, for linking into a PIE. Separate
+# objects rather than making the originals PIC: -fPIC costs a GOT indirection on
+# every global in code that runs before main in EVERY program, and the fixed-
+# address apps have no use for it.
+build/crt0_pic.o: user/lib/crt0.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+
+build/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+
+build/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+
+# The ONE genuinely position-independent executable in the tree, and the thing
+# `test pie` spawns twice to prove app text moves. Gated on the PIC newlib: with
+# no PIC libc there is no honest way to link a PIE, so the target simply does
+# not exist and `test pie` says why rather than a build failing for everyone who
+# has not built the second newlib.
+ifneq ($(PIE_OK),)
+build/pieprobe.elf: build/crt0_pic.o build/syscalls_pic.o build/pieprobe.o $(NEWLIB_PIE_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_PIE_LDFLAGS) $(NEWLIB_PIE_WL) \
+	    build/crt0_pic.o build/syscalls_pic.o build/pieprobe.o -lc -lgcc -o $@
+	@t=$$($(USER_TRIPLE)-readelf -h $@ | awk '/Type:/{print $$2}'); \
+	 if [ "$$t" != "DYN" ]; then echo "pieprobe.elf is $$t, not DYN -- not a PIE"; exit 1; fi
+endif
 
 # posixdemo.elf -- ring-3 self-check for the POSIX layer in user/lib/syscalls.c
 # (dirent/clocks/cwd + the honest refusals). `test posix` spawns it. Plain C, so
 # unlike cxxdemo it needs no toolchain gate. mkfs auto-discovers build/*.elf.
-build/posixdemo.o: user/bin/posixdemo.c | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
-build/posixdemo.elf: build/crt0.o build/syscalls.o build/posixdemo.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/posixdemo.o -lc -lgcc -o $@
 
 # ioracer.elf -- contends for the block layer's shared DMA bounce buffer and
 # verifies it got its OWN file's bytes back. Static-newlib console program like
 # posixdemo (no UI), spawned N-up by `test blockrace`.
-build/ioracer.o: user/bin/ioracer.c | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
-build/ioracer.elf: build/crt0.o build/syscalls.o build/ioracer.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/ioracer.o -lc -lgcc -o $@
 
 # capchild / capspawn -- the ring-1 capability-attenuation test pair. Static
 # newlib console programs (no UI). capspawn is spawned by `test spawncaps` with
 # a limited cap set and drives the rest across the spawn syscall.
-build/capchild.o: user/bin/capchild.c user/lib/embk.h | $(BUILD)
+build/capchild.o: user/tests/capchild/capchild.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/capchild.elf: build/crt0.o build/syscalls.o build/capchild.o user/lib/newlib.ld
+build/capchild.elf: build/crt0.o build/syscalls.o build/capchild.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capchild.o -lc -lgcc -o $@
 
 # capchild.embx -- the ring-2 fixture: capchild repackaged as an EMBX APP with a
@@ -553,31 +885,28 @@ build/capchild.embx: build/capchild.elf tools/embx/mkembx.py | $(BUILD)
 # deliberately faults from ring 3; `test faultkill` spawns it and proves the
 # kernel terminates only the process (isr_handler EMBDBG spec §6.6), not the
 # machine. Auto-discovered by mkfs into /data/apps/crasher/crasher.elf.
-build/crasher.o: user/bin/crasher.c | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/crasher.elf: build/crt0.o build/syscalls.o build/crasher.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/crasher.o -lc -lgcc -o $@
+
 
 # httpget -- the M4 ring-3 networking witness. Static newlib; resolves + connects
 # + GETs over the BSD-sockets shim (embk_socket.h -> native socket syscalls).
 # `test netuser` spawns it with/without CAP_NETWORK. Auto-discovered by mkfs.
-build/httpget.o: user/bin/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+build/httpget.o: user/tests/httpget/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o user/lib/newlib.ld
+build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpget.o -lc -lgcc -o $@
 
 # sockdemo -- proves the POSIX BSD-sockets shim (uses real <sys/socket.h>/<netdb.h>,
 # not the native embk_socket.h). The path Python's _socket / git take. Auto-packed.
-build/sockdemo.o: user/bin/sockdemo.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+build/sockdemo.o: user/tests/sockdemo/sockdemo.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/sockdemo.elf: build/crt0.o build/syscalls.o build/sockdemo.o user/lib/newlib.ld
+build/sockdemo.elf: build/crt0.o build/syscalls.o build/sockdemo.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/sockdemo.o -lc -lgcc -o $@
 
 # nbsock -- the non-blocking socket witness (fcntl O_NONBLOCK + EINPROGRESS
-# connect + select + EAGAIN recv). See user/bin/nbsock.c.
-build/nbsock.o: user/bin/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+# connect + select + EAGAIN recv). See user/tests/nbsock/nbsock.c.
+build/nbsock.o: user/tests/nbsock/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o user/lib/newlib.ld
+build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nbsock.o -lc -lgcc -o $@
 
 # Vellum -- the browser (docs/BROWSER.md). user/web/ = the engine: html (the
@@ -602,7 +931,8 @@ QJS_SRC ?= $(HOME)/cross/quickjs-2024-01-13
 QJS_OBJS := build/qjs/quickjs.o build/qjs/libregexp.o build/qjs/libunicode.o \
             build/qjs/cutils.o build/qjs/libbf.o
 QJS_CFLAGS := -D_GNU_SOURCE -DCONFIG_VERSION='"2024-01-13"' -DCONFIG_BIGNUM \
-              -DCONFIG_NO_ATOMICS -DCONFIG_NO_TM_GMTOFF -I$(QJS_SRC)
+              -DCONFIG_NO_ATOMICS -DCONFIG_NO_TM_GMTOFF -DCONFIG_MALLOC_H \
+              -I$(QJS_SRC)
 HAVE_QJS := $(if $(wildcard $(QJS_SRC)/quickjs.c),1,)
 
 build/qjs:
@@ -611,10 +941,10 @@ build/qjs:
 build/qjs/%.o: $(QJS_SRC)/%.c | build/qjs
 	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Wno-array-bounds $(QJS_CFLAGS) -c $< -o $@
 
-build/qjs/js.o: user/bin/js.c $(QJS_SRC)/quickjs.h | build/qjs
+build/qjs/js.o: user/apps/js/js.c $(QJS_SRC)/quickjs.h | build/qjs
 	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 $(QJS_CFLAGS) -c $< -o $@
 
-build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) user/lib/newlib.ld
+build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/qjs/js.o \
 	    $(QJS_OBJS) -lc -lm -lgcc -o $@
 
@@ -626,10 +956,10 @@ build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUIL
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
 build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h user/web/css/css.h user/web/imgcache.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
-build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
+build/vellum.o: user/apps/vellum/vellum.c user/web/html.h user/web/style.h user/web/render.h \
                 user/web/url.h user/web/net.h user/web/fetchjob.h user/web/css/css.h \
                 user/web/jsdom.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css $(if $(HAVE_QJS),-DHAVE_JSDOM,) -c $< -o $@
 # B2: url.c is pure string work; net.c reaches the network, so it needs the TLS
 # include set (same as wget) for tls.h.
 build/web_url.o: user/web/url.c user/web/url.h user/web/html.h | $(BUILD)
@@ -657,7 +987,7 @@ build/web_fetchjob.o: user/web/fetchjob.c user/web/fetchjob.h user/web/net.h | $
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 # B7 bindings: the DOM as JavaScript sees it. Only built with QuickJS present.
 build/web_jsdom.o: user/web/jsdom.c user/web/jsdom.h user/web/html.h | build/qjs
-	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Iuser/web -Iuser/web/css $(QJS_CFLAGS) -c $< -o $@
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Iuser/web -Iuser/web/css -DHAVE_JSDOM $(QJS_CFLAGS) -c $< -o $@
 # B6: PNG over our own DEFLATE, and the cache that fetches a page's pictures.
 build/web_png.o: user/web/png.c user/web/png.h user/lib/inflate.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
@@ -727,17 +1057,17 @@ build/httpd_mime.o: user/httpd/mime.c user/httpd/mime.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
 build/httpd_serve.o: user/httpd/serve.c user/httpd/serve.h user/httpd/http.h user/httpd/mime.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
-build/httpd.o: user/bin/httpd.c user/httpd/http.h user/httpd/serve.h user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+build/httpd.o: user/tools/httpd/httpd.c user/httpd/http.h user/httpd/serve.h user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
 HTTPD_OBJS := build/httpd.o build/httpd_http.o build/httpd_mime.o build/httpd_serve.o
-build/httpd.elf: build/crt0.o build/syscalls.o $(HTTPD_OBJS) user/lib/newlib.ld
+build/httpd.elf: build/crt0.o build/syscalls.o $(HTTPD_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(HTTPD_OBJS) -lc -lgcc -o $@
 
 # udptest -- the M5 ring-3 UDP witness: a userspace DNS resolver over a
 # SOCK_DGRAM socket (sendto/recvfrom). Auto-discovered by mkfs.
-build/udptest.o: user/bin/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+build/udptest.o: user/tests/udptest/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o user/lib/newlib.ld
+build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/udptest.o -lc -lgcc -o $@
 
 # libtls (docs/TLS.md): the TLS 1.3 client, built FOR USERSPACE. Reuses the
@@ -784,7 +1114,7 @@ build/nsemblink.elf: $(wildcard ports/netsurf/frontend/*.c) $(wildcard ports/net
 	cp -f $(NS_TREE)/netsurf/nsemblink-x86_64-elf build/nsemblink.debug
 	$(STRIP) -o $@ build/nsemblink.debug
 
-build/nsprobe.elf: build/crt0.o build/syscalls.o build/nsprobe.o build/ns_iconv.o user/lib/newlib.ld
+build/nsprobe.elf: build/crt0.o build/syscalls.o build/nsprobe.o build/ns_iconv.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nsprobe.o \
 	    build/ns_iconv.o $(NS_LIBS) -lc -lgcc -o $@
 
@@ -797,14 +1127,25 @@ iconv-test:
 
 # beep: the first program to use the audio syscalls, and the first user of
 # EMBK_CAP_AUDIO. Plain newlib link -- sound needs no toolkit.
-build/beep.o: user/bin/beep.c user/lib/embk.h | $(BUILD)
+# THE INSTALLER. The first and only program that holds EMBK_CAP_RAWDISK, which
+# capabilities.h reserved long before anything could use it. It reaches below
+# the filesystem to a disk with no filesystem on it yet -- which is what
+# installing an operating system is, and why the capability is separate from
+# FILESYSTEM rather than implied by it.
+build/install.o: user/tools/install/install.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/beep.elf: build/crt0.o build/syscalls.o build/beep.o user/lib/newlib.ld
+
+build/install.elf: build/crt0.o build/syscalls.o build/install.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/install.o -lc -lgcc -o $@
+
+build/beep.o: user/tools/beep/beep.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/beep.elf: build/crt0.o build/syscalls.o build/beep.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/beep.o -lc -lgcc -o $@
 
-build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+build/wget.o: user/tools/wget/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
-build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
 # gitclone -- our own git-over-HTTPS (git can't fork/exec its transport here).
@@ -823,18 +1164,18 @@ build/git_repo.o: user/git/repo.c user/git/repo.h user/git/pack.h user/git/sha1.
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
 build/git_push.o: user/git/push.c user/git/push.h user/git/pack.h user/git/sha1.h user/git/pktline.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
-build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
+build/gitclone.o: user/tools/gitclone/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_repo.o
-build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
 # gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
-build/gitpush.o: user/bin/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
+build/gitpush.o: user/tools/gitpush/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITPUSH_OBJS := build/gitpush.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_push.o
-build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
 # pkg -- the package manager (docs/PACKAGING_AND_SDK.md, PK1). Verifies an EMBX's
 # build_id (SHA-256 via tls_sha256.o; -Ikernel for crypto/sha256.h) against its
@@ -844,31 +1185,31 @@ build/pkg_manifest.o: user/pkg/manifest.c user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -c $< -o $@
 build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
-build/pkg.o: user/bin/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
+build/pkg.o: user/tools/pkg/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
 # pkg verifies the manifest signature with ECDSA P-256 (tls_ecdsa + tls_bignum).
 PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
             build/tls_sha256.o build/tls_ecdsa.o build/tls_bignum.o
-build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) user/lib/newlib.ld
+build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKG_OBJS) -lc -lgcc -o $@
 
 # pkgbuild -- generate a package bundle ON THE DEVICE (PK2b). embxgen is the C
 # EMBX writer (byte-identical to mkembx.py); sha256 via tls_sha256.o (-Ikernel).
 build/pkg_embxgen.o: user/pkg/embxgen.c user/pkg/embxgen.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
-build/pkgbuild.o: user/bin/pkgbuild.c user/pkg/embxgen.h user/pkg/manifest.h | $(BUILD)
+build/pkgbuild.o: user/tools/pkgbuild/pkgbuild.c user/pkg/embxgen.h user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -c $< -o $@
 PKGBUILD_OBJS := build/pkgbuild.o build/pkg_embxgen.o build/pkg_manifest.o build/tls_sha256.o
-build/pkgbuild.elf: build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) user/lib/newlib.ld
+build/pkgbuild.elf: build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) -lc -lgcc -o $@
 
 # pkgprobe -- the PK1 confinement test app, bundled as an EMBX + a manifest that
 # grants {filesystem} + ro /system + rw /data/apps/pkgprobe. mkembx repackages
 # the ELF into an EMBX; mkpkg derives the manifest from that EMBX (build_id/caps
 # consistent by construction). The bundle is STAGED (mkfs), pkg adopts it live.
-build/pkgprobe.o: user/bin/pkgprobe.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
-build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o user/lib/newlib.ld
+build/pkgprobe.o: user/tests/pkgprobe/pkgprobe.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgprobe.o -lc -lgcc -o $@
 # PK2: ONE spec (user/pkg/pkgprobe.pkgspec) -> all three views via pkggen, the
 # SDK generator -- the caps, the .ns and the manifest are consistent by
@@ -889,12 +1230,12 @@ build/pk_wide/pkgprobe.pkg: build/pkgprobe.elf user/pkg/pkgprobe_wide.pkgspec $(
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
 build/pkg_inflate.o: user/lib/inflate.c user/lib/inflate.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/pkg_unzip.o: user/lib/unzip.c user/lib/unzip.h user/lib/inflate.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
-build/pkgfetch.o: user/bin/pkgfetch.c user/lib/embk_socket.h user/lib/tls/tls.h user/lib/unzip.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/pkgfetch.o: user/tools/pkgfetch/pkgfetch.c user/lib/embk_socket.h user/lib/tls/tls.h user/lib/unzip.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/lib -c $< -o $@
-build/pkgfetch.elf: build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+build/pkgfetch.elf: build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
 build/tls_sha256.o: kernel/crypto/sha256.c | $(BUILD)
@@ -940,9 +1281,9 @@ build/tls_tls.o: user/lib/tls/tls.c | $(BUILD)
 build/tls_handle.o: user/lib/tls/tls_handle.c user/lib/tls/tls_handle.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 
-build/tlstest.o: user/bin/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+build/tlstest.o: user/tests/tlstest/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
-build/tlstest.elf: build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+build/tlstest.elf: build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
 # ---------------------------------------------------------------------------
@@ -1006,33 +1347,33 @@ build/emlibc_crt0.o: user/lib/crt0.c | $(BUILD)
 
 # The proof (house rule): a program that links emlibc INSTEAD of newlib -- no
 # -lc, no build/crt0.o, no build/syscalls.o -- and runs on the OS.
-build/emlibc_demo.o: user/bin/emlibc_net.c user/bin/emlibc_demo.c | $(BUILD)
+build/emlibc_demo.o: user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
-build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a user/lib/newlib.ld
-	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
 	    build/emlibc_crt0.o build/emlibc_demo.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_net -- native networking demo (em_tcp_connect over emlibc, 0 newlib).
 # (Distinct object name from the rim's build/emlibc_net.o.)
-build/emlibcnet_demo.o: user/bin/emlibc_net.c user/emlibc/include/net.h | $(BUILD)
+build/emlibcnet_demo.o: user/tests/emlibc_net/emlibc_net.c user/emlibc/include/net.h | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
-build/emlibc_net.elf: build/emlibc_crt0.o build/emlibcnet_demo.o build/libemlibc.a user/lib/newlib.ld
-	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+build/emlibc_net.elf: build/emlibc_crt0.o build/emlibcnet_demo.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
 	    build/emlibc_crt0.o build/emlibcnet_demo.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_caps -- the part newlib cannot express: capability inspection +
 # handle-based spawn with attenuation. Also emlibc-linked, not newlib.
-build/emlibc_caps.o: user/bin/emlibc_caps.c | $(BUILD)
+build/emlibc_caps.o: user/tests/emlibc_caps/emlibc_caps.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
-build/emlibc_caps.elf: build/emlibc_crt0.o build/emlibc_caps.o build/libemlibc.a user/lib/newlib.ld
-	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+build/emlibc_caps.elf: build/emlibc_crt0.o build/emlibc_caps.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
 	    build/emlibc_crt0.o build/emlibc_caps.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_math -- exercises emlibc's <math.h> + %f/%e formatting. emlibc-linked.
-build/emlibc_math.elf.o: user/bin/emlibc_math.c | $(BUILD)
+build/emlibc_math.elf.o: user/tests/emlibc_math/emlibc_math.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
-build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemlibc.a user/lib/newlib.ld
-	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
 	    build/emlibc_crt0.o build/emlibc_math.elf.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_embxapp -- the convergence artifact: an emlibc program linked by EmbLD
@@ -1043,7 +1384,7 @@ build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemli
 EMBCC_ROOT ?= $(HOME)/EmbCC
 HOST_EMBLD := $(EMBCC_ROOT)/embld
 LIBGCC_A   := $(shell $(USER_CC) -print-libgcc-file-name)
-build/emlibc_embxapp.o: user/bin/emlibc_embxapp.c | $(BUILD)
+build/emlibc_embxapp.o: user/tests/emlibc_embxapp/emlibc_embxapp.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_embxapp.embx: build/emlibc_crt0.o build/emlibc_embxapp.o build/libemlibc.a $(HOST_EMBLD)
 	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
@@ -1055,31 +1396,51 @@ build/emlibc_embxapp.embx: build/emlibc_crt0.o build/emlibc_embxapp.o build/libe
 # EmbCC + EmbLD are present; absent otherwise (honest, never faked).
 HOST_EMBCC    := $(EMBCC_ROOT)/embcc
 EMLIBC_EC_INC := -I$(EMLIBC_DIR)/include -I$(EMBCC_ROOT)/include -Iuser/lib -I$(EMLIBC_FD_DIR)
-build/mathself.embx: user/bin/mathself.c $(EMLIBC_DIR)/math/math.c $(EMLIBC_FD_SRCS) \
+build/mathself.embx: user/tests/mathself/mathself.c $(EMLIBC_DIR)/math/math.c $(EMLIBC_FD_SRCS) \
                      build/emlibc_crt0.o build/libemlibc.a $(HOST_EMBCC) $(HOST_EMBLD)
 	@rm -rf build/mathself.d && mkdir -p build/mathself.d
-	$(HOST_EMBCC) -c user/bin/mathself.c $(EMLIBC_EC_INC) -o build/mathself.d/mathself.o
+	$(HOST_EMBCC) -c user/tests/mathself/mathself.c $(EMLIBC_EC_INC) -o build/mathself.d/mathself.o
 	$(HOST_EMBCC) -c $(EMLIBC_DIR)/math/math.c $(EMLIBC_EC_INC) -o build/mathself.d/math.o
 	@for f in $(EMLIBC_FD_SRCS); do $(HOST_EMBCC) -c $$f $(EMLIBC_EC_INC) \
 	    -o build/mathself.d/$$(basename $$f .c).o || exit 1; done
 	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
 	    build/emlibc_crt0.o build/mathself.d/*.o build/libemlibc.a
 
-build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
+build/capspawn.o: user/tests/capspawn/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
+build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capspawn.o -lc -lgcc -o $@
-build/capreload.o: user/bin/capreload.c user/lib/embk.h | $(BUILD)
+build/capreload.o: user/tests/capreload/capreload.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/capreload.elf: build/crt0.o build/syscalls.o build/capreload.o user/lib/newlib.ld
+build/capreload.elf: build/crt0.o build/syscalls.o build/capreload.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capreload.o -lc -lgcc -o $@
-build/capgpu.o: user/bin/capgpu.c user/lib/embk.h | $(BUILD)
+build/capgpu.o: user/tests/capgpu/capgpu.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/capgpu.elf: build/crt0.o build/syscalls.o build/capgpu.o user/lib/newlib.ld
+build/capgpu.elf: build/crt0.o build/syscalls.o build/capgpu.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capgpu.o -lc -lgcc -o $@
-build/capfs.o: user/bin/capfs.c user/lib/embk.h | $(BUILD)
+build/lockdemo.o: user/tests/lockdemo/lockdemo.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o user/lib/newlib.ld
+build/lockdemo.elf: build/crt0.o build/syscalls.o build/lockdemo.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/lockdemo.o -lc -lgcc -o $@
+
+build/tonestress.o: user/tests/tonestress/tonestress.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/tonestress.elf: build/crt0.o build/syscalls.o build/tonestress.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tonestress.o -lc -lgcc -o $@
+
+build/jitter.o: user/tests/jitter/jitter.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/jitter.elf: build/crt0.o build/syscalls.o build/jitter.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/jitter.o -lc -lgcc -o $@
+
+build/capnet.o: user/tests/capnet/capnet.c user/tests/lockdemo/lockdemo.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capnet.elf: build/crt0.o build/syscalls.o build/capnet.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capnet.o -lc -lgcc -o $@
+
+build/capfs.o: user/tests/capfs/capfs.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capfs.o -lc -lgcc -o $@
 
 # --- shell.elf: the EmbLink structured shell (shell/) --------------------------
@@ -1089,7 +1450,7 @@ build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o user/lib/newlib.ld
 SHELL_INC = -Ishell
 SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
-             shell/builtins/builtins.h shell/hist/hist.h
+             shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h
 
 $(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1102,6 +1463,8 @@ $(BUILD)/shobj_lex.o: shell/lex/lex.c $(SHELL_HDRS) | $(BUILD)
 $(BUILD)/shobj_parse.o: shell/parse/parse.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_eval.o: shell/eval/eval.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_exec.o: shell/eval/exec.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_builtins.o: shell/builtins/builtins.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1116,11 +1479,12 @@ $(BUILD)/shobj_main.o: shell/main.c $(SHELL_HDRS) | $(BUILD)
 
 SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o \
              $(BUILD)/shobj_lex.o $(BUILD)/shobj_parse.o $(BUILD)/shobj_eval.o \
+             $(BUILD)/shobj_exec.o \
              $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
              $(BUILD)/shobj_eval_extern.o \
              $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
 
-build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(SHELL_OBJS) -lc -lgcc -o $@
 
 # --- external pipeline tools (shell/tools/): NOT builtins -- each is a real
@@ -1137,13 +1501,13 @@ $(BUILD)/shtool_tally.o: shell/tools/tally.c $(SHELL_HDRS) | $(BUILD)
 $(BUILD)/shtool_embbuild.o: shell/tools/embbuild.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 
-build/sysinfo.elf: $(BUILD)/shtool_sysinfo.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+build/sysinfo.elf: $(BUILD)/shtool_sysinfo.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
-build/tally.elf: $(BUILD)/shtool_tally.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+build/tally.elf: $(BUILD)/shtool_tally.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
 # EmbBuild (docs/BUILD.md): the typed-manifest walker. Same static sval-tool
 # shape; host-bootstrapped here, self-hosting is its own target #3.
-build/embbuild.elf: $(BUILD)/shtool_embbuild.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o user/lib/newlib.ld
+build/embbuild.elf: $(BUILD)/shtool_embbuild.o $(SHELL_SDK_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(SHELL_SDK_OBJS) -lc -lgcc -o $@
 
 # --- uidemo.elf: the EmbLink UI toolkit running live in ring-3 -----------------
@@ -1214,15 +1578,15 @@ $(BUILD)/picobj_dsl_em.o: ui/dsl/em.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-$(BUILD)/picobj_fileops.o: user/lib/fileops.c user/lib/fileops.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+$(BUILD)/picobj_fileops.o: user/lib/fileops.c user/lib/fileops.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
-               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o $(BUILD)/picobj_auth.o $(BUILD)/picobj_fileops.o
+               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o $(BUILD)/picobj_auth.o
 
 build/libembk.so: $(LIBEMBK_OBJS)
 	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(LIBEMBK_OBJS) -o $@
@@ -1230,24 +1594,36 @@ build/libembk.so: $(LIBEMBK_OBJS)
 libembk: build/libembk.so
 	@echo "libembk.so OK"
 
-# --- EmUI apps: AUTO-DISCOVERED from user/bin/*.c -----------------------------
-# Every user/bin/*.c EXCEPT the two special-linked programs (init.c is
+# --- EmUI apps: AUTO-DISCOVERED from user/apps/*/*.c -----------------------------
+# Every user/apps/*/*.c EXCEPT the two special-linked programs (init.c is
 # freestanding; hello.c is static-newlib) is a dynamically-linked EmUI app,
 # built by the identical pattern below and packed onto the boot image
-# automatically. So adding a new app is just: drop user/bin/foo.c in and
+# automatically. So adding a new app is just: drop user/apps/foo/foo.c in and
 # `make embkfs.img` -- no per-app Makefile rule, no mkfs edit. (uidemo,
 # wmdemo, home, v4demo, clockw all previously had five copies of the same
 # two rules here; this replaces them.)
+#
+# The wildcard covers EVERY program directory, not just user/apps: the set it
+# discovers is exactly the set the old flat user/bin/*.c produced, so the
+# restructure moved files and changed no build behaviour. A program with its own
+# explicit rule is filtered out below, as it always was.
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c user/bin/photos.c user/bin/mp3play.c, $(wildcard user/bin/*.c))
-EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
+EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
-# One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
-# include paths).
-build/%.o: user/bin/%.c user/lib/embk.h $(wildcard user/lib/embk_*.h) | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+# One compile rule per EmUI app object (newlib CFLAGS + the toolkit include
+# paths). GENERATED rather than a `build/%.o: user/bin/%.c` pattern, because a
+# pattern rule can only name ONE source directory and the programs now live in
+# five. The generator is the only thing that changed; the recipe is the same
+# one line it always was.
+define EMUI_APP_OBJ
+build/$(1).o: $$(call USER_SRC,$(1)) user/lib/embk.h | $$(BUILD)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -c $$< -o $$@
+endef
+$(foreach a,$(EMUI_APP_NAMES),$(eval $(call EMUI_APP_OBJ,$(a))))
 
 # One DYNAMIC link rule for any EmUI app: it imports the toolkit from
 # libembk.so instead of statically bundling it. NO -static (would forbid the
@@ -1265,7 +1641,7 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 # It shares the browser's decoders rather than carrying its own: png.c and
 # jpeg.c already decode to exactly the premultiplied BGRA the toolkit blits,
 # and a second copy of a JPEG decoder is a second place for a bug to live.
-build/photos.o: user/bin/photos.c user/photos/photo.h user/lib/embk.h | $(BUILD)
+build/photos.o: user/apps/photos/photos.c user/photos/photo.h user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/photos -c $< -o $@
 build/photo_decode.o: user/photos/decode.c user/photos/photo.h user/web/png.h user/web/jpeg.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/photos -Iuser/web -c $< -o $@
@@ -1392,7 +1768,7 @@ build/mp3_%.o: user/audio/mp3/%.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio/mp3 -c $< -o $@
 build/au_resample.o: user/audio/resample.c user/audio/resample.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio -c $< -o $@
-build/mp3play.o: user/bin/mp3play.c user/audio/mp3/mp3.h user/audio/resample.h | $(BUILD)
+build/mp3play.o: user/apps/mp3play/mp3play.c user/audio/mp3/mp3.h user/audio/resample.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/audio/mp3 -Iuser/audio -c $< -o $@
 
 build/mp3play.elf: build/crt0.o build/syscalls.o build/mp3play.o $(MP3_APP_OBJS) build/libembk.so
@@ -1415,7 +1791,7 @@ build/note_doc.o: user/note/doc.c user/note/doc.h user/note/syntax.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
 build/note_edit.o: user/note/edit.c user/note/edit.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
-build/notepp.o: user/bin/notepp.c user/note/doc.h user/note/syntax.h user/note/edit.h | $(BUILD)
+build/notepp.o: user/apps/notepp/notepp.c user/note/doc.h user/note/syntax.h user/note/edit.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/note -c $< -o $@
 build/notepp.elf: build/notepp.o build/note_syntax.o build/note_doc.o build/note_edit.o \
                   build/crt0.o build/syscalls.o build/libembk.so
@@ -1495,19 +1871,19 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(ISR_OBJ): $(ISR_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(SYSCALL_OBJ): $(SYSCALL_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(KCONTEXT_OBJ): $(KCONTEXT_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(KENTRY_OBJ): $(KENTRY_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(AP_ENTRY_OBJ): $(AP_ENTRY_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 # Flat binary, NOT linked into the kernel -- an AP starts in 16-bit real
 # mode and must execute below 1MB, which the kernel's higher-half ELF is
@@ -1516,7 +1892,7 @@ $(AP_TRAMPOLINE_BIN): $(AP_TRAMPOLINE_ASM) | $(BUILD)
 	$(ASM) -f bin $< -o $@
 
 $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 # Every kernel header is a prerequisite. The kernel is one monolithic $(CC)
 # over $(KERNEL_SRC) with no per-TU depfiles, so without this a header-only
@@ -1525,8 +1901,8 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 # 35-minute boots during EmbBuild v2. A wildcard over every .h under kernel/ is
 # coarse (any header touch rebuilds the whole kernel) but the kernel is one
 # compile anyway, so the granularity is already all-or-nothing; correctness wins.
-KERNEL_HDRS := $(shell find kernel -name '*.h') third_party/iwx/if_iwxreg.h $(wildcard user/lib/embk_*.h)
-$(KERNEL_ELF): $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
+KERNEL_HDRS := $(shell find kernel -name '*.h')
+$(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
 	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 
 # Boot image carries the stripped kernel (see KERNEL_BIN note above).
@@ -1561,7 +1937,7 @@ $(DISK):
 # make WHEN the image is stale -- and it has to stay complete, because an app
 # missing from it is not a build error: the image just silently keeps the old
 # copy, or never gains the new app at all. EMUI_APPS is a wildcard over
-# user/bin/*.c, so EmUI apps are automatic; static console programs have bespoke
+# user/apps/*/*.c, so EmUI apps are automatic; static console programs have bespoke
 # rules and must be named here (the check in the recipe below catches omissions).
 ifeq ($(HAVE_GIT),yes)
 GIT_APPS = build/git.elf
@@ -1600,11 +1976,12 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
-               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
-               build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
-               build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf \
+EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf $(if $(PIE_OK),build/pieprobe.elf,) \
+               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
+               build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
+               build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf build/notepp.elf \
+               build/install.elf \
                build/embbuild.elf build/pkg.elf build/pkgbuild.elf \
                build/pkgprobe.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
@@ -1672,7 +2049,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -1721,16 +2098,15 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(
 ahci.img:
 	dd if=/dev/zero of=ahci.img bs=1M count=64
 
+# mkfs.vfat and mcopy are Linux tools and this tree builds on two hosts, so the
+# volume is written directly by tools/mkfat32.py -- the same thing
+# tools/mkuefidisk.py already does for the EFI system partition. It writes no
+# subdirectory: that needs a second cluster chain and the driver's directory
+# walk is exercised by the root, which has several entries in it.
 fat32.img:
-	dd if=/dev/zero of=fat32.img bs=1M count=64
-	mkfs.vfat -F 32 -n EMBLINK fat32.img
-	echo "Hello from EmbLink filesystem!" > /tmp/hello.txt
-	mcopy -i fat32.img /tmp/hello.txt ::HELLO.TXT
-	echo "second file for testing the directory walk" > /tmp/test.txt
-	mcopy -i fat32.img /tmp/test.txt ::TEST.TXT
-	mmd -i fat32.img ::SUBDIR
-	echo "file inside a subdirectory" > /tmp/sub.txt
-	mcopy -i fat32.img /tmp/sub.txt ::SUBDIR/INSIDE.TXT
+	python3 tools/mkfat32.py fat32.img 64 \
+	    HELLO.TXT="Hello from EmbLink filesystem!" \
+	    TEST.TXT="second file for testing the directory walk"
 
 
 # NOTE: embkfs.img / embkfs_tree.img are built by the GROUPED rule further up
@@ -1749,12 +2125,20 @@ EMBKFS_SCRATCH := embkfs_scratch.img
 #  - XRES/YRES: the virtio-gpu scanout size (the whole stack -- fb, compositor,
 #    mouse clamp, home launcher -- adapts to whatever the device reports).
 #    Override per run: `make run-embkfs-cow XRES=1920 YRES=1080`.
-#  - zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
-#    window (stretching is what made the display look blurry/badly scaled).
 XRES ?= $(FB_W)
 YRES ?= $(FB_H)
 VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
-DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
+# zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
+# window (stretching is what made the display look blurry/badly scaled). Both
+# gtk and cocoa spell that suboption the same way; the BACKEND is the part that
+# differs, because Homebrew's qemu has no gtk at all (`-display help` lists only
+# none/curses/cocoa/dbus) and -display gtk fails outright there.
+ifeq ($(UNAME_S),Darwin)
+QEMU_DISPLAY ?= cocoa,zoom-to-fit=off
+else
+QEMU_DISPLAY ?= gtk,zoom-to-fit=off
+endif
+DISPLAY_1TO1 = -display $(QEMU_DISPLAY)
 # Default to full software emulation (TCG) so this runs on any machine without
 # KVM. `-cpu max` still exposes RDRAND (which getentropy() needs) under TCG.
 # On a host WITH KVM, opt in for host-CPU speed:
@@ -2021,16 +2405,53 @@ run-usb-ide: usb.img
 # GetMemoryMap -> boot_mmap, loads the EMBEDDED kernel to its fixed physical
 # address, builds the identity + higher-half page tables, ExitBootServices, then
 # enters the kernel with RDI = &boot_protocol (firmware = BOOT_FW_UEFI).
+# -Ikernel and -Ibuild: the loader shares the KERNEL'S SHA-256 rather than
+# carrying a second copy, and reads the digest the build generated. A
+# verification chain whose two ends disagree about what SHA-256 is would be a
+# chain in name only. SHA256_NO_SELFTEST drops the vectors, which print through
+# a kprintf this program does not have.
+# -std=gnu11 to match the kernel: without it this compiles as C23, where `bool`
+# is a keyword and kernel/include/types.h -- which the shared boot-protocol
+# header pulls in -- cannot typedef it.
 UEFI_CFLAGS = -ffreestanding -fpic -fno-stack-protector -mno-red-zone \
-              -fno-asynchronous-unwind-tables -Wall -c
+              -fno-asynchronous-unwind-tables -Wall -c -std=gnu11 \
+              -Ikernel -Ibuild -Iboot/uefi -DSHA256_NO_SELFTEST
 BOOTX64 = build/BOOTX64.EFI
-OVMF_CODE = /usr/share/OVMF/OVMF_CODE_4M.fd
-OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
+# OVMF: the UEFI firmware QEMU boots. Its path is per distribution, and the
+# defaults here were Linux-only -- which made `make run-uefi` impossible on the
+# macOS host this OS is developed on, so the UEFI path could not be tested at
+# all there. Homebrew's qemu ships edk2 beside itself; the x86_64 code pairs
+# with the i386 vars file, which is the naming edk2 uses, not a mistake.
+ifeq ($(UNAME_S),Darwin)
+QEMU_FW_DIR ?= $(shell dirname $(shell which qemu-system-x86_64))/../share/qemu
+OVMF_CODE   ?= $(QEMU_FW_DIR)/edk2-x86_64-code.fd
+OVMF_VARS   ?= $(QEMU_FW_DIR)/edk2-i386-vars.fd
+# The SECURE build is a different binary, not a flag: it keeps the variable
+# store behind SMM, which is what makes Secure Boot enforceable at all.
+OVMF_SECURE_CODE ?= $(QEMU_FW_DIR)/edk2-x86_64-secure-code.fd
+else
+OVMF_CODE   ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS   ?= /usr/share/OVMF/OVMF_VARS_4M.fd
+OVMF_SECURE_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+endif
 
 build/uefi_crt0.o: boot/uefi/crt0.S | $(BUILD)
 	$(CC) -c $< -o $@
 
-build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h boot/uefi/display_mode.h | $(BUILD)
+# THE KERNEL'S OWN HASH, computed over exactly the bytes kernel_blob.S embeds.
+# Generated rather than checked in: a digest in a source file is a digest
+# somebody forgets to update, and one that is stale fails the boot it was meant
+# to protect.
+build/uefi_kernel_hash.h: $(KERNEL_BIN) | $(BUILD)
+	@python3 -c "import hashlib,sys; \
+	  d=hashlib.sha256(open(sys.argv[1],'rb').read()).digest(); \
+	  print('/* generated by the Makefile from', sys.argv[1], '*/'); \
+	  print('static const unsigned char EMBK_KERNEL_SHA256[32] = {'); \
+	  print('   ', ', '.join('0x%02x'%b for b in d)); \
+	  print('};')" $(KERNEL_BIN) > $@
+	@echo "  kernel sha256 -> $@"
+
+build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h build/uefi_kernel_hash.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
 build/uefi_console.o: boot/uefi/console.c boot/uefi/console.h boot/uefi/uefi.h | $(BUILD)
@@ -2043,21 +2464,45 @@ build/uefi_menu.o: boot/uefi/menu.c boot/uefi/menu.h boot/uefi/console.h boot/ue
 build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
 	$(CC) -DKERNEL_BLOB_PATH='"$(KERNEL_BIN)"' -c $< -o $@
 
-UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
-            build/uefi_menu.o build/uefi_kernel_blob.o
+build/uefi_sha256.o: kernel/crypto/sha256.c kernel/crypto/sha256.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
 
+UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
+            build/uefi_menu.o build/uefi_sha256.o build/uefi_kernel_blob.o
+
+# Forward link options explicitly: bare-metal GCC does not pass its -shared
+# driver flag through like a hosted GCC. Bind local globals and retain separate
+# dynamic metadata sections so the self-relocator sees every required fixup.
 build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds Makefile
 	$(CC) -nostdlib -Wl,-shared,-Bsymbolic,--no-undefined -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
 
+
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
-# subsystem and PE layout correctly. Host objcopy: the cross one lacks pei.
+# subsystem and PE layout correctly.
+#
+# Prefer the cross objcopy when it supports EFI PE output, otherwise select a
+# compatible GNU host tool. Bare-metal binutils builds may enable only ELF;
+# tools/find_efi_objcopy.py checks actual targets rather than assuming support.
 $(BOOTX64): build/uefi_loader.so tools/check_uefi_elf.py
 	python3 tools/check_uefi_elf.py $<
-	objcopy -O efi-app-x86_64 -j .text -j .rodata -j .data -j .bss -j .got -j .rela -j .reloc $< $@
+	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .rodata -j .data -j .bss -j .got -j .rela -j .reloc $< $@
+
+# DOES IT BOOT THE WAY MACHINES BOOT NOW? Both images, under the real firmware.
+#
+# The UEFI path is not a compatibility mode here -- a machine built in the last
+# decade has no other way in, so this is the boot path that decides whether the
+# OS can be installed on one at all. It is also the path that has failed
+# silently before (a PIE that does not relocate itself dies with the screen
+# still blank), which is why the loader writes single bytes to COM1 and why
+# tools/uefi_test.py reads them back rather than settling for "the desktop
+# appeared".
+.PHONY: test-uefi
+test-uefi: uefi.img uefi-usb.img
+	@OVMF_CODE="$(OVMF_CODE)" OVMF_VARS="$(OVMF_VARS)" python3 tools/uefi_test.py
 
 # GPT + ESP disk carrying /EFI/BOOT/BOOTX64.EFI.
-uefi.img: $(BOOTX64) tools/mkuefidisk.sh
-	tools/mkuefidisk.sh $(BOOTX64) $@
+uefi.img: $(BOOTX64) tools/mkuefidisk.py
+	python3 tools/mkuefidisk.py $(BOOTX64) $@
 
 # Boot under OVMF. VARS must be a writable per-run copy. The kernel's EMBKFS root
 # rides a second drive for the MVP (kernel probes every block device for it).
@@ -2074,8 +2519,8 @@ run-uefi: uefi.img embkfs.img
 # [EMBKFS: root]. This is what you dd onto a real USB stick -- the firmware
 # launches BOOTX64.EFI and the kernel finds its root on the SAME device (no
 # second drive). `make run-uefi-usb` proves single-device boot under OVMF.
-uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.sh
-	tools/mkuefidisk.sh $(BOOTX64) $@ embkfs.img
+uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.py
+	python3 tools/mkuefidisk.py $(BOOTX64) $@ embkfs.img
 
 run-uefi-usb: uefi-usb.img
 	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
@@ -2255,11 +2700,25 @@ declare-test:
 	    -lm -o $(BUILD)/declare_test
 	$(BUILD)/declare_test
 
+# The text field and the keyboard: autofocus, Tab traversal (and the keys
+# typed after a Tab), wrap, Return, focus let go when its field is gone.
+# The DSL's multi-line editor, on the host. em.c compiles standalone (it knows
+# nothing about the kernel), so the editor every EmUI app uses can be driven
+# here in a second instead of only by booting a machine and typing.
+em-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) -Iui/dsl \
+	    $(UI_SRC) ui/dsl/em.c ui/dsl/em_test.c -lm -o $(BUILD)/em_test
+	$(BUILD)/em_test
+
+kit-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) $(UI_SRC) ui/kit/kit_test.c -lm -o $(BUILD)/kit_test
+	$(BUILD)/kit_test
+
 # Themed showcase: renders a real UI with the widget kit to a PNG, so the
 # toolkit's actual look can be seen (not just unit-tested).
 UI_SRC = ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c ui/backend/scene_render.c \
          ui/layout/layout.c ui/reactive/reactive.c ui/declare/declare.c ui/theme/theme.c ui/kit/kit.c
-UI_INC = -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare -Iui/theme -Iui/kit
+UI_INC = -Iui -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare -Iui/theme -Iui/kit
 showcase:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) \
 	    $(UI_SRC) ui/showcase/showcase.c -lm -o $(BUILD)/showcase
@@ -2341,7 +2800,568 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 	@# extending the range under a running device -- where the real bug was.
 	@AUDIO_CMD="run /data/apps/beep/beep.elf" python3 tools/audio_test.py
 
-.PHONY: test-audio
+# EVERY SOUND CARD THIS KERNEL CLAIMS TO DRIVE, from one binary.
+#
+# The drivers used to be chosen in this file, one per architecture, so "the
+# audio layer supports two devices" was a statement about the build and not
+# about any kernel that existed. It is a runtime table now, and this is what
+# holds that claim up: the same image is booted against an AC'97, an Intel HDA
+# controller on the ICH6, the later ICH9 one, and finally BOTH an AC'97 and an
+# HDA at once -- where the table has to choose, and has to choose the modern
+# part. Four boots; the WAV decides each one.
+#
+# The streaming pass on HDA is not decoration. HDA's DMA engine is cyclic and
+# pads a short descriptor with silence it then plays, so a writer whose chunk
+# is not a whole descriptor is the case that breaks: `tonestress` at a 20 ms
+# buffer measured 32% non-silent and 139.5 Hz before audio.c held the
+# remainder back, and 100% / 441.2 Hz after.
+.PHONY: test-audio-cards
+test-audio-cards: $(IMG) $(EMBKFS_MASTER)
+	@for card in ac97 hda ich9-hda both; do \
+	    AUDIO_CARD=$$card python3 tools/audio_test.py || exit 1; \
+	done
+	@AUDIO_CARD=hda AUDIO_CMD="run /data/apps/beep/beep.elf" \
+	    python3 tools/audio_test.py || exit 1
+	@AUDIO_CARD=hda AUDIO_CMD="run /data/apps/tonestress/tonestress.elf 1 400 0 20" \
+	    AUDIO_CHECK=0 python3 tools/audio_test.py >/dev/null || exit 1
+	@python3 tools/audio_check.py build/audio-out.wav --hz 440 --min-seconds 0.25
+
+# THE FIRMWARE'S OWN CODE, RUN. `test aml` checks that the namespace built and
+# that methods execute; `test prt` checks the thing the interpreter exists for,
+# and checks it against an INDEPENDENT witness -- the Interrupt Line byte the
+# firmware itself wrote into each PCI device's configuration space. Two routes
+# to the same wiring, with no common failure between them.
+#
+# Both chipsets, because their ACPI tables are generated separately: "pc" (the
+# i440fx)
+# routes PCI interrupts through the PIIX3's programmable PIRQ registers (so the
+# interpreter has to follow a link device into PCI config space and decode a
+# resource template), and q35 does not. A pass on one says nothing about the
+# other. Four extra PCI cards on each, so the cross-check has entries to check.
+.PHONY: test-acpi
+test-acpi: $(IMG) $(EMBKFS_MASTER)
+	@for m in pc q35; do \
+	  echo "--- $$m ---"; \
+	  MACHINE=$$m EXTRA_DEVICES="intel-hda;e1000;rtl8139;AC97" \
+	    python3 tools/console_test.py "test aml" || exit 1; \
+	  MACHINE=$$m EXTRA_DEVICES="intel-hda;e1000;rtl8139;AC97" \
+	    python3 tools/console_test.py "test prt" || exit 1; \
+	done
+
+# CAN YOU PLUG A STICK IN WHILE IT IS RUNNING?
+#
+# The ports used to be scanned once, at boot, so the answer was no -- a stick
+# pushed in afterwards did nothing at all. tools/usb_hotplug.py boots with an
+# EMPTY UHCI controller, attaches a FAT32 stick over QMP, requires the guest to
+# notice it, mount it AND READ A NAMED FILE off it, then pulls it out and
+# requires all three to go away again.
+#
+# The empty controller matters: a device present at boot would prove only that
+# the boot-time scan still works, which was never the missing part.
+.PHONY: test-usb-hotplug
+test-usb-hotplug: $(IMG) $(EMBKFS_MASTER)
+	@echo "=== UHCI (the shared core) ==="
+	@python3 tools/usb_hotplug.py piix3-usb-uhci || exit 1
+	@echo "=== OHCI ==="
+	@python3 tools/usb_hotplug.py pci-ohci || exit 1
+	@echo "=== EHCI ==="
+	@python3 tools/usb_hotplug.py usb-ehci || exit 1
+	@# xHCI has its own enumeration, its own slot model and its own transfer
+	@# rings -- it shares none of usb_core, so "hot-plug works" has to be
+	@# shown for it separately. Modern machines put USB 3 on xHCI, which
+	@# makes this the half a recent laptop actually needs.
+	@echo "=== xHCI (its own path entirely) ==="
+	@python3 tools/usb_hotplug.py qemu-xhci || exit 1
+	@echo "=== test-usb-hotplug: OK"
+
+# WILL A MACHINE WITH SECURE BOOT ON ACTUALLY RUN THIS?
+#
+# Retail hardware ships with it enabled, and a machine in that state does not
+# warn about an unsigned EFI application -- the firmware says "Access Denied"
+# and moves on, so the OS simply does not exist as far as the owner can tell.
+#
+# The test is a PAIR and neither half means anything alone: the unsigned loader
+# must be REFUSED (which is what proves the firmware is really enforcing) and
+# the signed one must BOOT. Running only the second against a firmware that
+# happens not to be enforcing is a pass that says nothing, and that is exactly
+# what OVMF's stock variable store gives you -- no platform key, setup mode,
+# everything launches.
+.PHONY: test-secureboot
+test-secureboot: $(IMG) $(EMBKFS_MASTER) uefi.img
+	@OVMF_SECURE_CODE="$(OVMF_SECURE_CODE)" OVMF_VARS="$(OVMF_VARS)" \
+	    python3 tools/secureboot_test.py
+
+# THE SIGNING KEY. Generated, never checked in: a private key in a public
+# repository signs nothing meaningfully, and one that everybody has is worse
+# than none because it looks like protection. This is a DEVELOPMENT key --
+# shipping a real one means a key somebody keeps offline, which is a policy
+# rather than a Makefile rule (docs/TODO.md).
+build/sbkeys/PK.crt:
+	@mkdir -p build/sbkeys
+	openssl req -new -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+	    -subj "/CN=EmbLinkOS Secure Boot Platform Key/" \
+	    -keyout build/sbkeys/PK.key -out build/sbkeys/PK.crt
+	openssl x509 -in build/sbkeys/PK.crt -outform DER -out build/sbkeys/PK.der
+
+# A SIGNED image, plus the firmware flash that trusts it. The second file is
+# the point: a signed image is useless on a machine that has never heard of the
+# key, so what a person actually needs is both -- the image to boot and the
+# key to enroll in their own firmware setup.
+.PHONY: uefi-signed
+uefi-signed: $(BOOTX64) build/sbkeys/PK.crt
+	python3 tools/sbsign.py $(BOOTX64) build/BOOTX64.signed.efi \
+	    build/sbkeys/PK.key build/sbkeys/PK.crt
+	python3 tools/mkuefidisk.py build/BOOTX64.signed.efi uefi-signed.img
+	python3 tools/efivars.py $(OVMF_VARS) build/ovmf_sb_enrolled.fd \
+	    build/sbkeys/PK.der
+	@echo "  enroll build/sbkeys/PK.der in the machine's firmware, or boot"
+	@echo "  QEMU with build/ovmf_sb_enrolled.fd as its variable store."
+
+# ---- loadable kernel modules ------------------------------------------------
+#
+# A module is an ordinary relocatable object built with the KERNEL'S flags --
+# same freestanding environment, same -mcmodel=kernel, same lack of a libc.
+# That is not a coincidence to be tidied away later: a module runs in the
+# kernel's address space at the kernel's privilege, so anything that would be
+# wrong to assume in the kernel is wrong to assume here.
+#
+# No linking. The output is the .o the compiler emits, relocations and all;
+# resolving them against the running kernel is the loader's job, which is the
+# whole point -- a linked object has already had its holes filled in against
+# addresses that were only true at build time.
+MODULE_CFLAGS = $(CFLAGS) -c -fno-pic
+MODULES_OUT = build/modules
+
+$(MODULES_OUT):
+	@mkdir -p $@
+
+build/modules/ramdisk.ko: modules/ramdisk/ramdisk.c kernel/module/module.h | $(MODULES_OUT)
+	$(CC) $(MODULE_CFLAGS) -Ikernel $< -o $@
+
+.PHONY: modules
+modules: build/modules/ramdisk.ko
+
+# CODE THE KERNEL DID NOT SHIP WITH.
+#
+# Loads a relocatable object the compiler produced and the kernel has never
+# seen, requires it to register a REAL block device, reads back through the
+# block layer something the module's own code wrote, checks in the PAGE TABLES
+# that its text came out read-only AND executable rather than writable, then
+# unloads it and requires the device to be gone.
+#
+# The read-back is what separates a loader that works from one that returned
+# success: a module whose relocations were applied wrongly still loads, still
+# reports a registered device, and produces garbage the first time anything
+# calls through it.
+# THE TWO-WIRE BUS. A monitor is attached at an address the memory SPD EEPROMs
+# do not already occupy -- on a PC, DDC and the first DIMM's SPD share 0x50 on
+# different bus segments, which an emulator has only one of.
+# THE HOST'S FILESYSTEM, READ FROM THE GUEST. The share is built here so the
+# test owns its own fixture: a file whose exact bytes the guest has to read
+# back, which is the difference between "the protocol walked" and "the data
+# arrived".
+# virtio-scsi, with a disk whose block 0 the HOST signed -- so a read that
+# returns zeroes is distinguishable from one that returns the truth.
+.PHONY: test-scsi
+test-scsi: $(IMG) $(EMBKFS_MASTER)
+	@python3 -c "import sys; d=bytearray(32*1024*1024); d[0:13]=b'EMBLINK-VSCSI'; open('build/vscsi.img','wb').write(bytes(d))"
+	@EXTRA_QEMU="-drive format=raw,file=build/vscsi.img,if=none,id=vsd" \
+	 EXTRA_DEVICES="virtio-scsi-pci,id=vs;scsi-hd,bus=vs.0,drive=vsd" \
+	    python3 tools/console_test.py "test scsi"
+
+# THE CARD READER, over both kinds of card and both addressing modes.
+#
+# An SD driver's characteristic bug is invisible on a small card: a
+# high-capacity part takes a BLOCK NUMBER where a standard one takes a BYTE
+# OFFSET, and a driver that guesses reads block zero for every request. So the
+# 4 GiB case is not decoration -- it is the one that catches it. eMMC is the
+# third case: it is woken by a different command, told its address rather than
+# asked for one, and keeps its real capacity in a register the CSD does not
+# reach.
+# EVERY SCSI CONTROLLER, THROUGH ONE TEST.
+#
+# These are six genuinely different ways of handing a command to a disk -- a
+# firmware mailbox, a paravirtual ring pair, a message-passing FIFO, a 1986
+# FIFO chip, a controller that executes a program, and virtio. The claim
+# kernel/block/scsi.c makes is that they differ only in the envelope. This is
+# how that claim is checked instead of asserted: the same disk, the same
+# signature, the same read-write-verify, over each of them in turn.
+# A TOUCHSCREEN IS NOT A MOUSE WITH A DIFFERENT NAME.
+#
+# It reports contacts, each with a slot, a position and a lifetime that ends
+# when its tracking id goes to -1 -- there is no release event. The failures
+# are quiet: one finger reported at the average of two, or a contact that
+# never lifts. tools/touch_test.py puts the fingers down from the host, so the
+# host knows what the guest's report should say.
+# PERSISTENT MEMORY'S ONLY INTERESTING PROPERTY cannot be checked in one boot.
+# Reading back what you just wrote proves nothing -- the bytes are in memory
+# either way. tools/pmem_test.py runs the guest twice over one backing file and
+# KILLS it in between, then reads the file from this side.
+# AN OFFLOAD ENGINE IS ONLY USEFUL IF IT COMPUTES THE SAME FUNCTION.
+# A wrong key length, a byte-swapped IV or a mode that is nearly CBC all
+# produce output as random-looking as the right answer, so the guest checks
+# the device's AES against kernel/crypto/aes.c, which has FIPS-197
+# known-answer tests of its own.
+# ANY DEVICE ON THE BUS CAN CURRENTLY READ ANY BYTE OF MEMORY -- the kernel's
+# page tables, the disk encryption key. An IOMMU is the page table for DMA, and
+# it is also the one driver that can stop the machine by working: an endpoint
+# attached to an empty domain cannot reach its own descriptors. So the test is
+# that the machine still boots AND still reads a block afterwards.
+# THE FIRMWARE HAS BEEN OFFERING THIS THE WHOLE TIME. `test amldump` has shown
+# \_SB.CPUS with an _EJ0 on every processor since the AML interpreter was
+# written, and the DSDT declares the memory devices too. This adds a CPU and a
+# DIMM to a running machine and checks the guest's numbers move -- the memory
+# half being the stricter, because it is only real if the page bitmap grew past
+# the end the firmware's memory map described at boot.
+# A CRASH REPORT THAT SURVIVES THE CRASH. Writing one to the disk is the
+# obvious way and the wrong one -- the disk driver may be what panicked. The
+# test runs the guest twice over one backing store and kills it in between.
+# A CONTROLLER BEHIND A BRIDGE. The brute-force PCI scan finds devices behind
+# bridges without ever looking AT the bridge -- and a device behind one cannot
+# DMA unless the BRIDGE has bus mastering on, whatever the device is set to.
+# So: put a SCSI controller behind a PCIe root port and behind a legacy
+# pci-bridge, and run the same read/write/verify through each.
+.PHONY: test-bridge
+test-bridge: $(IMG) $(EMBKFS_MASTER)
+	@dd if=/dev/zero of=build/sas.img bs=1m count=32 2>/dev/null
+	@printf 'EMBLINK-HBA\0' | dd of=build/sas.img bs=512 conv=notrunc 2>/dev/null
+	@echo "=== behind a pcie-root-port ==="
+	@MACHINE=q35 EXTRA_QEMU="-device pcie-root-port,id=rp0,chassis=1 -device virtio-scsi-pci,id=hba0,bus=rp0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
+	  python3 tools/console_test.py "test hba" || exit 1
+	@echo "=== behind a legacy pci-bridge ==="
+	@EXTRA_QEMU="-device pci-bridge,id=br0,chassis_nr=1 -device virtio-scsi-pci,id=hba0,bus=br0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
+	  python3 tools/console_test.py "test hba" || exit 1
+	@echo "=== test-bridge: OK"
+
+# CRASH THE KERNEL, TAKE THE POWER AWAY, ASK IT WHAT HAPPENED.
+#
+# A register dump to a serial port is enough on a desk and nothing at all on
+# the target machine. The record has to survive, and the check that it is a
+# REAL record rather than a plausible one is that the RIP it stored resolves --
+# through this host's nm, against the very kernel that crashed -- to a function.
+# PARTITIONS, AT BOTH LOGICAL BLOCK SIZES.
+#
+# Everything in GPT is counted in logical blocks -- the header is in block 1,
+# the entry array starts at a block number, and how many entries fit in one
+# read is the block size divided by the entry size. A parser that assumes 512
+# works on every image anyone here has ever built, because every tool that
+# builds them assumes 512 too. tools/mkgpt.py writes the one that is different.
+#
+# Each partition carries a signature in its first block: "a partition was
+# registered" and "the partition addresses the sectors the table named" are
+# different claims, and a parser reading the array with the wrong stride
+# registers plausible partitions at wrong offsets and looks entirely healthy.
+# THE SAME STICK, THROUGH ALL FOUR HOST CONTROLLERS.
+#
+# Nothing had ever done this, and that is how OHCI got away with enumerating a
+# device it could not then read from: every test used one controller, and the
+# one it used worked. The claim being checked is the whole chain -- the device
+# is found, the medium registers, its filesystem mounts, and a named file on
+# it can be listed -- because "enumerated" and "readable" turned out to be
+# very different things.
+.PHONY: test-usb-all
+test-usb-all: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/mkfat32_stick.py 2>/dev/null || true
+	@for hc in piix3-usb-uhci usb-ehci pci-ohci qemu-xhci; do \
+	  echo "=== $$hc ==="; \
+	  EXTRA_QEMU="-device $$hc,id=hc -drive id=usbstick,file=$(CURDIR)/build/usbstick.img,format=raw,if=none -device usb-storage,bus=hc.0,drive=usbstick" \
+	    python3 tools/console_test.py "test usbdevs" || exit 1; \
+	done
+	@echo "=== test-usb-all: OK"
+
+.PHONY: test-parts
+test-parts: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/mkgpt.py build/gpt512.img --block 512 --mib 64 --parts 2
+	@python3 tools/mkgpt.py build/gpt4k.img  --block 4096 --mib 64 --parts 2
+	@echo "=== 512-byte blocks ==="
+	@EXTRA_QEMU="-drive id=gptd,file=$(CURDIR)/build/gpt512.img,format=raw,if=none -device nvme,serial=gpt512,drive=gptd" \
+	  python3 tools/console_test.py "test parts" || exit 1
+	@echo "=== 4096-byte blocks (a 4Kn drive) ==="
+	@EXTRA_QEMU="-drive id=gptd,file=$(CURDIR)/build/gpt4k.img,format=raw,if=none -device nvme,serial=gpt4k,drive=gptd,logical_block_size=4096,physical_block_size=4096" \
+	  python3 tools/console_test.py "test parts" || exit 1
+	@echo "=== test-parts: OK"
+
+.PHONY: test-crash
+test-crash: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/crash_test.py
+
+.PHONY: test-erst
+test-erst: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/erst_test.py
+
+.PHONY: test-hotplug
+test-hotplug: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/hotplug_test.py
+
+.PHONY: test-iommu
+test-iommu: $(IMG) $(EMBKFS_MASTER)
+	@echo "=== virtio-iommu ==="
+	@MACHINE=q35 EXTRA_QEMU="-device virtio-iommu-pci" \
+	  python3 tools/console_test.py "test iommu" || exit 1
+	@echo "=== Intel VT-d ==="
+	@MACHINE=q35 EXTRA_QEMU="-device intel-iommu,intremap=off" \
+	  python3 tools/console_test.py "test iommu" || exit 1
+	@echo "=== AMD-Vi ==="
+	@MACHINE=q35 EXTRA_QEMU="-device amd-iommu" \
+	  python3 tools/console_test.py "test iommu" || exit 1
+	@echo "=== test-iommu: OK"
+
+.PHONY: test-crypto
+test-crypto: $(IMG) $(EMBKFS_MASTER)
+	@EXTRA_QEMU="-object cryptodev-backend-builtin,id=cd0 -device virtio-crypto-pci,id=vc0,cryptodev=cd0" \
+	  python3 tools/console_test.py "test crypto"
+
+.PHONY: test-pmem
+test-pmem: $(IMG) $(EMBKFS_MASTER)
+	@echo "=== virtio-pmem ==="
+	@python3 tools/pmem_test.py virtio-pmem || exit 1
+	@echo "=== nvdimm (no device at all: memory in a slot) ==="
+	@python3 tools/pmem_test.py nvdimm || exit 1
+	@echo "=== test-pmem: OK"
+
+.PHONY: test-touch
+test-touch: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/touch_test.py
+
+.PHONY: test-hba
+test-hba: $(IMG) $(EMBKFS_MASTER)
+	@dd if=/dev/zero of=build/sas.img bs=1m count=32 2>/dev/null
+	@printf 'EMBLINK-HBA\0' | dd of=build/sas.img bs=512 conv=notrunc 2>/dev/null
+	@for hba in megasas pvscsi mptsas1068 am53c974 lsi53c895a virtio-scsi-pci; do \
+	  echo "=== $$hba ==="; \
+	  EXTRA_QEMU="-device $$hba,id=hba0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
+	    python3 tools/console_test.py "test hba" || exit 1; \
+	done
+	@# UFS attaches its logical units to its own bus, not a SCSI one, and its
+	@# blocks are 4096 bytes rather than 512 -- which is why the test matches
+	@# on the disk's SIZE and not on its block count.
+	@echo "=== ufs ==="
+	@EXTRA_QEMU="-device ufs,id=ufs0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device ufs-lu,bus=ufs0,drive=hbad,lun=0" \
+	  python3 tools/console_test.py "test hba" || exit 1
+	@echo "=== test-hba: OK"
+
+.PHONY: test-sdcard
+test-sdcard: $(IMG) $(EMBKFS_MASTER)
+	@dd if=/dev/zero of=build/sdcard.img bs=1m count=64 2>/dev/null
+	@dd if=/dev/zero of=build/sdhc.img bs=1m count=0 seek=4096 2>/dev/null
+	@echo "=== SD, 64 MiB (byte addressing) ==="
+	@EXTRA_QEMU="-device sdhci-pci -drive id=sd0,file=$(CURDIR)/build/sdcard.img,format=raw,if=none -device sd-card,drive=sd0" \
+	  python3 tools/console_test.py "test sdcard" || exit 1
+	@echo "=== SDHC, 4 GiB (block addressing) ==="
+	@EXTRA_QEMU="-device sdhci-pci -drive id=sd0,file=$(CURDIR)/build/sdhc.img,format=raw,if=none -device sd-card,drive=sd0" \
+	  python3 tools/console_test.py "test sdcard" || exit 1
+	@echo "=== eMMC, 64 MiB ==="
+	@EXTRA_QEMU="-device sdhci-pci -drive id=sd0,file=$(CURDIR)/build/sdcard.img,format=raw,if=none -device emmc,drive=sd0" \
+	  python3 tools/console_test.py "test sdcard" || exit 1
+	@echo "=== test-sdcard: OK"
+
+# THE OPTICAL PATH, from the ATAPI envelope to a filename.
+#
+# Over both transports that carry SCSI to a drive: an IDE cable (`ide-cd`, the
+# PACKET command) and virtio-scsi (`scsi-cd`). They share every command and
+# differ only in the envelope, which is the entire point of kernel/block/scsi.c
+# -- and the way to prove it is to run the same test through both.
+#
+# tools/mkiso.py writes the disc, because mkisofs is a Linux package and
+# hdiutil produces a hybrid image whose ISO half is not what a plain reader
+# sees first. Same reasoning as tools/mkfat32.py.
+.PHONY: test-cdrom
+test-cdrom: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/mkiso.py build/test.iso \
+	  "HELLO.TXT=Hello from an ISO 9660 disc." \
+	  "SECOND.TXT=a second file, so the directory has more than one entry."
+	@echo "=== ATAPI over IDE ==="
+	@EXTRA_QEMU="-drive id=cd0,file=$(CURDIR)/build/test.iso,format=raw,if=none,media=cdrom -device ide-cd,drive=cd0,bus=ide.1" \
+	  python3 tools/console_test.py "test cdrom" || exit 1
+	@echo "=== the same disc over virtio-scsi ==="
+	@EXTRA_QEMU="-device virtio-scsi-pci,id=vscsi1 -drive id=cd1,file=$(CURDIR)/build/test.iso,format=raw,if=none,media=cdrom -device scsi-cd,bus=vscsi1.0,drive=cd1" \
+	  python3 tools/console_test.py "test cdrom" || exit 1
+	@echo "=== test-cdrom: OK"
+
+.PHONY: test-ninep
+test-ninep: $(IMG) $(EMBKFS_MASTER)
+	@rm -rf build/9pshare && mkdir -p build/9pshare/sub
+	@printf 'the host wrote this\n' > build/9pshare/HELLO.txt
+	@printf 'second\n' > build/9pshare/second.txt
+	@printf 'deep\n' > build/9pshare/sub/deep.txt
+	@NINEP=$(CURDIR)/build/9pshare python3 tools/console_test.py "test ninep"
+
+.PHONY: test-i2c
+test-i2c: $(IMG) $(EMBKFS_MASTER)
+	@EXTRA_DEVICES="i2c-ddc,address=0x38" python3 tools/console_test.py "test i2c"
+
+.PHONY: test-modules
+test-modules: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py "test modules"
+
+# TIME. Two witnesses: the guest breaks its own clock by four hundred days and
+# measures what SNTP leaves behind against the CMOS chip, and the harness
+# brackets the whole run with the HOST's clock so that a wrong epoch constant
+# -- the classic NTP bug, seventy years -- cannot pass by being wrong twice.
+# Needs outbound UDP/123 through SLIRP, like test-dns needs outbound DNS.
+.PHONY: test-ntp
+test-ntp: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/ntp_test.py
+
+# THE TIME ZONE. posixdemo.elf, spawned with a zone in its environment -- the
+# same path the desktop uses to hand the user's choice to every app it starts.
+# Fixed instants with known answers, one in each hemisphere's summer, so a
+# daylight rule that is parsed and ignored cannot pass.
+.PHONY: test-tz
+test-tz: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py "test tz"
+
+# ...and the half a person touches: pick Tokyo in Settings, and watch the
+# desktop say it has adopted it. The claim is the whole route -- Settings
+# writes the file, the desktop re-reads it, applies it, and hands it to every
+# app it launches next -- not that a widget moved.
+.PHONY: test-timezone
+test-timezone: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/timezone_shot.py
+
+# PUTTING THE OS ON A DISK, and then booting that disk.
+#
+# The test is the SECOND boot and nothing before it counts: an installer that
+# writes plausible bytes and reports success has failed in the only way that
+# matters if the firmware will not boot the result. So the stick is detached
+# before the second boot -- leaving it attached would let the firmware boot
+# from it and pass with the target completely empty.
+# THE STICK, BOOTED THE WAY A LAPTOP BOOTS IT: over USB, through xHCI, with no
+# PIT, no HPET, and -- in one of the three runs -- no serial port at all. Two
+# emulated internal disks (NVMe and SATA) are hashed before and after and must
+# not change. `make test-uefi` attaches the same image as an IDE disk, which is
+# not how any laptop has ever read a USB stick. See tools/laptop_test.py for
+# the list of what this found before the stick went near real hardware.
+.PHONY: test-laptop
+test-laptop: uefi-usb.img
+	@python3 tools/laptop_test.py
+
+.PHONY: test-install
+test-install: uefi-usb.img
+	@OVMF_CODE="$(OVMF_CODE)" OVMF_VARS="$(OVMF_VARS)" python3 tools/install_test.py
+
+# --- x86 console tests, scripted -----------------------------------------------
+# tools/console_test.py boots the kernel headless and types at its console. Any
+# self-test the kernel has can be run this way:  make test-x86 T="test mmap"
+.PHONY: test-x86 test-embkfs-crash test-swap-store test-swap test-login kit-test
+test-x86: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py $(T)
+
+# THE SAME STACK, OVER CARDS A REAL MACHINE MIGHT HAVE. Every network test this
+# OS ran for years went through virtio-net, which is a contract with a
+# hypervisor. These are drivers for silicon.
+#
+# Run against every part QEMU emulates that we drive, because they are
+# genuinely different hardware -- 82540EM (`e1000`, PCI, 2002), 82574L
+# (`e1000e`, PCIe, 2008) and the RTL8139, which has no receive descriptor ring
+# at all -- and a driver that works on one and not the others got lucky.
+#
+# The link half is separate because it needs QMP: tools/netlink_shot.py pulls
+# the virtual cable out with `set_link` and checks the OS notices. A driver that
+# always answers "up" passes every other test here.
+.PHONY: test-nics
+test-nics: $(IMG) $(EMBKFS_MASTER)
+	@for nic in e1000 e1000e rtl8139 igb i82559er; do \
+	  echo "=== $$nic ==="; \
+	  NET=1 NIC=$$nic python3 tools/console_test.py "test dhcp" "test dns" "test tcp" \
+	    "test net" "test netudp" || exit 1; \
+	done
+	@for nic in e1000 e1000e rtl8139 virtio-net; do \
+	  python3 tools/netlink_shot.py $$nic || exit 1; \
+	done
+
+# POWER LOSS, SIMULATED, AT EVERY WRITE. `test embkfs crash` copies the small
+# tree image into a RAM-backed block device inside the kernel, runs a workload
+# of commits against it while dropping every write after the N-th, remounts,
+# and requires the result to be exactly the state after some whole number of
+# commits -- for every N. The image is attached as a third disk only to be
+# READ once as the pristine seed; nothing is ever written to it, so the copy
+# is for hygiene, not correctness.
+# THE SEED IS A REAL FORMAT, NOT A FIXTURE. embkfs_tree.img is a hand-laid
+# two-level tree built for the path-walk tests; it has no root inode a writer
+# can update, and the first version of this test seeded from it and made zero
+# device writes. A 4 MiB image from the real formatter is what a fresh volume
+# actually looks like.
+build/crash-seed.img: tools/embkfs_mkfs/mkfs_embkfs.py | $(BUILD)
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py --size-mib 4 $@
+
+# A SWAP STORE for the tests: a 128 MiB raw image with the EMBKSWAP header,
+# attached as the fourth IDE disk. mkswap writes only block 0.
+build/swap.img: tools/mkswap.py | $(BUILD)
+	python3 tools/mkswap.py $@ 128
+
+# A disk the NVMe witness is ALLOWED TO DESTROY: 64 MiB, whose first bytes are
+# the marker kernel/drivers/storage/nvmetest.c looks for. A namespace without
+# it is read and never written. Made fresh by each run -- the test leaves its
+# patterns behind, and a stale pattern from a previous run is one of the things
+# it is built to tell apart from a real write.
+build/nvme-scratch.img: | $(BUILD)
+	python3 -c "f=open('$@','wb'); f.write(b'EMBKNVMETEST'.ljust(4096, b'\\0')); f.truncate(64 << 20); f.close()"
+
+# POWER, the way the machine's own ACPI tables say: FADT + the \_S5_ package
+# for power-off, the FADT reset register for reboot, on BOTH chipsets QEMU
+# emulates (their DSDTs differ), and judged on QEMU actually exiting. See
+# tools/power_test.py for why a power-off that works only through the emulator
+# fallback counts as a failure.
+.PHONY: test-power
+test-power: $(IMG) embkfs.img
+	python3 tools/power_test.py
+
+# The NVMe driver, three ways, on x86:
+#   1. the witness on a 512-byte-block namespace,
+#   2. the same witness on a 4096-byte-block namespace (the 4Kn format a real
+#      SSD can ship in, and the one EMBKFS's mount path used to overflow on),
+#   3. the whole OS booted with its ROOT FILESYSTEM on NVMe -- the thing that
+#      has to work on the machine this is for.
+.PHONY: test-nvme
+test-nvme: $(IMG) embkfs.img
+	rm -f build/nvme-scratch.img && $(MAKE) --no-print-directory build/nvme-scratch.img
+	NVME_DISK=build/nvme-scratch.img python3 tools/console_test.py "test nvme"
+	rm -f build/nvme-scratch.img && $(MAKE) --no-print-directory build/nvme-scratch.img
+	NVME_DISK=build/nvme-scratch.img NVME_BLOCK=4096 python3 tools/console_test.py "test nvme"
+	NVME_ROOT=1 python3 tools/console_test.py "test posix"
+
+# THE LOGIN PATH, typed on the real keyboard (QMP sendkey into the PS/2
+# controller): logout of the auto-login session, first-boot setup, a refused
+# password, a real sign-in, a planted hostile session profile refused, and
+# logout back to the greeter. Runs on a scratch copy of the image.
+test-login: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/login_test.py
+
+# THE SCREEN LOCK, end to end: the refusal on an account with no password,
+# first-boot setup typed on the real keyboard, then lock / wrong password /
+# right password on the session that account opens. Every claim is checked
+# where the two processes meet -- what the desktop says, and what authd says.
+.PHONY: test-lock
+test-lock: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/lock_test.py
+
+test-swap-store: $(IMG) $(EMBKFS_MASTER) build/swap.img
+	@SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap store"
+
+# ANONYMOUS MEMORY LARGER THAN RAM. `test swap` runs user/tests/swapper/swapper.elf,
+# which maps more than the machine has free, writes every page and reads every
+# page back; the kernel's own counters then say whether pages went out to the
+# store and came back. 256 MiB of RAM so the store is exercised in seconds
+# rather than minutes -- the witness sizes itself from what is actually free,
+# so any -m forces paging; a small one just makes it quick.
+test-swap: $(IMG) $(EMBKFS_MASTER) build/swap.img
+	@MEM=256M SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap"
+
+test-embkfs-crash: $(IMG) $(EMBKFS_MASTER) build/crash-seed.img
+	@EXTRA_DISK=build/crash-seed.img python3 tools/console_test.py "test embkfs crash"
+
+# HOW SHALLOW THE AUDIO BUFFER CAN BE, which is the same question as how much
+# latency the sound has. Separate from test-audio on purpose: this run
+# DELIBERATELY produces holes (that is the measurement), so the WAV checker
+# would rightly fail it. The pass/fail is the guest's own comparison of the two
+# scheduler policies -- see `test audiostress` in kernel/selftests.c.
+.PHONY: test-audio-latency
+test-audio-latency: $(IMG) $(EMBKFS_MASTER)
+	@AUDIO_CMD="test audiostress" AUDIO_CHECK=0 AUDIO_PLAY_WAIT=300 \
+	    AUDIO_SMP=4 python3 tools/audio_test.py
+
+.PHONY: test-audio test-audio-cards
 
 web-shots:
 	@$(MAKE) --no-print-directory build/browser_render
@@ -2392,6 +3412,29 @@ build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
 # Whatever the compiler recorded last time. Missing on a clean tree, which is
 # exactly when it is not needed.
 -include $(wildcard $(BUILD)/*.o.d) $(wildcard $(BUILD)/qjs/*.o.d)
+
+# --- second architecture ------------------------------------------------------
+# Everything above this line is the x86_64 build, and it is untouched by the
+# aarch64 campaign. A non-default ARCH pulls in that architecture's fragment,
+# which supplies its own rules and resets .DEFAULT_GOAL -- so `make
+# ARCH=aarch64` builds an aarch64 kernel rather than falling into `all` and
+# trying to assemble a BIOS boot sector for it.
+#
+# Included LAST, and guarded, on purpose:
+#   * guarded, so a plain `make` never even reads the file. The x86 build
+#     cannot be broken by a fragment it does not parse (docs/ARM64.md §2.9).
+#   * last, so the fragment can override .DEFAULT_GOAL, which is set at the
+#     top of this file and would otherwise win.
+#   * a fragment rather than ifeqs threaded through 2,400 lines of boot image,
+#     EMBKFS packing and userland -- none of which aarch64 has yet. Settles
+#     docs/ARM64.md §6.4.
+ifneq ($(ARCH),x86_64)
+ARCH_MK := kernel/arch/$(ARCH)/arch.mk
+ifeq ($(wildcard $(ARCH_MK)),)
+$(error unknown ARCH '$(ARCH)': no $(ARCH_MK). Known: x86_64, aarch64)
+endif
+include $(ARCH_MK)
+endif
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)

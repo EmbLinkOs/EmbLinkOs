@@ -12,7 +12,7 @@ void embkfs_lock(void){depth++;}
 void embkfs_unlock(void){assert(depth);depth--;}
 void kprintf(const char *f,...){(void)f;}
 int embkfs_read_node(struct embkfs_volume *v,const struct embk_block_ptr *p,uint8_t *out,size_t n){assert(v&&n==4096);if(p->block!=17&&p->block!=18)return -EMBK_EIO;memcpy(out,p->block==17?root_node:leaf,n);return 0;}
-int embkfs_stat_object(struct embkfs_volume *v,uint64_t oid,struct embk_inode_item *out){assert(oid==1 && !v->rcache[0].oid && !v->ecache_oid && !v->wcache_oid && !v->icache_valid);memset(out,0,sizeof *out);out->mode=0040700;return root_error;}
+int embkfs_stat_object(struct embkfs_volume *v,uint64_t oid,struct embk_inode_item *out){assert(oid==1 && !v->rcache[0].oid && !v->ecache_oid && !v->wcache_oid && !v->icache[0].valid);memset(out,0,sizeof *out);out->mode=0040700;return root_error;}
 int embkfs_read_object_at(struct embkfs_volume *v,uint64_t oid,uint64_t off,uint8_t *buf,uint64_t len,uint64_t *got){assert(depth && !v->rcache[0].oid && oid==2 && !off && len==4096);memset(buf,0,len);*got=len;data_reads++;return data_error;}
 static void fixture(struct embkfs_volume *v){
     memset(root_node,0,sizeof root_node);memset(leaf,0,sizeof leaf);
@@ -21,7 +21,7 @@ static void fixture(struct embkfs_volume *v){
     h=(void *)leaf;h->level=0;h->nritems=1;
     struct embk_item_header *i=(void *)(leaf+sizeof *h);i->key=s->key;i->offset=3968;i->size=128;
     struct embk_inode_item *ino=(void *)(leaf+3968);ino->mode=0100600;ino->size=4096;
-    v->rcache[0].oid=2;v->ecache_oid=2;v->wcache_oid=2;v->icache_valid=1;
+    v->rcache[0].oid=2;v->ecache_oid=2;v->wcache_oid=2;v->icache[0].valid=1;
 }
 int main(void){
     struct embk_block_device dev={.name="test"};

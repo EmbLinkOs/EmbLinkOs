@@ -3,11 +3,12 @@
  * input and codec-specific laptop amplifier quirks need separate support.
  * MSI has a dedicated vector; no legacy IRQ handler is overwritten. */
 #include "drivers/audio/hda.h"
+#include "drivers/audio/pcm.h"
 #include "drivers/bus/pci.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "drivers/timer/timer.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "include/kstring.h"
@@ -29,7 +30,8 @@ struct hda_device {
     uint32_t fg_pcm,fg_format,fg_inamp,fg_outamp;
     uint64_t physical;
     struct pci_device pci;
-    int present,running,fault;
+    uint64_t underruns;
+    int present,running,fault,exhausted;
 };
 static struct hda_device *h;
 static spinlock_t lock=SPINLOCK_INIT;
@@ -196,7 +198,7 @@ static void retire(void) {
         h->valid[h->retired]=0;memset(h->pcm[h->retired],0,HDA_PAGE);
         h->retired=(h->retired+1)%HDA_RING;
     }
-    if(!h->valid[current]) stop_dma();
+    if(!h->valid[current]) {h->exhausted=1;stop_dma();}
 }
 void hda_irq_handler(void) {
     spin_lock(&lock);retire();spin_unlock(&lock);lapic_send_eoi();
@@ -263,10 +265,11 @@ uint8_t hda_civ(void) {
 }
 static void start(void) {
     if(h->fault || h->running || !h->valid[h->retired]) return;
+    if(h->exhausted){h->underruns++;h->exhausted=0;}
     if(program(h->retired)) {h->fault=1;return;}
     __atomic_thread_fence(__ATOMIC_RELEASE);w8(h->sd,0x1e);h->running=1;
 }
-void hda_play(int last) {(void)last;if(!hda_present()) return;spin_lock(&lock);start();spin_unlock(&lock);}
+void hda_play(int last) {(void)last;if(!hda_present()) return;spin_lock(&lock);h->exhausted=0;h->underruns=0;start();spin_unlock(&lock);}
 void hda_set_last(int last) {(void)last;if(!hda_present()) return;spin_lock(&lock);retire();if(!h->running) start();spin_unlock(&lock);}
 bool hda_done(int last) {
     (void)last;if(!hda_present()) return true;
@@ -288,6 +291,19 @@ void hda_stop(void) {
     if(!h || !h->present) return;
     spin_lock(&lock);stop_dma();
     if(wait32(h->sd,2,0)) h->fault=1;
-    h->retired=0;memset(h->valid,0,sizeof h->valid);memset(h->pcm,0,sizeof h->pcm);
+    h->exhausted=0;h->retired=0;memset(h->valid,0,sizeof h->valid);memset(h->pcm,0,sizeof h->pcm);
     spin_unlock(&lock);
 }
+
+/* Retain bounded CORB/RIRB transactions and interrupt-backed page retirement
+ * behind the upstream PCM interface. HDA always plays the padded whole page. */
+static bool hda_pcm_init(void) {hda_init();return hda_present();}
+static uint32_t hda_pcm_rate(void) {return hda_present()?48000:0;}
+static uint32_t hda_pcm_frames(void) {return 1024;}
+static uint32_t hda_pcm_desc_frames(int i) {(void)i;return 1024;}
+static uint64_t hda_pcm_underruns(void) {return h?h->underruns:0;}
+const struct pcm_driver hda_driver={.name="hda",.init=hda_pcm_init,
+    .sample_rate=hda_pcm_rate,.frames_per_buffer=hda_pcm_frames,
+    .fill=hda_fill,.desc_frames=hda_pcm_desc_frames,.civ=hda_civ,
+    .set_last=hda_set_last,.play=hda_play,.done=hda_done,.stop=hda_stop,
+    .underruns=hda_pcm_underruns};

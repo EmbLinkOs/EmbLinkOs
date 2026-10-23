@@ -1,9 +1,26 @@
 #ifndef _VMM_H_
 #define _VMM_H_
 #include <stdint.h>
+#include "include/types.h"   /* bool */
 
 
-// Page table entry flags
+/* Page-table entry flags.
+ *
+ * BE HONEST ABOUT WHAT THESE ARE: bits 0-8 and 63 are the x86-64 page-table
+ * BIT POSITIONS. They are not an abstraction over two machines; they are one
+ * machine's hardware layout, and the x86 mapper ORs them straight into a PTE.
+ * aarch64 reads them as an ordinary flag word and translates.
+ *
+ * That is survivable for PRESENT/WRITABLE/USER, whose meanings coincide. It is
+ * NOT survivable for execution, because VMM_NX is INVERTED -- absent means
+ * executable -- so a caller that says nothing gets "executable" on x86 and
+ * (correctly) "not executable" on aarch64. Two machines, opposite answers, same
+ * silence. VMM_EXEC exists for that: execution asked for POSITIVELY, in the
+ * direction a permission reads, meaning the same thing everywhere.
+ *
+ * RULE FOR NEW CODE: say what you mean and say it in both dialects --
+ * VMM_EXEC to run code, VMM_NX to forbid it. Silence is not a policy. */
+
 #define VMM_PRESENT       (1ULL << 0)
 #define VMM_WRITABLE      (1ULL << 1)
 #define VMM_USER          (1ULL << 2)
@@ -14,6 +31,30 @@
 #define VMM_HUGE          (1ULL << 7)
 #define VMM_GLOBAL        (1ULL << 8)
 #define VMM_NX            (1ULL << 63)
+
+/* VMM_EXEC -- "code will run here", asked for POSITIVELY.
+ *
+ * Every flag above is an x86 page-table BIT POSITION wearing an interface
+ * name, and VMM_NX is the one that does not survive the trip to a second
+ * architecture: it is INVERTED (absent means executable), so a caller that
+ * asks for a writable page and says nothing about execution gets a writable,
+ * EXECUTABLE page. On x86 that is the hardware's own default and the reason
+ * the kernel heap is W+X today. aarch64's page tables spell the same
+ * permission the other way round (UXN/PXN set means "no execute", and the
+ * aarch64 mapper sets them unless told otherwise), so "say nothing" means the
+ * OPPOSITE there -- and a user text segment mapped by the SHARED ELF loader
+ * came out non-executable, faulting on the program's first instruction.
+ *
+ * Bit 9 is one of the three positions x86-64 leaves available to software, so
+ * setting it costs the x86 path nothing: the hardware ignores it, and that
+ * path keeps deciding execution from VMM_NX exactly as before. aarch64 reads
+ * it and clears UXN. Both architectures now get the same answer to the same
+ * question, and the question is asked in the direction a permission reads.
+ *
+ * docs/TODO.md asked for this ("name the flags for what they mean and make
+ * execute opt-in"). This is the opt-in half; renaming the rest is still open.
+ */
+#define VMM_EXEC          (1ULL << 9)
 
 // Address mask for physical addresses in page table entries
 #define VMM_ADDR_MASK 0x0000fffffffff000ULL
@@ -42,11 +83,42 @@ void vmm_unmap(uint64_t virt);
 // down -- see vmm.c and kernel/gfx/surface.c).
 void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt);
 
+/* Rewrite the PERMISSIONS of an existing mapping in `pml4_phys`, keeping the
+ * frame it already points at. Returns 0, or -1 if nothing is mapped there.
+ * This is what mprotect is built on: unmap-then-map would hand back a
+ * DIFFERENT frame, and the contents of the old one are the entire reason the
+ * caller asked. `flags` is the same VMM_* set vmm_map_in takes -- and, as ever
+ * on this seam, VMM_EXEC and VMM_NX must BOTH be stated: aarch64 reads the
+ * positive bit and x86 the inverted one, so silence means opposite things. */
+int vmm_protect_in(uint64_t pml4_phys, uint64_t virt, uint64_t flags);
+
+/* THE ACCESSED BIT -- what the reclaimer reads to tell a page that is still
+ * being used from one that merely happens to be mapped.
+ *
+ * `test_and_clear`: was the page referenced since the bit was last cleared?
+ * Clears it. On x86 the CPU sets the bit on a TLB fill and the clear is not
+ * followed by a flush -- an entry still in a TLB will not set it again until
+ * it is refilled, which is the imprecision every kernel accepts here (the
+ * alternative is a shootdown per page examined). On aarch64 the flag is
+ * software-managed (TCR_EL1.HA is not enabled): the clear invalidates the
+ * TLB entry, and the NEXT access takes an access-flag fault that
+ * `set_accessed` resolves. Both return false for an address with no page.
+ *
+ * `set_accessed`: mark the page referenced -- the aarch64 fault handler's
+ * half of the above; on x86 the hardware does it and this only reports
+ * whether the page is mapped. */
+bool vmm_test_and_clear_accessed_in(uint64_t pml4_phys, uint64_t virt);
+bool vmm_set_accessed_in(uint64_t pml4_phys, uint64_t virt);
+
 // Get the physical address of a virtual address (returns 0 if not mapped)
 uint64_t vmm_get_phys(uint64_t virt);
 
 // Invalidates the TLB entry for the given virtual address
 void vmm_flush_tlb(uint64_t virt);
+
+/* Flush THIS core's entire TLB, and only this core's. The IPI handler for a
+ * shootdown calls it; nothing else should. See include/arch_ipi.h. */
+void arch_tlb_flush_all_local(void);
 
 // Get the kernel's PML4 (for context switching)
 uint64_t vmm_get_kernel_pml4(void);
@@ -99,6 +171,18 @@ uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) ;
 // reclaimed (same simplification as vmm_map_mmio); only the backing physical
 // pages are freed, by vmm_free_kernel_stack.
 uint64_t vmm_alloc_kernel_stack(uint64_t size);
+
+/* ---- memory a loadable module runs from ---------------------------------
+ *
+ * WRITABLE FIRST, EXECUTABLE AFTER, never both: this kernel enforces W^X, and
+ * a module region that was both would be the single place in the system where
+ * an arbitrary write becomes arbitrary code. vmm_alloc_module returns writable
+ * non-executable pages in their own region; vmm_module_make_exec flips a range
+ * to read-only + executable once the loader has finished relocating it. Data
+ * sections are simply left alone. */
+uint64_t vmm_alloc_module(uint64_t size);
+int      vmm_module_make_exec(uint64_t virt, uint64_t size);
+void     vmm_free_module(uint64_t virt, uint64_t size);
 
 // Free the physical pages backing a stack returned by vmm_alloc_kernel_stack.
 // `size` must be the same value passed to the matching alloc call.

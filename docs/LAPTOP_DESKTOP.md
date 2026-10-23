@@ -5,22 +5,16 @@ layout, typography and accent palette. Browser development is separate.
 
 ## Desktop and preferences
 
-The top bar shows live Wi-Fi, sound and battery state. Its sound menu changes
-volume/mute, and its system menu opens Settings or requests restart/shutdown.
-Inert File/Edit/View menus and decorative status chips have been removed.
-The desktop receives Settings launch requests over `/run/emlink.settings` and
-restores an existing window. It restarts a failed top bar at most once every
-five seconds. This is limited desktop supervision, not a general service manager;
-init already supervises the desktop session.
+The incoming desktop, keyboard layouts, time-zone controls and wallpapers are
+preserved. Its status menus open Settings through the desktop service; the
+EmbLink menu opens a separate Notifications history window. Native notification
+banners still use `/run/emlink.notify`.
 
-Session preferences live at `$HOME/.settings.conf`. Non-session tools without
-HOME retain the old `/data/settings.conf` fallback. This fixes preference writes
-being outside the normal session's writable namespace. Theme, scale, dock,
-volume and mute use atomic replacement with flushes before and after rename.
-The desktop restores sound preferences at launch and persists top-bar changes.
-Bound sliders/toggles explicitly flush EmUI staging before reading changed values;
-this also repairs the existing dock-size slider callback. Per-pane reconciliation
-keys keep retained slider geometry out of newly displayed power buttons.
+Session preferences live at `$HOME/settings.conf`, with `/data/settings.conf`
+as the non-session fallback. Theme, scale, dock, keyboard, time-zone, sound and
+power preferences share this store. Saving writes a unique exclusive staging
+file, flushes it and atomically replaces the destination. A failed write leaves
+the previous preferences intact. Home reapplies sound and policy changes.
 
 ## Sound
 
@@ -39,7 +33,7 @@ A PCI class match alone is not a physical laptop compatibility claim.
 
 The sink remains one owner at a time, stereo S16 at 48 kHz. It applies linear
 software volume/mute while filling DMA pages; queued samples are not changed
-retroactively. A non-sleeping lock serializes ownership, writes and controls.
+retroactively. A non-sleeping lock serializes stream ownership and writes; volume/mute are atomic.
 Repeated open by the owner is idempotent. Last-thread exit releases the speaker
 before the parent waits, including a killed or crashed player.
 
@@ -73,8 +67,11 @@ flush-before-power-transition behavior and limits.
 ## ABI and checks
 
 Shared versioned structs: `user/lib/embk_{wifi,audio,display,power}.h`.
-Syscalls 99/100 are Wi-Fi info/request; 101/102 display info/brightness;
-103/104 audio info/volume. Wi-Fi changes require `network_admin` (ID 12),
+Incoming syscall numbers 1–128 are unchanged. Laptop calls are appended:
+129/130 Wi-Fi info/request, 131 power info, 132/133 display info/brightness,
+134/135 audio info/control, 136 GPU info, 137 no-replace rename, 138 boot mode,
+139 session control, 140/141 notification history, 142/143 policy.
+Wi-Fi changes require `network_admin` (ID 14),
 brightness requires `power`, and sound requires `audio`. UI snapshot reads never
 execute AML, wait for association or write profile files. Wi-Fi has one queued
 request and one latest completion record; a client refreshes state if a later
@@ -82,20 +79,20 @@ request supersedes its own completion. Saving a network does not claim WPA2
 success or a DHCP lease. [WIFI.md](WIFI.md) describes profiles and radio limits.
 
 ```sh
-make images uefi-usb.img
+make FB_W=1280 FB_H=800 images uefi-usb.img
 TEST_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' tests/drivers/run.sh
 iasl -p /tmp/emblink-power tests/acpi/power.asl
 
 # Disposable images; use the hardware smoke tool's normal environment setup.
 EMBLINK_CPUS=2 EMBLINK_DISK=nvme EMBLINK_AUDIO=hda \
   EMBLINK_SMOKE_COMMAND='test devices audio' \
-  EMBLINK_SMOKE_EXPECT='[cmd] test devices: exit=0 -> OK' python3 tools/hardware_smoke.py
+  EMBLINK_SMOKE_EXPECT='[cmd] test devices audio: exit=0 -> OK' python3 tools/hardware_smoke.py
 # Repeat with EMBLINK_AUDIO=ac97 for the existing backend.
 EMBLINK_SMOKE_COMMAND='test devices preferences' \
-  EMBLINK_SMOKE_EXPECT='[cmd] test devices: exit=0 -> OK' python3 tools/hardware_smoke.py
+  EMBLINK_SMOKE_EXPECT='[cmd] test devices preferences: exit=0 -> OK' python3 tools/hardware_smoke.py
 EMBLINK_ACPI_TABLE=/tmp/emblink-power.aml \
   EMBLINK_SMOKE_COMMAND='test devices fixture' \
-  EMBLINK_SMOKE_EXPECT='[cmd] test devices: exit=0 -> OK' python3 tools/hardware_smoke.py
+  EMBLINK_SMOKE_EXPECT='[cmd] test devices fixture: exit=0 -> OK' python3 tools/hardware_smoke.py
 ```
 
 Audio acceptance produces `audio.wav` in the printed log directory. Measure it

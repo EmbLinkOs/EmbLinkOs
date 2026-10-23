@@ -25,6 +25,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "embk_syscall.h"
 
 /* ==================================================================== */
@@ -72,6 +73,8 @@
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
+#define EMBK_SPAWN_SESSION_LIVE 1u
+#define EMBK_SPAWN_ACTION_NEW_SESSION 8   /* child leads a new session for user `path` */
 
 /* Coarse resource-class capabilities (kernel capabilities.h, EMBX spec §5.6).
  * A child's set is a subset of its parent's; declare a subset via a
@@ -85,9 +88,15 @@
 #define EMBK_CAP_SERIAL      7
 #define EMBK_CAP_RAWDISK     8
 #define EMBK_CAP_KERNEL_EXT  9
-#define EMBK_CAP_DEBUG       10
-#define EMBK_CAP_POWER       11
-#define EMBK_CAP_NETWORK_ADMIN 12
+#define EMBK_CAP_DEBUG      10
+#define EMBK_CAP_SESSION    11   /* open a session for a user; init only -- see embk_action_new_session */
+/* TURN THE MACHINE OFF. A class of its own because it is unlike every other
+ * one here: the rest gate what a process may TOUCH, and this gates something
+ * that ends every other process on the machine at once. The desktop shell
+ * holds it; an application has no business with it. */
+#define EMBK_CAP_POWER      12
+#define EMBK_CAP_SCREEN     13
+#define EMBK_CAP_NETWORK_ADMIN 14
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -184,15 +193,43 @@ struct embk_proc_info {
     uint8_t       priority;
     int           exit_code;    /* meaningful only for ZOMBIE */
     unsigned char is_kthread;
+    uint64_t      cpu_ns;       /* CPU actually consumed, all threads. Time
+                                 * EXECUTING -- a thread halted or blocked is
+                                 * charged nothing, which is the difference
+                                 * between this and wall time. */
+    uint32_t      session_id;   /* whose it is: 0 = the system session */
+    char          name[24];     /* the binary's basename; "" for kernel threads.
+                                 * A NAME FOR READING, never for deciding: a
+                                 * process's rights here are its namespace and
+                                 * its capabilities, and this string is not a
+                                 * second, weaker way to say who it is. Before
+                                 * it, `ps` was a column of bare numbers. */
 };
+/* WHAT THE MACHINE'S MEMORY IS DOING -- the whole machine's, not this
+ * process's. Mirrors struct meminfo_kbuf field for field; grow both together.
+ *
+ * used + free is LESS than total, and the gap is not a bug: total counts every
+ * page the machine reports and the allocator only ever owned the usable ones
+ * (firmware, MMIO holes and the page bitmap itself are in neither column). */
+struct embk_meminfo {
+    uint64_t total_pages;
+    uint64_t free_pages;
+    uint64_t used_pages;
+    uint64_t page_size;
+};
+static inline int embk_meminfo(struct embk_meminfo *out) {
+    return (int)embk_syscall1(EMBK_SYS_meminfo, (int64_t)(intptr_t)out);
+}
+
 /* Snapshot every live process (the shell's ps). Returns the count written
  * (<= max), or -EMBK_*. */
 static inline int embk_proc_list(struct embk_proc_info *out, int max) {
     return (int)embk_syscall2(EMBK_SYS_proc_list, (int64_t)(intptr_t)out, max);
 }
 /* Kill by PID (the shell's kill). Unlike embk_kill (handle-scoped to your
- * own children), this is the single-user OS's ambient process-manager
- * authority. 0, or -EMBK_ENOENT if no such live pid. */
+ * own children), this names any pid -- but only one in YOUR session may be
+ * killed this way (-EMBK_EPERM otherwise, and always for a kernel thread).
+ * 0, or -EMBK_ENOENT if no such live pid. */
 static inline int embk_proc_kill(uint32_t pid) {
     return (int)embk_syscall1(EMBK_SYS_proc_kill, (int64_t)pid);
 }
@@ -265,33 +302,48 @@ static inline int64_t embk_spawn_env(const char *path, char *const argv[],
 /* embk_spawn_env() with NO environment for the child. This is the plain spawn:
  * every existing caller keeps its exact behaviour, because "no environment" is
  * what they always got. */
-#include "embk_power.h"
-#include "embk_wifi.h"
-#include "embk_display.h"
-#include "embk_audio.h"
-static inline int embk_audio_get(struct embk_audio_info *out) {
-    return (int)embk_syscall2(EMBK_SYS_audio_info,(int64_t)(uintptr_t)out,sizeof(*out));
+/* ---- raw block devices --------------------------------------------------
+ *
+ * BELOW THE FILESYSTEM, and gated on EMBK_CAP_RAWDISK -- which is the most
+ * dangerous capability this system has. A program holding it can overwrite the
+ * running root filesystem, the partition table and the boot loader, with
+ * nothing between it and the platter.
+ *
+ * That is what installing an operating system consists of, which is why the
+ * capability exists and why it is separate from FILESYSTEM: holding one never
+ * implies the other, and an app that only wants to read your documents can
+ * never reach a disk this way.
+ *
+ * A transfer is capped at 64 blocks per call. Read or write more by looping;
+ * the cap is what stops a bad count from becoming a read of the whole address
+ * space. */
+#define EMBK_DISK_MAX_BLOCKS 64
+
+/* flags */
+#define EMBK_DISK_IS_PARTITION 1u   /* a partition OF a disk, not a whole one */
+
+struct embk_disk_info {
+    char     name[16];      /* "sda", "sda1" ...                            */
+    uint64_t block_count;
+    uint32_t block_size;
+    uint32_t flags;         /* EMBK_DISK_*                                  */
+};
+
+static inline int embk_disk_count(void) {
+    return (int)embk_syscall0(EMBK_SYS_disk_count);
 }
-static inline int embk_audio_volume(unsigned percent,unsigned mute) {
-    return (int)embk_syscall2(EMBK_SYS_audio_control,percent,mute);
+static inline int embk_disk_info(int index, struct embk_disk_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_disk_info, index, (int64_t)(intptr_t)out);
 }
-static inline int embk_display_get(struct embk_display_info *out) {
-    return (int)embk_syscall2(EMBK_SYS_display_info,(int64_t)(uintptr_t)out,sizeof(*out));
+static inline int embk_disk_read(int index, uint64_t lba, uint32_t count,
+                                 void *buf) {
+    return (int)embk_syscall4(EMBK_SYS_disk_read, index, (int64_t)lba,
+                              (int64_t)count, (int64_t)(intptr_t)buf);
 }
-static inline int embk_display_brightness(unsigned percent) {
-    return (int)embk_syscall1(EMBK_SYS_display_set,percent);
-}
-static inline int embk_wifi_get(struct embk_wifi_info *out) {
-    return (int)embk_syscall2(EMBK_SYS_wifi_info,(int64_t)(uintptr_t)out,sizeof(*out));
-}
-static inline int embk_wifi_change(const struct embk_wifi_request *request) {
-    return (int)embk_syscall2(EMBK_SYS_wifi_request,(int64_t)(uintptr_t)request,sizeof(*request));
-}
-static inline int embk_power_get(struct embk_power_info *out) {
-    return (int)embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)out,sizeof(*out));
-}
-static inline int embk_power_request(unsigned action) {
-    return (int)embk_syscall1(EMBK_SYS_power_request,action);
+static inline int embk_disk_write(int index, uint64_t lba, uint32_t count,
+                                  const void *buf) {
+    return (int)embk_syscall4(EMBK_SYS_disk_write, index, (int64_t)lba,
+                              (int64_t)count, (int64_t)(intptr_t)buf);
 }
 
 /* This process's own capability set (a bitmask of EMBK_CAP_BIT(id)). */
@@ -320,6 +372,57 @@ static inline int embk_fcntl_set_nonblock(int fd, int on) {
 /* Ready POLL* bits for one fd right now, without waiting. */
 static inline int embk_fd_poll(int fd, int events) {
     return (int)embk_syscall2(EMBK_SYS_fd_poll, fd, events);
+}
+
+/* WHAT THE NETWORK IS DOING. Mirrors the kernel's struct net_status_kbuf field
+ * for field -- sys_net_status copies it raw; grow both together.
+ *
+ * Addresses are in HOST order, so 10.0.2.15 reads as 0x0A00020F and the octets
+ * come out with >>24, >>16, >>8, &0xFF in that order.
+ *
+ * `up` is the link; `dhcp` says a lease configured it rather than a static
+ * address. A machine with up = 0 is not broken, it is not plugged in -- which
+ * is exactly what nothing could say before this existed. */
+struct embk_net_status {
+    int32_t  up, dhcp;
+    uint32_t ip, netmask, gateway, dns;
+    unsigned char mac[6];
+    unsigned char pad[2];
+};
+/* ---- DRAG AND DROP between applications ---------------------------------
+ *
+ * SESSION-SCOPED, like the clipboard: what one person drags, another session
+ * cannot see -- and a drop that arrives from a different session is not
+ * delivered at all.
+ *
+ * THE SOURCE calls embk_drag_begin while the button is down, saying what it is
+ * carrying: a short type name ("text/plain", "path") and the bytes. It keeps
+ * receiving pointer motion the whole time, because the compositor's pointer
+ * CAPTURE routes to the window the press landed on -- which is what lets it
+ * draw the thing under the cursor. Passing a null type CANCELS a drag.
+ *
+ * THE TARGET calls embk_drop_take each frame. It answers 1 exactly once, for
+ * the window the pointer was over when the button came up, with the position
+ * in that window's own content coordinates. Everything else is an ordinary
+ * frame with nothing dropped on it. */
+struct embk_drop {
+    int32_t  win;
+    int32_t  x, y;            /* content-local, like every other pointer coord */
+    uint32_t len;             /* bytes available; may exceed the cap you passed */
+    char     type[24];
+};
+static inline int embk_drag_begin(const char *type, const void *data, unsigned len) {
+    return (int)embk_syscall3(EMBK_SYS_drag_begin, (int64_t)(intptr_t)type,
+                              (int64_t)(intptr_t)data, len);
+}
+static inline int embk_drag_cancel(void) { return embk_drag_begin(0, 0, 0); }
+static inline int embk_drop_take(struct embk_drop *out, void *buf, unsigned cap) {
+    return (int)embk_syscall3(EMBK_SYS_drop_take, (int64_t)(intptr_t)out,
+                              (int64_t)(intptr_t)buf, cap);
+}
+
+static inline int embk_net_status(struct embk_net_status *out) {
+    return (int)embk_syscall1(EMBK_SYS_net_status, (int64_t)(intptr_t)out);
 }
 
 static inline int embk_net_socket(int type) {      /* type: 1=stream(TCP) 2=dgram(UDP); -> fd */
@@ -362,6 +465,71 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
     a->kind = EMBK_SPAWN_ACTION_SET_CAPS;
     a->target_fd = 0; a->path[0] = 0; a->flags = (int)cap_mask;
     a->mode = 0; a->src_obj_handle = 0;
+}
+
+/* The kernel's error codes -- a syscall that fails returns one NEGATED. The
+ * values are the kernel's own (kernel/include/errno.h); only the ones a
+ * program is likely to branch on are mirrored here. Guarded: other EmbLink
+ * headers define a few of them too. */
+#ifndef EMBK_EPERM
+#define EMBK_EPERM    1
+#endif
+#ifndef EMBK_ENOENT
+#define EMBK_ENOENT   2
+#endif
+#ifndef EMBK_EACCES
+#define EMBK_EACCES  13
+#endif
+#ifndef EMBK_EEXIST
+#define EMBK_EEXIST  17
+#endif
+#ifndef EMBK_EINVAL
+#define EMBK_EINVAL  22
+#endif
+#ifndef EMBK_ENODEV
+#define EMBK_ENODEV  19
+#endif
+#ifndef EMBK_E2BIG
+#define EMBK_E2BIG    7
+#endif
+
+/* --- sessions: whose a process is -------------------------------------------
+ *
+ * A session is opened when init authenticates someone: the desktop is spawned
+ * with a NEW_SESSION action naming the user, and every process started from it
+ * inherits the session and can never change it. When the leader exits the
+ * session ends and whatever it left running is stopped. Session 0 is the
+ * system (kernel, init, the login screen). */
+#define EMBK_EXIT_LOGOUT 0x4C4F47          /* a session leader's exit code after a logout */
+
+struct embk_session_info {
+    uint32_t id;                  /* 0 = the system session */
+    uint32_t leader_pid;          /* the process whose exit ends it */
+    char     user[32];            /* "" in the system session */
+};
+
+/* Who am I -- the kernel's answer, not $USER (which any parent can set). */
+static inline int embk_session_info(struct embk_session_info *out) {
+    return (int)embk_syscall1(EMBK_SYS_session_info, (int64_t)(intptr_t)out);
+}
+
+/* Log out: end session `sid` (0 = your own). Every process in it is stopped,
+ * the leader last with EMBK_EXIT_LOGOUT -- and you with them, so for your own
+ * session this does not return. Another session needs EMBK_CAP_SESSION. */
+static inline int embk_session_end(uint32_t sid) {
+    return (int)embk_syscall1(EMBK_SYS_session_end, (int64_t)sid);
+}
+
+/* Fill `a` as a NEW_SESSION action: the child leads a new session for `user`
+ * ([a-z0-9_-], 1..31). Needs EMBK_CAP_SESSION, which only init holds; the
+ * child is born without it. */
+static inline void embk_action_new_session(struct embk_spawn_file_action *a, const char *user) {
+    a->kind = EMBK_SPAWN_ACTION_NEW_SESSION;
+    a->target_fd = 0;
+    int i = 0;
+    if (user) { while (user[i] && i < 31) { a->path[i] = user[i]; i++; } }
+    a->path[i] = 0;
+    a->flags = 0; a->mode = 0; a->src_obj_handle = 0;
 }
 
 /* Namespace grant modes (mirror kernel enum ns_mode). */
@@ -425,6 +593,44 @@ static inline int64_t embk_cancel(int handle) {
     return embk_syscall1(EMBK_SYS_cancel, handle);
 }
 
+/* The one errno a caller of embk_wait() has to recognise by name. Mirrors
+ * kernel/include/errno.h, which is the source of truth; guarded because other
+ * headers in this tree define the codes they need the same way. */
+#ifndef EMBK_ESTOPPED
+#define EMBK_ESTOPPED 129
+#endif
+
+/* ---------------------------------------------------------------------------
+ * STOP a child, and start it again. The ^Z half of job control.
+ *
+ * ^C says "do not finish this". ^Z says "finish it later": the child keeps its
+ * memory, its file descriptors and its place in your handle table, and simply
+ * stops being scheduled. Handle-scoped like embk_cancel and embk_proc_kill --
+ * a child you spawned, never an arbitrary pid.
+ *
+ * WHAT CHANGES FOR THE PARENT: embk_wait() on a stopped child returns
+ * -EMBK_ESTOPPED rather than blocking. It has to -- a stopped process is not
+ * going to exit, so a wait for its exit code would never return. Treat that
+ * return as "it is still there, frozen", not as a failure.
+ *
+ * Returns how many threads changed state; 0 means it was already in that state
+ * (or every thread of it is pinned and cannot be frozen). */
+static inline int64_t embk_suspend(int handle) {
+    return embk_syscall2(EMBK_SYS_suspend, handle, 0);
+}
+static inline int64_t embk_resume(int handle) {
+    return embk_syscall2(EMBK_SYS_suspend, handle, 1);
+}
+
+/* Unpredictable bytes from the kernel's CSPRNG (HMAC_DRBG over SHA-256, seeded
+ * from a hardware generator where the processor has one and from clocks and
+ * timing jitter regardless). At most 256 per call; returns how many, which is
+ * always `len` unless the pointer is bad. The libc getentropy() is built on
+ * this where there is no unprivileged hardware instruction to build it on. */
+static inline int64_t embk_getrandom(void *buf, size_t len) {
+    return embk_syscall2(EMBK_SYS_getrandom, (int64_t)(intptr_t)buf, (int64_t)len);
+}
+
 /* 1 if THIS process has been cancelled, 0 if not.
  *
  * For compute loops that make no syscalls -- with nothing injected, a process
@@ -470,6 +676,10 @@ static inline int64_t embk_child_cancelled(int handle) {
  * single-user concession, same class as embk_proc_kill.
  *
  * Cancellation may be declined -- pair it with embk_kill() as the backstop. */
+#define EMBK_INTR_ROUTE_SELF  (-2)   /* ^C means ME (a shell at its own prompt) */
+#define EMBK_INTR_ROUTE_NONE  (-1)   /* reclaim: ^C is a byte again */
+/* handle >= 0 names a child. SELF used to be 0, which is also a process's first
+ * spawn handle -- a shell's first child's ^C went to the shell. */
 static inline int64_t embk_console_interrupt_route(int handle) {
     return embk_syscall1(EMBK_SYS_console_interrupt_route, handle);
 }
@@ -492,12 +702,24 @@ static inline void embk_exit(int code) {
 
 /* Start `entry` as a new thread of this process; `arg` arrives as entry's
  * first parameter (RDI). Returns a tid (>= 0) or -EMBK_*. The tid names a
- * thread only within THIS process. */
+ * thread only within THIS process.
+ *
+ * `entry` MUST END BY CALLING embk_thread_exit(). It is not called like an
+ * ordinary function and there is NO RETURN ADDRESS on its stack -- returning
+ * jumps to 0 and the thread dies with a page fault at instruction address
+ * zero, which looks like a wild function pointer and is nothing of the kind.
+ * A trampoline in the libc could make a plain `return` work; until one does,
+ * this is the contract. */
 static inline int64_t embk_thread_create(void (*entry)(long arg), long arg) {
     return embk_syscall2(EMBK_SYS_thread_create, (int64_t)(intptr_t)entry, arg);
 }
 
 /* Block until thread `tid` of this process exits; returns its exit code. */
+/* WHICH THREAD AM I -- the same number embk_thread_create returned for it. */
+static inline int embk_thread_self(void) {
+    return (int)embk_syscall0(EMBK_SYS_thread_self);
+}
+
 static inline int64_t embk_thread_join(int tid) {
     return embk_syscall1(EMBK_SYS_thread_join, tid);
 }
@@ -613,6 +835,27 @@ static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t 
 #define EMBK_KEY_PGUP   0x0E
 #define EMBK_KEY_PGDN   0x0F
 
+/* The EDITING commands, in the same byte stream as the text. 0xF8..0xFF can
+ * never occur in valid UTF-8 at any position, which is what makes it safe to
+ * carry them there -- and carrying them there is what keeps them in ORDER with
+ * the typed characters, so a paste between two keystrokes lands between them.
+ *
+ * They come from the GUI/Super key, not Ctrl, and that is a standing rule of
+ * this system rather than a preference: Ctrl+C is the console INTERRUPT here
+ * (docs/INTERRUPTION.md) and is consumed long before any application sees it.
+ * CTRL BELONGS TO THE TERMINAL, THE GUI KEY BELONGS TO THE INTERFACE.
+ * Mirrors EK_* in kernel/drivers/input/keyboard.h. */
+#define EMBK_KEY_SEL_LEFT   0xF8   /* Shift+Left  */
+#define EMBK_KEY_SEL_RIGHT  0xF9   /* Shift+Right */
+#define EMBK_KEY_SEL_HOME   0xFA   /* Shift+Home  */
+#define EMBK_KEY_SEL_END    0xFB   /* Shift+End   */
+#define EMBK_KEY_SEL_ALL    0xFC   /* GUI+A       */
+#define EMBK_KEY_COPY       0xFD   /* GUI+C       */
+#define EMBK_KEY_CUT        0xFE   /* GUI+X       */
+#define EMBK_KEY_PASTE      0xFF   /* GUI+V       */
+#define EMBK_KEY_UNDO       0xF6   /* GUI+Z */
+#define EMBK_KEY_REDO       0xF7   /* GUI+Shift+Z, GUI+Y */
+
 /* ---- key EVENTS (make/break + modifiers) --------------------------------
  * A SECOND stream beside the characters above, not a replacement. The char
  * stream answers "what did the user type"; it cannot answer "what key is down"
@@ -656,6 +899,78 @@ struct embk_key_event {
     unsigned char  mods;      /* EMBK_KM_* at event time */
     unsigned char  pressed;   /* 1 = pressed, 0 = released */
 };
+
+/* THE KEYBOARD LAYOUT. Kernel policy, because the driver is what turns a
+ * scancode into a character -- so this is an ask, not a setting userspace can
+ * keep to itself.
+ *
+ *   name != NULL : switch to it ("us", "azerty", "dvorak")
+ *   out  != NULL : receive the CURRENT layout's name
+ *
+ * 0, or -EMBK_EINVAL for a name nothing matches -- and on a bad name the
+ * layout is left alone, so a typo cannot leave the machine unable to type. */
+static inline int embk_kbd_layout(const char *name, char *out, int cap) {
+    return (int)embk_syscall3(EMBK_SYS_kbd_layout, (int64_t)(intptr_t)name,
+                              (int64_t)(intptr_t)out, cap);
+}
+
+/* WHAT WINDOWS EXIST. Mirrors the kernel's struct comp_win_info field for
+ * field -- sys_win_list copies it raw; grow both together.
+ *
+ * The answer is SCOPED TO YOUR SESSION and front-most first, and it leaves out
+ * what a person cannot switch to: the wallpaper, widgets, the translucent
+ * strips (menu bar, notifier) and anything that never named itself.
+ *
+ * TWO NAMES, and using the wrong one is the mistake to avoid. `title` is what
+ * the app calls this window; SHOW that. `app` is the basename of the binary;
+ * COMPARE that. A title changes as the person works -- open a document and the
+ * editor's window becomes the document's name -- so anything that tries to
+ * recognise an app by its title recognises it only until it is used. */
+#define EMBK_WIN_MINIMIZED  0x1
+#define EMBK_WIN_FOCUSED    0x2
+
+struct embk_win_info {
+    uint32_t pid;
+    uint32_t id;
+    uint32_t flags;      /* EMBK_WIN_* */
+    char     title[32];  /* COMP_TITLE_MAX + 1 -- show this */
+    char     app[24];    /* the binary's basename -- match on this */
+};
+
+static inline int embk_win_list(struct embk_win_info *out, int max) {
+    return (int)embk_syscall2(EMBK_SYS_win_list, (int64_t)(intptr_t)out, max);
+}
+
+/* Bring that process's windows forward, un-minimising them. The switcher's
+ * other half. -EMBK_EPERM for a pid outside your session -- you may raise what
+ * you were allowed to see.
+ *
+ * Distinct from embk_win_restore, which takes a SPAWN HANDLE and so only works
+ * for a child you started yourself (the dock's click-to-restore). */
+/* TURN THE MACHINE OFF (0) or RESTART IT (1).
+ *
+ * Does not return on success. -EMBK_EPERM without EMBK_CAP_POWER, which the
+ * desktop shell holds and an application should not: this ends every process
+ * on the machine, not just yours. A negative result otherwise means the
+ * platform has no mechanism -- reported rather than hung, because "this
+ * machine cannot power itself off" is something a person can act on. */
+static inline int embk_power(int what) {
+    return (int)embk_syscall1(EMBK_SYS_power, what);
+}
+static inline int embk_power_off(void)     { return embk_power(0); }
+static inline int embk_power_restart(void) { return embk_power(1); }
+
+static inline int embk_win_raise(uint32_t pid) {
+    return (int)embk_syscall1(EMBK_SYS_win_raise, pid);
+}
+
+/* The basename of an exec path: "/system/apps/term.elf" -> "term.elf". What you
+ * compare against embk_win_info::app. Returns a pointer INTO `path`. */
+static inline const char *embk_basename(const char *path) {
+    const char *b = path ? path : "";
+    for (const char *c = b; *c; c++) if (*c == '/') b = c + 1;
+    return b;
+}
 
 /* 1 = got an event, 0 = queue empty. Never blocks. */
 static inline int embk_key_event_poll(struct embk_key_event *ev) {
@@ -823,6 +1138,46 @@ static inline int embk_sleep_ms(uint64_t ms) {
     return (int)embk_syscall1(EMBK_SYS_sleep_ms, (int64_t)ms);
 }
 
+/* ---------------------------------------------------------------------------
+ * DECLARE THIS THREAD'S RATE: "I must run once every `period_ms`, and I need
+ * about `budget_ms` of CPU each time."
+ *
+ * This is what a compositor and an audio thread have that ordinary code does
+ * not: a cadence, and a small, known amount of work per beat. Saying so lets
+ * the scheduler run you close to your beat under load, where a plain sleep
+ * loop waits its ordinary turn behind whatever else is busy -- which for a
+ * 16 ms frame and three busy neighbours is a dropped frame every time.
+ *
+ * It is a request about TIMING, not importance, and it cannot make you run
+ * more than budget_ms per period ahead of anyone. Past that you are simply an
+ * ordinary thread again until the next period, so declaring one honestly costs
+ * you nothing and declaring one dishonestly gains you nothing.
+ *
+ * budget_ms == 0 means "half the period" -- generous, and the right answer when
+ * you have not measured. period_ms == 0 gives the reservation back.
+ *
+ * Returns 0, or -EBUSY if the machine has already promised out as much of
+ * itself as it is willing to. THAT IS NOT A FAILURE YOU SHOULD DIE ON: it
+ * means run the ordinary way, exactly as every program did before this
+ * existed. Check it, and carry on either way. */
+static inline int embk_sched_period(uint32_t period_ms, uint32_t budget_ms) {
+    return (int)embk_syscall2(EMBK_SYS_sched_period, period_ms, budget_ms);
+}
+
+/* CPU THIS THREAD HAS ACTUALLY USED, in nanoseconds. Monotonic, includes the
+ * slice it is running right now.
+ *
+ * Use this, not the clock, whenever you want the COST of something. On a busy
+ * machine wall time is mostly how long you were not running: the UI toolkit
+ * timing a frame in order to declare an honest scheduling budget measured
+ * ~40 ms for a frame whose real work was a few milliseconds, and then declined
+ * to ask for a cadence it could easily have kept. Subtract two readings around
+ * the work and you have what the work cost. */
+static inline uint64_t embk_thread_cpu_ns(void) {
+    int64_t r = embk_syscall0(EMBK_SYS_thread_cpu_ns);
+    return r > 0 ? (uint64_t)r : 0;
+}
+
 /* 1 if the child named by spawn HANDLE `handle` (what embk_spawn returned) is
  * still alive, else 0 (unknown/freed handles are "not alive"). Handle-based on
  * purpose: spawn never exposes raw pids, and a handle stays pinned to the
@@ -844,7 +1199,27 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * buttons is the mouse state -- EMBK_MOUSE_LEFT etc.), 0 otherwise. The home
  * launcher reads this to make its tiles clickable. */
 #define EMBK_WIN_ACTION_MAXIMIZE  0x80000001u
-struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
+/* PLEASE CLOSE. The window's close light, or GUI+W. It is a REQUEST: the app
+ * takes itself down, which is what gives it the chance to save. Ignore it and
+ * the compositor kills the process a few seconds later, because a window that
+ * cannot be closed is worse than an app that loses a moment of state. */
+#define EMBK_WIN_ACTION_CLOSE     0x80000002u
+/* SOMETHING WAS DROPPED ON YOU. Delivered so that an idle application wakes
+ * up: one that is not drawing never polls embk_drop_take, and the drop would
+ * sit in its window unread. The runtime turns this into a frame; the payload
+ * still comes from embk_drop_take. */
+#define EMBK_WIN_ACTION_DROP      0x80000003u
+/* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
+ * copies it raw; grow both together.
+ *
+ * `when` is the millisecond the reported state was MADE. For a press the
+ * compositor had to hold back (the app was mid-render when it happened) that
+ * is when the finger actually went down, NOT when this poll ran -- which is
+ * the difference between double-click working on a slow machine and not. Held
+ * clicks are replayed one per poll, so two real clicks 130 ms apart reach an
+ * app rendering at a few frames a second half a second apart. */
+struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win;
+                        int32_t wheel; uint32_t when; };
 static inline int embk_win_input(struct embk_win_input *out) {
     return (int)embk_syscall1(EMBK_SYS_win_input, (int64_t)(intptr_t)out);
 }
@@ -872,8 +1247,6 @@ static inline int embk_chan_pair(int out_handles[2]) {
 /* Send one message: `len` payload bytes plus `n_hnd` ancillary handles
  * (`hnds[]`) with per-handle COPY/MOVE (`flags[]`, or NULL for all-COPY).
  * Blocks if the peer's inbox is full; -EMBK_EPIPE if the peer has closed.
- * Cancellation of a blocking send returns -EMBK_ECANCELED without transferring
- * handles or enqueueing the message. Available capacity wins over cancellation.
  * Returns 0 or -EMBK_*. */
 static inline int embk_chan_send(int handle, const void *bytes, unsigned len,
                                  const int *hnds, const int *flags, unsigned n_hnd) {
@@ -884,8 +1257,7 @@ static inline int embk_chan_send(int handle, const void *bytes, unsigned len,
 /* Receive one message. Blocks until one arrives or the peer closes
  * (-EMBK_EPIPE). Fills up to `buflen` payload bytes (-EMBK_EMSGSIZE, message
  * left queued, if it's bigger); *out_len gets the real length. Ancillary
- * An empty receive returns -EMBK_ECANCELED when cancelled; queued data wins.
- * Ancillary handles are installed in this process's table, their ints written to
+ * handles are installed in this process's table, their ints written to
  * out_hnds[], count to *out_nhnd. Returns 0 or -EMBK_*. */
 static inline int embk_chan_recv(int handle, void *buf, unsigned buflen,
                                  unsigned *out_len, int *out_hnds, unsigned *out_nhnd) {
@@ -914,8 +1286,7 @@ static inline int embk_chan_listen(const char *path) {
 }
 
 /* Block until a client connects; returns a new CHANNEL handle for that
- * connection, or -EMBK_*. Cancellation refuses a blocking wait with
- * -EMBK_ECANCELED; an already queued connection is accepted. */
+ * connection, or -EMBK_*. */
 static inline int embk_chan_accept(int listen_handle) {
     return (int)embk_syscall1(EMBK_SYS_chan_accept, listen_handle);
 }
@@ -967,6 +1338,17 @@ static inline int embk_win_restore(int handle) {
 /* How bright is what is already composed under this screen rect (0-255, or
  * -1)? For a window that paints no background of its own and must still stay
  * legible over whatever wallpaper it happens to sit on. */
+/* THE COMPOSED SCREEN, as 0x00RRGGBB pixels, row-major. `cap` is how many
+ * PIXELS the buffer holds. Returns the number written, or -EMBK_EPERM without
+ * EMBK_CAP_SCREEN -- which a program asks for in its .caps manifest and almost
+ * nothing should: this is the call that shows one application what every other
+ * one is displaying. */
+static inline int embk_screen_read(int x, int y, int w, int h,
+                                   uint32_t *out, unsigned cap) {
+    return (int)embk_syscall6(EMBK_SYS_screen_read, x, y, w, h,
+                              (int64_t)(intptr_t)out, cap);
+}
+
 static inline int embk_screen_luma(int x, int y, int w, int h) {
     return (int)embk_syscall4(EMBK_SYS_screen_luma, x, y, w, h);
 }
@@ -1002,6 +1384,115 @@ static inline int embk_audio_close(void) {
     return (int)embk_syscall1(EMBK_SYS_audio_close, 0);
 }
 
+/* WPA2 station status contains no passwords or saved keys. Changes require
+ * NETWORK_ADMIN; NETWORK alone only permits reading connection state. */
+#include "embk_wifi.h"
+static inline int embk_wifi_get(struct embk_wifi_info *info) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_info, (int64_t)(intptr_t)info, sizeof *info);
+}
+static inline int embk_wifi_change(const struct embk_wifi_request *request) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_request, (int64_t)(intptr_t)request, sizeof *request);
+}
+
+#include "embk_power.h"
+#include "embk_display.h"
+#include "embk_audio.h"
+#include "embk_gpu.h"
+static inline int embk_power_get(struct embk_power_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_display_get(struct embk_display_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_display_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_audio_get(struct embk_audio_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_audio_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_gpu_get(struct embk_gpu_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_gpu_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_display_brightness(unsigned percent) {
+    return (int)embk_syscall1(EMBK_SYS_display_set,percent);
+}
+static inline int embk_audio_volume(unsigned percent,unsigned mute) {
+    return (int)embk_syscall2(EMBK_SYS_audio_control,percent,mute);
+}
+static inline int embk_power_request(unsigned action) {
+    if(action!=EMBK_POWER_OFF && action!=EMBK_POWER_REBOOT)return -22;
+    return (int)embk_syscall1(EMBK_SYS_power,action==EMBK_POWER_OFF?0:1);
+}
+
+#include "embk_session.h"
+static inline int embk_session(unsigned command,int arg) {
+    return (int)embk_syscall2(EMBK_SYS_session_control,command,arg);
+}
+
+#include "embk_notify.h"
+#include "embk_policy.h"
+static inline void embk_notice_copy(char *out,unsigned cap,const char *source) {
+    unsigned at=0;
+    while(source && source[at]) {
+        unsigned char c=(unsigned char)source[at];
+        unsigned n=c<128?1:c>=0xc2 && c<=0xdf?2:c>=0xe0 && c<=0xef?3:c>=0xf0 && c<=0xf4?4:0;
+        if(!n || at+n>=cap)break;
+        unsigned valid=1;
+        for(unsigned j=1;j<n;j++)if(((unsigned char)source[at+j]&0xc0)!=0x80){valid=0;break;}
+        if(!valid)break;
+        for(unsigned j=0;j<n;j++)out[at+j]=source[at+j];
+        at+=n;
+    }
+    out[at]=0;
+}
+static inline int embk_notify_send(unsigned severity,const char *title,const char *body) {
+    struct embk_notice_request r={.version=EMBK_NOTIFY_VERSION,.severity=severity};
+    embk_notice_copy(r.title,sizeof r.title,title);embk_notice_copy(r.body,sizeof r.body,body);
+    return (int)embk_syscall2(EMBK_SYS_notice_post,(int64_t)(uintptr_t)&r,sizeof r);
+}
+static inline int embk_notify_get(struct embk_notice_info *out,int clear) {
+    return (int)embk_syscall3(EMBK_SYS_notice_get,(int64_t)(uintptr_t)out,sizeof *out,clear);
+}
+static inline int embk_policy_get(struct embk_policy *out) {
+    return (int)embk_syscall2(EMBK_SYS_policy_get,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_policy_set(const struct embk_policy *p) {
+    return (int)embk_syscall2(EMBK_SYS_policy_set,(int64_t)(uintptr_t)p,sizeof *p);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * WHERE THE SPEAKER ACTUALLY IS, in frames since this stream started.
+ * Monotonic; 0 until the device begins.
+ *
+ * A streaming writer needs this and cannot substitute the clock. The device
+ * does not start when you start writing -- it starts once enough is queued to
+ * keep it fed -- so "frames the clock says should have played" runs ahead of
+ * the truth by exactly the start-up buffer, and a writer pacing off it silently
+ * holds far more audio queued than it meant to. (That mistake is what made the
+ * first version of this OS's own latency test measure nothing.)
+ *
+ * It is also the number A/V sync is made of: picture time is sound time here.
+ * Resolution is one buffer, about 21 ms -- the position of the buffer being
+ * played, not of the sample inside it. */
+static inline uint64_t embk_audio_position(void) {
+    int64_t r = embk_syscall0(EMBK_SYS_audio_position);
+    return r > 0 ? (uint64_t)r : 0;
+}
+
+/* Ask to start playing sooner: the device begins once `ms` of audio is queued
+ * instead of the default ~170 ms.
+ *
+ * THAT NUMBER IS THE LATENCY of everything the stream does afterwards -- the
+ * delay between deciding to make a sound and the sound existing. Lower it if
+ * your refill loop can be relied on to come back in time (declaring a period
+ * with embk_sched_period() is how you make that true), and leave it alone if
+ * it cannot: running dry is a hole in the sound, and that is worse than delay.
+ *
+ * Call it after embk_audio_open() and before the first write. Returns the
+ * latency actually granted in ms -- rounded UP to whole buffers, floored at
+ * two -- or -EBUSY if the sound has already started. */
+static inline int embk_audio_latency(uint32_t ms) {
+    return (int)embk_syscall1(EMBK_SYS_audio_latency, ms);
+}
+
 static inline int embk_win_minimize(int win) {
     return (int)embk_syscall1(EMBK_SYS_win_minimize, win);
 }
@@ -1022,9 +1513,11 @@ static inline int embk_win_desktop_front(int on) {
     return (int)embk_syscall1(EMBK_SYS_win_desktop_front, on);
 }
 
-/* --- the system clipboard: one machine-global text buffer ----------------
+/* --- the clipboard: one text buffer PER SESSION ---------------------------
  * Set replaces it whole; get copies up to cap bytes OUT and returns how many
- * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix. */
+ * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix.
+ * What one session copied, another sees as an empty clipboard, and a session's
+ * clipboard is wiped when it ends. */
 static inline int embk_clip_set(const void *buf, size_t len) {
     return (int)embk_syscall2(EMBK_SYS_clip_set, (int64_t)(intptr_t)buf, (int64_t)len);
 }
@@ -1036,31 +1529,298 @@ static inline int embk_tty_mode(int mode) {
     return (int)embk_syscall1(EMBK_SYS_tty_mode, mode);
 }
 
-#include "embk_session.h"
-static inline int embk_session(unsigned command,int arg) {
-    return (int)embk_syscall2(EMBK_SYS_session_control,command,arg);
+/* --- anonymous memory mappings -------------------------------------------
+ * Pages with the permissions you ask for, at an address the kernel picks, and
+ * -- unlike the sbrk heap, which only ever grows -- pages you can give back.
+ *
+ * PRIVATE AND ANONYMOUS ONLY. There is no `fd`: a file mapping needs a page
+ * cache the kernel does not have, and MAP_SHARED that quietly behaved as
+ * MAP_PRIVATE would be two processes each believing they saw the other's
+ * writes. There is no `addr`: an address the caller chooses is an address the
+ * caller can collide with.
+ *
+ * PROT_WRITE|PROT_EXEC is REFUSED (-EMBK_EINVAL). A page that is both is the
+ * primitive every code injection needs. A JIT maps it writable, writes, and
+ * then flips it to executable -- which is mprotect, and is not built yet.
+ *
+ * Every page arrives ZEROED, and the whole mapping is allocated up front, so
+ * a large mapping costs its full size immediately. */
+#define EMBK_PROT_NONE   0x0
+#define EMBK_PROT_READ   0x1
+#define EMBK_PROT_WRITE  0x2
+#define EMBK_PROT_EXEC   0x4
+
+#define EMBK_MAP_SHARED   0x01
+#define EMBK_MAP_PRIVATE  0x02
+
+/* fd < 0 = anonymous. A file mapping shares the kernel's page cache object for
+ * that file, so a reader and a mapper see one set of pages -- and the mapping
+ * holds its own reference, so closing the fd afterwards is fine. */
+static inline int64_t embk_mmap_fd(size_t len, int prot, int flags,
+                                   int fd, uint64_t off) {
+    return embk_syscall5(EMBK_SYS_mmap, (int64_t)len, prot, flags, fd, (int64_t)off);
+}
+static inline int64_t embk_mmap(size_t len, int prot) {
+    return embk_mmap_fd(len, prot, 0, -1, 0);
 }
 
-#include "embk_notify.h"
-#include "embk_gpu.h"
-#include "embk_policy.h"
-static inline int embk_notify_send(unsigned severity,const char *title,const char *body) {
-    struct embk_notice_request r={.version=EMBK_NOTIFY_VERSION,.severity=severity};
-    unsigned i=0;while(title[i] && i<sizeof r.title-1){r.title[i]=title[i];i++;}
-    i=0;while(body[i] && i<sizeof r.body-1){r.body[i]=body[i];i++;}
-    return (int)embk_syscall2(EMBK_SYS_notice_post,(int64_t)(uintptr_t)&r,sizeof r);
+/* Unmaps a whole mapping, or a page-aligned prefix, suffix or middle of one --
+ * a middle splits it in two. Unmapping a range that was never mapped is an
+ * ERROR, not a no-op: it is far more often a bug than idempotent cleanup, and
+ * succeeding silently would hide a double free of address space. */
+static inline int embk_munmap(void *addr, size_t len) {
+    return (int)embk_syscall2(EMBK_SYS_munmap, (int64_t)(intptr_t)addr, (int64_t)len);
 }
-static inline int embk_notify_get(struct embk_notice_info *out,int clear) {
-    return (int)embk_syscall3(EMBK_SYS_notice_get,(int64_t)(uintptr_t)out,sizeof *out,clear);
+
+/* Change the permissions of memory you already have, keeping its contents.
+ *
+ * This is the other half of the W^X rule. mmap will not give you a page that
+ * is writable AND executable; with mprotect you do not need one:
+ *
+ *     void *code = (void *)embk_mmap(len, EMBK_PROT_READ | EMBK_PROT_WRITE);
+ *     ... emit instructions into it ...
+ *     embk_mprotect(code, len, EMBK_PROT_READ | EMBK_PROT_EXEC);
+ *
+ * The dangerous state never exists, and generated code still runs. Asking for
+ * WRITE|EXEC in one call is refused here too.
+ *
+ * EMBK_PROT_NONE is real, not a rounding: the pages stay yours and every
+ * access to them faults, which is how you place a guard page around something.
+ *
+ * The range must be page-aligned and ENTIRELY mapped -- a range with a hole in
+ * it is refused whole (-EMBK_ENOMEM) rather than half-applied, because a
+ * caller that believes it protected N pages and got M has a guarantee it does
+ * not have. */
+static inline int embk_mprotect(void *addr, size_t len, int prot) {
+    return (int)embk_syscall3(EMBK_SYS_mprotect, (int64_t)(intptr_t)addr,
+                              (int64_t)len, prot);
 }
-static inline int embk_policy_get(struct embk_policy *out) {
-    return (int)embk_syscall2(EMBK_SYS_policy_get,(int64_t)(uintptr_t)out,sizeof *out);
+
+/* --- a second name for an open file ---------------------------------------
+ * `newfd` < 0 asks for the lowest free descriptor at or above `min_fd`;
+ * otherwise `newfd` is the exact slot and whatever it held is closed first.
+ *
+ * The two descriptors share ONE open file description -- one cursor, one
+ * reference to the underlying object. A write through either advances both,
+ * and closing either leaves the other fully working. That shared cursor is the
+ * entire promise of dup: re-opening the file instead would give a separate
+ * one, which is the opposite of what the caller asked for.
+ *
+ * embk_dup(fd, fd) returns fd unchanged rather than closing and reopening it,
+ * because closing the target first would destroy the description being
+ * duplicated. */
+static inline int embk_dup(int oldfd, int newfd, int min_fd) {
+    return (int)embk_syscall3(EMBK_SYS_dup, oldfd, newfd, min_fd);
 }
-static inline int embk_gpu_get(struct embk_gpu_info *out) {
-    return (int)embk_syscall2(EMBK_SYS_gpu_info,(int64_t)(uintptr_t)out,sizeof *out);
+
+/* Do not return until this file's outstanding writes are ON THE DEVICE.
+ *
+ * write() returns as soon as the bytes reach the page cache, which is what
+ * makes writing fast and what makes a crash able to lose them. This is the
+ * control: a journal, a lock file, a git ref -- anything whose ordering
+ * against a later write must survive a power cut -- calls this and waits.
+ * Everything else does not, and gets the speed. */
+static inline int embk_fsync(int fd) {
+    return (int)embk_syscall1(EMBK_SYS_fsync, fd);
 }
-static inline int embk_policy_set(const struct embk_policy *p) {
-    return (int)embk_syscall2(EMBK_SYS_policy_set,(int64_t)(uintptr_t)p,sizeof *p);
+
+/* --- being interrupted, and surviving it ----------------------------------
+ *
+ * ^C routed at a process CANCELS it, and cancellation is sticky on purpose --
+ * a process must not be able to miss one by being between calls. That makes it
+ * exactly wrong for the other thing ^C means: "stop what you are doing and go
+ * back to your prompt". A shell that routed ^C at itself would take one
+ * keystroke and never read a line again.
+ *
+ * So a process can opt IN to catching interrupts instead. Then ^C increments a
+ * COUNTER it takes and clears whenever it is ready to act -- as many times as
+ * a human presses the key. Counted rather than a flag so a second press during
+ * a slow unwind is not lost, and so an impatient double-tap is visible as one.
+ *
+ *     embk_intr_catch(1);                    // ^C now interrupts, not kills
+ *     embk_console_interrupt_route(0);       // ...and it is aimed at me
+ *     while (working) {
+ *         if (embk_intr_take()) break;       // a human asked us to stop
+ *     }
+ *     embk_console_interrupt_route(-1);      // hand ^C back
+ */
+static inline int embk_intr_catch(int on) {
+    return (int)embk_syscall2(EMBK_SYS_intr, 1, on);
+}
+static inline unsigned embk_intr_take(void) {
+    int64_t n = embk_syscall2(EMBK_SYS_intr, 0, 0);
+    return n > 0 ? (unsigned)n : 0u;
+}
+
+/* --- symbolic links --------------------------------------------------------
+ * A link holds TEXT, not a reference to an object. It may name something that
+ * does not exist (creating one before its target is normal), it is re-resolved
+ * on every path walk, and a cycle is reported as -EMBK_ELOOP rather than
+ * hung on. `target` is stored verbatim, so a relative target stays relative --
+ * which is what lets a tree of links survive being moved.
+ *
+ * embk_readlink reports the FULL length even when the buffer was too small, so
+ * a caller can tell a truncated answer from a complete one. */
+/* A HARD link: `newpath` becomes a second name for the object `oldpath`
+ * names. Unlike embk_symlink this is a reference to the thing, not a string
+ * that names it -- both names are equal, neither is the original, and the
+ * data lives until the last name is unlinked. Directories are refused. */
+static inline int embk_link(const char *oldpath, const char *newpath) {
+    return (int)embk_syscall2(EMBK_SYS_link, (int64_t)(intptr_t)oldpath,
+                              (int64_t)(intptr_t)newpath);
+}
+
+static inline int embk_symlink(const char *target, const char *linkpath) {
+    return (int)embk_syscall2(EMBK_SYS_symlink, (int64_t)(intptr_t)target,
+                              (int64_t)(intptr_t)linkpath);
+}
+static inline int64_t embk_readlink(const char *path, char *buf, size_t cap) {
+    return embk_syscall3(EMBK_SYS_readlink, (int64_t)(intptr_t)path,
+                         (int64_t)(intptr_t)buf, (int64_t)cap);
+}
+
+/* ===========================================================================
+ * LOCKS -- the first correct way for two threads in one process to agree
+ * about anything.
+ *
+ * embk_thread_create has existed for a long time; a way to SHARE data between
+ * the threads it makes has not. A program had a choice between spinning on an
+ * atomic -- burning a whole timeslice per contention, on a machine where the
+ * holder may be on another core or may not be scheduled at all -- and being
+ * wrong. There was no third option.
+ *
+ * THE FAST PATH NEVER ENTERS THE KERNEL. An uncontended lock is one atomic
+ * compare-and-swap in ring 3 and nothing else; the syscall below is only what
+ * happens when a thread must actually wait. That is the whole point of the
+ * futex shape, and it is why the kernel call is the odd-looking "sleep if this
+ * word still says what I think it says" rather than "lock this".
+ *
+ * THREE STATES, not two, and the third is what stops a lost wakeup:
+ *
+ *     0  free
+ *     1  held, and NOBODY is waiting        -- unlock needs no syscall
+ *     2  held, and somebody MAY be waiting  -- unlock must wake
+ *
+ * With only free/held, a thread that released the lock could not know whether
+ * anyone was asleep on it, so it would have to make the wake syscall every
+ * time -- paying the kernel on the uncontended path, which is the one case
+ * that must stay free. */
+#define EMBK_FUTEX_WAIT 0
+#define EMBK_FUTEX_WAKE 1
+
+static inline int64_t embk_futex(volatile uint32_t *addr, int op, uint32_t val) {
+    return embk_syscall3(EMBK_SYS_futex, (int64_t)(intptr_t)addr, op, val);
+}
+
+typedef struct { volatile uint32_t state; } embk_mutex;
+
+#define EMBK_MUTEX_INIT { 0 }
+
+static inline void embk_mutex_init(embk_mutex *m) { m->state = 0; }
+
+static inline void embk_mutex_lock(embk_mutex *m) {
+    uint32_t expected = 0;
+    /* THE FAST PATH: one CAS, free -> held-uncontended. No syscall. */
+    if (__atomic_compare_exchange_n(&m->state, &expected, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+
+    /* Contended. Announce it by moving the lock to state 2 and then sleeping
+     * on that value -- so the holder's unlock knows a wake is owed.
+     *
+     * The exchange is unconditional: whatever the lock was (1 or 2) it is 2
+     * now, which is the safe direction. Claiming "somebody may be waiting"
+     * when nobody is costs one wasted wake syscall; the opposite mistake
+     * loses a wakeup and hangs. */
+    while (__atomic_exchange_n(&m->state, 2, __ATOMIC_ACQUIRE) != 0) {
+        /* Sleep only while the lock still reads 2. If the holder released
+         * between the exchange and here, the kernel's compare fails, WAIT
+         * returns EAGAIN, and we loop round to try the exchange again --
+         * which is exactly the lost-wakeup window the in-kernel compare
+         * exists to close. */
+        (void)embk_futex(&m->state, EMBK_FUTEX_WAIT, 2);
+    }
+}
+
+static inline int embk_mutex_trylock(embk_mutex *m) {
+    uint32_t expected = 0;
+    return __atomic_compare_exchange_n(&m->state, &expected, 1, false,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED) ? 0 : -1;
+}
+
+static inline void embk_mutex_unlock(embk_mutex *m) {
+    /* If the lock was 1, nobody ever announced a wait and there is nothing to
+     * wake -- the uncontended unlock is one atomic store and no syscall. */
+    if (__atomic_exchange_n(&m->state, 0, __ATOMIC_RELEASE) == 2)
+        (void)embk_futex(&m->state, EMBK_FUTEX_WAKE, 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * CONDITION VARIABLES -- waiting for a STATE, not for a lock.
+ *
+ * A mutex answers "may I touch this yet". It cannot answer "has it become
+ * what I need", and that is what almost every piece of concurrent code
+ * actually wants: a consumer waiting for an item, a worker waiting for a job,
+ * a thread waiting for shutdown. Without one, the only way to express it is to
+ * take the lock, look, drop the lock, and try again -- a poll loop that burns
+ * a core to discover nothing changed.
+ *
+ * A SEQUENCE NUMBER IS THE WHOLE IMPLEMENTATION. The counter is not the state
+ * anyone cares about; it exists so a waiter can say "sleep unless something
+ * has been signalled since I looked". Read it BEFORE dropping the mutex, and
+ * the dangerous window closes: if a signal lands between the unlock and the
+ * futex call, the counter has already moved, the kernel's compare fails, and
+ * the wait returns immediately instead of sleeping through the event it was
+ * waiting for. That lost wakeup is the entire difficulty of condition
+ * variables, and this is where it is prevented.
+ *
+ * SPURIOUS WAKEUPS ARE PART OF THE CONTRACT, not a defect to be papered over.
+ * A wake means "the state MAY have changed"; it never means it did. Every
+ * caller must re-check its own condition in a loop:
+ *
+ *     embk_mutex_lock(&m);
+ *     while (!ready)                     // while, never if
+ *         embk_cond_wait(&c, &m);
+ *     ... consume ...
+ *     embk_mutex_unlock(&m);
+ *
+ * Writing `if` there is the classic bug, and it is silent: it works until the
+ * day two waiters are woken by one signal and the second finds nothing.
+ */
+typedef struct { volatile uint32_t seq; } embk_cond;
+
+#define EMBK_COND_INIT { 0 }
+
+static inline void embk_cond_init(embk_cond *c) { c->seq = 0; }
+
+/* Atomically release `m` and sleep until signalled; re-acquires `m` before
+ * returning. The mutex MUST be held on entry -- that is what makes the
+ * caller's check of its own condition and this wait a single indivisible
+ * step from any other thread's point of view. */
+static inline void embk_cond_wait(embk_cond *c, embk_mutex *m) {
+    /* Read the sequence WHILE STILL HOLDING THE MUTEX. Everything depends on
+     * this ordering: a signal cannot slip past between here and the sleep,
+     * because a signal moves the counter and the kernel refuses to sleep on a
+     * value that has changed. */
+    uint32_t seq = __atomic_load_n(&c->seq, __ATOMIC_RELAXED);
+
+    embk_mutex_unlock(m);
+    (void)embk_futex(&c->seq, EMBK_FUTEX_WAIT, seq);
+    embk_mutex_lock(m);
+}
+
+/* Wake ONE waiter. Correct only when any single waiter can make progress --
+ * which is not true of, say, a bounded queue with producers and consumers on
+ * one condition, where the one woken may be the wrong kind. Broadcast when in
+ * doubt: waking too many costs time, waking too few hangs. */
+static inline void embk_cond_signal(embk_cond *c) {
+    __atomic_fetch_add(&c->seq, 1, __ATOMIC_RELEASE);
+    (void)embk_futex(&c->seq, EMBK_FUTEX_WAKE, 1);
+}
+
+static inline void embk_cond_broadcast(embk_cond *c) {
+    __atomic_fetch_add(&c->seq, 1, __ATOMIC_RELEASE);
+    (void)embk_futex(&c->seq, EMBK_FUTEX_WAKE, 0x7FFFFFFF);
 }
 
 #endif /* __EMBK_H__ */

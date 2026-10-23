@@ -7,4 +7,8 @@
 // Full/low-speed devices are released to companion controllers (UHCI/OHCI).
 bool ehci_init_controller(struct usb_controller *ctrl);
 
+/* Compare this controller's ports against what the device table remembers,
+ * enumerating what appeared and tearing down what left. */
+void ehci_rescan(void *hc);
+
 #endif /* __EHCI_H__ */

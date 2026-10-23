@@ -18,9 +18,23 @@ ZSRC="${1:?usage: $0 /path/to/zlib-1.3.1 [outdir]}"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 M="${MYOS:-$(cd "$HERE/../.." && pwd)}"
-NEWLIB_PREFIX="${NEWLIB_PREFIX:-$(make -C "$M" -s --no-print-directory print-newlib-prefix)}"
-NL="$NEWLIB_PREFIX/x86_64-elf"
-CROSS="${CROSS:-x86_64-elf-}"
+# TARGET picks the architecture; everything else derives from it. Defaults to
+# x86_64-elf, so an existing invocation is unchanged.
+#   aarch64:  TARGET=aarch64-elf tools/zlib/build-zlib-emblink.sh <src> <out>
+TARGET="${TARGET:-x86_64-elf}"
+NEWLIB_PREFIX="${NEWLIB_PREFIX:-$(make -C "$M" ARCH=$([ "$TARGET" = aarch64-elf ] && echo aarch64 || echo x86_64) -s --no-print-directory print-newlib-prefix)}"
+NL="$NEWLIB_PREFIX/$TARGET"
+CROSS="${CROSS:-$TARGET-}"
+
+# -mno-red-zone is an X86 flag, and aarch64-elf-gcc does not merely ignore it:
+# it errors, zlib's hand-rolled configure sees a failing probe compile, and
+# aborts with "compiler error reporting is too harsh" -- which points at
+# -Werror and has nothing to do with -Werror. The AAPCS has no red zone, so
+# there is nothing to ask for.
+case "$TARGET" in
+  x86_64-elf)  ARCH_CFLAGS="-mno-red-zone" ;;
+  *)           ARCH_CFLAGS="" ;;
+esac
 export PATH="${CROSS_BIN:-/usr/local/cross/bin}:$PATH"
 OUT="${2:-$ZSRC/../build-zlib}"
 mkdir -p "$OUT"
@@ -40,7 +54,7 @@ cd "$ZSRC"
 make distclean >/dev/null 2>&1 || true
 CHOST="${CROSS%-}" \
 CC="${CROSS}gcc" AR="${CROSS}ar" RANLIB="${CROSS}ranlib" \
-CFLAGS="-O2 -mno-red-zone -fno-stack-protector -I$M/user/lib -isystem $NL/include" \
+CFLAGS="-O2 $ARCH_CFLAGS -fno-stack-protector -I$M/user/lib -isystem $NL/include" \
     ./configure --static --prefix="$OUT"
 
 make -j"$(nproc 2>/dev/null || echo 4)" libz.a

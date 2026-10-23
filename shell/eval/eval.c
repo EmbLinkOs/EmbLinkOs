@@ -299,6 +299,13 @@ struct value expr_eval(const struct expr *e, struct scope *env) {
         value_free(&obj);
         return out;
     }
+    case EXPR_CAPTURE:
+        /* $(pipeline) -- run it here, in THIS scope, and hand back its value.
+         * Running it in the current scope is what makes `$(where size > $n)`
+         * see `n`; a fresh scope would make command substitution the one
+         * place in the language where bindings stop being visible. */
+        return pipeline_run(e->u.capture, env);
+
     case EXPR_UNARY: {
         struct value v = expr_eval(e->u.unary.operand, env);
         if (v.type == VAL_ERROR) return v;
@@ -356,6 +363,14 @@ struct value expr_eval(const struct expr *e, struct scope *env) {
 /* -------------------------------------------------------------------------
  * Pipeline runner -- materialize v1: each stage is Value -> Value.
  * ------------------------------------------------------------------------- */
+/* NULL until eval/exec.c's exec_init() sets them -- see eval.h. A build
+ * without the program layer (the host tests) leaves them NULL and dispatches
+ * builtin-then-external exactly as it always did. */
+bool (*eval_user_command_exists)(const char *name) = NULL;
+struct value (*eval_user_command_call)(const struct command *cmd,
+                                       struct value input,
+                                       struct scope *env) = NULL;
+
 struct value pipeline_run(const struct pipeline *pl, struct scope *top) {
     struct value cur = value_null();   /* first stage gets NULL as input */
 
@@ -365,6 +380,8 @@ struct value pipeline_run(const struct pipeline *pl, struct scope *top) {
         struct value next;
         if (fn) {
             next = fn(cmd, cur, top);           /* stage takes ownership of cur */
+        } else if (eval_user_command_exists && eval_user_command_exists(cmd->name)) {
+            next = eval_user_command_call(cmd, cur, top);
         } else {
             next = extern_stage_run(cmd, cur, top);
         }

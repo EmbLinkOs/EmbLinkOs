@@ -32,6 +32,7 @@
 #include "include/kstring.h"
 #include "drivers/bus/pci.h"
 #include "mm/pmm.h"
+#include "drivers/audio/pcm.h"
 #include "drivers/timer/timer.h"
 
 #define AC97_VENDOR_INTEL   0x8086
@@ -56,8 +57,9 @@
 #define AC97_CR_IOCE        0x10   /* interrupt on completion enable         */
 #define AC97_SR_BCIS        0x08   /* buffer completion interrupt status     */
 #define AC97_SR_LVBCI       0x04   /* last valid buffer completed            */
-#define AC97_SR_DCH         0x01   /* DMA halted                              */
-#define AC97_SR_FIFOE       0x10
+
+#define AC97_SR_DCH 0x01
+#define AC97_SR_FIFOE 0x10
 
 #define AC97_BDL_ENTRIES    32
 #define AC97_SAMPLE_RATE    48000
@@ -90,6 +92,23 @@ static void disable_bus_mastering(void) {
     g_ac97.present=false;
 }
 
+
+/* HOW MANY TIMES THE SPEAKER RAN DRY.
+ *
+ * The device latches "last valid buffer completed" when it reaches LVI and
+ * halts -- which happens for exactly one reason once a stream is running: the
+ * writer did not get back in time. ac97_set_last() has always DETECTED that
+ * (it has to, or a new LVI would not restart anything); it just never said so.
+ *
+ * This is the only failure in the whole audio path that a person hears
+ * directly, and it is the hardware's own account of it rather than an
+ * inference from timing -- which makes it the right number to judge a
+ * scheduler by. Zeroed on every ac97_play(), because a count that spans two
+ * unrelated sounds answers no question anyone asked. */
+static uint64_t g_underruns;
+
+static uint64_t ac97_underruns(void) { return g_underruns; }
+
 /* AC'97 codec registers are reached through BAR0's ports directly on this
  * controller -- there is no index/data pair to sequence. */
 static void mixer_write(uint8_t reg, uint16_t value)
@@ -102,35 +121,44 @@ static uint16_t mixer_read(uint8_t reg)
     return inw((uint16_t)(g_ac97.mixer + reg));
 }
 
-bool ac97_present(void) { return g_ac97.present; }
-uint32_t ac97_sample_rate(void) { return AC97_SAMPLE_RATE; }
+static uint32_t ac97_sample_rate(void) { return g_ac97.present ? AC97_SAMPLE_RATE : 0; }
 
 /* How many stereo FRAMES one descriptor's buffer holds. */
-uint32_t ac97_frames_per_buffer(void)
+static uint32_t ac97_frames_per_buffer(void)
 {
     return g_ac97.buf_samples / 2;
 }
 
 /* Fill descriptor `i` from `frames` stereo frames of interleaved S16. Returns
- * how many frames were taken -- the caller keeps the rest for the next one. */
-uint32_t ac97_fill(int i, const int16_t *frames, uint32_t nframes)
+ * how many frames were taken -- the caller keeps the rest for the next one.
+ *
+ * A DESCRIPTOR IS AS LONG AS WHAT WAS PUT IN IT, which is the point. This used
+ * to declare every descriptor a full page (1024 frames, ~21 ms at 48 kHz) and
+ * zero-pad a short fill, so the smallest unit of audio the device could be
+ * given was 21 ms and the shallowest buffer anyone could ask for was two of
+ * them. That is a 43 ms latency floor written into the driver, and it is not a
+ * hardware limit -- the BDL entry has carried a length field the whole time.
+ *
+ * Writing the true length also retires the zero-padding and the click it was
+ * there to hide: the device now stops at the end of the audio instead of
+ * playing whatever the rest of the page still held. The buffer's tail is
+ * stale, and unread.
+ *
+ * A page is still the CAP, so a writer that hands over big chunks gets big
+ * descriptors and the same behaviour as before. Granularity is the writer's
+ * choice now, and it is the same choice as its latency. */
+static uint32_t ac97_fill(int i, const int16_t *frames, uint32_t nframes)
 {
     if (!g_ac97.present || i < 0 || i >= AC97_BDL_ENTRIES) return 0;
 
     uint32_t cap = ac97_frames_per_buffer();
     uint32_t take = nframes < cap ? nframes : cap;
+    if (take == 0) return 0;
 
     memcpy(g_ac97.buf[i], frames, (size_t)take * 2 * sizeof(int16_t));
-    /* Silence the tail rather than leaving the previous buffer's audio in it:
-     * a short final block otherwise repeats whatever was there, which is the
-     * click at the end of every sound a half-finished driver plays. */
-    if (take < cap) {
-        memset(g_ac97.buf[i] + take * 2, 0,
-               (size_t)(cap - take) * 2 * sizeof(int16_t));
-    }
 
     g_ac97.bdl[i].addr    = (uint32_t)g_ac97.buf_phys[i];
-    g_ac97.bdl[i].samples = (uint16_t)(cap * 2);   /* SAMPLES, both channels */
+    g_ac97.bdl[i].samples = (uint16_t)(take * 2);  /* SAMPLES, both channels */
     g_ac97.bdl[i].flags   = AC97_BD_IOC;
     return take;
 }
@@ -138,7 +166,7 @@ uint32_t ac97_fill(int i, const int16_t *frames, uint32_t nframes)
 /* Which descriptor the device is playing RIGHT NOW. Everything above this
  * file schedules against it: a ring that writes past the current index
  * overwrites audio that has not been heard yet. */
-uint8_t ac97_civ(void)
+static uint8_t ac97_civ(void)
 {
     if (!g_ac97.present) return 0;
     return inb((uint16_t)(g_ac97.bus + AC97_PO_CIV));
@@ -147,7 +175,7 @@ uint8_t ac97_civ(void)
 /* Extend how far the list is valid, without restarting. This is how a stream
  * differs from a one-shot: the device keeps walking and the writer keeps
  * moving the goalpost ahead of it. */
-void ac97_set_last(int last)
+static void ac97_set_last(int last)
 {
     if (!g_ac97.present) return;
 
@@ -175,6 +203,7 @@ void ac97_set_last(int last)
     bool halted=(sr&(AC97_SR_DCH|AC97_SR_LVBCI))!=0;
 
     if (halted) {
+        g_underruns++;
         /* It DID reach the old end and stop. Clear the latch -- while it is
          * set, a new LVI does not restart anything -- and run again. An
          * underrun costs a gap, not the rest of the sound. */
@@ -188,7 +217,7 @@ void ac97_set_last(int last)
 }
 
 /* Start the DMA walking descriptors 0..last inclusive. */
-void ac97_play(int last)
+static void ac97_play(int last)
 {
     if (!g_ac97.present) return;
 
@@ -200,6 +229,7 @@ void ac97_play(int last)
      * closed the device, and the sound was cut to whatever had been prefilled.
      * Exactly 0.18s of a 0.5s beep, which is the prefill and nothing else. */
     outw((uint16_t)(g_ac97.bus + AC97_PO_SR), AC97_SR_BCIS | AC97_SR_LVBCI);
+    g_underruns = 0;              /* this sound's count, not the last one's */
     /* LVI LAST: this is the write that tells the device how far the list is
      * valid, and therefore the one that starts it moving. */
     outb((uint16_t)(g_ac97.bus + AC97_PO_LVI), (uint8_t)last);
@@ -207,7 +237,7 @@ void ac97_play(int last)
 }
 
 /* True once the device has walked past the last descriptor we gave it. */
-bool ac97_done(int last)
+static bool ac97_done(int last)
 {
     if (!g_ac97.present) return true;
     uint8_t civ = inb((uint16_t)(g_ac97.bus + AC97_PO_CIV));
@@ -223,7 +253,7 @@ bool ac97_done(int last)
     return done;
 }
 
-void ac97_stop(void)
+static void ac97_stop(void)
 {
     if (!g_ac97.present) return;
     outb((uint16_t)(g_ac97.bus + AC97_PO_CR), 0);
@@ -237,7 +267,7 @@ void ac97_stop(void)
     }
 }
 
-void ac97_init(void)
+static bool ac97_init(void)
 {
     uint32_t n = pci_devices_count();
     const struct pci_device *dev = NULL;
@@ -249,17 +279,17 @@ void ac97_init(void)
     }
     if (dev == NULL) {
         kprintf("ac97: no controller (add -device AC97 to the QEMU line)\n");
-        return;
+        return false;
     }
-    g_ac97.pci=*dev;
 
     struct pci_bar b0 = pci_read_bar(dev->bus, dev->device, dev->function, 0);
     struct pci_bar b1 = pci_read_bar(dev->bus, dev->device, dev->function, 1);
     if (!b0.valid || !b1.valid || b0.is_mmio || b1.is_mmio) {
         kprintf("ac97: expected two I/O BARs, got mmio=%d/%d\n",
                 (int)b0.is_mmio, (int)b1.is_mmio);
-        return;
+        return false;
     }
+    g_ac97.pci = *dev;
     g_ac97.mixer = (uint16_t)b0.address;
     g_ac97.bus   = (uint16_t)b1.address;
 
@@ -281,7 +311,7 @@ void ac97_init(void)
      * addresses, because the device walks this itself and knows nothing about
      * our page tables. */
     uint64_t bdl_page = pmm_alloc_page();
-    if (!bdl_page || bdl_page>UINT32_MAX-PAGE_SIZE) { kprintf("ac97: no 32-bit page for the descriptor list\n");disable_bus_mastering();return; }
+    if (!bdl_page || bdl_page > UINT32_MAX-PAGE_SIZE) { kprintf("ac97: no 32-bit descriptor list\n"); disable_bus_mastering(); return false; }
     g_ac97.bdl_phys = bdl_page;
     g_ac97.bdl = (struct ac97_bd *)P2V(bdl_page);
     memset(g_ac97.bdl, 0, PAGE_SIZE);
@@ -289,7 +319,7 @@ void ac97_init(void)
     g_ac97.buf_samples = PAGE_SIZE / sizeof(int16_t);   /* 2048 samples/page */
     for (int i = 0; i < AC97_BDL_ENTRIES; i++) {
         uint64_t p = pmm_alloc_page();
-        if (!p || p>UINT32_MAX-PAGE_SIZE) { kprintf("ac97: only %d usable buffers\n", i);disable_bus_mastering();return; }
+        if (!p || p > UINT32_MAX-PAGE_SIZE) { kprintf("ac97: only %d usable buffers\n", i); disable_bus_mastering(); return false; }
         g_ac97.buf_phys[i] = p;
         g_ac97.buf[i] = (int16_t *)P2V(p);
         memset(g_ac97.buf[i], 0, PAGE_SIZE);
@@ -297,9 +327,27 @@ void ac97_init(void)
 
     g_ac97.present = true;
     ac97_stop();
-    if(!g_ac97.present) return;
+    if (!g_ac97.present) return false;
     kprintf("ac97: 82801AA at mixer 0x%x bus 0x%x, %u Hz, %u frames/buffer\n",
             g_ac97.mixer, g_ac97.bus, AC97_SAMPLE_RATE,
             ac97_frames_per_buffer());
     kprintf("ac97: codec id 0x%x\n", mixer_read(AC97_RESET));
+    return true;
 }
+
+/* AC'97 writes the true length into each descriptor, so what fill() took and
+ * what the device plays are the same number -- no desc_frames op needed. */
+const struct pcm_driver ac97_driver = {
+    .name              = "ac97",
+    .init              = ac97_init,
+    .sample_rate       = ac97_sample_rate,
+    .frames_per_buffer = ac97_frames_per_buffer,
+    .fill              = ac97_fill,
+    .desc_frames       = NULL,
+    .civ               = ac97_civ,
+    .set_last          = ac97_set_last,
+    .play              = ac97_play,
+    .done              = ac97_done,
+    .stop              = ac97_stop,
+    .underruns         = ac97_underruns,
+};

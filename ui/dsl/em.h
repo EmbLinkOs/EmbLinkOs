@@ -283,8 +283,24 @@ struct EmV {
 /* Emphasise a span of the next TextField's value while it is not being edited.
  * See ui_text_field_emphasis. */
 void em_field_emphasis(unsigned start, unsigned len);
+/* The next TextField/PasswordField takes keyboard focus if nothing has it: a
+ * form that opens ready to type into. Tab moves to the next field, always. */
+void em_field_autofocus(void);
 #define PasswordField(...) em_password_field(__VA_ARGS__)
 #define Segmented(...)   em_segmented(__VA_ARGS__)
+/* EMIT THE STAGED ELEMENT NOW. An element is staged, not emitted -- that is
+ * what lets .caption().grow() chain after the call -- so a widget handed a
+ * pointer (Segmented, Slider, Toggle, Check, Stepper, Dropdown) writes through
+ * it at the NEXT flush, not on the line you called it. Reading the value
+ * before then reads the old one, silently. A closing brace flushes, so a
+ * widget inside a block is already settled by the time the block ends; one
+ * that is not needs this:
+ *
+ *     Segmented(names, n, &pick);
+ *     Sync();                        // <- now pick is what the widget decided
+ *     if (pick != was) apply(pick);
+ */
+#define Sync()           em_flush()
 #define Spacer()         em_spacer_()
 /* Divider() as before; Divider("key") when it sits among rows that come and
  * go -- see EmProps.key. The concatenation makes the no-argument form pass an
@@ -362,7 +378,7 @@ void em_windowbar_(const char *title, EmProps p);
 void em_windowbar_end_(void);
 /* AppBar -- the standard chrome for an OS application window. One definition
  * so Files, Settings and the Terminal are visibly the same product: traffic
- * lights leading (close, then minimize, Mac order), the title centred in the
+ * the three lights leading (close, minimize, zoom), the title centred in the
  * space between, and whatever the app puts in the scope trailing. The whole
  * bar is a drag zone except where a control sits.
  *
@@ -377,8 +393,42 @@ void em_appbar_end_(void);
 #define CloseButton(...)  em_close_button()
 EmV  em_close_button(void);            /* modern single round close control; chainable (.clicked()) */
 int  em_window_closed(void);           /* 1 if the built-in CloseButton fired this frame */
+int  em_window_maximized(void);        /* 1 if the built-in MaximizeButton fired this frame */
+void em_window_post_maximize(void);    /* ask the runtime to maximize next pass */
+int  em_window_take_maximize(void);    /* the runtime, consuming that ask */
 #define MinimizeButton(...) em_min_button()
 EmV  em_min_button(void);              /* park the window; the dock icon brings it back */
+#define ZoomButton(...)     em_max_button()
+#define MaximizeButton(...) em_max_button()   /* the old name for ZoomButton */
+/* The house window controls as ONE widget: the three lights. What AppBar puts
+ * at the head of its bar -- use it in any bar you assemble yourself, so every
+ * window in the OS carries the same controls in the same place. */
+#define WindowControls()    em_window_controls()
+void em_window_controls(void);
+
+/* WHERE A WINDOW CAN BE PUT, which is the whole point of the zoom light: the
+ * pointer resting on it opens a small board of these, and picking one places
+ * the window. `Normal` is the size and position it had before.
+ *
+ * FILL AND FULL ARE DIFFERENT ON PURPOSE and the difference is the one people
+ * actually want a choice about: Fill takes the WORK AREA -- everything that is
+ * not the top bar and not the dock, so both stay reachable -- while Full takes
+ * the display, bar and dock included, for a video or a game. Every other
+ * system makes you learn which of its two similar-looking buttons is which;
+ * this one shows you both and names them. */
+typedef enum {
+    EmWinNormal = 0,
+    EmWinFill,          /* the work area: not under the bar, not under the dock */
+    EmWinFull,          /* the whole display, bar and dock covered */
+    EmWinLeft, EmWinRight, EmWinTop, EmWinBottom,   /* halves */
+} EmWinLayout;
+
+/* The toolkit posts a layout during the view; the runtime takes it at the top
+ * of the next pass and does the resize (it owns the shared pixel mapping).
+ * Apps do not call these -- em_app_run does. */
+void em_window_post_layout(EmWinLayout want);
+int  em_window_take_layout(EmWinLayout *out);   /* 1 if one was posted */
+EmV  em_max_button(void);              /* fill the work area, or come back to size */
 int  em_window_minimized(void);        /* 1 if the built-in MinimizeButton fired this frame */
 /* CloseGrip: EmbLink's own close GESTURE (not a fixed button). Put it in the
  * WindowBar; the user PULLS it -- the window fades + slides toward the drag and
@@ -549,6 +599,11 @@ void em_context_menu_end_(void);
 /* Runtime plumbing: the app loop feeds raw right-button state here (em_app_run
  * does it). A press EDGE of the right button becomes one em_right_clicked(). */
 void em_feed_right_button(float x, float y, bool down);
+/* Look at a pending right-click without consuming it, then take it. Two calls
+ * because a click must be offered to whichever widget it landed in, and one
+ * that consumes on inspection lets the first widget asked swallow it. */
+int  em_right_peek(float *x, float *y);
+void em_right_take(void);
 
 /* ======================================================================= */
 /* EmUI V7 -- multi-line text editing                                       */

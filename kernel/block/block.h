@@ -45,7 +45,6 @@ struct embk_block_device {
     // DMA constraints (filled by the driver at registration)
     uint64_t dma_max_phys;   // highest physical address the controller can DMA to
                              // (e.g. 0xFFFFFFFF for 32-bit ATA, UINT64_MAX for 64-bit AHCI)
-    bool durability_pending; /* block layer: writes not covered by a real flush */
     bool needs_kernel_range;  // true if buffer must be KV2P-able (both, for now)
 };
 
@@ -57,6 +56,11 @@ struct embk_block_device {
 // The driver owns the struct's memory; the layer stores a pointer to it.
 int embk_block_register(struct embk_block_device *dev);
 
+/* Take a device back out: the medium is gone. Removes it from the table
+ * BEFORE anything else can look it up, and does not recycle its name. Returns
+ * -ENODEV if it was not registered. The driver still owns the struct. */
+int embk_block_unregister(struct embk_block_device *dev);
+
 // How many block devices are reistered?.
 uint32_t embk_block_count(void);
 
@@ -65,10 +69,11 @@ struct embk_block_device *embk_block_get(uint32_t index);
 
 // Find a registered device by name ("sda"), or NULL.
 struct embk_block_device *embk_block_get_by_name(const char *name);
+
+
 struct embk_block_identity {char transport[12],model[41],serial[21];};
 void embk_block_set_identity(struct embk_block_device *,const char *,const char *,const char *);
 const struct embk_block_identity *embk_block_identity(const struct embk_block_device *);
-
 
 // Convenience wrappers with bounds-checking. Higher layers (Filesystem)
 // Call these instead of dev->reqd/write directly - they validate the LBA range
@@ -115,11 +120,5 @@ struct embk_blkstat {
 };
 void embk_blkstat_reset(void);
 void embk_blkstat_get(struct embk_blkstat *out);
-
-/* System power transition: freeze waits for in-flight block writes. The
- * caller first holds embkfs_lock so filesystem transactions finish atomically. */
-void embk_block_freeze_writes(void);
-void embk_block_thaw_writes(void);
-int embk_block_sync_dirty(void);
 
 #endif /* _BLOCK_H_ */

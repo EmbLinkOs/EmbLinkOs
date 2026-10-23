@@ -1,0 +1,1444 @@
+# aarch64 build fragment -- docs/ARM64.md, phases A0 onward.
+#
+# Included by the top-level Makefile ONLY when ARCH=aarch64, so the x86_64
+# build never parses a line of it (§2.9: a second architecture must not tax the
+# person who is not working on it).
+#
+# This settles open sub-decision §6.4 in favour of a per-arch fragment. The
+# x86_64 build is deliberately NOT hoisted into a matching fragment: that would
+# be pure churn today, and §2.3 says to derive the shared shape from two
+# WORKING implementations rather than invent it from one. When the aarch64 side
+# grows a real source list, the common parts will be visible and can move up.
+
+AARCH64_PREFIX ?= aarch64-elf-
+AARCH64_CC     := $(AARCH64_PREFIX)gcc
+AARCH64_OBJCOPY:= $(AARCH64_PREFIX)objcopy
+
+ARM_BUILD   := $(BUILD)/aarch64
+
+# WHICH MACHINE -- docs/RPI4.md §2.1. `virt` (QEMU, the CI target) or `rpi4`
+# (a Raspberry Pi 4 Model B). Only the KERNEL differs: it is linked at a
+# board-specific physical address and boots with board-specific first page
+# tables (board.h). The userland and the root filesystem are the same bytes on
+# both, so they stay in $(ARM_BUILD) and are shared; the kernel of a non-virt
+# board goes in a subdirectory so switching BOARD never links one board's
+# kernel into the other's image.
+BOARD       ?= virt
+ifeq ($(BOARD),virt)
+ARM_KBUILD  := $(ARM_BUILD)
+ARM_BOARD_CFLAGS :=
+else ifeq ($(BOARD),rpi4)
+ARM_KBUILD  := $(ARM_BUILD)/rpi4
+ARM_BOARD_CFLAGS := -DBOARD_RPI4 -Wl,--defsym=BOARD_KERNEL_PHYS_BASE=0x80000
+else
+$(error unknown BOARD '$(BOARD)' for ARCH=aarch64. Known: virt, rpi4)
+endif
+
+ARM_ELF     := $(ARM_KBUILD)/kernel.elf
+ARM_IMG     := $(ARM_KBUILD)/kernel.img
+# Declared HERE, with the other output paths, and not beside the rule that
+# builds it further down: make expands a rule's prerequisites when it READS the
+# rule, so `arm64: ... $(ARM_ROOTFS)` below would expand to NOTHING if this line
+# came after it. It did, and `make ARCH=aarch64` on a clean tree built a kernel
+# with no userland and no disk for it to read -- which then failed only at run
+# time, as "no EMBKFS volume".
+# Per BOARD, because it carries /system/kernel.embdbg -- the symbol table of
+# THIS board's kernel, which mkfs_arm64.py picks up from beside the image.
+ARM_ROOTFS  := $(ARM_KBUILD)/embkfs-arm64.img
+ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
+
+ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
+               kernel/arch/aarch64/irq/vectors.S \
+               kernel/arch/aarch64/cpu/kcontext.S \
+
+# The aarch64-specific sources...
+ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
+               kernel/arch/aarch64/boot/fdt.c \
+               kernel/arch/aarch64/boot/boot_protocol_dtb.c \
+               kernel/arch/aarch64/irq/exception.c \
+               kernel/arch/aarch64/irq/gic.c \
+               kernel/arch/aarch64/irq/gicv3.c \
+               kernel/arch/aarch64/irq/gicv2.c \
+               kernel/arch/aarch64/irq/its.c \
+               kernel/arch/aarch64/irq/ipi.c \
+               kernel/arch/aarch64/sched/bringup.c \
+               kernel/arch/aarch64/smp/smp.c \
+               kernel/arch/aarch64/drivers/timer_generic.c \
+               kernel/arch/aarch64/drivers/pci_ecam.c \
+               kernel/arch/aarch64/drivers/pl031.c \
+               kernel/arch/aarch64/drivers/bcm_mbox.c \
+               kernel/arch/aarch64/drivers/sdhci_dt.c \
+               kernel/arch/aarch64/drivers/pcie_brcmstb.c \
+               kernel/arch/aarch64/drivers/absent.c \
+               kernel/arch/aarch64/cpu/spinlock.c \
+               kernel/arch/aarch64/cpu/arch_thread.c \
+               kernel/arch/aarch64/cpu/cpu_features.c \
+               kernel/arch/aarch64/cpu/percpu.c \
+               kernel/arch/aarch64/mm/pagetable.c \
+               kernel/arch/aarch64/mm/pmm_arch.c \
+               kernel/arch/aarch64/mm/usercopy.c \
+               kernel/arch/aarch64/syscall/syscall.c \
+               kernel/arch/aarch64/drivers/pl011.c
+
+# ...and the SHARED kernel, compiled for a second architecture with no #ifdef
+# in it. This list is the honest measure of how portable the tree really is,
+# and it is meant to grow every phase until it is most of kernel/. Anything
+# that appears here and then needs an #ifdef to build is a design question, not
+# a build question -- the answer is usually an arch hook, as pmm.c's
+# arch_pmm_reserve_fixed() ended up being.
+ARM_SHARED_SRC := kernel/mm/pmm.c \
+                  kernel/mm/uaccess_guard.c \
+                  kernel/mm/vma.c \
+                  kernel/mm/vm_object.c \
+                  kernel/process/futex.c \
+                  kernel/process/sched.c \
+                  kernel/process/sched_rr.c \
+                  kernel/process/sched_deadline.c \
+                  kernel/power/power.c \
+                  kernel/arch/aarch64/power/power_arm.c \
+                  kernel/mm/ipi.c \
+                  kernel/mm/kheap.c \
+                  kernel/mm/kmalloc.c \
+                  kernel/lib/kprintf.c \
+                  kernel/lib/klog.c \
+                  kernel/lib/crashlog.c \
+                  kernel/lib/kstring.c \
+                  kernel/lib/errno.c \
+                  kernel/lib/random.c \
+                  kernel/lib/canary.c \
+                  kernel/mm/swap.c \
+                  kernel/mm/swaptest.c \
+                  kernel/loader/pietest.c \
+                  kernel/lib/ksym.c \
+                  kernel/drivers/bus/pci.c \
+                  kernel/drivers/storage/virtio_blk.c \
+                  kernel/drivers/storage/nvme.c \
+                  kernel/drivers/storage/sdhci.c \
+                  kernel/drivers/usb/usb.c \
+                  kernel/drivers/usb/usb_core.c \
+                  kernel/drivers/usb/usb_uas.c \
+                  kernel/drivers/usb/xhci.c \
+                  kernel/drivers/usb/ehci.c \
+                  kernel/drivers/usb/ohci.c \
+                  kernel/net/usb_net.c \
+                  kernel/drivers/storage/virtio_scsi.c \
+                  kernel/drivers/storage/nvmetest.c \
+                  kernel/block/block.c \
+                  kernel/block/scsi.c \
+                  kernel/block/partition.c \
+                  kernel/process/process.c \
+                  kernel/process/ksync.c \
+                  kernel/process/debug.c \
+                  kernel/loader/elf.c \
+                  kernel/loader/embx.c \
+                  kernel/syscall/syscalls.c \
+                  kernel/fs/vfs.c \
+                  kernel/fs/automount.c \
+                  kernel/fs/ninep.c \
+                  kernel/module/module.c \
+                  kernel/module/exports.c \
+                  kernel/fs/fd.c \
+                  kernel/fs/namespace.c \
+                  kernel/fs/epfs.c \
+                  kernel/fs/embkfs/embkfs.c \
+                  kernel/fs/embkfs/embkfs_compress.c \
+                  kernel/fs/embkfs/crc32c.c \
+                  kernel/fs/embkfs/embk_vfs.c \
+                  kernel/fs/fat32.c \
+                  kernel/ipc/handle.c \
+                  kernel/ipc/channel.c \
+                  kernel/ipc/clipboard.c \
+                  kernel/ipc/endpoint.c \
+                  kernel/ipc/pipe.c \
+                  kernel/gfx/surface.c \
+                  kernel/gfx/compositor.c \
+                  kernel/kworker/kworker.c \
+                  kernel/tty/tty.c \
+                  kernel/acpi/acpi.c \
+                  kernel/acpi/aml.c \
+                  kernel/acpi/acpi_dev.c \
+                  kernel/drivers/audio/audio.c \
+                  kernel/drivers/audio/virtio_snd.c \
+                  kernel/crypto/sha256.c \
+                  kernel/crypto/hmac.c \
+                  kernel/crypto/pbkdf2.c \
+                  kernel/crypto/aes.c \
+                  kernel/crypto/xts.c \
+                  user/lib/tls/crypto/hkdf.c \
+                  user/lib/tls/crypto/gcm.c \
+                  user/lib/tls/crypto/x25519.c \
+                  user/lib/tls/crypto/selftest.c \
+                  kernel/drivers/bus/virtio_pci.c \
+                  kernel/drivers/char/virtio_rng.c \
+                  kernel/drivers/char/virtio_console.c \
+                  kernel/drivers/misc/virtio_balloon.c \
+                  kernel/drivers/misc/virtio_mem.c \
+                  kernel/drivers/storage/virtio_pmem.c \
+                  kernel/drivers/crypto/virtio_crypto.c \
+                  kernel/drivers/iommu/virtio_iommu.c \
+                  kernel/fs/iso9660.c \
+                  kernel/drivers/char/platform_misc.c \
+                  kernel/drivers/i2c/smbus.c \
+                  kernel/drivers/input/virtio_input.c \
+                  kernel/drivers/input/keyboard.c \
+                  kernel/drivers/input/mouse.c \
+                  kernel/drivers/video/framebuffer.c \
+                  kernel/drivers/video/console.c \
+                  kernel/drivers/video/font_8x16.c \
+                  kernel/drivers/video/rawcon.c \
+                  kernel/drivers/video/gpu.c \
+                  kernel/drivers/video/bootanim.c \
+                  kernel/drivers/video/virtio_gpu.c \
+                  kernel/net/net.c \
+                  kernel/net/virtio_net.c \
+                  kernel/net/e1000.c \
+                  kernel/net/igb.c \
+                  kernel/net/i8255x.c \
+                  kernel/net/rtl8139.c \
+                  kernel/net/ethernet/eth.c \
+                  kernel/net/ethernet/arp.c \
+                  kernel/net/ip/ipv4.c \
+                  kernel/net/ip/icmp.c \
+                  kernel/net/udp/udp.c \
+                  kernel/net/dhcp/dhcp.c \
+                  kernel/net/dns/dns.c \
+                  kernel/net/ntp/ntp.c \
+                  kernel/net/tcp/tcp.c
+
+# Coarse on purpose, exactly as $(KERNEL_HDRS) is on the x86 side: one
+# compile, no per-TU depfiles, so a header-only change must rebuild it all.
+ARM_HDRS    := $(shell find kernel -name '*.h' 2>/dev/null)
+
+# -std=gnu11 for the same reason the x86 side pins it, and known in advance
+# this time rather than discovered: aarch64-elf-gcc is GCC 16, which defaults
+# to gnu23, where `bool`/`true`/`false` are keywords and kernel/include/types.h
+# stops compiling. docs/ARM64.md §2.8.
+#
+# -mgeneral-regs-only is the aarch64 analogue of the x86 side's -mno-mmx/-msse
+# wall: FP and Advanced SIMD are DISABLED at EL1 out of reset (CPACR_EL1.FPEN),
+# so a compiler-generated `str q0, [...]` -- gcc will happily emit one to copy a
+# 16-byte struct -- traps. Before A1 there are no exception vectors, so that
+# trap is an unexplained hang at an address with no obvious relation to any
+# floating-point code.
+#
+# -fstack-protector-strong: __stack_chk_guard lives in kernel/lib/canary.c and
+# is seeded by boot.S before the first C frame exists -- see that file.
+# -Wall -Wextra: this tree is 300 lines old. Everything the compiler is willing
+# to notice is cheaper to fix now than after it has 6,000 lines of company.
+# -mno-outline-atomics: gcc 10+ compiles C11 atomics into calls to libgcc
+# helpers (__aarch64_swp4_acq and friends) that pick between LSE and LL/SC at
+# RUN time by reading a global. A freestanding kernel links no libgcc, so the
+# first spinlock is an undefined reference -- and even if it linked, a hidden
+# indirect call inside the lock path is not something a kernel wants. This
+# makes gcc emit LDAXR/STXR inline, which is what the code was written to be.
+ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
+              -std=gnu11 -mgeneral-regs-only -mno-outline-atomics \
+              -fstack-protector-strong \
+              -Wall -Wextra \
+              -Ikernel \
+              -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
+              -Wl,--no-warn-rwx-segments \
+              -g -O0
+
+# --no-warn-rwx-segments: the linker objects that our single LOAD segment is
+# readable, writable AND executable. It is, and it must be while the MMU is
+# off -- there are no page permissions to enforce until A2 builds page tables.
+# The warning is aimed at userspace binaries. Delete this flag at A2 and see
+# whether it is still needed; if it is, the page tables are not doing their job.
+
+$(ARM_BUILD):
+	mkdir -p $(ARM_BUILD)
+
+ifneq ($(ARM_KBUILD),$(ARM_BUILD))
+$(ARM_KBUILD):
+	mkdir -p $(ARM_KBUILD)
+endif
+
+
+# One compile, like the x86 kernel: every header is a prerequisite because
+# there are no per-TU depfiles to consult. Same reasoning as $(KERNEL_HDRS).
+# $(FB_STAMP) for the same reason the x86 kernel has it: FB_W/FB_H reach the
+# kernel as compile-time defines, and a prerequisite list of source files alone
+# would rebuild nothing when they change -- so `make FB_W=1280` would silently
+# boot the OLD cap. The stamp's mtime moves only when the pair actually changes.
+$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_KBUILD)
+	$(AARCH64_CC) $(ARM_CFLAGS) $(ARM_BOARD_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
+
+# The flat Image. QEMU boots the ELF directly, so this is not on the run path
+# -- it exists because a real ARM board loads a headerless blob at a fixed
+# address, and building it now keeps that assumption honest (it is why
+# .text.boot is KEEP'd first in the linker script).
+$(ARM_IMG): $(ARM_ELF)
+	$(AARCH64_OBJCOPY) -O binary $< $@
+	@# The arm64 Image magic must land at byte 56 or QEMU silently falls back
+	@# to "raw blob", and the DTB pointer quietly becomes zero again -- which
+	@# is a boot that LOOKS fine until A2 asks for memory. Assert it here, at
+	@# the moment it can still be cheap to explain.
+	@m=$$(od -An -tx1 -j56 -N4 $@ | tr -d ' \n'); \
+	  if [ "$$m" != "41524d64" ]; then \
+	    printf 'aarch64: Image magic at byte 56 is %s, expected 41524d64 ("ARM" 0x64).\n' "$$m" >&2; \
+	    echo 'aarch64: the header in boot.S has drifted from 64 bytes.' >&2; exit 1; fi
+	@echo "aarch64: Image header ok (magic at byte 56)"
+
+.PHONY: arm64
+arm64: $(ARM_ELF) $(ARM_IMG) $(ARM_ROOTFS)
+	@echo "aarch64 kernel: $(ARM_ELF)"
+	@$(AARCH64_PREFIX)size $(ARM_ELF) 2>/dev/null || true
+
+# ARCH=aarch64 means the aarch64 kernel is what `make` builds. The top-level
+# `.DEFAULT_GOAL := all` would otherwise send us into the x86 boot image.
+.DEFAULT_GOAL := arm64
+
+# --- A6: the userland -------------------------------------------------------
+# docs/ARM64.md phase A6. user/lib is ONE implementation for both machines --
+# embk_syscall.h gained an `svc #0` branch, crt0.c an aarch64 _start and
+# variant-I TLS -- so there is nothing here but paths and a pattern rule. The
+# COMPILER FLAGS are the top-level Makefile's ($(NEWLIB_CFLAGS),
+# $(NEWLIB_LDFLAGS), $(USER_CFLAGS)), which now derive from $(USER_TRIPLE); they
+# are deliberately NOT restated here, because two lists of userland flags is how
+# the two architectures start drifting apart.
+#
+# The objects live under $(ARM_BUILD)/user rather than build/, and that is not
+# tidiness: `build/crt0.o` cannot mean both x86 and aarch64 machine code, and a
+# shared path would make `make` hand whichever was built last to the other
+# architecture's linker. The top-level Makefile hardcodes `build/` in 372
+# places; redirecting all of them is churn with a real chance of breaking the
+# x86 image, so the second architecture takes a subdirectory instead.
+ARM_USER      := $(ARM_BUILD)/user
+ARM_CRT0      := $(ARM_USER)/crt0.o
+ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
+# Their -fPIC twins, for the programs linked as PIEs. Named HERE, beside the
+# originals, and not beside the rules that build them: ARM_NEWLIB_PROG expands
+# these when it is called, so a name defined further down expands to nothing and
+# the link silently drops crt0 -- the failure this fragment's own comments warn
+# about four times over.
+ARM_PIE_CRT0     := $(ARM_USER)/crt0_pic.o
+ARM_PIE_SYSCALLS := $(ARM_USER)/syscalls_pic.o
+
+# The programs built for aarch64. This is SHORT ON PURPOSE and is the honest
+# statement of how much userland the second architecture has: hello.elf is a
+# real newlib program (printf, malloc, time, a native thread) and is the A6
+# witness; init.elf is the freestanding pid-1. The GUI apps are absent because
+# libembk.so and the compositor are A7 work -- see docs/TODO.md. Add a name here
+# and it builds; nothing else needs editing.
+# Static newlib console programs (-T newlib.ld, no libembk.so).
+ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn lockdemo jitter \
+                    crasher ioracer sockdemo udptest nbsock httpget \
+                    tlstest wget pkgfetch pkg pkgbuild httpd \
+                    posixdemo pkgprobe shell sysinfo tally embbuild \
+                    $(if $(HAVE_QJS),js,) \
+                    $(if $(HAVE_ZLIB_ARM),gitclone gitpush,)
+
+# Freestanding: own _start, no libc at all (-T user.ld).
+ARM_PLAIN_PROGS  ?= init primtest
+
+# The dynamically-linked EmUI apps. DERIVED FROM THE x86 LIST rather than
+# retyped: $(EMUI_APP_SRCS) is the top-level Makefile's auto-discovery of
+# user/apps/*/*.c minus the programs that are not EmUI apps, and it is defined
+# before this fragment is included. Deriving it means a new app appears on BOTH
+# architectures the moment it is dropped in user/apps -- which is the whole point
+# of that auto-discovery, and it would have been lost by keeping a second list
+# here that someone has to remember to update.
+#
+# TWO SUBTRACTIONS. $(EMUI_APP_SRCS) is "everything that is not on the
+# exclusion list", and on x86 two of the survivors are still not dynamic EmUI
+# apps -- they are rescued by EXPLICIT rules that shadow the generic pattern,
+# which is knowledge the variable itself does not carry:
+#   beep      is a STATIC newlib console program (-T newlib.ld), below.
+#   primtest  is FREESTANDING, with its own _start and no main (-T user.ld).
+# Left in, primtest fails at link with "undefined reference to `main'" from
+# crt0 -- which is a true statement about a program that has none.
+#
+# Override on the command line to build a subset:  make ARCH=aarch64 ARM_UI_PROGS=uidemo
+# Programs that link emlibc INSTEAD of newlib -- see the emlibc section below.
+# Declared here with the other lists, and not beside their rules, because
+# ARM_USER_ELVES is a `:=` assignment: a name defined later expands to nothing
+# and the program silently never builds. This fragment has produced that bug
+# four times now.
+# mathself belongs HERE, not with the newlib programs: it is an emlibc program
+# (its open()/O_WRONLY come from emlibc's <unistd.h>, where POSIX would put them
+# in <fcntl.h>), which is why x86 builds it only through EmbCC and never as a
+# newlib ELF. Putting it in the newlib list compiled it against newlib's headers
+# and failed on O_WRONLY -- and "fixing" that with #include <fcntl.h> then broke
+# the EmbCC build, whose header set has no fcntl.h. The list was the bug.
+ARM_EMLIBC_PROGS ?= emlibc_demo emlibc_net emlibc_caps emlibc_math \
+                    emlibc_embxapp mathself
+
+ARM_UI_PROGS     ?= $(filter-out beep primtest,\
+                      $(basename $(notdir $(EMUI_APP_SRCS)))) \
+                    photos mp3play vellum
+
+# QuickJS's five translation units. DECLARED HERE, built by the rule in the
+# QuickJS section further down -- for the reason this file has now learned five
+# separate times: a `:=` assignment that references a variable defined LATER
+# expands to NOTHING, silently, and the feature simply does not happen. The
+# symptom is never an error about the variable; it is a link that is missing
+# objects, or a compile that is missing a flag.
+#
+# RULE FOR THIS FILE: every `:=` list lives above every `$(eval $(call ...))`
+# that reads it. Rules can go anywhere; DECLARATIONS cannot.
+# The SHELL and its external pipeline tools. They live in shell/, not
+# a program directory, so they are not in $(EMUI_APP_SRCS) and need naming here. The tools
+# are separate .elf files on purpose -- the shell SPAWNS them as pipeline
+# stages rather than running them as builtins -- and each links the same three
+# SDK objects (value/wire/sval) that carry the shell's typed-record protocol.
+# zlib for THIS target -- a separate prefix from the x86 build, because it is
+# separate machine code. Gated: an absent optional port must leave the rest of
+# the userland building ("absent means absent, not broken").
+ZLIB_ARM_BUILD ?= $(HOME)/cross/build-zlib-arm
+ZLIB_ARM_A     := $(ZLIB_ARM_BUILD)/lib/libz.a
+HAVE_ZLIB_ARM  := $(if $(wildcard $(ZLIB_ARM_A)),1,)
+
+ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+                 shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+                 shell/eval/exec.c \
+                 shell/builtins/builtins.c shell/hist/hist.c \
+                 shell/eval/eval_extern.c shell/builtins/builtins_os.c
+ARM_SHELL_SDK := shell/value/value.c shell/wire/wire.c shell/sval/sval.c
+
+# A few apps are more than one translation unit, exactly as they are on x86
+# (where each has an explicit rule with extra objects). Naming the extra
+# SOURCES per app keeps that fact in one place instead of a second explicit
+# rule per app down here.
+ARM_XSRC_home   := user/lib/appauth.c
+ARM_XSRC_notepp := user/note/syntax.c user/note/doc.c user/note/edit.c
+
+# The TLS stack, as SOURCES rather than the x86 side's object list, because the
+# objects are built into a different directory here. Same files, same order.
+ARM_TLS_SRC := kernel/crypto/sha256.c kernel/crypto/hmac.c kernel/crypto/aes.c \
+               user/lib/tls/crypto/hkdf.c user/lib/tls/crypto/gcm.c \
+               user/lib/tls/crypto/x25519.c user/lib/tls/crypto/sha512.c \
+               user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+               user/lib/tls/crypto/rsa.c user/lib/tls/x509/asn1.c \
+               user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c \
+               user/lib/tls/keysched.c user/lib/tls/record.c \
+               user/lib/tls/handshake.c user/lib/tls/tls.c user/lib/tls/prf12.c \
+               user/lib/tls/record12.c user/lib/tls/tls12.c \
+               user/lib/tls/tls_handle.c
+
+# mp3_test.c and mp3dec.c are excluded because each has its OWN main(): they
+# are standalone host tools that live in the decoder's directory, not part of
+# the decoder. The x86 side spells the eleven decoder objects out one by one
+# and so never had to notice; a wildcard does, and links two extra main()s into
+# the app if it does not.
+ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
+                 $(wildcard user/audio/mp3/*.c)) \
+               user/audio/resample.c
+
+ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \
+                     user/photos/album.c user/web/png.c user/web/jpeg.c \
+                     user/lib/inflate.c
+ARM_XSRC_mp3play  := $(ARM_MP3_SRC)
+ARM_XSRC_tlstest  := $(ARM_TLS_SRC)
+ARM_XSRC_wget     := $(ARM_TLS_SRC)
+ARM_XSRC_pkgfetch := user/lib/inflate.c user/lib/unzip.c $(ARM_TLS_SRC)
+ARM_XSRC_pkg      := user/pkg/manifest.c user/pkg/embxinfo.c \
+                     kernel/crypto/sha256.c user/lib/tls/crypto/ecdsa.c \
+                     user/lib/tls/crypto/bignum.c
+ARM_XSRC_pkgbuild := user/pkg/embxgen.c user/pkg/manifest.c kernel/crypto/sha256.c
+ARM_XSRC_httpd    := user/httpd/http.c user/httpd/mime.c user/httpd/serve.c
+
+# vellum: the browser. Its 29 in-tree translation units, plus jsdom when
+# QuickJS is available. The list is the x86 $(VELLUM_OBJS) as SOURCES.
+ARM_XSRC_vellum   := user/web/html.c user/web/style.c user/web/render.c \
+                     user/web/url.c user/web/net.c user/web/fetchjob.c \
+                     user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+                     user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
+                     user/web/png.c user/web/jpeg.c user/web/imgcache.c \
+                     user/lib/inflate.c user/web/ico.c user/web/favicon.c \
+                     user/web/form.c user/web/select.c user/web/cssref.c \
+                     user/web/cookie.c user/web/store.c user/web/find.c \
+                     user/web/history.c user/web/tabs.c user/web/charset.c \
+                     user/web/svg.c $(if $(HAVE_QJS),user/web/jsdom.c,) \
+                     $(ARM_TLS_SRC)
+# -DHAVE_JSDOM is what selects jsdom.c's REAL bindings over its stubs; without
+# it the file compiles both and the second set is a redefinition error.
+ARM_INC_vellum    := -Iuser/web -Iuser/web/css $(TLS_LIB_INC) \
+                     $(if $(HAVE_QJS),-DHAVE_JSDOM $(QJS_CFLAGS),)
+ARM_INC_js        := $(QJS_CFLAGS)
+
+# shell/ programs: their sources are outside the program directories, so each names its own
+# main and its own extra objects.
+ARM_XSRC_shell    := $(ARM_SHELL_SRC)
+ARM_XSRC_sysinfo  := $(ARM_SHELL_SDK)
+ARM_XSRC_tally    := $(ARM_SHELL_SDK)
+ARM_XSRC_embbuild := $(ARM_SHELL_SDK)
+ARM_INC_shell     := -Ishell
+ARM_INC_sysinfo   := -Ishell
+ARM_INC_tally     := -Ishell
+ARM_INC_embbuild  := -Ishell
+
+# Where each one's main() lives, when $(call USER_SRC,<name>) does not find it.
+# gitclone / gitpush: the in-tree git client. Both need the TLS stack (HTTPS),
+# the pack/pktline/sha1/repo layer, and libz -- the same cross-built zlib the
+# x86 side links, built for this target with
+#   TARGET=aarch64-elf tools/zlib/build-zlib-emblink.sh <src> <out>
+ARM_XSRC_gitclone := user/git/githttp.c user/git/pktline.c user/git/pack.c \
+                     user/git/sha1.c user/git/repo.c $(ARM_TLS_SRC)
+ARM_XSRC_gitpush  := user/git/githttp.c user/git/pktline.c user/git/pack.c \
+                     user/git/sha1.c user/git/repo.c user/git/push.c \
+                     $(ARM_TLS_SRC)
+ARM_INC_gitclone  := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
+ARM_INC_gitpush   := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
+ARM_EXTRAOBJ_gitclone := $(ZLIB_ARM_A)
+ARM_EXTRAOBJ_gitpush  := $(ZLIB_ARM_A)
+
+ARM_MAIN_shell    := shell/main.c
+ARM_MAIN_sysinfo  := shell/tools/sysinfo.c
+ARM_MAIN_tally    := shell/tools/tally.c
+ARM_MAIN_embbuild := shell/tools/embbuild.c
+
+# Per-app include paths. The EmUI set is added to every app anyway; this is the
+# extra a particular app needs, mirroring its explicit x86 rule.
+# Taken from each app's x86 compile rule, and reusing the Makefile's OWN
+# $(TLS_LIB_INC) rather than a second spelling of it -- the TLS tree's kshim
+# and -Ikernel paths are not obvious and are exactly the kind of thing two
+# copies would drift on.
+ARM_INC_photos   := -Iuser/photos -Iuser/web
+ARM_INC_mp3play  := -Iuser/audio/mp3 -Iuser/audio
+ARM_INC_tlstest  := $(TLS_LIB_INC)
+ARM_INC_wget     := $(TLS_LIB_INC)
+ARM_INC_pkgfetch := $(TLS_LIB_INC) -Iuser/lib -Iuser/pkg
+ARM_INC_pkg      := -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel
+ARM_INC_pkgbuild := -Iuser/pkg -Iuser/lib
+ARM_INC_httpd    := -Iuser/httpd
+
+
+# The EmUI apps. Same link shape as x86's: NO -static (it would forbid the .so)
+# and NO -T newlib.ld (the DEFAULT script is what emits the .dynamic/.dynsym/
+# .rela.plt/.got the in-kernel loader reads). libembk.so comes before -lc -lm so
+# ld pulls the libc the toolkit needs INTO the app, and --export-dynamic exports
+# it back to the .so. --no-dynamic-linker because the kernel is the loader.
+# Every extra source any app needs, deduplicated -- two apps may share one.
+ARM_XSRC_ALL := $(sort $(foreach p,$(ARM_UI_PROGS) $(ARM_NEWLIB_PROGS),$(ARM_XSRC_$(p))))
+# The union of every per-app include, used when compiling a SHARED extra object
+# (one file may be pulled in by two apps -- kernel/crypto/sha256.c is pulled in
+# by three -- so it is compiled once with the superset rather than several
+# times with different sets).
+#
+# NOT $(sort). Sorting deduplicates, which would be welcome, but it also
+# REORDERS, and -I order is significant: $(TLS_LIB_INC) puts
+# user/lib/tls/kshim ahead of -Ikernel precisely so the shim's headers shadow
+# the kernel's for userspace builds. Sorted alphabetically, -Ikernel wins and
+# the TLS tree compiles against the wrong headers. Duplicate -I flags are
+# harmless; a reordered one is not.
+ARM_INC_ALL  := $(foreach p,$(ARM_UI_PROGS) $(ARM_NEWLIB_PROGS),$(ARM_INC_$(p)))
+ARM_XOBJ      = $(patsubst %,$(ARM_USER)/x_%.o,$(subst /,_,$(basename $(1))))
+
+
+ARM_QJS_UNITS := quickjs libregexp libunicode cutils libbf
+ARM_QJS_OBJ   := $(patsubst %,$(ARM_USER)/qjs_%.o,$(ARM_QJS_UNITS))
+
+# Objects an app links that are NOT built from an in-tree source, so they
+# cannot go through ARM_XSRC (whose object names are derived from source
+# PATHS). QuickJS is the only such case: a third-party tree outside this repo.
+ARM_EXTRAOBJ_js     := $(if $(HAVE_QJS),$(ARM_QJS_OBJ),)
+ARM_EXTRAOBJ_vellum := $(if $(HAVE_QJS),$(ARM_QJS_OBJ),)
+
+define ARM_XOBJ_RULE
+$(ARM_USER)/x_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_ALL) -c $$< -o $$@
+endef
+$(foreach src,$(ARM_XSRC_ALL),$(eval $(call ARM_XOBJ_RULE,$(src))))
+
+ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
+                  $(if $(PIE_OK),$(ARM_USER)/pieprobe.elf,) \
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_PLAIN_PROGS)) \
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_UI_PROGS)) \
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_EMLIBC_PROGS))
+
+$(ARM_USER):
+	mkdir -p $(ARM_USER)
+
+# The retargeting layer, once.
+$(ARM_USER)/crt0.o: user/lib/crt0.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+$(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+# EXPLICIT rules, generated per program, NOT pattern rules -- and that is a
+# correctness requirement, not a style. The top-level Makefile defines
+#
+#     build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
+#
+# for the dynamically-linked EmUI apps, and `build/aarch64/user/hello.elf`
+# MATCHES it with the stem `aarch64/user/hello`. It won, too: the first dry run
+# of this fragment linked hello.elf against build/crt0.o (x86 machine code) and
+# an aarch64 libembk.so it had helpfully just built. An explicit rule always
+# takes precedence over a pattern rule, so generating one per program is what
+# makes the outcome depend on nothing but this file.
+define ARM_NEWLIB_PROG
+ifeq ($$(and $$(PIE_OK),$$(filter $(1),$$(NEWLIB_SIMPLE_PROGS))),)
+$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),$(call USER_SRC,$(1))) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+                      $(ARM_EXTRAOBJ_$(1)) \
+                      $(ARM_CRT0) $(ARM_SYSCALLS) $(NEWLIB_LDSCRIPT)
+	$$(USER_CC) $$(NEWLIB_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
+	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+	    $(ARM_EXTRAOBJ_$(1)) -lc -lm -lgcc -o $$@
+else
+# On the PIE list (the top-level Makefile's $(NEWLIB_SIMPLE_PROGS): one source
+# file, no non-PIC dependency) and a PIC libc is installed -- so this program is
+# ET_DYN here exactly as it is on x86. The list is SHARED rather than repeated,
+# because a program that is position-independent on one architecture and not on
+# the other is a difference nobody would go looking for.
+$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),$(call USER_SRC,$(1))) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_PIE_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_PIE_CRT0) $(ARM_PIE_SYSCALLS) \
+                      $(NEWLIB_PIE_LDSCRIPT)
+	$$(USER_CC) $$(NEWLIB_PIE_LDFLAGS) $$(NEWLIB_PIE_WL) \
+	    $(ARM_PIE_CRT0) $(ARM_PIE_SYSCALLS) $(ARM_USER)/$(1).o -lc -lm -lgcc -o $$@
+	@t=$$$$($$(USER_TRIPLE)-readelf -h $$@ | awk '/Type:/{print $$$$2}'); \
+	 if [ "$$$$t" != "DYN" ]; then echo "$(1).elf is $$$$t, not DYN -- PIE_OK is set but it did not link PIE"; exit 1; fi
+endif
+endef
+$(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
+
+# --- the PIE witness, aarch64 -------------------------------------------------
+# Same program, same two link ingredients, as the x86 side: everything compiled
+# -fPIC against the -fPIC newlib, linked -pie with newlib-pie.ld. Its own rule
+# rather than a member of ARM_NEWLIB_PROGS because every object on the line --
+# crt0 and the syscall stubs included -- has to be the PIC one, and sharing the
+# list would have linked the non-PIC crt0 into it. Gated on the PIC newlib
+# existing, exactly as x86 is.
+ifneq ($(PIE_OK),)
+$(ARM_USER)/crt0_pic.o: user/lib/crt0.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+$(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+$(ARM_USER)/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+$(ARM_USER)/pieprobe.elf: $(ARM_USER)/crt0_pic.o $(ARM_USER)/syscalls_pic.o \
+                           $(ARM_USER)/pieprobe.o $(NEWLIB_PIE_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_PIE_LDFLAGS) $(NEWLIB_PIE_WL) \
+	    $(ARM_USER)/crt0_pic.o $(ARM_USER)/syscalls_pic.o $(ARM_USER)/pieprobe.o \
+	    -lc -lm -lgcc -o $@
+	@t=$$($(USER_TRIPLE)-readelf -h $@ | awk '/Type:/{print $$2}'); \
+	 if [ "$$t" != "DYN" ]; then echo "pieprobe.elf is $$t, not DYN -- not a PIE"; exit 1; fi
+endif
+
+
+# Freestanding programs (init.elf): own _start, no libc, linked with the raw ld
+# against user.ld exactly as x86 does -- $(USER_LD) is aarch64-elf-ld here.
+define ARM_PLAIN_PROG
+$(ARM_USER)/$(1).plain.o: $(call USER_SRC,$(1)) | $(ARM_USER)
+	$$(USER_CC) $$(USER_CFLAGS) $$(if $$(AUTOLOGIN),-DDEV_AUTOLOGIN=$$(AUTOLOGIN)) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).plain.o user/lib/user.ld
+	$$(USER_LD) -T user/lib/user.ld -z max-page-size=0x1000 $$< -o $$@
+endef
+$(foreach p,$(ARM_PLAIN_PROGS),$(eval $(call ARM_PLAIN_PROG,$(p))))
+
+.PHONY: arm64-user
+arm64-user: $(ARM_USER_ELVES)
+	@echo "aarch64 userland:"; for f in $(ARM_USER_ELVES); do \
+	  printf '  %-40s %s bytes\n' "$$f" "$$(wc -c < $$f | tr -d ' ')"; done
+
+# --- A6 + A7: libembk.so and the dynamically-linked EmUI apps ---------------
+# A6's "done when" is a dynamically-linked EmUI app loading, and it needed A7's
+# display first: an app with nothing to draw on is not a test of anything.
+#
+# The TOOLKIT is `ui/` -- scene graph, CPU raster backend, font, layout,
+# reactive, declare, theme, kit, the DSL -- plus user/lib/auth.c, built -fPIC
+# into one shared object. It is exactly the x86 object list, which is why it is
+# derived from ONE list of sources here rather than the twelve near-identical
+# three-line rules the x86 side still spells out.
+#
+# The kernel is the dynamic loader (there is no ld.so and no PT_INTERP), and it
+# already understood aarch64: elf.h has carried EM_AARCH64 and the R_AARCH64_*
+# set behind the neutral ELF_RELOC_* names since A4.
+ARM_LIBEMBK_SRC := ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
+                   ui/backend/scene_render.c ui/layout/layout.c \
+                   ui/reactive/reactive.c ui/declare/declare.c \
+                   ui/theme/theme.c ui/kit/kit.c ui/dsl/em.c ui/dsl/em_app.c \
+                   user/lib/auth.c user/lib/fileops.c
+
+# build/aarch64/user/pic_ui_scene_scene.o -- the source path flattened, so two
+# files with the same basename in different directories cannot collide.
+ARM_LIBEMBK_OBJ := $(patsubst %,$(ARM_USER)/pic_%.o,\
+                     $(subst /,_,$(basename $(ARM_LIBEMBK_SRC))))
+ARM_LIBEMBK     := $(ARM_USER)/libembk.so
+
+define ARM_PIC_OBJ
+$(ARM_USER)/pic_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) -fPIC $$(UIDEMO_INC) -c $$< -o $$@
+endef
+$(foreach src,$(ARM_LIBEMBK_SRC),$(eval $(call ARM_PIC_OBJ,$(src))))
+
+$(ARM_LIBEMBK): $(ARM_LIBEMBK_OBJ)
+	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(ARM_LIBEMBK_OBJ) -o $@
+
+
+define ARM_UI_PROG
+$(ARM_USER)/$(1).o: $(call USER_SRC,$(1)) user/lib/embk.h | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_$(1)) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+                      $(ARM_EXTRAOBJ_$(1)) \
+                      $(ARM_CRT0) $(ARM_SYSCALLS) $(ARM_LIBEMBK)
+	$$(USER_CC) $$(NEWLIB_DYN_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
+	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+	    $(ARM_EXTRAOBJ_$(1)) \
+	    $(ARM_LIBEMBK) -lc -lm -lgcc $$(NEWLIB_DYN_WL) -o $$@
+endef
+$(foreach p,$(ARM_UI_PROGS),$(eval $(call ARM_UI_PROG,$(p))))
+
+# --- QuickJS: js and vellum's script engine ----------------------------------
+# QuickJS is a third-party tree OUTSIDE this repo ($(QJS_SRC)), compiled
+# straight from source by the top-level Makefile rather than pre-built into a
+# library. Everything about that is the same here -- the same five translation
+# units, the same $(QJS_CFLAGS) -- so all this adds is a build directory and
+# the arm compiler.
+#
+# GATED on the source actually being present, exactly as x86 gates it: an
+# absent optional port must leave the rest of the userland building. "Absent
+# means absent, not broken."
+$(ARM_USER)/qjs_%.o: $(QJS_SRC)/%.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Wno-array-bounds $(QJS_CFLAGS) -c $< -o $@
+
+# --- emlibc: the ALTERNATIVE libc, and the programs that link it -------------
+# user/emlibc is a second C library -- not a wrapper over newlib but a
+# replacement for it -- and its headers DELIBERATELY SHADOW newlib's. That is
+# why it cannot simply join the app lists above: it compiles -nostdinc against
+# its own include tree, links no -lc and no crt0.o/syscalls.o, and its programs
+# take neither the static-newlib nor the dynamic-EmUI shape.
+#
+# Adding -Iuser/emlibc/include to the ordinary apps instead is the mistake that
+# looks like the fix -- it breaks every newlib program in the tree, because
+# emlibc's <stdio.h> is then the one they get.
+#
+# The flags are the x86 rules' with the x86 out of them: no -mno-red-zone
+# (AAPCS64 has no red zone) and no SSE note, everything else identical.
+EMLIBC_DIR       := user/emlibc
+ARM_GCC_FREEINC  := $(shell $(USER_CC) -print-file-name=include)
+ARM_EMLIBC_INC   := -nostdinc -isystem $(ARM_GCC_FREEINC) \
+                    -I$(EMLIBC_DIR)/include -Iuser/lib
+ARM_EMLIBC_CFLAGS = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin \
+                    -fno-stack-protector -O2 -Wall -Wextra $(ARM_EMLIBC_INC)
+
+# fdlibm is vendored third-party (Sun's ~1-ulp library, the source newlib's
+# libm is built from). It compiles -w on purpose: we do not "fix" third-party
+# warnings.
+ARM_EMLIBC_FD_DIR := $(EMLIBC_DIR)/math/fdlibm
+ARM_EMLIBC_FD_SRC := $(wildcard $(ARM_EMLIBC_FD_DIR)/*.c)
+ARM_EMLIBC_FD_CFLAGS = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin \
+                       -fno-stack-protector -O2 -w -nostdinc \
+                       -isystem $(ARM_GCC_FREEINC) -I$(EMLIBC_DIR)/include \
+                       -Iuser/lib -I$(ARM_EMLIBC_FD_DIR)
+
+ARM_EMLIBC_SRC := $(EMLIBC_DIR)/string/string.c $(EMLIBC_DIR)/stdlib/stdlib.c \
+                  $(EMLIBC_DIR)/stdio/stdio.c $(EMLIBC_DIR)/rim/syscalls.c \
+                  $(EMLIBC_DIR)/rim/errno.c $(EMLIBC_DIR)/process/process.c \
+                  $(EMLIBC_DIR)/math/math.c $(EMLIBC_DIR)/net/net.c
+
+ARM_EMLIBC_OBJ := $(patsubst %,$(ARM_USER)/em_%.o,$(subst /,_,$(basename $(ARM_EMLIBC_SRC))))
+ARM_EMLIBC_FD_OBJ := $(patsubst $(ARM_EMLIBC_FD_DIR)/%.c,$(ARM_USER)/emfd_%.o,$(ARM_EMLIBC_FD_SRC))
+ARM_LIBEMLIBC  := $(ARM_USER)/libemlibc.a
+
+define ARM_EMLIBC_OBJ_RULE
+$(ARM_USER)/em_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(ARM_EMLIBC_CFLAGS) -c $$< -o $$@
+endef
+$(foreach src,$(ARM_EMLIBC_SRC),$(eval $(call ARM_EMLIBC_OBJ_RULE,$(src))))
+
+$(ARM_USER)/emfd_%.o: $(ARM_EMLIBC_FD_DIR)/%.c | $(ARM_USER)
+	$(USER_CC) $(ARM_EMLIBC_FD_CFLAGS) -c $< -o $@
+
+$(ARM_LIBEMLIBC): $(ARM_EMLIBC_OBJ) $(ARM_EMLIBC_FD_OBJ)
+	$(AARCH64_PREFIX)ar rcs $@ $(ARM_EMLIBC_OBJ) $(ARM_EMLIBC_FD_OBJ)
+
+# emlibc's own crt0: the SAME source as newlib's, compiled against emlibc's
+# headers so exit/malloc/environ resolve to emlibc's.
+$(ARM_USER)/emlibc_crt0.o: user/lib/crt0.c | $(ARM_USER)
+	$(USER_CC) $(ARM_EMLIBC_CFLAGS) -c $< -o $@
+
+# Each program's object name differs from its source basename in two cases,
+# both inherited from x86: emlibc_demo builds from emlibc_demo.c but the rim's
+# net.c already owns the name emlibc_net.o, and emlibc_math's object is
+# .elf.o. Naming them here keeps that quirk in one place.
+ARM_EMSRC_emlibc_net := user/tests/emlibc_net/emlibc_net.c
+
+define ARM_EMLIBC_PROG
+$(ARM_USER)/app_$(1).o: $(if $(ARM_EMSRC_$(1)),$(ARM_EMSRC_$(1)),$(call USER_SRC,$(1))) | $(ARM_USER)
+	$$(USER_CC) $$(ARM_EMLIBC_CFLAGS) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
+                      $(ARM_LIBEMLIBC) $(NEWLIB_LDSCRIPT)
+	$$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
+	    -Wl,-z,max-page-size=0x1000 \
+	    $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
+	    -L$(ARM_USER) -lemlibc -lgcc -o $$@
+endef
+$(foreach p,$(ARM_EMLIBC_PROGS),$(eval $(call ARM_EMLIBC_PROG,$(p))))
+
+# --- A6: the root filesystem ------------------------------------------------
+# A SEPARATE, MINIMAL image, not the x86 embkfs.img. tools/embkfs_mkfs's main
+# script packs the whole x86 desktop -- icons, wallpapers, music, CPython, tcc,
+# the newlib headers for on-OS compilation -- none of which exists for aarch64
+# yet, and most of which is machine code that would be silently wrong here. The
+# arm64 packer reuses the SAME make_image()/build_root_items() formatter (so the
+# on-disk format cannot drift between the two) and simply gives it a shorter
+# object list.
+# The image depends on EVERYTHING that decides its contents, not just the
+# script named on the recipe line. mkfs_arm64.py imports its layout and its
+# manifest lookup from mkfs_embkfs.py and layout.py, and packs each program's
+# .ns/.caps/.app from its program directory -- so a change to any of those
+# changed what the image SHOULD hold while make considered it up to date. The
+# symptom was an x86 image and an aarch64 image built from the same tree
+# disagreeing about which apps the launcher shows.
+# The panic symbolizer's table for THIS kernel. Same tool and same reason as
+# the x86 rule in the top-level Makefile -- it reads the ELF symtab and lets
+# binutils decode the DWARF, so it is architecture-neutral as long as it is
+# handed the readelf that matches the ELF.
+ARM_EMBDBG_READELF ?= aarch64-elf-readelf
+$(ARM_KBUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_KBUILD)
+	@if [ -x "$(EMBDBG)" ]; then \
+	   echo "  EMBDBG   $@"; READELF=$(ARM_EMBDBG_READELF) $(EMBDBG) $< emit-kernel $@; \
+	 else echo "  (embdbg tool absent -> no kernel panic symbols on aarch64)"; : > $@; fi
+
+ARM_ROOTFS_INPUTS := tools/embkfs_mkfs/mkfs_arm64.py tools/embkfs_mkfs/mkfs_embkfs.py \
+                     tools/embkfs_mkfs/layout.py \
+                     $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app)
+$(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) $(ARM_KBUILD)/kernel.embdbg | $(ARM_KBUILD)
+	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)
+
+.PHONY: arm64-rootfs
+arm64-rootfs: $(ARM_ROOTFS)
+
+# --- running ----------------------------------------------------------------
+# gic-version=3 is NOT redundant. docs/ARM64.md §6.2 said "v3 is what `virt`
+# gives by default" -- that is true under KVM/HVF and FALSE under TCG, where
+# QEMU still defaults to GICv2 and the kernel finds no arm,gic-v3 node at all.
+# Asking for it explicitly is also more honest: the machine we target is a
+# GICv3 machine, and that should be visible in the command line rather than
+# inherited from an accelerator's default.
+ARM_MACHINE ?= virt,gic-version=3
+ARM_MEM     ?= 512M
+
+# FOUR CORES BY DEFAULT (A9). Not a demo setting: SMP is where the locking is
+# either right or silently wrong, and a kernel only ever exercised on one core
+# is one where every missing lock passes. Override with ARM_SMP=1 to reproduce
+# a single-core failure.
+ARM_SMP     ?= 4
+
+# WHICH ACCELERATOR, and why it is a per-HOST default rather than a fixed one.
+#
+# On Apple Silicon an aarch64 guest can run on aarch64 hardware: -accel hvf,
+# which needs -cpu host because HVF cannot emulate a core it is not running on.
+# Measured against TCG on the same machine, same kernel: identical wall-clock
+# for a timer-bound workload (both run in real time), and ~8x the computation
+# per unit of time for a CPU-bound one -- 93.4M loop iterations per scheduler
+# slice against 11.6M. From A7 on, when there are pixels to composite, that is
+# the difference between usable and not.
+#
+# Everywhere else -- including the Linux box this project is also developed on,
+# where an aarch64 guest cannot be accelerated at all -- it is TCG, and nothing
+# about the default changes for that host.
+#
+# TCG IS NOT A FALLBACK, IT IS A SECOND OPINION. `-d int,unimp` reports what the
+# CPU actually did and HVF offers no equivalent, so `run-arm64-tcg` stays one
+# word away. More to the point, the two disagree in ways that find bugs: A3's
+# level-triggered-interrupt ordering error was invisible under TCG and obvious
+# under HVF.
+#
+# BUT IT IS NOT IN THE DEFAULT RUN ANY MORE, on a host that has HVF. TCG is
+# roughly ten times slower than the hardware it pretends to be, and as the boot
+# self-test grew -- the scheduler A/B alone runs `jitter` twice against six
+# threads that never sleep -- a TCG pass stopped being a statement about the
+# kernel and became a statement about how long the harness was willing to wait.
+# It reports a run that ended early as eleven unrelated marker failures, which
+# is worse than useless: it is misleading. Every one of those in this repo's
+# history has been the clock, not a bug.
+#
+# It is one word away when it is wanted, and that word is worth typing when
+# touching interrupts, the GIC, or anything where the two might disagree:
+#
+#     ARM_TEST_ACCELS="hvf tcg" make ARCH=aarch64 test-arm64-boot
+#
+# On a host with no HVF, TCG is still the only opinion available and is used.
+ARM_HOST_ARCH := $(shell uname -m)
+ifeq ($(UNAME_S)-$(ARM_HOST_ARCH),Darwin-arm64)
+ARM_ACCEL       ?= hvf
+ARM_TEST_ACCELS ?= hvf
+else
+ARM_ACCEL       ?= tcg
+ARM_TEST_ACCELS ?= tcg
+endif
+
+ARM_CPU_tcg ?= cortex-a72
+ARM_CPU_hvf ?= host
+
+# -nographic wires the PL011 to this terminal's stdio (quit with Ctrl-A X).
+# There is no framebuffer to show until A7, so a window would be an empty one.
+#
+# We boot $(ARM_IMG), NOT $(ARM_ELF). Both run, but only the flat image carries
+# the arm64 Image header, and only the Image header makes QEMU hand us the
+# device tree pointer in x0 -- see the long note at the top of boot.S. The ELF
+# is still what you point gdb at: same addresses, plus symbols.
+ARM_QEMU_hvf = qemu-system-aarch64 -M $(ARM_MACHINE),accel=hvf -cpu $(ARM_CPU_hvf) -smp $(ARM_SMP) -m $(ARM_MEM)
+ARM_QEMU_tcg = qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU_tcg) -smp $(ARM_SMP) -m $(ARM_MEM)
+
+# The root filesystem is attached on every run target: without a disk there is
+# no /system/bin/hello.elf, so the kernel reaches A6 and has nothing to run.
+ARM_DISK = -drive file=$(ARM_ROOTFS),format=raw,if=none,id=d0 \
+           -device virtio-blk-pci,drive=d0
+
+# The display. `virt` has no VGA and no firmware framebuffer -- there is no
+# legacy path to fall back to, so if this device is absent the machine simply
+# has no screen (ARM64.md §6.5 settled: virtio-gpu only).
+ARM_GPU  = -device virtio-gpu-pci
+
+# Input. TWO devices, because a keyboard and a pointer are two virtio-input
+# functions; the driver tells them apart by asking each what events it can
+# produce. The TABLET rather than virtio-mouse on purpose: it reports ABSOLUTE
+# coordinates, so the guest cursor tracks the host's 1:1 and never "escapes"
+# the window the way a relative device does.
+ARM_INPUT = -device virtio-keyboard-pci -device virtio-tablet-pci
+
+# Sound. `none` is a real audio backend, not a way of disabling one: it
+# consumes samples at the correct rate and discards them, which is exactly what
+# a headless test wants -- the driver's buffers still round-trip through the
+# device and still retire on time. Use `-audiodev coreaudio,id=a0` (or pa/alsa)
+# to actually hear it.
+ARM_SND  = -device virtio-sound-pci,audiodev=a0 -audiodev none,id=a0
+
+# NETWORK. QEMU's user-mode stack (SLIRP): the guest gets 10.0.2.15 by DHCP
+# with the router at .2 and DNS at .3, and no host setup at all -- no bridge,
+# no tap, no root.
+#
+# The x86 run targets have had this since M1 and aarch64 never did, so
+# kernel/net/virtio_net.c was COMPILED for this arch and never given a device
+# to drive: the machine booted permanently offline. Nothing said so until the
+# bar grew a network indicator, which then reported it correctly and
+# unhelpfully on every ARM boot.
+#
+# -pci rather than the mmio variant to match every other device here: `virt`
+# has a PCIe host bridge and that is where the rest of them sit.
+ARM_NET  = -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+#
+# ON THE RUN TARGETS BUT NOT ON THE ACCEPTANCE TEST, and that is a statement
+# about net_init rather than about the NIC: it leases an address SYNCHRONOUSLY,
+# so the boot waits for DHCP before reaching userspace. On this arch RX is
+# tick-driven (the log says "virtio-net: no MSI-X"), which made that wait long
+# enough to blow the test's 120 s budget -- 43 failures, every one of them a
+# test that never got to run. The test measures how fast this machine boots,
+# and a DHCP round trip is not part of that question. Recorded in docs/TODO.md:
+# the real fix is for net_init to stop blocking boot on a lease.
+#
+# `-nic none` on the test, and it is NOT redundant: qemu's `virt` machine
+# attaches a DEFAULT network device when none is named, so the guest had a NIC
+# all along and simply had no driver calling net_init(). Leaving the default in
+# place would have meant the test still paid for a DHCP round trip after the
+# explicit device was taken off it -- which is exactly what happened, and cost
+# a run to notice.
+
+.PHONY: run-arm64
+run-arm64: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_$(ARM_ACCEL)) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) $(ARM_NET) -kernel $(ARM_IMG)
+
+# Force one or the other regardless of host.
+.PHONY: run-arm64-hvf
+run-arm64-hvf: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_hvf) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) $(ARM_NET) -kernel $(ARM_IMG)
+
+.PHONY: run-arm64-tcg
+run-arm64-tcg: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) $(ARM_NET) -kernel $(ARM_IMG)
+
+# --- run-arm64-desktop: the whole machine, in a window ------------------------
+# `run-arm64` above is the SERIAL target: -nographic, kernel log on stdio, no
+# screen. That is the right default for a kernel you are debugging and the wrong
+# one for using the OS, because the desktop has nowhere to draw. This is the
+# other one -- the aarch64 equivalent of x86's `run-embkfs`: a real display, a
+# real keyboard and pointer, real audio, and the kernel log still on stdio so
+# you can watch the boot and type test commands while the desktop is up.
+#
+# THE THREE DISKS are not optional decoration. The kernel runs its self-tests
+# before it starts init, and two of them want a device: the crash-consistency
+# test writes to the second (sdb) and the swap witness pages out to the third
+# (sdc). Boot without them and the machine still reaches the desktop, but it
+# reports two failures on the way for no reason other than the disks being
+# absent -- which is exactly the kind of noise that teaches you to ignore
+# failures. The first disk (sda) is the root filesystem and is written in place,
+# so changes you make persist across runs.
+ARM_DESKTOP_DISKS = \
+    -drive file=$(ARM_ROOTFS),format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 \
+    -drive file=build/crash-seed.img,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1 \
+    -drive file=build/swap.img,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2
+
+# The scanout size -- the SAME per-host default the x86 targets use, and for
+# the reason spelled out where FB_W/FB_H are defined: -display cocoa with
+# zoom-to-fit=off draws one guest pixel per PHYSICAL pixel, and Mac panels are
+# Retina, so a 1280x800 guest fills about 640x400 points and looks half-size.
+# The guest resolution has to roughly double to LOOK normal. Hardcoding 1280x800
+# here is exactly the mistake that note exists to prevent.
+#
+# The whole stack -- framebuffer, compositor, mouse clamp, the launcher -- takes
+# whatever the device reports, so this is a free choice:
+#   make ARCH=aarch64 run-arm64-desktop ARM_XRES=2560 ARM_YRES=1600
+# and smaller is the cheapest speedup available if it ever feels sluggish.
+ARM_XRES ?= $(FB_W)
+ARM_YRES ?= $(FB_H)
+ARM_GPU_WINDOW = -device virtio-gpu-pci,xres=$(ARM_XRES),yres=$(ARM_YRES)
+
+# zoom-to-fit=off shows guest pixels 1:1 rather than stretching them to the
+# window, which is what makes an unscaled display look blurry. The BACKEND is
+# the part that differs by host: Homebrew's qemu is built without gtk, so
+# -display gtk fails outright on macOS.
+ifeq ($(UNAME_S),Darwin)
+ARM_DISPLAY  ?= cocoa,zoom-to-fit=off
+ARM_AUDIODEV ?= coreaudio
+else
+ARM_DISPLAY  ?= gtk,zoom-to-fit=off
+ARM_AUDIODEV ?= pa
+endif
+# A REAL audio backend here, unlike the test target's `none` -- the point of
+# this target is to use the machine, and `none` consumes samples and discards
+# them.
+#
+# QEMU may print `Can not open virtio-sound.in (no host audio driver)` on the
+# way up. That is the CAPTURE half of the device, which nothing in this OS uses;
+# playback opens fine and the warning is not fatal. On macOS it is the
+# microphone permission prompt you did not answer. `ARM_AUDIODEV=none` silences
+# it at the cost of hearing anything.
+ARM_SND_REAL = -device virtio-sound-pci,audiodev=a0 -audiodev $(ARM_AUDIODEV),id=a0
+
+.PHONY: run-arm64-desktop
+run-arm64-desktop: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
+	@echo "==> EmbLinkOS aarch64.  The kernel console is THIS terminal."
+	@echo "    Auto-login is ON: this build boots straight into a session as 'yves'."
+	@echo "    For the REAL first-boot setup and password login screen, build with"
+	@echo "    authentication required:"
+	@echo "        make ARCH=aarch64 AUTOLOGIN=0 run-arm64-desktop"
+	$(ARM_QEMU_$(ARM_ACCEL)) $(ARM_DESKTOP_DISKS) $(ARM_GPU_WINDOW) $(ARM_INPUT) \
+	    $(ARM_SND_REAL) $(ARM_NET) -display $(ARM_DISPLAY) \
+	    -serial stdio -no-reboot -no-shutdown -kernel $(ARM_IMG)
+
+# Interrupt/exception tracing. TCG only -- this is the capability HVF does not
+# have, and the reason TCG stays a first-class target rather than a fallback.
+.PHONY: debug-arm64
+debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) $(ARM_NET) -kernel $(ARM_IMG) \
+	    -d int,unimp,guest_errors -D $(ARM_BUILD)/qemu.log
+
+# --- the acceptance test ----------------------------------------------------
+# Every phase's "done when" from docs/ARM64.md, made machine-checkable so it
+# stays true. Cumulative on purpose: a later phase must not quietly break an
+# earlier one.
+#
+# Run under EVERY available accelerator, not just the default. This is not
+# thoroughness for its own sake: TCG and HVF disagree, and the disagreements are
+# where the bugs are. A3's interrupt-ordering error (ending a level-triggered
+# interrupt before the device de-asserted) passed cleanly under TCG for an
+# entire phase and failed immediately under HVF.
+#
+# No `timeout(1)`: it is GNU coreutils and this repo builds on macOS, where it
+# is absent unless someone installed gtimeout. Backgrounding qemu and killing it
+# is portable to both hosts -- the same rule the top-level Makefile applies to
+# stat and truncate.
+#
+# THE BUDGETS ARE MEASURED, and overridable (ARM_TCG_SECS / ARM_HVF_SECS)
+# because a slower host is a real thing and a hardcoded number is not
+# debuggable. TCG was 90 seconds for a long time and quietly became marginal as
+# the self-test grew -- the scheduler A/B alone runs `jitter` twice against six
+# threads that never sleep. Bisected: it stops in the same place at 90, 100,
+# 105 and 120 and completes at 115 and 170, i.e. it needs a little over 100 and
+# the old budget was sometimes enough and sometimes not. 150 is that with room
+# for a loaded host. HVF drifted the same way for the same reason: 40 seconds
+# was right when it was set and became marginal without anyone changing it --
+# it fails, then passes, then fails on the same build. It completed at 55 and
+# at 70, so it was set to 75 -- and 75 then failed twice on the next build,
+# with the log ending inside the 25-second session wait. Which is the lesson:
+# two passing samples are not a measurement of a budget, they are two samples.
+# 120 now, and the guest prints its OWN uptime on its final tally line (see
+# early.c, "all self-tests done"), echoed below -- so the next person sets
+# this from that number plus headroom, not from a feeling.
+#
+# A run that ends early does not report a timeout, it reports every marker
+# after that point as missing -- which reads as a dozen unrelated failures in
+# subsystems that are fine, and is why this is worth writing down. If this test
+# ever reports a broad spread of failures across unrelated phases, suspect the
+# clock before the kernel.
+# Each accelerator boots a COPY of the root filesystem, never the original.
+# posixdemo WRITES -- mkdir, create, rename, unlink -- so a run mutates the
+# image, and without a scratch copy the second accelerator inherits the first
+# one's leftovers and a re-run is not the same test as the first. It showed up
+# as an EMBKFS free-block count that disagreed with the superblock by one.
+.PHONY: test-arm64-boot
+test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img build/nvme-scratch.img
+	@overall=0; \
+	for acc in $(ARM_TEST_ACCELS); do \
+	  case $$acc in \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-120};;  \
+	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=$${ARM_TCG_SECS:-150};; \
+	  esac; \
+	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
+	  echo "=== $$acc ==="; \
+	  scratch=$(ARM_BUILD)/rootfs-$$acc.img; \
+	  cp $(ARM_ROOTFS) $$scratch; \
+	  seed=$(ARM_BUILD)/crash-seed-$$acc.img; cp build/crash-seed.img $$seed; \
+	  swapimg=$(ARM_BUILD)/swap-$$acc.img; cp build/swap.img $$swapimg; \
+	  nvimg=$(ARM_BUILD)/nvme-$$acc.img; cp build/nvme-scratch.img $$nvimg; \
+	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 -drive file=$$seed,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1 -drive file=$$swapimg,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2 -drive file=$$nvimg,format=raw,if=none,id=nv0 -device nvme,serial=EMBKSCRATCH,drive=nv0"; \
+	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
+	  host_t0=$$(date +%s); \
+	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -nic none -display none -serial file:$$log \
+	      -qmp tcp:127.0.0.1:$$port,server,nowait -kernel $(ARM_IMG) 2>/dev/null & \
+	  qpid=$$!; \
+	  python3 tools/arm64_input_probe.py $$port $$secs >/dev/null 2>&1 & \
+	  ipid=$$!; \
+	  for i in $$(seq $$secs); do grep -q 'all self-tests done' $$log 2>/dev/null && break; sleep 1; done; \
+	  host_done=$$(( $$(date +%s) - host_t0 )); \
+	  kill $$ipid 2>/dev/null; wait $$ipid 2>/dev/null; \
+	  python3 tools/arm64_click_launcher.py $$port $$log >/dev/null 2>&1; \
+	  sleep 2; \
+	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
+	  kill $$ipid 2>/dev/null; wait $$ipid 2>/dev/null; \
+	  fail=0; \
+	  chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
+	  chk 'EmbLinkOS aarch64'              A0 'no banner -- PL011 or the entry point is wrong'; \
+	  chk 'CurrentEL   : EL1'              A0 'not running at EL1'; \
+	  chk 'fdt: blob at phys'              A0 'the DTB pointer did not survive the handoff'; \
+	  chk 'VBAR_EL1 installed'             A1 'exception vectors were never installed'; \
+	  chk 'BRK instruction'                A1 'brk was not decoded (ESR EC 0x3C)'; \
+	  chk 'alignment fault, on a READ'     A1 'the abort was not decoded down to FSC + direction'; \
+	  chk 'higher half: YES'               A2 'the kernel is not executing from the kernel window'; \
+	  chk 'boot: dtb memory'               A2 'the device tree did not yield a memory map'; \
+	  chk 'translation fault, on a READ'   A2 'low addresses still resolve -- identity map not dropped'; \
+	  chk 'permission fault, on a WRITE'   A2 '.rodata is still writable -- section permissions are not real'; \
+	  chk 'wrote and read back via the direct map' A2 'the physical allocator or the direct map is broken'; \
+	  chk 'gic: initialised (GICv'         A3 'the interrupt controller did not come up'; \
+	  chk 'generic timer'                  A3 'the timer never registered an interrupt line'; \
+	  chk '100 Hz tick'                    A3 'the generic timer was not programmed'; \
+	  chk 'worker 1 was scheduled'         A3 'no preemption report'; \
+	  chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
+	  chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
+	  chk 'kmalloc/kfree across 5 size'    A6 'the shared kernel heap does not work here'; \
+	  chk 'in one space and'               A6 'address spaces are not isolated from each other'; \
+	  chk 'pci: ECAM at'                   A7 'the PCIe host bridge was not found in the device tree'; \
+	  : 'The witness for "enumeration works" is the DISPLAY controller, not the' \
+	    'network one it used to be. That assertion was passing on QEMU'"'"'s DEFAULT' \
+	    'NIC -- a device this target never asked for and does not attach -- so' \
+	    'the moment the default was turned off (-nic none, to keep a DHCP round' \
+	    'trip out of a boot-time budget) it failed, with nothing wrong. The GPU' \
+	    'is attached by ARM_GPU on every one of these runs, so it witnesses the' \
+	    'same fact and cannot disappear behind a default.'; \
+	  chk 'Display controller'             A7 'PCIe enumeration found no virtio device'; \
+	  chk 'pci: assigned'                  A7 'no BAR was assigned -- there is no firmware to do it here'; \
+	  chk 'virtio-blk: sda'              A7 'the virtio-blk device did not come up'; \
+	  chk 'power cut at every write: OK' A7 'the crash-consistency test did not pass here (seed disk sdb)'; \
+	  chk 'anonymous memory larger than RAM: OK' A7 'the swap witness did not pass here (store sdc)'; \
+	  chk 'the account store and the session policy: OK' A7 'the account store test did not pass here'; \
+	  chk 'nvme: every transfer shape written and read back: OK' NV 'the NVMe driver did not pass its witness (scratch namespace)'; \
+	  chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
+	  chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
+	  chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \
+	  chk 'distinct line'                  A7 'PCI interrupt routing was not exercised'; \
+	  chk 'all reclaimed'                  A6 'destroying an address space leaks pages'; \
+	  chk 'hello.elf launched as pid'      A6 'the kernel could not create a user process'; \
+	  chk 'hello from newlib'              A6 'printf never reached the console -- write(2) or the retargeting layer'; \
+	  chk 'argv0=/system/bin/hello.elf'    A6 'argc/argv did not survive the transition to EL0'; \
+	  chk 'malloc/free of 4096 bytes'      A6 'malloc/sbrk does not work in ring 3'; \
+	  chk 'snprintf: OK'                   A6 'libc formatting is broken (C99 formats?)'; \
+	  chk 'plausible wall clock'           A6 'time() did not reach the RTC'; \
+	  chk 'embk thread create/join: OK'    A6 'a second EL0 thread could not be created or joined'; \
+	  chk 'hello: 5/5 checks passed'       A6 'the userland witness did not pass every check'; \
+	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
+	  chk 'zeroed, written and read back'  MM 'mmap did not produce usable memory'; \
+	  chk 'munmap returned the memory'     MM 'munmap leaked pages -- page tables, most likely'; \
+	  chk 'PAN: EL1 reading a USER page'   MM 'PAN is not enforcing -- EL1 can read user memory'; \
+	  chk 'canary: a deliberate overrun was caught' MM 'the stack protector did not fire on a deliberate overrun'; \
+	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
+	  chk 'the generated code RUNS and returns 42' MM 'mprotect W->X did not make the page executable'; \
+	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \
+	  if [ -n "$(PIE_OK)" ]; then chk 'a PIE moves between runs: OK' PIE 'a position-independent executable did not run, or landed at the same address twice'; fi; \
+	  chk 'two writes APPENDED (one shared cursor'  FD 'dup gave the copy its OWN cursor -- not a shared open file description'; \
+	  chk 'dup2 lands on exactly the descriptor'    FD 'dup2 did not honour the requested fd number'; \
+	  chk 'pagecache: writeback thread started'    PC 'the page cache never came up'; \
+	  chk 'fstat reports every byte written'       PC 'stat disagrees with read about the size of a file with unflushed writes'; \
+	  chk 'one object per FILE, not per open'      PC 'two opens of one file cached it twice -- an incoherent cache'; \
+	  chk 'the cached tail went too'               PC 'O_TRUNC left stale bytes in the cache'; \
+	  chk 'power: idle accounting armed'          PW 'the power subsystem never came up'; \
+	  chk 'the total is EXACT'                    FX 'the userland mutex lost updates -- the futex does not exclude'; \
+	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
+	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
+	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
+	  chk 'libembk.so linked'              A6 'the dynamic link failed -- no EmUI app can load'; \
+	  chk 'init.elf launched as pid'       A6 'pid 1 did not start'; \
+	  chk 'ns: /system is read-only'       A6 'init could not confine itself -- the namespace is not enforced'; \
+	  chk 'desktop session started'        A6 'init never spawned the session'; \
+	  chk 'home: desktop ready'            A7 'the desktop came up but never finished'; \
+	  chk 'first frame presented'          A7 'the compositor never presented a frame'; \
+	  chk 'home: launcher OPEN'            A7 'the launcher button did nothing -- the top bar could not reach the desktop through /run'; \
+	  chk 'framebuffer 1280x800'           A7 'virtio-gpu did not come up'; \
+	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
+	  chk 'is a tablet'                    A7 'virtio-input found no pointer'; \
+	  chk 'statusq (LEDs)'                 A7 'the keyboard has no status queue -- the lock LEDs cannot work'; \
+	  chk 'virtio-snd: stream 0 ready'     A7 'virtio-snd did not accept its PCM parameters'; \
+	  chk 'frame(s) accepted at 44100 Hz'  A7 'audio buffers were not submitted or never retired'; \
+	  chk 'PSCI via'                       A9 'no PSCI conduit found in the device tree'; \
+	  if [ "$$acc" = tcg ] && echo '$(ARM_MACHINE)' | grep -q 'gic-version=3'; then \
+	    chk 'software-triggered MSI'       A7 'the ITS did not deliver a translated interrupt'; \
+	    chk 'MSI -> LPI .* delivered'      A7 'the MSI was mapped but never arrived'; \
+	  else \
+	    chk 'MSI unavailable, INTx still works' A7 'no ITS here (HVF, or a GICv2); the driver should have said so and fallen back'; \
+	  fi; \
+	  chk "$(ARM_SMP) of $(ARM_SMP) core(s) online" A9 'not every secondary core came up'; \
+	  chk 'other core(s) took the interrupt' A9 'an IPI reached nobody -- cross-core interrupts do not work'; \
+	  chk 'every core is taking interrupts on its own timer' A9 'a core is online but INERT -- no timer, so it never preempts'; \
+	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
+	  ptrn=$$(sed -n 's/.*virtio-input: [0-9][0-9]* key event(s), \([0-9][0-9]*\) pointer.*/\1/p' $$log | tail -1); \
+	  [ -n "$$keyn" ] && [ "$$keyn" -gt 0 ] 2>/dev/null || \
+	    { echo "FAIL(A7): no KEY events reached the driver ($${keyn:-none}) -- the queue is armed but empty"; fail=1; }; \
+	  [ -n "$$ptrn" ] && [ "$$ptrn" -gt 0 ] 2>/dev/null || \
+	    { echo "FAIL(A7): no POINTER events reached the driver ($${ptrn:-none})"; fail=1; }; \
+	  n=$$(grep -c 'matches KV2P' $$log); \
+	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
+	  if grep -q 'KV2P.*MISMATCH\|MISMATCH.*KV2P' $$log; then \
+	    echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
+	  if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
+	  echo "  guest clock at final tally: $$(grep -o 'at [0-9]* ms of uptime' $$log || echo 'NOT REACHED -- the budget ($$secs s) ended the run first')"; \
+	  echo "  host wall clock until the guest's tally: $$host_done s (timeout $$secs s) -- compare with the guest's own two clocks on that line"; \
+	  if grep -q 'DID NOT TAKE' $$log; then echo "FAIL(A7): a BAR write did not stick"; fail=1; fi; \
+	  if [ $$fail -ne 0 ]; then \
+	    echo "--- serial ($$acc) ---"; cat $$log; echo "--- end ---"; overall=1; \
+	  else \
+	    grep -E 'timer fired|CNTVCT and the tick|was scheduled|spurious:' $$log | sed 's/^/  /'; \
+	    echo "  PASS ($$acc)"; \
+	  fi; \
+	done; \
+	if [ $$overall -eq 0 ]; then \
+	  echo; echo "PASS on [$(ARM_TEST_ACCELS)]:"; \
+	  echo "  A0 banner, EL1, DTB handoff"; \
+	  echo "  A1 vectors, ESR/FAR decode, recovery"; \
+	  echo "  A2 higher half, DTB memory map, pmm, section permissions, no identity map"; \
+	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
+	  echo "  A6 the shared kernel heap, per-process address spaces, clean teardown"; \
+	  echo "  A7 PCIe ECAM, virtio-blk, and the REAL filesystem mounted + read"; \
+	  echo "  A6 a newlib program from that filesystem, at EL0: argv, printf,"; \
+	  echo "     malloc, snprintf, time, a second thread, and a clean exit(5)"; \
+	  echo "  A6 a kernel fault on user memory RECOVERS (the copy_to/from_user"; \
+	  echo "     time-of-check/time-of-use hole SMP made reachable)"; \
+	  echo "  A6 posixdemo: the whole POSIX suite, ALL PASS -- including"; \
+	  echo "     variant-I TLS (TPIDR_EL0, block above the pointer)"; \
+	  echo "  A6 the REAL session: init -> auth -> a namespace-confined desktop,"; \
+	  echo "     dynamically linked against libembk.so"; \
+	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame, and the"; \
+	  echo "     launcher button PRESSED over QMP and the launcher opening"; \
+	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
+	  echo "  A7 virtio-snd: a real buffer submitted through the shared audio"; \
+	  echo "     layer and retired by the device"; \
+	  echo "  A7 MSI: the GIC ITS translates and delivers (TCG; HVF has no ITS"; \
+	  echo "     and correctly falls back to INTx)"; \
+	  echo "  MM mmap/munmap/mprotect: anonymous mappings, W^X enforced,"; \
+	  echo "     every page given back (page tables included), and code"; \
+	  echo "     GENERATED at runtime, flipped W->X, and executed"; \
+	  if [ -n "$(PIE_OK)" ]; then \
+	    echo "  PIE a position-independent executable: loaded at a random bias,"; \
+	    echo "      its RELATIVE relocations applied, its constructor run, its"; \
+	    echo "      __thread variable intact, and a DIFFERENT address each run"; \
+	  fi; \
+	  echo "  NV NVMe over PCIe: controller brought up with no firmware to help,"; \
+	  echo "     every PRP shape and a split transfer written and read back, the"; \
+	  echo "     end of the namespace enforced, and a shutdown + restart survived"; \
+	  echo "  FD dup/dup2/F_DUPFD over a real shared open file"; \
+	  echo "     description: two descriptors, ONE cursor"; \
+	  echo "  PC the unified page cache: write-back, one object per file,"; \
+	  echo "     coherent between independent opens, and a real fsync"; \
+	  echo "  PW power: per-core idle residency measured, PSCI SYSTEM_OFF"; \
+	  echo "     and SYSTEM_RESET wired to a real shutdown path"; \
+	  echo "  FX futex: four ring-3 threads and one shared counter,"; \
+	  echo "     with a mutex whose fast path never enters the kernel"; \
+	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
+	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
+	  echo "     themselves, all TICKING, and all reachable by IPI"; \
+	else exit 1; fi
+
+# The USERLAND libc is probed the way the x86 check-tools does it: by actually
+# COMPILING an #include with the build's own flags, so a wrong NEWLIB_PREFIX and
+# a toolchain that ships no libc are both caught. Homebrew's aarch64-elf-gcc
+# ships NO newlib at all, so this is the step people will miss -- and its
+# absence shows up otherwise as a wall of "undefined reference" at the first
+# link, a long way from "you have not built a libc yet".
+.PHONY: check-tools-arm64
+check-tools-arm64:
+	@miss=0; \
+	echo "EmbLinkOS aarch64 prerequisites  (make ARCH=aarch64 check-tools-arm64)"; echo; \
+	for t in $(AARCH64_CC) $(AARCH64_PREFIX)ld $(AARCH64_OBJCOPY) qemu-system-aarch64; do \
+	  if command -v $$t >/dev/null 2>&1; then printf '  [ ok ]  %s\n' "$$t"; \
+	  else printf '  [MISS]  %s\n' "$$t"; miss=$$((miss+1)); fi; \
+	done; \
+	if [ -z "$(NEWLIB_PREFIX)" ]; then \
+	  printf '  [ -- ]  userspace libc  (NEWLIB_PREFIX empty -- kernel only, no userland)\n'; \
+	elif echo '#include <string.h>' | $(USER_CC) $(NEWLIB_INC) -ffreestanding -x c -E - >/dev/null 2>&1; then \
+	  printf '  [ ok ]  userspace libc  (<string.h> resolves via NEWLIB_PREFIX=$(NEWLIB_PREFIX))\n'; \
+	else \
+	  printf '  [MISS]  userspace libc  for aarch64 -- build it with:\n'; \
+	  printf '            tools/newlib/build-newlib-emblink.sh <newlib-src> aarch64-elf\n'; \
+	  miss=1; fi; \
+	echo; \
+	if [ $$miss -gt 0 ]; then \
+	  echo "==> missing. macOS:  brew install aarch64-elf-gcc qemu"; \
+	  echo "                Linux:  your distro's gcc-aarch64-none-elf (or crosstool-ng)"; exit 1; \
+	else echo "==> ok.  Build + boot:  make ARCH=aarch64 && make ARCH=aarch64 run-arm64"; fi
+
+.PHONY: clean-arm64
+clean-arm64:
+	rm -rf $(ARM_BUILD)
+
+# --- USB input on aarch64 -- docs/RPI4.md P5 --------------------------------
+# A Pi 4's keyboard and mouse are USB behind PCIe. raspi4b has no PCIe, so the
+# USB half is proven here instead: `virt` with a qemu-xhci, a usb-kbd and a
+# usb-mouse and NO virtio input, keys and motion sent through QEMU's input
+# layer, and the driver's report counters and the cursor read back out of
+# guest memory. The same xHCI/HID code runs on the Pi.
+.PHONY: test-arm64-usb
+test-arm64-usb: $(ARM_IMG) $(ARM_ROOTFS) tools/arm64_usb_input_test.py
+	python3 tools/arm64_usb_input_test.py $(ARM_IMG) $(ARM_ELF) $(ARM_ROOTFS) \
+	  $(ARM_KBUILD)/test-arm64-usb.log
+	@# ...and again with both behind a hub: every Pi 4 keyboard is (its USB
+	@# 2.0 ports are a hub inside the VL805).
+	python3 tools/arm64_usb_input_test.py $(ARM_IMG) $(ARM_ELF) $(ARM_ROOTFS) \
+	  $(ARM_KBUILD)/test-arm64-usb-hub.log --hub
+
+# --- Raspberry Pi 4 -- docs/RPI4.md ----------------------------------------
+# Everything below needs BOARD=rpi4, because it is about the Pi's kernel:
+#
+#   make ARCH=aarch64 BOARD=rpi4 rpi4-sdboot     the SD card's boot partition
+#   make ARCH=aarch64 BOARD=rpi4 run-rpi4        QEMU's raspi4b, on this terminal
+#   make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot  the current phase, asserted
+#
+# The firmware is fetched once into $(RPI4_FW), outside any BOARD's kernel
+# directory so clean-arm64 does not throw away a download. The stamp exists
+# only if every file matched its pinned hash (tools/rpi4_firmware.sh).
+RPI4_FW     := $(BUILD)/rpi4-firmware
+RPI4_STAMP  := $(RPI4_FW)/.fetched
+RPI4_DTB    := $(RPI4_FW)/bcm2711-rpi-4-b.dtb
+RPI4_SDBOOT := $(ARM_BUILD)/rpi4/sdboot
+RPI4_SDCARD := $(ARM_BUILD)/rpi4/sdcard.img
+
+$(RPI4_STAMP): tools/rpi4_firmware.sh
+	sh tools/rpi4_firmware.sh $(RPI4_FW)
+	@touch $@
+
+.PHONY: rpi4-firmware
+rpi4-firmware: $(RPI4_STAMP)
+
+# QEMU's raspi4b is the Pi's CI target the way `virt` is the kernel's: the same
+# BCM2711 memory map, the same GIC-400 and PL011, booted with the SAME device
+# tree the real firmware hands over. It has no PCIe, no Ethernet and no USB,
+# so it can prove the early phases and nothing that needs those; the real board
+# is the only witness for P5 onward. QEMU does not fill in /memory the way the
+# firmware does from the RAM it finds -- it sizes it itself -- which is why the
+# test below checks that a memory range arrived rather than its size.
+RPI4_QEMU = qemu-system-aarch64 -M raspi4b -dtb $(RPI4_QEMU_DTB)
+
+# THE ONE WAY QEMU'S raspi4b IS NOT A PI 4 THAT P3 CANNOT IGNORE: it wires its
+# SD card to the older controller at 0x7e300000 -- where the real board has
+# its Wi-Fi -- and leaves EMMC2, the real SD slot, empty (its sd-bus is not
+# reachable from the command line either). So QEMU boots a COPY of the real
+# device tree with that controller's SD-card node switched from "disabled" to
+# "okay": the tree then describes the emulated machine as it is, and the
+# kernel is taught nothing about QEMU. The SD card is still found, partitioned
+# and mounted through the same driver, the same 32-bit-only register path and
+# the same code after it; what only the real board can test is EMMC2's own
+# two quirks (no card-detect, a firmware-owned clock). docs/RPI4.md P3.
+RPI4_QEMU_DTB := $(ARM_BUILD)/rpi4/qemu-bcm2711-rpi-4-b.dtb
+$(RPI4_QEMU_DTB): $(RPI4_STAMP)
+	@mkdir -p $(dir $@)
+	cp $(RPI4_DTB) $@.tmp
+	fdtput -t s $@.tmp /soc/mmc@7e300000 status okay
+	mv $@.tmp $@
+
+# What the phases so far claim, one grep each.
+#  P0:  the board header and the first page tables got it to EL1 in the higher
+#       half with a memory map from the Pi's own device tree, the MMIO window
+#       really is Device memory over the Pi's peripherals (an unaligned read
+#       there FAULTS), and nothing that runs before interrupts failed.
+#  P0b: the firmware gave the kernel a framebuffer over the mailbox and the
+#       kernel log is on it -- the script also screenshots the display and
+#       checks the pixels (tools/rpi4_boot_test.py).
+#  P1:  the GIC-400 came up through the GICv2 back-end, the generic timer
+#       ticks through it at the rate CNTVCT says it should, and the scheduler
+#       PREEMPTS -- every thread got slices it did not yield. The munmap line
+#       is here because P1 is what first ran it on the Pi, and it found the
+#       self-test miscounting a heap grow as a leak.
+#  P2:  cores 1-3 released from their spin-table slots, all four online,
+#       IPIs reach every other core through the GIC-400, and every core's own
+#       timer ticks (measured by the script, not claimed by a log line).
+#  P3:  the SD card (sdcard.img) is found, switched to its fast bus, its MBR
+#       read, sda2 mounted as `/` -- and everything that needed a disk now
+#       runs from it: programs, the accounts, init, the desktop session.
+#       Through the older controller, because QEMU wires the card there
+#       (RPI4_QEMU_DTB above); EMMC2 itself is for the real board.
+# What still fails on raspi4b is PCIe (P5: nothing is routed) and swap (the
+# card carries no swap area); neither is claimed.
+RPI4_MARKS = 'board       : rpi4' \
+             'CurrentEL   : EL1' \
+             'higher half: YES' \
+             'boot: dtb memory 0x0000000000000000 + ' \
+             'fdt: firmware reservation 0x0000000000000000 + 1000' \
+             'mbox: framebuffer ' \
+             'rawcon: kernel log on the firmware framebuffer' \
+             '[ ok ] unaligned load on Device memory' \
+             '[ ok ] write to .rodata -> permission fault' \
+             'self-test done: 0 failure(s)' \
+             'gic: initialised (GICv2' \
+             '[ ok ] timer fired' \
+             '[ ok ] CNTVCT and the tick count agree' \
+             '[ ok ] worker 1 was scheduled' \
+             '[ ok ] worker 2 was scheduled' \
+             '[ ok ] boot thread was scheduled back' \
+             '[ ok ] free pages' \
+             'released from its spin-table' \
+             'smp: 4 of 4 core(s) online' \
+             '[ ok ] IPI: 3 of 3 other core(s) took the interrupt' \
+             'sdhci: sda = SD card' \
+             '4-bit bus at up to 25 MHz' \
+             'part: sda1 type 0xC' \
+             'part: sda2 type 0x83' \
+             'EMBKFS: sda2: mounted' \
+             'VFS: mounted fs at "/"' \
+             '[ ok ] /system/bin/hello.elf launched' \
+             'init: desktop session started' \
+             'home: desktop ready' \
+             '[ ok ] every core is taking interrupts on its own timer'
+
+ifeq ($(BOARD),rpi4)
+.PHONY: rpi4-sdboot
+rpi4-sdboot: $(ARM_IMG) $(RPI4_STAMP) boot/rpi4/config.txt
+	rm -rf $(RPI4_SDBOOT)
+	mkdir -p $(RPI4_SDBOOT)/overlays
+	cp $(RPI4_FW)/start4.elf $(RPI4_FW)/fixup4.dat $(RPI4_DTB) $(RPI4_SDBOOT)/
+	cp $(RPI4_FW)/overlays/disable-bt.dtbo $(RPI4_SDBOOT)/overlays/
+	cp boot/rpi4/config.txt $(RPI4_SDBOOT)/
+	cp $(ARM_IMG) $(RPI4_SDBOOT)/kernel8.img
+	@echo
+	@echo "Pi 4 boot partition staged in $(RPI4_SDBOOT)/"
+	@echo "Copy EVERYTHING in it to the root of a FAT32-formatted SD card, then"
+	@echo "connect a 3.3 V USB-serial adapter: GND -> pin 6, RX -> pin 8 (TXD),"
+	@echo "TX -> pin 10 (RXD), and open it at 115200 8N1. See docs/RPI4.md §4."
+
+# THE WHOLE CARD (P3): partition 1 the boot files above, partition 2 the
+# root filesystem -- tools/mkrpi4sd.py. This is the image to write to a real
+# card (Raspberry Pi Imager: "Use custom"; or dd), and the one QEMU boots with.
+.PHONY: rpi4-sdcard
+rpi4-sdcard: rpi4-sdboot $(ARM_ROOTFS) tools/mkrpi4sd.py
+	python3 tools/mkrpi4sd.py $(RPI4_SDCARD) $(RPI4_SDBOOT) $(ARM_ROOTFS)
+	@echo "Write $(RPI4_SDCARD) to the WHOLE card (not a partition) -- docs/RPI4.md §4."
+
+# The card is attached with snapshot=on: the kernel writes to its root
+# filesystem, and a test run must not change the image the next one boots.
+RPI4_SD_DRIVE = -drive if=sd,format=raw,snapshot=on,file=$(RPI4_SDCARD)
+
+.PHONY: run-rpi4
+run-rpi4: rpi4-sdcard $(RPI4_QEMU_DTB)
+	$(RPI4_QEMU) -nographic $(RPI4_SD_DRIVE) -kernel $(ARM_IMG)
+
+.PHONY: test-rpi4-boot
+test-rpi4-boot: rpi4-sdcard $(RPI4_QEMU_DTB) tools/rpi4_boot_test.py
+	python3 tools/rpi4_boot_test.py $(ARM_IMG) $(RPI4_QEMU_DTB) \
+	  $(ARM_KBUILD)/test-rpi4-boot.log --sd $(RPI4_SDCARD) $(RPI4_MARKS)
+else
+.PHONY: rpi4-sdboot rpi4-sdcard run-rpi4 test-rpi4-boot
+rpi4-sdboot rpi4-sdcard run-rpi4 test-rpi4-boot:
+	@echo "$@ is about the Raspberry Pi kernel: make ARCH=aarch64 BOARD=rpi4 $@" >&2; exit 1
+endif

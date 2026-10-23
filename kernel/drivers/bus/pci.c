@@ -1,7 +1,5 @@
 #include "drivers/bus/pci.h"
 #include "include/io.h"
-#include "arch/x86_64/cpu/spinlock.h"
-static spinlock_t config_lock = SPINLOCK_INIT;
 #include "include/kprintf.h"
 #include "drivers/char/serial.h"
 #include "mm/vmm.h"   // vmm_map_mmio for the MSI-X table (lives in a BAR)
@@ -22,17 +20,8 @@ static uint32_t pci_config_address(uint8_t bus, uint8_t device, uint8_t function
 
 // Read a 32-bit value from the PCI configuration space
 uint32_t pci_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
-    
-    uint32_t address = pci_config_address(bus, device, function, offset);
-    // We need outl/inl (32 bits port I/O). 
-
-    spin_lock(&config_lock);
-    outl(PCI_CONFIG_ADDRESS, address);
-    uint32_t value = inl(PCI_CONFIG_DATA);
-    spin_unlock(&config_lock);
-    return value;
+    return arch_pci_cfg_read32(bus, device, function, offset);
 }
-
 
 uint16_t pci_read16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
     uint32_t value = pci_read32(bus, device, function, offset & 0xFC);
@@ -48,25 +37,14 @@ uint8_t pci_read8(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset)
 }
 
 void pci_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value){
-    uint32_t address = pci_config_address(bus, device, function, offset);
-    spin_lock(&config_lock);
-    outl(PCI_CONFIG_ADDRESS, address);
-    outl(PCI_CONFIG_DATA, value);
-    spin_unlock(&config_lock);
+    arch_pci_cfg_write32(bus, device, function, offset, value);
 }
 
-// Exact-width writes avoid clearing adjacent write-one-to-clear status bits.
-void pci_write16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value) {
-    spin_lock(&config_lock);
-    outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, device, function, offset));
-    outw(PCI_CONFIG_DATA + (offset & 2), value);
-    spin_unlock(&config_lock);
-}
-void pci_write8(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint8_t value) {
-    spin_lock(&config_lock);
-    outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, device, function, offset));
-    outb(PCI_CONFIG_DATA + (offset & 3), value);
-    spin_unlock(&config_lock);
+void pci_write16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value){
+    uint32_t dword = pci_read32(bus, device, function, offset & 0xFC);
+    uint32_t shift = (offset & 2) * 8;
+    dword = (dword & ~(0xFFFFu << shift)) | ((uint32_t)value << shift);
+    pci_write32(bus, device, function, offset & 0xFC, dword);
 }
 
 // Find the device's MSI capability and program it to deliver `vector` to the
@@ -85,13 +63,18 @@ bool pci_enable_msi(uint8_t bus, uint8_t device, uint8_t function,
         if (id == 0x05) { // MSI capability
             uint16_t ctrl = pci_read16(bus, device, function, cap + 2);
             bool is64 = (ctrl & (1u << 7)) != 0;
-            uint32_t msg_addr = 0xFEE00000u | ((uint32_t)apic_id << 12); // LAPIC MSI addr
-            pci_write32(bus, device, function, cap + 4, msg_addr);
+            uint64_t msg_addr = 0;
+            uint32_t msg_data = 0;
+            if (!arch_pci_msi_message(bus, device, function, vector, apic_id,
+                                      &msg_addr, &msg_data))
+                return false;   /* no MSI on this machine: caller falls back */
+
+            pci_write32(bus, device, function, cap + 4, (uint32_t)msg_addr);
             if (is64) {
-                pci_write32(bus, device, function, cap + 8, 0);           // upper addr
-                pci_write16(bus, device, function, cap + 12, vector);     // message data
+                pci_write32(bus, device, function, cap + 8, (uint32_t)(msg_addr >> 32));
+                pci_write16(bus, device, function, cap + 12, (uint16_t)msg_data);
             } else {
-                pci_write16(bus, device, function, cap + 8, vector);      // message data
+                pci_write16(bus, device, function, cap + 8, (uint16_t)msg_data);
             }
             ctrl &= ~(0x7u << 4); // Multiple Message Enable = 0 -> a single vector
             ctrl |= 1u;           // MSI Enable
@@ -127,11 +110,19 @@ bool pci_enable_msix(uint8_t bus, uint8_t device, uint8_t function,
             // Map the table (entry 0 is 16 bytes at bar.address + off).
             uint64_t virt = vmm_map_mmio(bar.address + off, 16);
             if (!virt) { return false; }
+            uint64_t msg_addr = 0;
+            uint32_t msg_data = 0;
+            if (!arch_pci_msi_message(bus, device, function, vector, apic_id,
+                                      &msg_addr, &msg_data)) {
+                vmm_unmap_mmio(virt, 16);
+                return false;   /* no MSI on this machine: caller falls back */
+            }
+
             volatile uint32_t *e0 = (volatile uint32_t *)(uintptr_t)virt;
-            e0[0] = 0xFEE00000u | ((uint32_t)apic_id << 12); // Message Address low
-            e0[1] = 0;                                       // Message Address high
-            e0[2] = vector;                                  // Message Data
-            e0[3] = 0;                                       // Vector Control: unmasked
+            e0[0] = (uint32_t)msg_addr;          // Message Address low
+            e0[1] = (uint32_t)(msg_addr >> 32);  // Message Address high
+            e0[2] = msg_data;                    // Message Data
+            e0[3] = 0;                           // Vector Control: unmasked
 
             ctrl |= (1u << 15);   // MSI-X Enable
             ctrl &= ~(1u << 14);  // clear function mask
@@ -335,6 +326,9 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
             result.size = size & 0xFFFFFFFF;
             result.valid = (result.size != 0);
         }
+        /* What the BAR holds is a BUS address; what a driver maps is a CPU
+         * one. The same thing on most machines -- see arch_pci_bus_to_cpu. */
+        result.address = arch_pci_bus_to_cpu(result.address);
     }
     return result;
 }
@@ -343,10 +337,249 @@ void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function) {
     uint32_t dword = pci_read32(bus, device, function, PCI_COMMAND); // PCI command register
     dword |= (1 << 2 ); // Set bus mastering bit
     // Also ensure I/O space and memory space are enabled (bits 0 and 1) otherwise the device won't respond to MMIO or I/O accesses even if bus mastering is enabled
-    dword |= (1 << 0);
+    //
+    // BIT 1 WAS NEVER SET, despite the line above saying it was. Every MMIO
+    // device this is called for -- AHCI, the virtio transport -- worked anyway,
+    // because the emulator's firmware (SeaBIOS; the aarch64 BAR assigner) had
+    // already turned memory decoding on. Real firmware usually does the same
+    // for the disk it booted from and is under no obligation to for anything
+    // else. A device whose memory space is off answers every MMIO read with all
+    // ones, which reads as "controller not responding", which is exactly what a
+    // perfectly good second drive would have looked like.
+    dword |= (1 << 0) | (1 << 1);
     pci_write32(bus, device, function, PCI_COMMAND, dword); // Write back to PCI command register
 
     uint32_t verify = pci_read32(bus, device, function, PCI_COMMAND);
-    kprintf("IDE PCI command now %x (bus master %s)\n",
-            (unsigned int)(verify & 0xFFFF), (verify & (1 << 2)) ? "ON" : "OFF");
+    kprintf("pci: %02x:%02x.%x command now %x (memory %s, bus master %s)\n",
+            bus, device, function, (unsigned int)(verify & 0xFFFF),
+            (verify & (1 << 1)) ? "ON" : "OFF", (verify & (1 << 2)) ? "ON" : "OFF");
+}
+
+/* --- resource assignment (see pci.h) --------------------------------------
+ *
+ * One pass over every enumerated device, giving each unassigned memory BAR an
+ * aligned address out of the caller's window. A BAR's alignment requirement is
+ * its size -- that is not a convention, it is how the decode works: the device
+ * compares the high bits of an address against the BAR, so a BAR of size N can
+ * only sit on an N-boundary. */
+void pci_assign_resources(uint64_t window_base, uint64_t window_size) {
+    uint64_t next = window_base;
+    uint64_t end  = window_base + window_size;
+    uint32_t assigned = 0;
+
+    for (uint32_t i = 0; i < pci_devices_count(); i++) {
+        const struct pci_device *d = pci_get_device(i);
+        if (!d)
+            continue;
+
+        bool any = false;
+
+        for (uint8_t b = 0; b < 6; b++) {
+            struct pci_bar bar = pci_read_bar(d->bus, d->device, d->function, b);
+            if (!bar.valid || !bar.is_mmio || !bar.size)
+                continue;
+            if (bar.address != 0)
+                continue;                    /* firmware already placed it */
+
+            uint64_t align = bar.size;
+            uint64_t addr  = (next + align - 1) & ~(align - 1);
+            if (addr + bar.size > end) {
+                kprintf("pci: out of MMIO window assigning %d:%d.%d BAR%d (%d bytes)\n",
+                        d->bus, d->device, d->function, b, (int)bar.size);
+                break;
+            }
+
+            /* `addr` is where the CPU will reach it; the BAR takes where the
+             * BUS will (arch_pci_cpu_to_bus -- different on a Pi 4). */
+            uint64_t busaddr = arch_pci_cpu_to_bus(addr);
+            pci_write32(d->bus, d->device, d->function,
+                        PCI_BAR0 + b * 4, (uint32_t)busaddr);
+            if (bar.is_64bit)
+                pci_write32(d->bus, d->device, d->function,
+                            PCI_BAR0 + (b + 1) * 4, (uint32_t)(busaddr >> 32));
+
+            /* Read it back. A BAR has read-only low bits (the type and
+             * prefetch flags) and read-only ADDRESS bits below its size, so
+             * what the device kept is not necessarily what was written -- and
+             * a mismatch means the address was never decoded, which shows up
+             * much later as a driver reading zeros from a register window. */
+            struct pci_bar back = pci_read_bar(d->bus, d->device, d->function, b);
+            bool took = (back.address == addr);
+
+            kprintf("pci: %d:%d.%d BAR%d -> %p (%d bytes)%s\n",
+                    d->bus, d->device, d->function, b,
+                    (void *)(uintptr_t)addr, (int)bar.size,
+                    took ? "" : "  *** DID NOT TAKE ***");
+
+            next = addr + bar.size;
+            assigned++;
+            any = true;
+
+            if (bar.is_64bit)
+                b++;                          /* the pair consumed two slots */
+        }
+
+        if (any) {
+            /* Memory decode off means the device ignores every access to the
+             * addresses just assigned -- so this is not a finishing touch, it
+             * is what makes the assignment take effect. Bus mastering too:
+             * virtio devices DMA, and a device that cannot master the bus
+             * cannot complete a single request. */
+            uint16_t cmd = pci_read16(d->bus, d->device, d->function, PCI_COMMAND);
+            cmd |= (1u << 1) | (1u << 2);     /* Memory Space | Bus Master */
+            pci_write16(d->bus, d->device, d->function, PCI_COMMAND, cmd);
+        }
+    }
+
+    kprintf("pci: assigned %d BAR(s) from %p + %d MiB\n", (int)assigned,
+            (void *)(uintptr_t)window_base, (int)(window_size >> 20));
+}
+
+/* ---- bridges -------------------------------------------------------------
+ *
+ * pci_init above finds every device by brute force: it asks all 256 buses
+ * whether anything answers. That works, and it hides a gap -- it finds
+ * devices BEHIND a bridge without ever looking at the bridge itself.
+ *
+ * A bridge is not passive. It forwards a transaction only if the target is in
+ * a range it was TOLD to forward: a secondary/subordinate bus number pair for
+ * configuration traffic, a memory base/limit pair for memory, and a separate
+ * prefetchable pair. And -- the one that bites -- a device behind a bridge
+ * cannot DMA unless THE BRIDGE has bus mastering enabled, whatever the device
+ * itself is set to.
+ *
+ * On a PC, firmware has already programmed all of this before the kernel
+ * runs, which is exactly why this was missing for so long and why nothing
+ * appeared to be wrong. It is not true on a machine booted with `-kernel` and
+ * no firmware, where the bridges read back as zeros, and it is not true after
+ * a hot-plug into a root port that firmware never saw.
+ *
+ * What this does: report every bridge, make sure decoding and mastering are
+ * on, and fill in a bus range or a memory window that nobody assigned. It
+ * does NOT re-lay-out windows that firmware already set -- rewriting a
+ * working configuration to a theoretically nicer one is how you lose a boot
+ * disk.
+ */
+
+/* Type 1 (bridge) configuration header. */
+#define PCI_PRIMARY_BUS      0x18
+#define PCI_SECONDARY_BUS    0x19
+#define PCI_SUBORDINATE_BUS  0x1A
+#define PCI_IO_BASE          0x1C
+#define PCI_IO_LIMIT         0x1D
+#define PCI_MEM_BASE         0x20
+#define PCI_MEM_LIMIT        0x22
+#define PCI_PREF_MEM_BASE    0x24
+#define PCI_PREF_MEM_LIMIT   0x26
+#define PCI_BRIDGE_CONTROL   0x3E
+
+static uint32_t g_bridges;
+static uint32_t g_bridges_fixed;
+
+uint32_t pci_bridge_count(void) { return g_bridges; }
+uint32_t pci_bridges_configured(void) { return g_bridges_fixed; }
+
+/* The highest bus number anything answered on, so an unassigned subordinate
+ * can be given a range that is at least honest. */
+static uint8_t pci_highest_bus(void) {
+    uint8_t high = 0;
+    for (uint32_t i = 0; i < pci_device_count; i++)
+        if (devices[i].bus > high) high = devices[i].bus;
+    return high;
+}
+
+/* Does anything live behind this bridge, and where are its BARs? */
+static bool pci_behind_bridge(uint8_t secondary, uint8_t subordinate,
+                              uint64_t *out_lo, uint64_t *out_hi) {
+    uint64_t lo = ~0ULL, hi = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < pci_device_count; i++) {
+        const struct pci_device *d = &devices[i];
+        if (d->bus < secondary || d->bus > subordinate) continue;
+        any = true;
+        for (uint8_t b = 0; b < 6; b++) {
+            struct pci_bar bar = pci_read_bar(d->bus, d->device, d->function, b);
+            if (!bar.valid || !bar.is_mmio || !bar.size) { if (bar.is_64bit) b++; continue; }
+            if (bar.address < lo) lo = bar.address;
+            if (bar.address + bar.size > hi) hi = bar.address + bar.size;
+            if (bar.is_64bit) b++;
+        }
+    }
+    if (!any) return false;
+    *out_lo = lo; *out_hi = hi;
+    return true;
+}
+
+void pci_bridge_configure(void) {
+    g_bridges = 0;
+    g_bridges_fixed = 0;
+    uint8_t highest = pci_highest_bus();
+
+    for (uint32_t i = 0; i < pci_device_count; i++) {
+        struct pci_device *d = &devices[i];
+        /* Class 06 subclass 04 is a PCI-to-PCI bridge; a PCIe root port is
+         * the same class with a PCI Express capability, and is configured
+         * identically as far as this is concerned. */
+        if (d->class_code != 0x06 || d->subclass != 0x04) continue;
+        g_bridges++;
+
+        uint8_t sec = pci_read8(d->bus, d->device, d->function, PCI_SECONDARY_BUS);
+        uint8_t sub = pci_read8(d->bus, d->device, d->function, PCI_SUBORDINATE_BUS);
+        bool fixed = false;
+
+        if (sec == 0 || sub < sec) {
+            /* NOBODY ASSIGNED A BUS RANGE. Give it one past everything that
+             * answered, so configuration traffic to whatever is plugged in
+             * later is forwarded rather than dropped. */
+            sec = (uint8_t)(highest + 1);
+            sub = 0xFF;
+            pci_write16(d->bus, d->device, d->function, PCI_PRIMARY_BUS,
+                        (uint16_t)(d->bus | (sec << 8)));
+            pci_write16(d->bus, d->device, d->function, PCI_SUBORDINATE_BUS,
+                        (uint16_t)sub);
+            highest = sec;
+            fixed = true;
+        }
+
+        uint16_t mbase = pci_read16(d->bus, d->device, d->function, PCI_MEM_BASE);
+        uint16_t mlimit = pci_read16(d->bus, d->device, d->function, PCI_MEM_LIMIT);
+        /* BASE GREATER THAN LIMIT IS HOW A WINDOW IS TURNED OFF, and it is
+         * also what an unprogrammed bridge reads back as. Either way, nothing
+         * behind it is reachable. */
+        if (mbase > mlimit) {
+            uint64_t lo = 0, hi = 0;
+            if (pci_behind_bridge(sec, sub, &lo, &hi)) {
+                /* The window granularity is one megabyte and the register
+                 * holds only the top sixteen bits of the address. */
+                /* The BARs were read as CPU addresses; a bridge window is in
+                 * BUS addresses (arch_pci_cpu_to_bus -- different on a Pi 4). */
+                lo = arch_pci_cpu_to_bus(lo);
+                hi = arch_pci_cpu_to_bus(hi - 1) + 1;
+                uint16_t nb = (uint16_t)((lo & 0xFFF00000ULL) >> 16);
+                uint16_t nl = (uint16_t)(((hi - 1) & 0xFFF00000ULL) >> 16);
+                pci_write16(d->bus, d->device, d->function, PCI_MEM_BASE, nb);
+                pci_write16(d->bus, d->device, d->function, PCI_MEM_LIMIT, nl);
+                fixed = true;
+            }
+        }
+
+        /* DECODING AND MASTERING ON THE BRIDGE ITSELF. A device behind a
+         * bridge whose bus-master bit is clear cannot complete a single DMA,
+         * however it is configured -- the transaction is refused upstream of
+         * it, and the symptom is a controller that answers every register
+         * read and never finishes a transfer. */
+        uint16_t cmd = pci_read16(d->bus, d->device, d->function, PCI_COMMAND);
+        uint16_t want = (uint16_t)(cmd | (1u << 0) | (1u << 1) | (1u << 2));
+        if (want != cmd) {
+            pci_write16(d->bus, d->device, d->function, PCI_COMMAND, want);
+            fixed = true;
+        }
+
+        if (fixed) g_bridges_fixed++;
+        kprintf("pci: bridge %02x:%02x.%u -> buses %02x-%02x, mem %04x-%04x%s\n",
+                d->bus, d->device, d->function, sec, sub,
+                pci_read16(d->bus, d->device, d->function, PCI_MEM_BASE),
+                pci_read16(d->bus, d->device, d->function, PCI_MEM_LIMIT),
+                fixed ? " (configured here)" : "");
+    }
 }

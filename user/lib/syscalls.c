@@ -62,6 +62,10 @@
 #include <sys/select.h>   /* fd_set, FD_*, FD_SETSIZE -- for select() */
 
 #include "embk_syscall.h"
+#include "embk.h"          /* embk_net_*, embk_mmap/mprotect/dup -- the kernel API.
+                            * Included HERE and not further down: dup() and the
+                            * memory wrappers appear well before the socket code
+                            * that used to be its only caller. */
 
 /* --- kernel types replicated on the user side (no kernel headers here) ---
  * struct vfs_stat (kernel/fs/vfs.h) and the VFS_DT_* type tags, byte-for-
@@ -103,7 +107,6 @@ struct embk_vfs_dirent {
 #define EMBK_O_EXCL    0x0080
 #define EMBK_O_TRUNC   0x0200
 #define EMBK_O_APPEND  0x0400
-#define EMBK_O_NONBLOCK 0x0800
 
 /* The environment. newlib requires `environ`; getenv() walks it.
  *
@@ -373,7 +376,6 @@ int open(const char *name, int flags, ...) {
     if (flags & O_EXCL)   kflags |= EMBK_O_EXCL;
     if (flags & O_TRUNC)  kflags |= EMBK_O_TRUNC;
     if (flags & O_APPEND) kflags |= EMBK_O_APPEND;
-    if (flags & O_NONBLOCK) kflags |= EMBK_O_NONBLOCK;
 
     char abs[EMBK_PATH_MAX];
     if (path_abs(name, abs, sizeof abs) != 0) return -1;   /* errno set */
@@ -471,17 +473,27 @@ int stat(const char *path, struct stat *st) {
     return 0;
 }
 
-/* lstat() == stat(), and here that is exact rather than a convenient fudge:
- * NOTHING in this kernel dereferences a symlink. embkfs can store a link
- * (EMBKFS_DT_LNK -> VFS_DT_LNK, and stat reports S_IFLNK for it), but there is
- * no readlink() and no follow step anywhere in path resolution -- so stat()
- * already reports the link itself, which is precisely lstat()'s contract. With
- * no dereferencing to skip, the two cannot disagree.
+/* lstat() -- metadata of the LINK, not of what it points at.
  *
- * If link-following is ever implemented, this alias becomes a LIE and must be
- * split into a real no-follow call at the same time. */
+ * This used to be a plain alias for stat(), and the comment on it said exactly
+ * why that was honest at the time -- nothing in the kernel dereferenced a
+ * symlink, so stat() already reported the link itself -- and exactly what
+ * would make it dishonest:
+ *
+ *     If link-following is ever implemented, this alias becomes a LIE and
+ *     must be split into a real no-follow call at the same time.
+ *
+ * Link-following is implemented. This is that call, and it is a different
+ * syscall from stat() rather than the same one wearing two names. */
 int lstat(const char *path, struct stat *st) {
-    return stat(path, st);
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(path, abs, sizeof abs) != 0) return -1;
+    struct embk_vfs_stat vs;
+    int64_t ret = embk_syscall2(EMBK_SYS_lstat, (int64_t)(intptr_t)abs,
+                                (int64_t)(intptr_t)&vs);
+    if (embk_is_err(ret)) return embk_fail(ret);
+    embk_fill_stat(st, &vs);
+    return 0;
 }
 
 /* EmbLink tracks mtime but exposes no syscall to SET it, so utime() cannot do
@@ -787,28 +799,49 @@ mode_t umask(mode_t mask) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Synchronization and remaining unsupported calls                    */
+/* Genuinely absent -- fail rather than pretend                        */
 /* ------------------------------------------------------------------ */
 
-/* A synchronous write can still sit in a device's volatile cache. Let the
- * kernel validate the fd and flush its filesystem; never invent success. */
+/* fsync/fdatasync -- A REAL DEVICE FLUSH.
+ *
+ * This function used to succeed as a documented no-op, and the reasoning was
+ * sound at the time: there was no write-back path, every write() went straight
+ * to the device synchronously, so "your writes are committed" was already a
+ * true statement and fsync had nothing left to do. The comment ended with a
+ * standing obligation:
+ *
+ *     If a write-back cache is ever added, THIS must become a real device
+ *     flush the same day, or it turns into the lie the old comment feared.
+ *
+ * The write-back cache is here (kernel/mm/vm_object.h). write() now returns
+ * once the bytes are in memory, so this is no longer vacuous -- it is the
+ * only thing standing between a caller and losing its data to a power cut,
+ * and it does not return until the file's dirty pages are on the device.
+ *
+ * fdatasync is the same call. The distinction POSIX draws -- data without
+ * metadata -- has nothing to attach to here: EMBKFS commits an object's data
+ * and its inode in ONE copy-on-write transaction, so there is no cheaper
+ * flush to offer. Reporting that as a separate, weaker guarantee would be
+ * inventing a difference this filesystem does not have. */
 int fsync(int fd) {
-    int64_t rc = embk_syscall3(EMBK_SYS_fsync, fd, 0, 0);
-    return embk_is_err(rc) ? embk_fail(rc) : 0;
+    int r = embk_fsync(fd);
+    return r < 0 ? embk_fail(r) : 0;
 }
 
 int fdatasync(int fd) {
-    /* Flushing metadata too is a valid, stronger data-sync guarantee. */
     return fsync(fd);
 }
 
-/* No dup: the fd table has no duplicate-into-lowest-free operation, and faking
- * one by re-opening would give a SEPARATE file position, which is the opposite
- * of what dup() promises (a shared cursor). */
+/* dup -- the lowest free descriptor, referring to the SAME open file.
+ *
+ * This used to be ENOSYS, and the reason it could not simply be faked is worth
+ * keeping: re-opening the file would give the copy a SEPARATE cursor, which is
+ * the opposite of what dup promises. The kernel now has a real shared open
+ * file description (fs/fd.h), so both descriptors advance one cursor and the
+ * underlying object is released once, when the last of them closes. */
 int dup(int fd) {
-    (void)fd;
-    errno = ENOSYS;
-    return -1;
+    int r = embk_dup(fd, -1, 0);
+    return r < 0 ? embk_fail(r) : r;
 }
 
 /* There is no fcntl SYSCALL, but the descriptor-flag commands are answerable
@@ -831,10 +864,15 @@ int dup(int fd) {
  * convenient stub. (Should exec ever exist -- it will not, by design -- this
  * must become real state.)
  *
- * F_GETFL translates the kernel's actual access mode, append and nonblocking
- * bits into newlib's bit layout. F_SETFL changes the nonblocking flag without
- * changing how the descriptor was opened; socket operations honor it.
- * F_DUPFD likewise refused, since dup() itself is ENOSYS (see above).
+ * F_GETFL reports the TRUE state: O_RDWR, blocking (no O_NONBLOCK) -- every fd
+ * here is blocking, so this is a fact, not a stub. F_SETFL accepts a request to
+ * (re)assert blocking mode (a no-op: already so) but REFUSES O_NONBLOCK, because
+ * a false "non-blocking is set" is the real trap -- the caller would then hang
+ * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
+ * which reads/sets the flags) work while never lying about non-blocking.
+ * F_DUPFD is real, and routes to the same kernel operation dup() uses -- with
+ * the "lowest free descriptor AT OR ABOVE this number" behaviour that is the
+ * only thing distinguishing it from dup().
  */
 #include <fcntl.h>
 /* uname(): real facts about this OS -- nothing here is faked or guessed.
@@ -869,13 +907,18 @@ int fcntl(int fd, int cmd, ...) {
          * there is nothing to store and nothing that could later disagree. */
         return 0;
     case F_GETFL: {
-        int64_t flags = embk_syscall3(EMBK_SYS_fcntl, fd, 3, 0);
-        if (embk_is_err(flags)) return embk_fail(flags);
-        int mode = (int)flags & 3;
-        int result = mode == 0 ? O_RDONLY : mode == 1 ? O_WRONLY : O_RDWR;
-        if (flags & EMBK_O_NONBLOCK) result |= O_NONBLOCK;
-        if (flags & EMBK_O_APPEND) result |= O_APPEND;
-        return result;
+        /* Access mode is always read/write here; report O_NONBLOCK truthfully
+         * from the kernel fd flag (sockets can now be non-blocking). sys_fcntl
+         * cmd 1 = get non-blocking. */
+        int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
+        return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+    }
+    case F_DUPFD: {
+        va_list ap; va_start(ap, cmd);
+        int min_fd = va_arg(ap, int);
+        va_end(ap);
+        int r = embk_dup(fd, -1, min_fd);
+        return r < 0 ? embk_fail(r) : r;
     }
     case F_SETFL: {
         va_list ap; va_start(ap, cmd);
@@ -904,13 +947,23 @@ int execv(const char *path, char *const argv[]) {
     return -1;
 }
 
+/* symlink(target, linkpath) -- real.
+ *
+ * The TARGET IS NOT RESOLVED and not checked to exist. That is not laxity: a
+ * link created before its target is the normal case in every build system that
+ * uses them, and a symlink() that validated would break the thing links are
+ * for. `linkpath`'s own parent must exist, because that is where the name
+ * goes. */
 int symlink(const char *target, const char *linkpath) {
-    /* EMBKFS can STORE a link type (VFS_DT_LNK) but nothing creates or follows
-     * one -- see lstat() above. Creating a link nothing can traverse would be
-     * worse than refusing. */
-    (void)target; (void)linkpath;
-    errno = ENOSYS;
-    return -1;
+    if (!target || !linkpath) { errno = EINVAL; return -1; }
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(linkpath, abs, sizeof abs) != 0) return -1;
+    /* The target is stored VERBATIM -- relative targets stay relative, which is
+     * what makes a tree of links survive being moved. */
+    int64_t ret = embk_syscall2(EMBK_SYS_symlink, (int64_t)(intptr_t)target,
+                                (int64_t)(intptr_t)abs);
+    if (embk_is_err(ret)) return embk_fail(ret);
+    return 0;
 }
 
 int chroot(const char *path) {
@@ -1023,6 +1076,18 @@ void *sbrk(ptrdiff_t incr) {
  * Implemented on RDRAND: the CPU's on-die entropy source, an UNPRIVILEGED
  * instruction, so this needs no syscall at all.
  *
+ * ON AARCH64 THERE IS NO SUCH INSTRUCTION WE CAN REACH, and this returns
+ * ENOSYS. The architectural equivalent is FEAT_RNG's RNDR (ARMv8.5), which is
+ * readable at EL0 -- but only when it is implemented, and the feature bit that
+ * says so lives in ID_AA64ISAR0_EL1, which EL0 may NOT read: an MRS of an ID
+ * register from EL0 traps to EL1, and this kernel does not emulate those the
+ * way Linux does. So there is no way to ASK before executing, and executing
+ * RNDR on a part without it is simply UNDEFINED -- the probe would be a dead
+ * process. QEMU's cortex-a72 does not implement it either way.
+ * Two ways out, neither of them a userland change, both recorded in
+ * docs/TODO.md: emulate the ID registers for EL0, or give the kernel an
+ * entropy syscall and let it be the one to read RNDR at EL1.
+ *
  * DELIBERATELY FAILS (ENOSYS) rather than substituting uptime/pid mixing when
  * RDRAND is absent. getentropy is a SECURITY primitive -- its whole contract
  * is unpredictable bytes. A plausible-looking fallback built from a clock is
@@ -1030,6 +1095,7 @@ void *sbrk(ptrdiff_t incr) {
  * crypto with attacker-predictable state. A caller that gets -1 can decide;
  * one that gets fake entropy cannot. If a soft RNG is ever wanted, it must be
  * a differently-named function nobody mistakes for this one. */
+#if defined(__x86_64__)
 static int cpu_has_rdrand(void) {
     uint32_t eax, ebx, ecx, edx;
     __asm__ volatile("cpuid"
@@ -1050,6 +1116,7 @@ static int rdrand64(uint64_t *out) {
     }
     return 0;
 }
+#endif /* __x86_64__ */
 
 int getentropy(void *buf, size_t len) {
     if (len > 256) {          /* the documented cap; POSIX/OpenBSD agree */
@@ -1060,8 +1127,15 @@ int getentropy(void *buf, size_t len) {
         errno = EFAULT;
         return -1;
     }
+#if defined(__x86_64__)
     if (!cpu_has_rdrand()) {
-        errno = ENOSYS;       /* honest: we have no entropy source */
+        /* No RDRAND: the kernel's generator, which is seeded from every clock
+         * the machine has and is the same source the kernel lays out address
+         * spaces with. Not a clock-derived fake -- the refusal below is for
+         * when even THAT is unreachable. */
+        long got = embk_getrandom(buf, len);
+        if (got == (long)len) return 0;
+        errno = ENOSYS;
         return -1;
     }
 
@@ -1079,6 +1153,18 @@ int getentropy(void *buf, size_t len) {
         done += n;
     }
     return 0;
+#else
+    /* aarch64: no unprivileged instruction to ask -- RNDR's feature bit is in
+     * a register EL0 cannot read, so there was no safe way to even probe. The
+     * kernel can probe, and does; this is the syscall the note above asked
+     * for. It reads RNDR at EL1 where the processor has it and falls back to
+     * its clock-and-jitter-seeded DRBG where it does not -- random_quality()
+     * on the kernel side says which, and `test random` prints it. */
+    long got = embk_getrandom(buf, len);
+    if (got == (long)len) return 0;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -1195,9 +1281,13 @@ pid_t wait(int *status) {
 }
 
 int link(const char *oldpath, const char *newpath) {
-    (void)oldpath; (void)newpath;
-    errno = ENOSYS;   /* VFS public surface exposes no link op yet */
-    return -1;
+    /* REAL since SYS_link (112). This stub said "no link op yet" for as long
+     * as the filesystem had had one -- embkfs_link_name predates it by a long
+     * way, and the namespace self-test exercised it -- because nothing in
+     * userland had asked. git's object store and ln both do. */
+    int rc = embk_link(oldpath, newpath);
+    if (rc < 0) { errno = -rc; return -1; }
+    return 0;
 }
 
 int unlink(const char *path) {
@@ -1229,7 +1319,6 @@ int unlink(const char *path) {
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include "embk.h"          /* embk_net_* -- the kernel CAP_NETWORK socket layer */
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
@@ -1348,14 +1437,21 @@ int chmod(const char *path, mode_t mode) {
     return 0;
 }
 
+/* readlink(path, buf, bufsiz) -- the text a link holds, without following it.
+ *
+ * POSIX says the return is the number of bytes PLACED IN THE BUFFER, and gives
+ * a caller no way to distinguish "it fit exactly" from "it was truncated". The
+ * kernel call reports the FULL length, which is the more useful contract; this
+ * wrapper clamps it to POSIX's for callers that expect POSIX's, and the extra
+ * information is available to anyone who wants it via the syscall directly. */
 ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
-    /* The kernel HAS embkfs_readlink_object; no syscall exposes it yet. git
-     * only readlinks entries lstat reported as symlinks, which EmbLink repos
-     * will not contain (symlink() below is ENOSYS, so git init sets
-     * core.symlinks=false and never creates one). */
-    (void)path; (void)buf; (void)bufsiz;
-    errno = ENOSYS;
-    return -1;
+    if (!path || !buf) { errno = EINVAL; return -1; }
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(path, abs, sizeof abs) != 0) return -1;
+    int64_t ret = embk_syscall3(EMBK_SYS_readlink, (int64_t)(intptr_t)abs,
+                                (int64_t)(intptr_t)buf, (int64_t)bufsiz);
+    if (embk_is_err(ret)) return embk_fail(ret);
+    return (ssize_t)((size_t)ret < bufsiz ? (size_t)ret : bufsiz);
 }
 
 int pipe(int fds[2]) {
@@ -1374,15 +1470,26 @@ pid_t waitpid(pid_t pid, int *status, int options) {
     (void)pid; (void)status; (void)options;
     errno = ENOSYS; return (pid_t)-1;
 }
-/* WEAK: a libc stub must YIELD to an application that ships its own. CPython
- * carries a dup2 compat implementation (for platforms lacking the call) and a
- * strong definition here collides with it -- "multiple definition of `dup2'",
- * found the moment python.elf was relinked against this libc. Weak means their
- * definition simply wins, which is what a portable program expects from a libc
- * it is overriding. (Theirs fails too -- it goes through fcntl(F_DUPFD), which
- * we also refuse -- but it fails as THEIR code, on their terms.) */
+/* dup2 -- redirection. `cmd > file` is this call and nothing else: open the
+ * file, dup2 it onto fd 1, and every write the program makes to stdout lands
+ * in the file without the program knowing.
+ *
+ * dup2(fd, fd) returns fd UNCHANGED and closes nothing. POSIX calls that out
+ * explicitly and it is not a special case for its own sake: the general path
+ * closes the target before duplicating, which here would destroy the very
+ * description being duplicated.
+ *
+ * Still WEAK, for the reason it always was: a libc stub must yield to an
+ * application shipping its own. CPython carries a dup2 compat implementation
+ * for platforms lacking the call, and a strong definition here collided with
+ * it ("multiple definition of `dup2'") the moment python.elf was relinked.
+ * Theirs now works too -- it goes through fcntl(F_DUPFD), which is also real
+ * now. */
 __attribute__((weak))
-int dup2(int oldfd, int newfd) { (void)oldfd; (void)newfd; errno = ENOSYS; return -1; }
+int dup2(int oldfd, int newfd) {
+    int r = embk_dup(oldfd, newfd, 0);
+    return r < 0 ? embk_fail(r) : r;
+}
 pid_t setsid(void)             { errno = ENOSYS; return (pid_t)-1; }
 pid_t getpgid(pid_t pid)       { (void)pid; errno = ENOSYS; return (pid_t)-1; }
 pid_t tcgetpgrp(int fd)        { (void)fd; errno = ENOSYS; return (pid_t)-1; }
@@ -1420,20 +1527,65 @@ int ioctl(int fd, unsigned long request, ...) {
     return -1;
 }
 
-/* NO mmap. Memory here is sbrk (a real growable heap) and typed objects
- * (shared surfaces, zero-copy windows); mapping a FILE into an address space is
- * a capability this OS has never had. Refused, not faked out of malloc: an
- * anonymous-looking block would silently not be MAP_SHARED and would not be
- * backed by the file the caller named. TCC's `-run` is the caller; `tcc -o`
- * never reaches here. */
+/* mmap -- ANONYMOUS PRIVATE ONLY, over the kernel's EMBK_SYS_mmap.
+ *
+ * Everything the kernel cannot honour is refused HERE, at the call, rather
+ * than approximated:
+ *
+ *   file-backed (fd >= 0)  ENODEV  -- needs a page cache that does not exist.
+ *                                     Returning anonymous zeroes for a file
+ *                                     the caller named is a bug that surfaces
+ *                                     a long way from the call.
+ *   MAP_SHARED             ENOTSUP -- two processes would each believe they
+ *                                     saw the other's writes.
+ *   MAP_FIXED              ENOTSUP -- the kernel picks the address. An address
+ *                                     the caller chooses is one it can collide
+ *                                     with, and nothing here needs it.
+ *   PROT_WRITE|PROT_EXEC   EINVAL  -- refused by the kernel. Map writable,
+ *                                     write, then mprotect to executable --
+ *                                     once mprotect exists.
+ *
+ * `off` must be zero: there is nothing for a non-zero offset to be an offset
+ * INTO. TCC's `-run` was the historical caller of this function and got an
+ * honest ENOSYS; it now gets real memory for the anonymous case it actually
+ * uses, and the same honest refusal for the rest. */
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    (void)addr; (void)len; (void)prot; (void)flags; (void)fd; (void)off;
-    errno = ENOSYS;
-    return MAP_FAILED;
+    if (flags & MAP_FIXED)             { errno = ENOTSUP; return MAP_FAILED; }
+    if (addr != NULL)                  { errno = ENOTSUP; return MAP_FAILED; }
+    if (len == 0)                      { errno = EINVAL;  return MAP_FAILED; }
+    if (off < 0 || (off & 0xFFF))      { errno = EINVAL;  return MAP_FAILED; }
+
+    /* Anonymous mappings are PRIVATE, always: MAP_SHARED anonymous memory
+     * would be shared with nobody, since there is no fork here to share it
+     * with. A file mapping honours whichever the caller asked for. */
+    if (fd < 0) {
+        if (off != 0)                  { errno = EINVAL;  return MAP_FAILED; }
+        if (flags & MAP_SHARED)        { errno = ENOTSUP; return MAP_FAILED; }
+    } else if (!(flags & (MAP_SHARED | MAP_PRIVATE))) {
+        errno = EINVAL;                /* a file mapping must say which */
+        return MAP_FAILED;
+    }
+
+    int64_t ret = embk_mmap_fd(len, prot, flags, fd, (uint64_t)off);
+    if (ret < 0) { embk_fail((int)ret); return MAP_FAILED; }
+    return (void *)(intptr_t)ret;
 }
-int munmap(void *addr, size_t len) { (void)addr; (void)len; errno = ENOSYS; return -1; }
+
+int munmap(void *addr, size_t len) {
+    int r = embk_munmap(addr, len);
+    return r < 0 ? embk_fail(r) : 0;
+}
+/* mprotect -- real, and the reason mmap can refuse PROT_WRITE|PROT_EXEC
+ * outright. A JIT maps writable, emits, then flips to executable; the
+ * simultaneous W+X page that every code-injection technique needs never
+ * exists. Asking for both here is EINVAL, from the kernel.
+ *
+ * PROT_NONE is honoured as no access at all (a guard page), not approximated
+ * as read-only. The range must be page-aligned and fully mapped -- a hole in
+ * it is ENOMEM for the whole call rather than a partial application. */
 int mprotect(void *addr, size_t len, int prot) {
-    (void)addr; (void)len; (void)prot; errno = ENOSYS; return -1;
+    int r = embk_mprotect(addr, len, prot);
+    return r < 0 ? embk_fail(r) : 0;
 }
 int msync(void *addr, size_t len, int flags) {
     (void)addr; (void)len; (void)flags; errno = ENOSYS; return -1;
@@ -1660,4 +1812,70 @@ struct servent *getservbyname(const char *name, const char *proto) {
     se.s_name = (char *)name; se.s_aliases = NULL;
     se.s_port = htons((unsigned short)port); se.s_proto = (char *)proto;
     return &se;
+}
+
+/* ---- the allocator's lock -----------------------------------------------
+ *
+ * MAKING newlib'S ALLOCATOR SAFE TO CALL FROM MORE THAN ONE THREAD.
+ *
+ * THE BUG THIS CLOSES, and it had already been paid for three times. newlib
+ * calls __malloc_lock/__malloc_unlock around every allocation; the copy in
+ * libc.a is a stub that locks nothing, so two threads in malloc at once
+ * corrupt the heap. Nothing noticed for a long time because no thread in any
+ * application allocated -- the shell's channel listeners work entirely out of
+ * stack buffers, and user/web/net.c and user/web/fetchjob.h both carry comments
+ * explaining that they must not allocate for exactly this reason.
+ *
+ * Then the screenshot writer did, and the desktop died instantly: a general
+ * protection fault inside _free_r the moment its last write landed, while the
+ * render loop was allocating in the middle of a frame. The backtrace names
+ * newlib's _mallocr.c and not the caller, so it reads as a heap bug in whoever
+ * allocated last rather than as a missing lock -- which is why a workaround
+ * ("do not allocate on that thread") is a rule nobody can see and everybody
+ * eventually breaks.
+ *
+ * WHY RECURSIVE. newlib's own stub takes a RECURSIVE mutex, and it is right
+ * to: the allocator can re-enter itself through _sbrk_r and through the
+ * reentrancy hooks. A plain mutex here would turn a rare crash into a certain
+ * deadlock, which is not an improvement. So this counts depth and remembers
+ * the owner -- and it needs a thread identity to do that, which is what
+ * SYS_thread_self exists for.
+ *
+ * WHY IT IS SAFE TO DEFINE THESE HERE. libc.a's mlock.o defines nothing but
+ * these two symbols, so an object file that defines them first means mlock.o
+ * is never pulled in at all: no duplicate, no link order subtlety.
+ */
+struct _reent;   /* opaque here: these hooks never look inside it */
+
+/* The lock's state. `owner` is a thread id (+1, so zero means unowned, which
+ * is what a zeroed BSS gives us and what a valid tid 0 must not be confused
+ * with). `depth` is how many times the owner has taken it. */
+static embk_mutex g_malloc_mtx;
+static volatile int g_owner_p1;
+static volatile int g_depth;
+
+void __malloc_lock(struct _reent *r) {
+    (void)r;
+    int me = embk_thread_self() + 1;
+
+    /* ALREADY MINE: count it and return without touching the mutex. Reading
+     * `owner` unlocked is safe precisely because only the owner can ever see
+     * its own id there -- another thread reads somebody else's, or zero, and
+     * either way takes the slow path below. */
+    if (g_owner_p1 == me) { g_depth++; return; }
+
+    embk_mutex_lock(&g_malloc_mtx);
+    g_owner_p1 = me;
+    g_depth = 1;
+}
+
+void __malloc_unlock(struct _reent *r) {
+    (void)r;
+    if (g_depth > 1) { g_depth--; return; }
+    /* Clear the owner BEFORE releasing: the moment the mutex is free another
+     * thread may take it and write its own id, and a store landing after that
+     * would hand it the lock with somebody else's name on it. */
+    g_owner_p1 = 0;
+    g_depth = 0;
+    embk_mutex_unlock(&g_malloc_mtx);
 }

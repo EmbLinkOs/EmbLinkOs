@@ -145,7 +145,7 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   harness that had squatted the name) was renamed `primtest.elf` — `test ring3
   threads` still passes. The bare-`/` **font** stragglers moved to `/system/fonts/`
   (`font.ttf`, `mono.ttf`); the `.txt` items at `/` are deliberate FS-format/POSIX
-  test *fixtures* and correctly stay there. `user/bin/init.c` is freestanding
+  test *fixtures* and correctly stay there. `user/system/init/init.c` is freestanding
   (own `_start`, no libc — init keeps no dependency it must keep alive).
 - **UP2 — the namespace mechanism. ✅ SHIPPED (2026-07-28).** Per-process
   binding tables in the kernel (`kernel/fs/namespace.{c,h}`, `struct namespace`
@@ -196,7 +196,7 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   to a non-owner user is UP3b — needs the apps' broad grants tightened to the
   user's home.)*
 - **UP4 — declared namespaces. ✅ SHIPPED (2026-07-28).** An app *ships* its
-  declared namespace as a per-app manifest (`user/bin/<name>.ns` →
+  declared namespace as a per-app manifest (`<progdir>/<name>.ns` →
   `/data/apps/<name>/<name>.ns`, lines of `<ro|rw> <prefix>`), and the session
   (home) reads it and grants EXACTLY those bindings via NS_BIND — no manifest =>
   the app inherits the full view (un-manifested apps unaffected). Shipped:
@@ -212,7 +212,7 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
 
 - **UP5 — declared capabilities. ✅ SHIPPED (2026-08-07).** The other half of
   the same idea, and the half that completes "permission = nameable AND
-  capable": an app also ships what it may *do*, as `user/bin/<name>.caps` →
+  capable": an app also ships what it may *do*, as `<progdir>/<name>.caps` →
   `/data/apps/<name>/<name>.caps`, one capability class per line
   (`filesystem network gpu audio camera usb serial rawdisk kernel_ext debug`,
   or the single word `none`). The session reads it and grants exactly that mask

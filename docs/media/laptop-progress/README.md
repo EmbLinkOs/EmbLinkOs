@@ -1,19 +1,145 @@
 # Laptop progress captures
 
-These are real EmbLinkOS screens captured from QEMU during development and native
-acceptance runs. PNG exports preserve the original pixels and 800 x 600 dimensions;
-there is no retouching, reconstruction or upscaling. The dates follow the guest UTC
-clock. Synthetic ACPI readings are identified in the captions and manifest.
+Forty actual EmbLinkOS captures document two milestones: the original laptop
+work and its integration with master through `a281865`. PNG exports preserve
+original pixels and dimensions; no retouching, reconstruction or upscaling.
+All are QEMU captures. They do not establish physical laptop compatibility.
 
-The captures show software progress, not physical laptop compatibility. Wi-Fi RF,
-physical device behavior, general GPU modesetting/acceleration and sleep/wake remain
-open; see [DAILY_USE.md](../../DAILY_USE.md).
+Use [gallery.json](gallery.json) for ordering, captions, dimensions, source and
+PNG hashes, fixture flags, featured images and historical/current metadata.
+Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show the
+merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
+The current desktop guest includes a **synthetic ACPI fixture** throughout;
+backlight, battery and lid readings do not come from physical hardware.
 
-For the website, use the PNGs directly and read [gallery.json](gallery.json) for
-ordered phases, captions, alt text, dimensions, source names and SHA-256 hashes.
-`featured` marks useful lead images. Keep the fixture/compatibility context when
-reusing the associated captures. Only the screenshot assets belong in a website
-build; no boot images or firmware are needed.
+## Current merged desktop
+
+![Desktop after reboot and login](38-merged-persistence.png)
+
+### First account on the merged desktop
+
+Normal UEFI boot reaches first-account setup on a fresh NVMe disk.
+
+![First account on the merged desktop in EmbLinkOS](21-first-account.png)
+
+### Password login
+
+The newly created account reaches the native login screen.
+
+![Password login in EmbLinkOS](22-account-login.png)
+
+### Merged desktop
+
+The incoming graphite wallpaper, desktop and dock are preserved.
+
+![Merged desktop in EmbLinkOS](23-merged-desktop.png)
+
+### Appearance and wallpaper
+
+The current Appearance pane retains theme, wallpaper, scale and accent controls.
+
+![Appearance and wallpaper in EmbLinkOS](24-appearance.png)
+
+### Wi-Fi status
+
+Settings reports that this QEMU machine has no supported Wi-Fi radio. No physical connection is claimed.
+
+![Wi-Fi status in EmbLinkOS](25-merged-wifi.png)
+
+### HDA output
+
+Settings discovers the emulated Intel HDA output; separate recorded-output tests measure real playback.
+
+![HDA output in EmbLinkOS](26-hda-output.png)
+
+### Mute applied
+
+Pointer input enables mute, verified against the kernel audio state.
+
+![Mute applied in EmbLinkOS](27-hda-muted.png)
+
+### Saved output volume
+
+Pointer input changes volume to 49%; the native test verifies kernel state and persistence after reboot.
+
+![Saved output volume in EmbLinkOS](28-hda-volume.png)
+
+### Display information
+
+Settings reports 1280 × 800 VirtIO display and software rendering.
+
+![Display information in EmbLinkOS](29-merged-display.png)
+
+### Brightness round trip
+
+The synthetic ACPI backlight fixture changes from 60% to 40%; kernel state is checked independently.
+
+![Brightness round trip in EmbLinkOS](30-merged-brightness.png)
+
+### Battery and power preferences
+
+The pane uses synthetic ACPI batteries and lid data; mixed units leave total charge unavailable.
+
+![Battery and power preferences in EmbLinkOS](31-merged-power.png)
+
+### Keyboard settings
+
+The incoming keyboard-layout pane remains accessible alongside the added laptop controls.
+
+![Keyboard settings in EmbLinkOS](32-keyboard-layouts.png)
+
+### Native notification banner
+
+About EmbLink posts a real banner through the existing session notification service.
+
+![Native notification banner in EmbLinkOS](33-notification-banner.png)
+
+### Notification history
+
+The same session message appears in the new history window.
+
+![Notification history in EmbLinkOS](34-notification-history.png)
+
+### Locked session
+
+The native desktop owns the opaque password surface while the kernel gates other windows and input.
+
+![Locked session in EmbLinkOS](35-merged-lock.png)
+
+### Wrong password rejected
+
+Authd refuses an incorrect password and the session stays locked.
+
+![Wrong password rejected in EmbLinkOS](36-merged-rejection.png)
+
+### Logout reaches login
+
+Ending the native session stops its descendants and returns to login.
+
+![Logout reaches login in EmbLinkOS](37-merged-logout.png)
+
+### Desktop after a separate boot
+
+The saved account signs in after a separate NVMe boot; volume preferences survive and cold integrity passes.
+
+![Desktop after a separate boot in EmbLinkOS](38-merged-persistence.png)
+
+### Recovery installation
+
+Read-only recovery verifies and expands a disposable NVMe target while preserving the source image hash.
+
+![Recovery installation in EmbLinkOS](39-merged-recovery.png)
+
+### Installed disk boots alone
+
+The installed disk boots without the source media through native NVMe into account setup.
+
+![Installed disk boots alone in EmbLinkOS](40-merged-installed.png)
+
+## Historical milestone (before the master merge)
+
+The following captions describe the earlier implementation and its validation.
+Current behavior and test evidence are in [LAPTOP_VALIDATION.md](../../LAPTOP_VALIDATION.md).
 
 ## Early bring-up to a persistent desktop
 

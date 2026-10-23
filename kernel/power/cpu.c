@@ -1,6 +1,6 @@
 #include "power/policy.h"
 #include "power/hwp.h"
-#include "arch/x86_64/cpu/percpu.h"
+#include "include/percpu.h"
 struct core_power {unsigned initialized,supported,epp,applied;uint64_t caps;};
 static struct core_power cores[MAX_CPUS];
 static unsigned selected;

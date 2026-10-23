@@ -1,7 +1,9 @@
 #include "crypto/sha256.h"
 #include "include/types.h"
 #include "include/kstring.h"
+#ifndef SHA256_NO_SELFTEST
 #include "include/kprintf.h"
+#endif
 
 /* FIPS 180-4 round constants: the fractional parts of the cube roots of the
  * first 64 primes. Extremely standard, but errors here are invisible until
@@ -124,6 +126,14 @@ static bool digest_eq_hex(const uint8_t digest[SHA256_DIGEST_SIZE], const char *
     return true;
 }
 
+/* SHA256_NO_SELFTEST: built into the UEFI LOADER as well as the kernel, and
+ * the loader has no kprintf. Sharing one implementation rather than carrying a
+ * second copy is the point -- the hash the build computes, the hash the loader
+ * checks and the hash the kernel could re-check are then the same code, and a
+ * verification chain whose two ends disagree about what SHA-256 is would be a
+ * chain in name only. */
+#ifndef SHA256_NO_SELFTEST
+
 /* Vectors independently computed via `python3 -c "import hashlib; ..."`
  * (hashlib.sha256), not transcribed from memory -- see the v2.2 crypto
  * phase notes in docs/EMBKFS_spec_v2.2.md for how these were generated. */
@@ -166,3 +176,5 @@ int sha256_run_selftests(void) {
     kprintf("CRYPTO: sha256: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : -1;
 }
+
+#endif /* SHA256_NO_SELFTEST */

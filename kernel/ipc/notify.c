@@ -2,7 +2,7 @@
 #include "process/session.h"
 #include "process/process.h"
 #include "drivers/timer/timer.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "include/kstring.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
@@ -46,7 +46,7 @@ static int post(uint32_t pid,const struct embk_notice_request *r) {
 int notify_post(struct process *p,const struct embk_notice_request *r) {
     if(!p || !p->session_id || p->session_id!=session_active_epoch())return -EMBK_EPERM;
     if(r->version!=EMBK_NOTIFY_VERSION || r->severity>2 ||
-       !valid(r->title,sizeof r->title,0) || !valid(r->body,sizeof r->body,1))return -EMBK_EINVAL;
+       !valid(r->title,sizeof r->title,0) || (r->body[0] && !valid(r->body,sizeof r->body,1)))return -EMBK_EINVAL;
     return post(p->pid,r);
 }
 int notify_snapshot(struct process *p,struct embk_notice_info *out,int clear) {

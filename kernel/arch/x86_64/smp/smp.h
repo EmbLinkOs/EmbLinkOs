@@ -2,6 +2,7 @@
 #define __SMP_H__
 
 #include <stdint.h>
+#include "include/types.h"
 
 /* Physical address the AP (application processor) real-mode trampoline is
  * copied to before sending the SIPI (Startup IPI) that tells each AP to
@@ -41,6 +42,11 @@ void ap_bootstrap_map(void);
  * since they all share the one trampoline page. Must run after
  * ap_bootstrap_map(), percpu_init_topology(), and idt_init(). */
 void smp_bringup(void);
+
+/* Start a processor that appeared after boot. Registers it in the topology
+ * table if it is not there, then runs the same trampoline and startup-IPI
+ * sequence smp_bringup() uses -- the same code, not a copy of it. */
+bool smp_hotplug_cpu(uint8_t apic_id);
 
 /* C entry point an AP reaches via kernel/cpu/ap_entry.asm's ap_entry64,
  * once it has a valid higher-half stack (poked by smp_bringup() before

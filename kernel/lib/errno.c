@@ -43,6 +43,7 @@ const char *embk_strerror(int err) {
         case EMBK_EILSEQ:        return "illegal byte sequence";
         case EMBK_ETIMEDOUT:     return "operation timed out";
         case EMBK_ECANCELED:     return "operation cancelled";
+        case EMBK_ESTOPPED:      return "the process is stopped, not finished";
         default:                 return "unknown error";
     }
 }

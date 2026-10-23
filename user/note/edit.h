@@ -24,8 +24,9 @@
 
 #include <stddef.h>
 
-/* Undo depth. Each entry owns a copy of the text it replaced, so this is the
- * memory the feature costs: bounded, like every other arena here. */
+/* Undo depth. Each entry owns a copy of the text it replaced AND of the text
+ * it added, so this is the memory the feature costs: bounded, like every other
+ * arena here. */
 #define ED_UNDO_MAX   64
 #define ED_UNDO_TEXT  (64 * 1024)
 
@@ -38,8 +39,27 @@ struct ed_undo {
     int    cursor_before;
     int    sel_before;
     int    text_off;           /* into the undo text pool: the REMOVED bytes */
+    /* AND THE ADDED ONES. The pool used to keep only what a change removed,
+     * which is all UNDO needs -- but redo then had nothing to put back, so
+     * redoing anything you had typed silently did nothing. Both halves of a
+     * change are stored now and the two directions are symmetric. */
+    int    added_off;          /* into the pool: the ADDED bytes             */
     unsigned char op;
     unsigned char coalesce;    /* may merge with the next typed character */
+};
+
+/* THE UNDO HISTORY, LIFTED OUT so it can be put somewhere else and brought
+ * back. ed_init clears the arena, and the multi-document editor re-binds the
+ * engine on every tab switch -- so switching away from a document and back
+ * threw its entire history away, silently, and the first Ctrl+Z after that did
+ * nothing. The history belongs to the DOCUMENT, not to the engine that is
+ * currently pointed at it. */
+struct ed_undo_state {
+    struct ed_undo undo[ED_UNDO_MAX];
+    char   text[ED_UNDO_TEXT];
+    int    text_n;
+    int    n;
+    int    at;
 };
 
 struct editor {
@@ -88,6 +108,11 @@ void ed_move_line(struct editor *e, int dir);   /* -1 up, +1 down */
 int  ed_undo(struct editor *e);             /* 1 if something was undone */
 int  ed_redo(struct editor *e);
 int  ed_can_undo(const struct editor *e);
+
+/* Take the history out, and put one back. A caller that owns several documents
+ * keeps one of these per document and swaps them with the binding. */
+void ed_undo_save(const struct editor *e, struct ed_undo_state *out);
+void ed_undo_load(struct editor *e, const struct ed_undo_state *in);
 int  ed_can_redo(const struct editor *e);
 
 /* --- movement. `extend` keeps the anchor, i.e. shift-held. --- */

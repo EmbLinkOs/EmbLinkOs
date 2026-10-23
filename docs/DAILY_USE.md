@@ -9,8 +9,8 @@ general native GPU modesetting and suspend/resume are outstanding.
 
 EmbBoot offers normal boot, Recovery, Diagnostics and an explicit live desktop.
 Normal boot opens account setup on an empty system, then password login. The
-live desktop uses `/home/.live-guest`, separate from account homes, and has
-no password lock. The EFI loaded-image
+explicit live desktop opens the existing developer user without a password
+lock; it is not a private guest sandbox. The EFI loaded-image
 device path identifies the actual boot disk by its GPT partition GUID, so an
 internal disk enumerating before the boot USB does not silently become root.
 Legacy BIOS boot records remain compatible with the extended boot protocol.
@@ -67,35 +67,30 @@ image rather than an already-personalized source.
 
 ## Authentication and session lifetime
 
-The development autologin shortcut is removed. Init alone supervises setup,
-login and the unlock greeter. Passwords use salted PBKDF2-SHA256 (100,000 rounds
-for new records; bounded legacy records remain readable). Account files and
-session profiles use flushed replacements. Shadow is the authentication commit
-point; retrying an interrupted passwd-only creation avoids duplicate entries.
-These records are not a substitute for disk encryption.
+Init supervises first-account setup, login and session lifetime. Normal boot
+requires authentication; only explicit Live selection permits autologin.
+Passwords use salted PBKDF2-SHA256 with 210,000 rounds for new records and a
+one-million-round parser ceiling. The incoming administrator/user model and
+system-owned `/etc/sessions/<user>.ns` profiles are retained, with namespace
+bindings clamped to the session policy.
 
-User-editable `user.ns` profiles cannot ask init for arbitrary authority. Bindings
-must stay within the authenticated home or `/run`, or read-only `/system` and
-`/data/apps`, with component boundaries and traversal checks. The desktop's
-capabilities exclude debugging, raw disk access and kernel extensions.
+The incoming kernel session ID follows descendants. Its safe kill path lets
+in-flight kernel work unwind before threads exit; IPC cancellation prevents
+blocked services from re-entering indefinite waits. A trusted home process
+registers the x86 screen controller and owns the lock surface. Its authd service
+verifies passwords; only home can release the kernel input/render gate after
+successful proof. Background applications continue running behind that gate.
+Clipboard contents are cleared when locking or ending a session.
 
-A kernel session epoch follows all descendants, including orphaned apps. Lock
-hides other windows and isolates keyboard/pointer/clipboard access while init
-runs the greeter. Killing/closing the greeter does not unlock. Only successful
-proof for the current account lets init release the gate. Raw framebuffer
-presentation is unavailable once a managed session exists. Clipboard contents
-are cleared on locking and logout. App key events go to the focused window.
+Use **Lock Screen** in the EmbLink menu. The compositor's existing GUI+Tab
+shortcut cannot raise another window while locked. The current compositor has
+eight window slots. Ending a session stops its descendants and init returns to
+setup or login. This uses the incoming session teardown rather than a second
+scheduler or process-lifetime implementation.
 
-Use **Lock Screen** in the EmbLink menu, **Ctrl+Alt+L**, or **Super+L**. **Alt+Tab**
-and **Alt+Shift+Tab** cycle normal visible windows in stable window order.
-The compositor supports 32 windows and reserves two slots for the greeter.
-Logout blocks further old-session spawns, terminates every session member,
-drains in-flight syscalls so filesystem/device locks can be released, waits for
-live threads to stop and returns to login. A newly scheduled process
-also checks its session lifetime before entering userspace.
-IPC accept/receive, sends waiting for queue space, and thread joins honor
-cancellation before blocking again. Completed operations still win; a cancelled
-pending send leaves its message and ancillary handles uncommitted.
+ARM retains its existing desktop/session behavior. The new screen controller,
+notification history and laptop policy syscalls currently return ENOTSUP there;
+this integration cross-builds its kernel but does not claim ARM runtime testing.
 
 The serial kernel console remains a privileged development interface. This is
 not a complete multi-user security model or a physical-access security claim.
@@ -121,7 +116,7 @@ boundary and refuses an occupied original name. Select the container in Trash
 and choose Restore, or use Undo Trash immediately after moving an item. The
 separate Delete action remains permanent and refuses non-empty directories.
 
-The top bar has a notification center with paged history and Clear. The kernel
+The EmbLink menu opens Notifications, with paged history and Clear. The kernel
 keeps eight bounded messages, assigns source PID/sequence/time, checks UTF-8 and
 rate limits delivery. Histories are session-scoped, hidden while locked and
 cleared for the next session. System battery warnings are distinguished from
@@ -182,10 +177,11 @@ not advertise sleep as working.
 Cross-build images, then run host and native acceptance:
 
 ```sh
-make -j4 images uefi-usb.img
+make -j4 FB_W=1280 FB_H=800 images uefi-usb.img
 TEST_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' tests/drivers/run.sh
 python3 tools/recovery_smoke.py
-python3 tools/session_smoke.py
+python3 tools/integration_smoke.py
+python3 tools/lock_test.py
 
 iasl -p /tmp/emblink-power tests/acpi/power.asl
 EMBLINK_ACPI_TABLE=/tmp/emblink-power.aml python3 tools/desktop_smoke.py
@@ -193,15 +189,15 @@ EMBLINK_FIRMWARE=uefi EMBLINK_DISK=nvme EMBLINK_CPUS=2 \
   EMBLINK_SMOKE_COMMAND='test ipc cancel' \
   EMBLINK_SMOKE_EXPECT='IPC counts restored=1 -> OK' python3 tools/hardware_smoke.py
 EMBLINK_FIRMWARE=uefi EMBLINK_DISK=nvme EMBLINK_CPUS=2 \
-  EMBLINK_SMOKE_COMMAND='test session drain' \
-  EMBLINK_SMOKE_EXPECT='[cmd] test session drain: exit=0 -> OK' python3 tools/hardware_smoke.py
+  EMBLINK_SMOKE_COMMAND='test kill io' \
+  EMBLINK_SMOKE_EXPECT='[cmd] test kill io: OK' python3 tools/hardware_smoke.py
 EMBLINK_FIRMWARE=uefi EMBLINK_DISK=nvme EMBLINK_CPUS=2 \
   EMBLINK_SMOKE_COMMAND='test devices files' \
-  EMBLINK_SMOKE_EXPECT='[cmd] test devices: exit=0 -> OK' python3 tools/hardware_smoke.py
+  EMBLINK_SMOKE_EXPECT='[cmd] test devices files: exit=0 -> OK' python3 tools/hardware_smoke.py
 EMBLINK_FIRMWARE=uefi EMBLINK_DISK=nvme EMBLINK_CPUS=2 EMBLINK_NO_HPET=1 \
   EMBLINK_ACPI_TABLE=/tmp/emblink-power.aml \
   EMBLINK_SMOKE_COMMAND='test devices policy' \
-  EMBLINK_SMOKE_EXPECT='[cmd] test devices: exit=0 -> OK' python3 tools/hardware_smoke.py
+  EMBLINK_SMOKE_EXPECT='[cmd] test devices policy: exit=0 -> OK' python3 tools/hardware_smoke.py
 ```
 
 Use `EMBLINK_OVMF_DIR` for a nonstandard OVMF location. Native runners use QEMU;

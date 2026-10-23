@@ -1,8 +1,9 @@
 #include "fs/fd.h"
 #include "fs/vfs.h"
-#include "fs/embkfs/embkfs.h"
 #include "fs/namespace.h"   /* ns_check_writable -- read-only binding gate (UP2) */
 #include "include/errno.h"
+#include "include/kmalloc.h"   /* open file descriptions are heap objects */
+#include "mm/vm_object.h"        /* the page cache: one object per file */
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
@@ -62,6 +63,41 @@ static struct fd_entry *fd_table(void)
 static inline void fdlock(struct process *p)   { if (p) mutex_lock(&p->fd_lock); }
 static inline void fdunlock(struct process *p) { if (p) mutex_unlock(&p->fd_lock); }
 
+/* --- open file descriptions (see struct open_file in fd.h) -----------------
+ *
+ * The refcount is atomic rather than fd-table-locked because the descriptors
+ * sharing one description can live in DIFFERENT processes -- a spawn-inherited
+ * fd is exactly that -- so no single table lock covers them all. Anything else
+ * here (vn, pos) is touched only through a descriptor, and a descriptor is
+ * reached only under its own process's fd lock. */
+static struct open_file *of_alloc(struct vnode vn) {
+    struct open_file *of = kmalloc(sizeof *of);
+    if (!of)
+        return NULL;
+    of->vn = vn;
+    of->pos = 0;
+    of->refs = 1;
+    /* Join the file's page object, creating it if this is the first open. NULL
+     * is not a failure -- it means the cache cannot serve this backing, and
+     * every path below falls through to the filesystem. */
+    of->obj = vmo_get(vn);
+    return of;
+}
+
+static void of_get(struct open_file *of) {
+    if (of) __atomic_fetch_add(&of->refs, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Drop one descriptor's reference. True when that was the LAST one, meaning
+ * the caller must release the vnode -- which it does differently depending on
+ * whether it may block, hence the two close ops. The struct itself is freed
+ * here either way. */
+static bool of_put(struct open_file *of) {
+    if (!of)
+        return false;
+    return __atomic_sub_fetch(&of->refs, 1, __ATOMIC_ACQ_REL) == 0;
+}
+
 void vfs_fd_init(void)
 {
     struct fd_entry *fds = fd_table();
@@ -70,7 +106,7 @@ void vfs_fd_init(void)
         fds[i].backing = FD_BACKING_NONE;
         fds[i].ops = NULL;
         fds[i].flags = 0;
-        fds[i].u.file.pos = 0;
+        fds[i].u.file.of = NULL;
     }
 }
 
@@ -188,21 +224,116 @@ int vfs_mkdir_path(const char *path)
     return parent.mnt->ops->mkdir(&parent, leaf, leaf_len, &made);
 }
 
-int vfs_rename_noreplace(const char *old_path,const char *new_path) {
-    /* Serialize the existence check with every EMBKFS mutation. The ordinary
-     * rename keeps its POSIX replacement behavior for editors and databases. */
-    int rc=ns_check_writable(old_path);
-    if(!rc) rc=ns_check_writable(new_path);
-    if(rc) return rc;
-    embkfs_lock();
-    struct vnode found;
-    rc=vfs_resolve(new_path,&found);
-    if(!rc) rc=-EMBK_EEXIST;
-    else if(rc==-EMBK_ENOENT) rc=vfs_rename_path(old_path,new_path);
-    embkfs_unlock();return rc;
+/* symlink(target, linkpath) -- create `linkpath` as a link holding the TEXT
+ * `target`.
+ *
+ * The target is NEVER resolved or validated here. A symlink may name something
+ * that does not exist, and creating one before its target is the normal case
+ * in every build system that uses them -- checking would break the thing they
+ * are for. Only the LINK's own parent has to exist and be writable. */
+int vfs_symlink_path(const char *target, const char *linkpath)
+{
+    if (!target || !linkpath || !*target)
+        return -EMBK_EINVAL;
+
+    int wok = ns_check_writable(linkpath);   /* refuse in a read-only binding (UP2) */
+    if (wok != EMBK_OK)
+        return wok;
+
+    struct vnode parent;
+    const char *leaf = NULL;
+    size_t leaf_len = 0;
+
+    int rc = fd_split_parent(linkpath, &parent, &leaf, &leaf_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->symlink)
+        return -EMBK_ENOSYS;
+
+    return parent.mnt->ops->symlink(&parent, leaf, leaf_len, target);
 }
 
-int vfs_rename_path(const char *old_path, const char *new_path)
+/* readlink(path) -- the TEXT a link holds, without following it.
+ *
+ * Resolved with follow_final FALSE, which is the whole point: resolving it the
+ * ordinary way would land on the link's TARGET and there would be nothing left
+ * to read. Reports the full length even when the buffer is short, so a caller
+ * can tell truncation from completion. */
+/* A hard link: `newpath` becomes a second name for the object `oldpath`
+ * names. The target is resolved WITH symlink following -- a hard link is to
+ * the thing, never to the pointer -- and must be on the same filesystem as
+ * the new name, because a link is a directory entry naming an object id and
+ * an id means nothing on another volume (EXDEV, the same answer rename gives
+ * across mounts). Directories are refused here, uniformly, before any
+ * filesystem gets to decide: two parents is a cycle, and every filesystem
+ * that allowed it has regretted it. */
+int vfs_link_path(const char *oldpath, const char *newpath)
+{
+    if (!oldpath || !newpath || !*oldpath || !*newpath)
+        return -EMBK_EINVAL;
+
+    int wok = ns_check_writable(newpath);
+    if (wok != EMBK_OK)
+        return wok;
+
+    struct vnode target;
+    int rc = vfs_resolve(oldpath, &target);
+    if (rc != EMBK_OK)
+        return rc;                        /* ENOENT: nothing to link to */
+    if (target.type == VFS_DT_DIR)
+        return -EMBK_EPERM;
+
+    struct vnode parent;
+    const char *leaf = NULL;
+    size_t leaf_len = 0;
+    rc = fd_split_parent(newpath, &parent, &leaf, &leaf_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (parent.mnt != target.mnt)
+        return -EMBK_EXDEV;
+    if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->link)
+        return -EMBK_ENOSYS;
+
+    return parent.mnt->ops->link(&parent, leaf, leaf_len, &target);
+}
+
+int vfs_readlink_path(const char *path, char *buf, size_t cap, size_t *out_len)
+{
+    if (!path || !buf || !out_len)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int rc = vfs_resolve_nofollow(path, &vn);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (vn.type != VFS_DT_LNK)
+        return -EMBK_EINVAL;          /* POSIX: EINVAL, not ENOENT -- it exists */
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->readlink)
+        return -EMBK_ENOSYS;
+
+    return vn.mnt->ops->readlink(&vn, buf, cap, out_len);
+}
+
+/* lstat -- metadata of the LINK, not of what it points at. The one place a
+ * caller can see that a symlink is a symlink. */
+int vfs_lstat_path(const char *path, struct vfs_stat *out)
+{
+    if (!path || !out)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int rc = vfs_resolve_nofollow(path, &vn);
+    if (rc != EMBK_OK)
+        return rc;
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+    return vn.mnt->ops->stat(&vn, out);
+}
+
+static int rename_path(const char *old_path, const char *new_path,int noreplace)
 {
     struct vnode old_parent, new_parent;
     const char *old_leaf = NULL, *new_leaf = NULL;
@@ -232,9 +363,17 @@ int vfs_rename_path(const char *old_path, const char *new_path)
     if (!old_parent.mnt || !old_parent.mnt->ops || !old_parent.mnt->ops->rename)
         return -EMBK_ENOSYS;
 
+    if(noreplace) {
+        if(!old_parent.mnt->ops->rename_noreplace)return -EMBK_ENOTSUP;
+        return old_parent.mnt->ops->rename_noreplace(&old_parent,old_leaf,old_len,
+                                                    &new_parent,new_leaf,new_len);
+    }
     return old_parent.mnt->ops->rename(&old_parent, old_leaf, old_len,
                                        &new_parent, new_leaf, new_len);
 }
+
+int vfs_rename_path(const char *old_path,const char *new_path) {return rename_path(old_path,new_path,0);}
+int vfs_rename_noreplace(const char *old_path,const char *new_path) {return rename_path(old_path,new_path,1);}
 
 /* ftruncate: fd -> vnode -> the per-fs truncate op that already exists (EMBKFS
  * wires it). Only a VNODE-backed fd can be truncated -- truncating a pipe or
@@ -246,10 +385,53 @@ int vfs_fd_truncate(int fd, uint64_t size)
         return -EMBK_EBADF;
     if (e->backing != FD_BACKING_VNODE)
         return -EMBK_EINVAL;
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->truncate)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->truncate)
         return -EMBK_ENOSYS;
 
-    return e->u.file.vn.mnt->ops->truncate(&e->u.file.vn, size);
+    int rc = of->vn.mnt->ops->truncate(&of->vn, size);
+    if (rc == EMBK_OK)
+        vmo_truncated(of->obj, size);   /* or the cache serves the old tail */
+    return rc;
+}
+
+/* fsync(fd) -- push this file's dirty pages to the device and do not return
+ * until they are there.
+ *
+ * This used to be vacuously true: every write() went straight to the device,
+ * so "your writes are committed" was already a fact and fsync had nothing to
+ * do. user/lib/syscalls.c carried the standing obligation that came with that
+ * -- "if a write-back cache is ever added, these must become a real device
+ * flush the same day". This is that day. */
+/* mmap needs the file's pages, and the fd is what names them. A NEW reference
+ * is taken here rather than borrowing the descriptor's: a mapping outlives the
+ * close() that made it, which is the one behaviour every caller of mmap
+ * relies on and the reason the object is refcounted at all. */
+struct vm_object *vfs_fd_object(int fd)
+{
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e || e->backing != FD_BACKING_VNODE)
+        return NULL;
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->obj)
+        return NULL;
+    return vmo_get(of->vn);          /* same object, one more holder */
+}
+
+int vfs_fd_fsync(int fd)
+{
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e)
+        return -EMBK_EBADF;
+    /* A pipe, a socket or the console has no device behind it and nothing
+     * buffered on the caller's behalf. Succeeding is the true answer, not a
+     * convenient one: there is genuinely nothing outstanding. */
+    if (e->backing != FD_BACKING_VNODE)
+        return EMBK_OK;
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->obj)
+        return EMBK_OK;
+    return vmo_flush(of->obj);
 }
 
 int vfs_chmod_path(const char *path, uint32_t mode)
@@ -358,7 +540,7 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         return -EMBK_EINVAL;
     if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
         return -EMBK_EINVAL;
-    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_NONBLOCK))
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
         return -EMBK_EINVAL;
 
     /* /dev/null: the one special name (see nulldev_fd_ops above). Checked
@@ -434,6 +616,10 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         err = vn.mnt->ops->truncate(&vn, 0);
         if (err != EMBK_OK)
             return err;
+        /* Somebody ELSE may have this file open and cached. The truncate went
+         * to the device; the pages have to follow, or that other descriptor
+         * keeps reading a file that no longer has those bytes. */
+        vmo_file_truncated(vn, 0);
     }
 
     /* Find a free slot and claim it ATOMICALLY. Before the lock, the find and
@@ -470,10 +656,18 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         }
     }
 
+    struct open_file *of = of_alloc(vn);
+    if (!of) {
+        fds[fd - FD_BASE].used = false;
+        fdunlock(p);
+        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put)
+            (void)vn.mnt->ops->obj_put(vn.mnt, vn.ino);
+        return -EMBK_ENOMEM;
+    }
+
     fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
     fds[fd - FD_BASE].ops = &vnode_fd_ops;
-    fds[fd - FD_BASE].u.file.vn = vn;
-    fds[fd - FD_BASE].u.file.pos = 0;
+    fds[fd - FD_BASE].u.file.of = of;
     fds[fd - FD_BASE].flags = flags;
     fdunlock(p);
 
@@ -481,7 +675,7 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            fds[fd - FD_BASE].u.file.pos = st.size;
+            of->pos = st.size;
     }
 
     return fd;
@@ -579,6 +773,71 @@ int vfs_close(int fd)
     return EMBK_OK;
 }
 
+/* dup / dup2 / fcntl(F_DUPFD) -- see fd.h.
+ *
+ * ONE open file description, TWO descriptors. Not a copy: the cursor is
+ * shared, so a write through either advances both, and the vnode reference is
+ * released once when the last descriptor closes. Anything else would be the
+ * "accidental third thing" vnode_fd_inherit() spent a paragraph refusing to
+ * be, and the whole reason this needed a real object rather than a struct
+ * assignment.
+ *
+ * dup2(fd, fd) is a NO-OP that returns fd, which is not an arbitrary special
+ * case: closing the target first and then duplicating would destroy the very
+ * description being duplicated. POSIX calls it out for the same reason. */
+int vfs_fd_dup(int oldfd, int newfd, int min_fd) {
+    if (oldfd < FD_BASE || oldfd >= FD_BASE + FD_MAX_OPEN)
+        return -EMBK_EBADF;
+    if (newfd >= FD_BASE + FD_MAX_OPEN || min_fd < 0 || min_fd >= FD_MAX_OPEN)
+        return -EMBK_EBADF;
+
+    struct process *p = current_process;
+
+    fdlock(p);
+    struct fd_entry *fds = fd_table();
+    struct fd_entry *src = &fds[oldfd - FD_BASE];
+    if (!src->used || !src->ops) { fdunlock(p); return -EMBK_EBADF; }
+
+    if (newfd >= 0 && newfd == oldfd) { fdunlock(p); return oldfd; }
+
+    /* A backing that cannot say what inheriting means must not be guessed at:
+     * "inherit" is a struct copy for a stateless singleton and a refcount bump
+     * for anything owned, and picking wrong is a silent use-after-free. */
+    if (!src->ops->inherit) { fdunlock(p); return -EMBK_ENOSYS; }
+
+    int target = newfd;
+    if (target < 0) {
+        target = -1;
+        for (int i = min_fd; i < FD_MAX_OPEN; i++)
+            if (!fds[i].used) { target = i + FD_BASE; break; }
+        if (target < 0) { fdunlock(p); return -EMBK_EMFILE; }
+    }
+
+    struct fd_entry *dst = &fds[target - FD_BASE];
+
+    /* Whatever the target held is closed -- that IS dup2, and it is how every
+     * shell redirect works. Snapshot then clear under the lock, tear down
+     * after: the same ordering rule vfs_close() states, for the same reason
+     * (a close op may take g_sched_lock, which this mutex is built on). */
+    struct fd_entry snap;
+    bool had = dst->used && dst->ops && dst->ops->close;
+    if (had) snap = *dst;
+    memset(dst, 0, sizeof(*dst));
+
+    int rc = src->ops->inherit(dst, src);
+    if (rc != EMBK_OK) {
+        memset(dst, 0, sizeof(*dst));
+        fdunlock(p);
+        if (had) snap.ops->close(&snap);   /* it is gone either way */
+        return rc;
+    }
+    dst->used = true;
+    fdunlock(p);
+
+    if (had) snap.ops->close(&snap);
+    return target;
+}
+
 int64_t vfs_fd_avail(int fd) {
     struct fd_entry *e = fd_lookup(fd);
     if (!e)
@@ -616,23 +875,6 @@ int vfs_fd_set_nonblock(int fd, bool on) {
     return EMBK_OK;
 }
 
-int vfs_fd_sync(int fd)
-{
-    struct process *p = current_thread ? current_process : NULL;
-    struct vnode vn;
-    fdlock(p);
-    struct fd_entry *e = fd_lookup(fd);
-    int rc = !e ? -EMBK_EBADF
-           : e->backing != FD_BACKING_VNODE ? -EMBK_EINVAL : EMBK_OK;
-    if (rc == EMBK_OK) vn = e->u.file.vn;
-    fdunlock(p);
-    if (rc != EMBK_OK) return rc;
-    /* Mounts outlive descriptors. Snapshot before blocking so close/reuse of
-     * this fd cannot redirect a flush to a different filesystem. */
-    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->sync) return -EMBK_ENOTSUP;
-    return vn.mnt->ops->sync(&vn);
-}
-
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
 {
     struct fd_entry *e = fd_lookup(fd);
@@ -664,7 +906,7 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     int acc = flags & O_ACCMODE;
     if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
         return -EMBK_EINVAL;
-    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_NONBLOCK))
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
         return -EMBK_EINVAL;
 
     struct vnode vn;
@@ -699,6 +941,10 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         err = vn.mnt->ops->truncate(&vn, 0);
         if (err != EMBK_OK)
             return err;
+        /* Somebody ELSE may have this file open and cached. The truncate went
+         * to the device; the pages have to follow, or that other descriptor
+         * keeps reading a file that no longer has those bytes. */
+        vmo_file_truncated(vn, 0);
     }
 
     /* Lock the TARGET's table, not current's. At spawn time target is the child,
@@ -713,36 +959,72 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
 
     memset(e, 0, sizeof(*e));
 
+    struct open_file *of = of_alloc(vn);
+    if (!of) {
+        fdunlock(target);
+        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put)
+            (void)vn.mnt->ops->obj_put(vn.mnt, vn.ino);
+        return -EMBK_ENOMEM;
+    }
+
     e->used = true;
     e->backing = FD_BACKING_VNODE;
     e->ops = &vnode_fd_ops;
-    e->u.file.vn = vn;
-    e->u.file.pos = 0;
+    e->u.file.of = of;
     e->flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            e->u.file.pos = st.size;
+            of->pos = st.size;
     }
     fdunlock(target);
 
     return target_fd;
  }
 
+/* Metadata from the filesystem, with the SIZE corrected to what a reader can
+ * actually see.
+ *
+ * A write that has only reached the cache has already changed the file: any
+ * descriptor onto it reads the new bytes back immediately. Reporting the
+ * device's idea of the length would make stat() disagree with read(), and the
+ * failure is not subtle -- every program that stats a file and then reads that
+ * many bytes (which is most of them) would get a truncated copy of anything
+ * recently written. */
+static int vnode_stat_cached(struct open_file *of, struct vfs_stat *out) {
+    int err = of->vn.mnt->ops->stat(&of->vn, out);
+    if (err)
+        return err;
+    if (of->obj) {
+        uint64_t cached = vmo_size(of->obj);
+        if (cached > out->size)
+            out->size = cached;
+    }
+    return EMBK_OK;
+}
+
 static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
     if (!fd_readable(e->flags))
         return -EMBK_EBADF;
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->read)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->read)
         return -EMBK_ENOSYS;
 
     size_t bytes_read = 0;
-    int err = e->u.file.vn.mnt->ops->read(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_read);
+    int err;
+    if (of->obj) {
+        uint64_t done = 0;
+        err = vmo_read(of->obj, of->pos, buf, len, &done);
+        bytes_read = (size_t)done;
+    } else {
+        err = of->vn.mnt->ops->read(&of->vn, of->pos, buf, len, &bytes_read);
+    }
     if (err)
         return err;
 
-    e->u.file.pos += bytes_read;
+    of->pos += bytes_read;
     *out_read = bytes_read;
     return EMBK_OK;
 }
@@ -750,32 +1032,48 @@ static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_
 static int vnode_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
     if (!fd_writable(e->flags))
         return -EMBK_EBADF;
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->write)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->write)
         return -EMBK_ENOSYS;
 
     size_t bytes_written = 0;
-    int err = e->u.file.vn.mnt->ops->write(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_written);
+    int err;
+    if (of->obj) {
+        /* Into the cache, and the call returns. The bytes are on their way to
+         * the device, not on it -- fsync() is how a caller says it needs the
+         * difference, and the writeback thread bounds how long it lasts. */
+        uint64_t done = 0;
+        err = vmo_write(of->obj, of->pos, buf, len, &done);
+        bytes_written = (size_t)done;
+    } else {
+        err = of->vn.mnt->ops->write(&of->vn, of->pos, buf, len, &bytes_written);
+    }
     if (err)
         return err;
 
-    e->u.file.pos += bytes_written;
+    of->pos += bytes_written;
     *out_written = bytes_written;
     return EMBK_OK;
 }
 
 static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
         return -EMBK_ENOSYS;
 
+    /* SEEK_END means the END OF THE FILE, which now includes bytes that are
+     * only in the cache. Asking the device would report the length before the
+     * last writeback -- so an append loop (seek to end, write, repeat) would
+     * seek back over its own unflushed data and overwrite it. */
     struct vfs_stat st;
-    int err = e->u.file.vn.mnt->ops->stat(&e->u.file.vn, &st);
+    int err = vnode_stat_cached(of, &st);
     if (err)
         return err;
 
     uint64_t base;
     switch (whence) {
         case 0: base = 0; break; // SEEK_SET
-        case 1: base = e->u.file.pos; break; // SEEK_CUR
+        case 1: base = of->pos; break; // SEEK_CUR
         case 2: base = st.size; break; // SEEK_END
         default: return -EMBK_EINVAL;
     }
@@ -785,40 +1083,52 @@ static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t
     if (err)
         return err;
 
-    e->u.file.pos = new_pos;
+    of->pos = new_pos;
     *out_offset = new_pos;
     return EMBK_OK;
 }
 
 
 static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
         return -EMBK_ENOSYS;
 
-    return e->u.file.vn.mnt->ops->stat(&e->u.file.vn, out);
+    return vnode_stat_cached(of, out);
 }
 
 
 static int vnode_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
-    (void)dst; (void)src;
-    /* Deliberately NOT "obj_get + struct copy". That would fix the LIFETIME
-     * bug (refcount) while leaving the CURSOR bug: the child would get an
-     * independent u.file.pos onto the same object -- neither POSIX (which
-     * shares the offset through a shared open-file-description) nor a fresh
-     * open. It's an accidental third thing, and it corrupts silently.
+    /* This used to be an outright -ENOSYS, and the comment it carried said
+     * why: "obj_get + struct copy" would have fixed the LIFETIME bug while
+     * leaving the CURSOR bug -- the child getting an INDEPENDENT offset onto
+     * the same object, which is neither POSIX nor a fresh open but an
+     * accidental third thing that corrupts silently. It also said when to fix
+     * it properly: "when something eventually redirects a child's stdout to a
+     * FILE". dup2() is that, so the shared open file description now exists
+     * and this is a reference bump onto it -- one cursor, two descriptors,
+     * exactly as POSIX describes.
      *
-     * Nothing can put a vnode in fds 0/1/2 today, so this cannot fire. When
-     * something eventually redirects a child's stdout to a FILE, it will
-     * fail LOUDLY here rather than quietly sharing a cursor -- and that's
-     * the moment to build the real shared open-file-description (the gap
-     * already tracked in TODO.md), not before. */
-    return -EMBK_ENOSYS;
+     * The vnode's own reference is NOT bumped here: it belongs to the
+     * description, which is what is being shared, and is released once when
+     * the last descriptor onto it closes. */
+    *dst = *src;
+    of_get(dst->u.file.of);
+    return EMBK_OK;
 }
 
 
 static void vnode_fd_close(struct fd_entry *e) {
-    if (e->u.file.vn.mnt && e->u.file.vn.mnt->ops && e->u.file.vn.mnt->ops->obj_put)
-        (void)e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
+    struct open_file *of = e->u.file.of;
+    if (!of_put(of))
+        return;                 /* another descriptor still holds it */
+    /* Before the vnode reference goes: the last descriptor onto a file is the
+     * last chance to write its dirty pages while the object is still nameable.
+     * vmo_put flushes if this was the final reference. */
+    vmo_put(of->obj);
+    if (of->vn.mnt && of->vn.mnt->ops && of->vn.mnt->ops->obj_put)
+        (void)of->vn.mnt->ops->obj_put(of->vn.mnt, of->vn.ino);
+    kfree(of);
 }
 
 static void vnode_fd_close_locked(struct fd_entry *e) {
@@ -827,7 +1137,15 @@ static void vnode_fd_close_locked(struct fd_entry *e) {
      * I/O, disqualifying under g_sched_lock. Defer to the kworker, which
      * obj_puts from a normal schedulable thread holding nothing. This CLOSES
      * the pre-existing exit-time vnode refcount leak. */
-    kworker_defer_obj_put_locked(e->u.file.vn);
+    struct open_file *of = e->u.file.of;
+    if (!of_put(of))
+        return;
+    /* NOT vmo_put() here: it takes a sleeping lock and may write to the disk,
+     * and this runs under g_sched_lock -- the same reason the obj_put below is
+     * deferred. The object is handed to the kworker with the vnode, which
+     * flushes and releases it from a context that is allowed to block. */
+    kworker_defer_vmo_put_locked(of->vn, of->obj);
+    kfree(of);
 }
 
 static const struct fd_ops vnode_fd_ops = {
@@ -849,13 +1167,41 @@ static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *ou
     return tty_read(buf, len, out_read);  // line discipline
 }
 
+/* ONE write() TO THE CONSOLE IS ONE WRITE. Without this a process preempted
+ * mid-loop -- typically while the UART's 16-byte FIFO drains -- lets another
+ * process's bytes land in the middle of its line. The aarch64 boot test saw
+ * `home: desktop ready` arrive as `home: desktop re` + TopBar's lines +
+ * `ady`, and reported a working desktop as failed. A sleeping lock, because
+ * the loop is long and this is syscall context; kprintf takes its own path
+ * to the serial port. It IS serialised against kprintf now, a line at a time --
+ * see below. */
+static struct mutex g_console_write_lock = MUTEX_INIT;
+
 static int console_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
     (void)e; 
 
     const char *cbuf = (const char *)buf;
-    for (size_t i = 0; i < len; i++) {
-        console_putchar(cbuf[i]);
+    /* The mutex keeps two USER writers apart; kprintf's spinlock keeps the
+     * KERNEL out of the middle of a line. Both are needed and they nest in
+     * this order only -- kprintf never takes the mutex, so there is no cycle.
+     *
+     * A LINE AT A TIME, not the whole write. A program dumping a megabyte must
+     * not own the serial port for the duration of it, and the line is the unit
+     * that has to arrive whole: a kernel line inside a user line is what made
+     * the aarch64 acceptance test report `init never spawned the session` on a
+     * boot where it had (the log read `init: desktop seEMBKFS: sda: ...`). */
+    mutex_lock(&g_console_write_lock);
+    size_t i = 0;
+    while (i < len) {
+        size_t end = i;
+        while (end < len && cbuf[end] != '\n') end++;
+        if (end < len) end++;                    /* take the newline with it */
+        kprintf_line_begin();
+        for (size_t k = i; k < end; k++) console_putchar(cbuf[k]);
+        kprintf_line_end();
+        i = end;
     }
+    mutex_unlock(&g_console_write_lock);
     *out_written = len;
     return EMBK_OK;
 }

@@ -13,18 +13,46 @@
  * map higher-half -> phys 0, exactly like stage2 does.
  */
 #include "uefi.h"
+#include "crypto/sha256.h"
 #include "console.h"
 #include "menu.h"
 #include "display_mode.h"
 
-/* ---- boot_protocol ABI (mirrors kernel/arch/x86_64/boot/boot_protocol.h;
- *      that header's _Static_asserts are the master copy -- keep in sync). --- */
-#define BOOT_PROTOCOL_MAGIC   0x4F52504B4E494C45ULL   /* "ELINKPRO" */
-#define BOOT_PROTOCOL_VERSION 1
-#define BOOT_FW_UEFI          2
-#define BOOT_MODE_NORMAL 0
-#define BOOT_MODE_RECOVERY 1
-#define BOOT_MODE_DIAGNOSTICS 2
+/* A BYTE ON COM1. See crt0.S: the firmware's console may not be ours yet, and
+ * on real hardware may not exist, so the loader marks its own progress on the
+ * serial port where a failure between two ConOut calls would otherwise leave
+ * nothing at all.
+ *
+ * THE LETTERS ARE A CONTRACT, checked by tools/uefi_test.py:
+ *
+ *   1  crt0's first instruction ran -- firmware handed off
+ *   2  the image relocated ITSELF; every global is reachable from here on
+ *   3  C code entered with the MS x64 ABI honoured
+ *   4  the system table is stored and the console is usable
+ *   B  the menu chose to boot; last marker before ExitBootServices
+ *
+ * Each is the far side of a step that has failed here before, and they are the
+ * only evidence a real machine with no display will give. `2` in particular is
+ * the one that cost a week: with `-shared` instead of `-pie` this linker
+ * relaxes cross-file global reads into ABSOLUTE addresses and emits no
+ * relocation for them, so the loop between __rela_start and __rela_end has
+ * nothing to apply and every global reads from low memory that is not the
+ * image. It printed `2` then too -- what changed is that `4` now follows. */
+static inline void mark(char c) {
+    __asm__ volatile("outb %0, %1" :: "a"(c), "Nd"((unsigned short)0x3F8));
+}
+
+
+
+/* ---- the boot protocol: THE REAL HEADER, not a copy of it ----------------
+ *
+ * This used to be a hand-transcribed duplicate of the struct with a comment
+ * asking the next person to keep it in sync. It went stale the first time a
+ * field was added to the other one, which is the only thing that kind of
+ * comment ever achieves. The loader compiles with -Ikernel now and includes
+ * the master definition, so the two CANNOT disagree -- and the assertions in
+ * that header check the layout for both sides at once. */
+#include "boot/boot_protocol.h"
 
 /* our memory-map type numbering (kernel pmm.h) */
 #define E820_USABLE       1
@@ -32,37 +60,6 @@
 #define E820_ACPI_RECLAIM 3
 #define E820_ACPI_NVS     4
 #define E820_BAD_MEMORY   5
-
-struct boot_mmap_entry {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;
-    uint32_t attr;
-};
-
-struct boot_protocol {
-    uint64_t magic;
-    uint32_t version;
-    uint32_t size;
-    uint32_t firmware;
-    uint32_t mmap_count;
-    uint64_t mmap_phys;
-    uint32_t mmap_stride;
-    uint32_t boot_disk_sig;
-    uint64_t fb_addr;
-    uint32_t fb_width;
-    uint32_t fb_height;
-    uint32_t fb_pitch;
-    uint32_t fb_bpp;
-    uint32_t fb_format;
-    uint8_t  boot_drive;
-    uint8_t  boot_mode;
-    uint8_t  _reserved[2];
-    uint64_t acpi_rsdp;
-    uint8_t boot_partition_guid[16];
-};
-_Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry 24");
-_Static_assert(sizeof(struct boot_protocol)   == 0x60, "boot_protocol 0x60");
 
 /* ---- ELF64 (only what we parse) ----------------------------------------- */
 typedef struct {
@@ -94,6 +91,22 @@ extern const uint8_t kernel_elf_start[] __attribute__((visibility("hidden")));
 extern const uint8_t kernel_elf_end[]   __attribute__((visibility("hidden")));
 
 /* ---- tiny freestanding helpers ------------------------------------------ */
+
+/* PLAIN memcpy/memset, not just the mini_ ones, because kernel/crypto/sha256.c
+ * is compiled into this loader and calls them by their real names -- and
+ * because GCC emits calls to them for structure assignment whether or not
+ * anything wrote one. There is no libc here to provide them. */
+void *memcpy(void *d, const void *s, unsigned long n) {
+    uint8_t *dp = d; const uint8_t *sp = s;
+    while (n--) *dp++ = *sp++;
+    return d;
+}
+void *memset(void *d, int c, unsigned long n) {
+    uint8_t *dp = d;
+    while (n--) *dp++ = (uint8_t)c;
+    return d;
+}
+
 static void *mini_memcpy(void *d, const void *s, uint64_t n) {
     uint8_t *dp = d; const uint8_t *sp = s;
     while (n--) *dp++ = *sp++;
@@ -127,7 +140,28 @@ static EFI_PHYSICAL_ADDRESS alloc_pages(EFI_ALLOCATE_TYPE how,
                                         const char *what) {
     EFI_PHYSICAL_ADDRESS m = at;
     EFI_STATUS s = ST->BootServices->AllocatePages(how, EfiLoaderData, pages, &m);
-    if (EFI_ERROR(s)) { con_print(what); con_die("AllocatePages failed"); }
+    if (EFI_ERROR(s)) {
+        con_print(what);
+        con_print("AllocatePages status="); con_printhex(s);
+        con_print(" address="); con_printhex(at);
+        con_print(" pages="); con_printhex(pages); con_print("\n");
+        UINTN bytes = 0, key = 0, stride = 0;
+        uint32_t version = 0;
+        EFI_MEMORY_DESCRIPTOR *map = 0;
+        ST->BootServices->GetMemoryMap(&bytes, 0, &key, &stride, &version);
+        bytes += 8 * sizeof(EFI_MEMORY_DESCRIPTOR);
+        if (!EFI_ERROR(ST->BootServices->AllocatePool(EfiLoaderData, bytes, (void **)&map)) &&
+            !EFI_ERROR(ST->BootServices->GetMemoryMap(&bytes, map, &key, &stride, &version))) {
+            for (UINTN offset = 0; stride >= sizeof(*map) && offset + sizeof(*map) <= bytes; offset += stride) {
+                EFI_MEMORY_DESCRIPTOR *d = (void *)((uint8_t *)map + offset);
+                if (d->PhysicalStart >= 0x1000000) continue;
+                con_print("  memory "); con_printhex(d->PhysicalStart);
+                con_print(" pages="); con_printhex(d->NumberOfPages);
+                con_print(" type="); con_printhex(d->Type); con_print("\n");
+            }
+        }
+        con_die("AllocatePages failed");
+    }
     return m;
 }
 
@@ -318,6 +352,23 @@ static void finalize_and_handoff(struct boot_protocol *bp,
         /* translate -> boot_mmap_entry (coalescing not needed; kernel handles
          * a sparse map). NO firmware allocation happens past this point. */
         UINTN n = map_size / desc_size, out = 0;
+
+        /* REFUSE RATHER THAN TRUNCATE. The loop below used to stop at
+         * mmap_cap and say nothing, and what that costs is worth being exact
+         * about: the kernel's PMM marks every page USED and then frees only
+         * what this map calls usable, so a dropped entry does not hand out
+         * reserved memory -- it loses RAM. Silently, and from the TOP, because
+         * the firmware's map is in ascending order. A machine would boot with
+         * a fraction of its memory and nothing anywhere would say why.
+         *
+         * The ceiling is 2560 entries against the ~110 OVMF produces and the
+         * couple of hundred a real machine does, so this should never fire.
+         * That is exactly why it has to be loud: an impossible case that is
+         * silently wrong is how a machine gets diagnosed for a week. Dying
+         * here is still possible -- ExitBootServices has not been called, so
+         * the firmware console is alive to say it. */
+        if (n > mmap_cap) con_die("firmware memory map is larger than the loader can carry");
+
         for (UINTN i = 0; i < n && out < mmap_cap; i++) {
             EFI_MEMORY_DESCRIPTOR *d =
                 (EFI_MEMORY_DESCRIPTOR *)((uint8_t *)map + i * desc_size);
@@ -345,11 +396,87 @@ static void finalize_and_handoff(struct boot_protocol *bp,
     __builtin_unreachable();
 }
 
+/* ---- what the firmware checked, and what we check ------------------------
+ *
+ * TWO DIFFERENT QUESTIONS, and conflating them is how a machine ends up
+ * claiming a security property it does not have.
+ *
+ *   `SecureBoot` says whether the FIRMWARE verified the image it launched --
+ *   this loader. It is the firmware's answer about its own behaviour and
+ *   there is no way to check it from here; we report it and say where it
+ *   came from.
+ *
+ *   The kernel hash below is OURS. The kernel is embedded in this binary, so
+ *   when Secure Boot is on the firmware's signature already covers it and
+ *   this check adds nothing against a determined attacker -- it is the same
+ *   bytes under the same signature. What it DOES catch is the case Secure
+ *   Boot cannot: a machine with it turned off, where nothing checks anything,
+ *   and a corrupted or substituted image boots silently. And it is the
+ *   mechanism that has to exist before the kernel can move out into a file on
+ *   the ESP, which is what the Recovery entry needs.
+ *
+ * Both end up in the boot protocol because the kernel cannot learn either one
+ * for itself: by the time it runs, boot services are gone. */
+static uint8_t read_secure_boot(uint8_t *setup_mode) {
+    *setup_mode = 0;
+    if (!ST || !ST->RuntimeServices || !ST->RuntimeServices->GetVariable)
+        return BOOT_SB_UNKNOWN;
+
+    EFI_GUID g = EFI_GLOBAL_VARIABLE_GUID;
+    uint8_t val = 0;
+    UINTN sz = 1;
+    CHAR16 nm_sb[] = { 'S','e','c','u','r','e','B','o','o','t', 0 };
+    CHAR16 nm_sm[] = { 'S','e','t','u','p','M','o','d','e', 0 };
+
+    uint8_t sm = 0;
+    sz = 1;
+    if (!EFI_ERROR(ST->RuntimeServices->GetVariable(nm_sm, &g, 0, &sz, &sm)))
+        *setup_mode = sm ? 1 : 0;
+
+    sz = 1;
+    EFI_STATUS s = ST->RuntimeServices->GetVariable(nm_sb, &g, 0, &sz, &val);
+    if (EFI_ERROR(s)) return BOOT_SB_UNKNOWN;
+    return val ? BOOT_SB_ON : BOOT_SB_OFF;
+}
+
+/* The digest the build computed over exactly these bytes, generated into
+ * build/uefi_kernel_hash.h. */
+#include "uefi_kernel_hash.h"
+
+static uint8_t verify_kernel(void) {
+    uint64_t len = (uint64_t)(kernel_elf_end - kernel_elf_start);
+    uint8_t got[SHA256_DIGEST_SIZE];
+    sha256(kernel_elf_start, (size_t)len, got);
+
+    for (int i = 0; i < SHA256_DIGEST_SIZE; i++)
+        if (got[i] != EMBK_KERNEL_SHA256[i]) {
+            con_print("\n*** THE KERNEL IMAGE DOES NOT MATCH ITS BUILD HASH ***\n");
+            con_print("  expected "); con_printhex(
+                ((uint64_t)EMBK_KERNEL_SHA256[0] << 56) |
+                ((uint64_t)EMBK_KERNEL_SHA256[1] << 48) |
+                ((uint64_t)EMBK_KERNEL_SHA256[2] << 40) |
+                ((uint64_t)EMBK_KERNEL_SHA256[3] << 32) |
+                ((uint64_t)EMBK_KERNEL_SHA256[4] << 24) |
+                ((uint64_t)EMBK_KERNEL_SHA256[5] << 16) |
+                ((uint64_t)EMBK_KERNEL_SHA256[6] << 8)  |
+                ((uint64_t)EMBK_KERNEL_SHA256[7]));
+            con_print("\n  found    "); con_printhex(
+                ((uint64_t)got[0] << 56) | ((uint64_t)got[1] << 48) |
+                ((uint64_t)got[2] << 40) | ((uint64_t)got[3] << 32) |
+                ((uint64_t)got[4] << 24) | ((uint64_t)got[5] << 16) |
+                ((uint64_t)got[6] << 8)  | ((uint64_t)got[7]));
+            con_print("\n");
+            return BOOT_KV_FAILED;
+        }
+    return BOOT_KV_OK;
+}
+
 /* Boot EmbLinkOS: the OS-handoff backend. Loads the (embedded, for M1) kernel,
  * builds the boot_protocol + page tables, ExitBootServices, and jumps. Never
  * returns. This is the machinery the "Boot EmbLinkOS" and (later) "Recovery"
  * menu entries invoke; the menu itself lives in menu.c. */
-void boot_emblinkos(EFI_HANDLE image, unsigned mode) {
+static void boot_emblinkos(EFI_HANDLE image,unsigned mode) {
+    mark('B');                 /* B: booting -- the last marker before the kernel */
     con_print("\nBooting EmbLinkOS...\n");
 
     /* Structures the kernel reads via KP2V must live below 1GB (the extent of
@@ -369,9 +496,27 @@ void boot_emblinkos(EFI_HANDLE image, unsigned mode) {
     bp->mmap_stride   = sizeof(struct boot_mmap_entry);
     bp->boot_disk_sig = 0;      /* not resolved yet (kernel probes all disks) */
     bp->boot_drive    = 0xFF;   /* n/a under UEFI */
-    bp->boot_mode     = mode;
-    fill_boot_device(image, bp);
     bp->acpi_rsdp     = find_acpi_rsdp();
+    bp->boot_mode=mode;fill_boot_device(image,bp);
+
+    /* WHAT WAS TRUSTED, recorded before boot services go away and the
+     * question becomes unanswerable. */
+    uint8_t setup_mode = 0;
+    bp->secure_boot = read_secure_boot(&setup_mode);
+    bp->setup_mode  = setup_mode;
+    con_print("secure boot: ");
+    con_print(bp->secure_boot == BOOT_SB_ON  ? "ENABLED"
+            : bp->secure_boot == BOOT_SB_OFF ? "disabled"
+                                             : "not reported by this firmware");
+    if (setup_mode) con_print("  (firmware is in setup mode: no platform key)");
+    con_print("\n");
+
+    bp->kernel_verified = verify_kernel();
+    con_print("kernel image: ");
+    con_print(bp->kernel_verified == BOOT_KV_OK ? "matches its build hash\n"
+                                                : "DOES NOT MATCH\n");
+    if (bp->kernel_verified != BOOT_KV_OK)
+        con_die("refusing to boot a kernel that does not match its build hash");
 
     con_print("locating GOP...\n");
     fill_framebuffer(bp);
@@ -395,22 +540,20 @@ void boot_emblinkos(EFI_HANDLE image, unsigned mode) {
 
 /* ---- EmbBoot entry point: run the menu, dispatch the choice ---------------- */
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
+    mark('3');
     con_init(st);
+    mark('4');
 
     for (;;) {
         int choice = menu_run();          /* draws the menu, returns an entry id */
         switch (choice) {
         case MENU_BOOT_EMBLINKOS:
-            boot_emblinkos(image, BOOT_MODE_NORMAL);
-            break;
         case MENU_RECOVERY:
-            boot_emblinkos(image, BOOT_MODE_RECOVERY);
-            break;
-        case MENU_LIVE_DESKTOP:
-            boot_emblinkos(image, 3);
-            break;
         case MENU_DIAGNOSTICS:
-            boot_emblinkos(image, BOOT_MODE_DIAGNOSTICS);
+        case MENU_LIVE_DESKTOP:
+            boot_emblinkos(image,choice==MENU_RECOVERY?BOOT_MODE_RECOVERY:
+                choice==MENU_DIAGNOSTICS?BOOT_MODE_DIAGNOSTICS:
+                choice==MENU_LIVE_DESKTOP?BOOT_MODE_LIVE:BOOT_MODE_NORMAL);        /* never returns */
             break;
         default:
             /* Recovery / Diagnostics / Firmware Update / Boot Manager / Secure

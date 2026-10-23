@@ -18,7 +18,9 @@
       "height": 600,
       "sha256": "f45df8f2e84ba2fb46d6457e2fe1114c08b9af3ce12d8593f9f5c3313b4a73cb",
       "source_capture": "laptop-alpha-battery-uefi.png",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "02-wifi-controls",
@@ -34,7 +36,9 @@
       "height": 600,
       "sha256": "b900eed4304e62239cb83f9cc3b46566e2286065127576450ff49986856d3c3b",
       "source_capture": "wifi-unavailable.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "03-sound-output",
@@ -50,7 +54,9 @@
       "height": 600,
       "sha256": "81f0e4feceafdafc6858e18aa3141e93c9a67b18db756c67fdea821d4dd88919",
       "source_capture": "shot-desktop-controls-sound-before.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "04-sound-muted",
@@ -66,7 +72,9 @@
       "height": 600,
       "sha256": "9284da926b02b516cefa855bca8576d4b8679d6f34ba1085c3cd8fe73b4b45a5",
       "source_capture": "shot-desktop-controls-muted.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "05-sound-volume",
@@ -82,7 +90,9 @@
       "height": 600,
       "sha256": "36a84d154ef2b0c9cb28e9c8886c8f39239e7ab826f09b6ce6470d2f5d3680f7",
       "source_capture": "shot-desktop-controls-sound.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "06-display-brightness",
@@ -98,7 +108,9 @@
       "height": 600,
       "sha256": "88949f208a0dd30798bf85736534a0d2d4492eefb938d69346fea11b1ec2dfeb",
       "source_capture": "shot-desktop-controls-display.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "07-power-preferences",
@@ -114,7 +126,9 @@
       "height": 600,
       "sha256": "1c50d3443140224d35c6a8b8af6d20a26379bb91e0296729c912a2ccbe05be6c",
       "source_capture": "shot-desktop-controls-power.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "08-first-account",
@@ -130,7 +144,9 @@
       "height": 600,
       "sha256": "b7e86313a030a99f07a52118d46565350b318e989f5fe627258c2474b77186e4",
       "source_capture": "session-setup-filled.ppm",
-      "featured": true
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "09-login",
@@ -146,7 +162,9 @@
       "height": 600,
       "sha256": "14abe08f1b06dba2c91afbe25fdde92af4badea8429c8fce4d797ca125925c6e",
       "source_capture": "session-login.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "10-locked",
@@ -162,7 +180,9 @@
       "height": 600,
       "sha256": "ca0ced2a59e2558b09db0f1354151b5fdfb789f26f818394ba32717dc8c50ed3",
       "source_capture": "session-locked.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "11-password-rejected",
@@ -178,7 +198,9 @@
       "height": 600,
       "sha256": "04310a033588b90d0a8c52188d4c486d63ad35cf06b6bba5a87368e0202b5e84",
       "source_capture": "session-wrong-password.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "12-app-switching",
@@ -194,7 +216,9 @@
       "height": 600,
       "sha256": "afbfc497b1487848e70b756ce945d853209b2f5ce9c94ae6daaa4269114f4b2f",
       "source_capture": "session-apps-and-notification.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "13-notifications",
@@ -210,7 +234,9 @@
       "height": 600,
       "sha256": "a4e350caa6a4d08ed3b72c1ef463eb496557218682acd6c258e84bb37c6883ec",
       "source_capture": "notification-center.ppm",
-      "featured": true
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "14-files-home",
@@ -226,7 +252,9 @@
       "height": 600,
       "sha256": "e9b56fb2a07ad361ce6094e6701177fd3ba93feebd99e4eb9dc139a15f8b24ad",
       "source_capture": "files-home.ppm",
-      "featured": true
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "15-wifi-status",
@@ -242,7 +270,9 @@
       "height": 600,
       "sha256": "dc4d8936eb04fe1a0b9923b9b605fb5988296c33c295b4757c9f3d3f7f3a9c5d",
       "source_capture": "shot-progress-wifi.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "16-logout-menu",
@@ -258,7 +288,9 @@
       "height": 600,
       "sha256": "471fe43809c6cfa1903c5daee6e6fd8e171cccb66a17c7183107691a20f846e4",
       "source_capture": "session-logout-menu.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "17-after-logout",
@@ -274,7 +306,9 @@
       "height": 600,
       "sha256": "d4dc214b9e02d4990e7313bbe040e96ec62e5c47f009fef630dac94f08287a35",
       "source_capture": "session-logged-out.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "18-persistent-desktop",
@@ -290,7 +324,9 @@
       "height": 600,
       "sha256": "05f3075d083a2cf3bb3b9e64b95c2d5c169ea606247b1467fba18b7ab6b0b2bd",
       "source_capture": "session-persistent-login.ppm",
-      "featured": true
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "19-recovery-install",
@@ -306,7 +342,9 @@
       "height": 600,
       "sha256": "f1b0feb2f0c9c0fb9c2fb5ea31e6322b8ff48c95071812d667c41e9aa2c46a3c",
       "source_capture": "recovery.ppm",
-      "featured": true
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
     },
     {
       "id": "20-installed-first-boot",
@@ -322,7 +360,389 @@
       "height": 600,
       "sha256": "46091fe8b5fda69ebaa97ff49a485fa955822177f6d2829dd0b6aaa482b1ced4",
       "source_capture": "setup.ppm",
-      "featured": false
+      "featured": false,
+      "milestone": "Pre-merge laptop milestone (c90c478)",
+      "historical": true
+    },
+    {
+      "id": "21-first-account",
+      "phase": "Merged master integration",
+      "title": "First account on the merged desktop",
+      "caption": "Normal UEFI boot reaches first-account setup on a fresh NVMe disk.",
+      "alt": "First account on the merged desktop in EmbLinkOS",
+      "file": "21-first-account.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "603e464e4d1d21b5b8782f7353aaacfb61f59ccebbd421b5eb4452208630bddd",
+      "source_capture": "setup.ppm",
+      "source_sha256": "f42dfd2c22894ff0e541125138431d29f9ead51262b038430cfb41ef6373104f",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "22-account-login",
+      "phase": "Merged master integration",
+      "title": "Password login",
+      "caption": "The newly created account reaches the native login screen.",
+      "alt": "Password login in EmbLinkOS",
+      "file": "22-account-login.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "b28cafe0ed2724387762c83a67f12c4637be0e240f03213a4ba18e9a0ad2ea61",
+      "source_capture": "login.ppm",
+      "source_sha256": "1983b38dc7e69a763cffdb326798d01e6335ca2c259103bc976fe5f7efa2772b",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "23-merged-desktop",
+      "phase": "Merged master integration",
+      "title": "Merged desktop",
+      "caption": "The incoming graphite wallpaper, desktop and dock are preserved.",
+      "alt": "Merged desktop in EmbLinkOS",
+      "file": "23-merged-desktop.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "9e50e00bfb5a89c10b72c6e464634630e7acebd3ed14bfbe624b24d99edfdb9a",
+      "source_capture": "desktop.ppm",
+      "source_sha256": "8d465a87c9405cfa29cf67d409e7e467e209c359d3cddccc9a8d3126cbed675a",
+      "featured": true,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "24-appearance",
+      "phase": "Merged master integration",
+      "title": "Appearance and wallpaper",
+      "caption": "The current Appearance pane retains theme, wallpaper, scale and accent controls.",
+      "alt": "Appearance and wallpaper in EmbLinkOS",
+      "file": "24-appearance.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "8803c7832d62cbdd8e38585cb838d912a2b036b5fadd957c1fcd676015a9fed3",
+      "source_capture": "appearance.ppm",
+      "source_sha256": "d550aa8985be09717efbf156843dbccda1dc26e32d4acd0efa8a7a06311806a1",
+      "featured": true,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "25-merged-wifi",
+      "phase": "Merged master integration",
+      "title": "Wi-Fi status",
+      "caption": "Settings reports that this QEMU machine has no supported Wi-Fi radio. No physical connection is claimed.",
+      "alt": "Wi-Fi status in EmbLinkOS",
+      "file": "25-merged-wifi.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "9b317af3ea2af9d85b8344bdb131db6e3c475640d499a529c085fe4706c8556b",
+      "source_capture": "wifi.ppm",
+      "source_sha256": "90efcc093a40e53b2d7b6027800772a8832fc0fa578fa33154ad4cbb0a004729",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "26-hda-output",
+      "phase": "Merged master integration",
+      "title": "HDA output",
+      "caption": "Settings discovers the emulated Intel HDA output; separate recorded-output tests measure real playback.",
+      "alt": "HDA output in EmbLinkOS",
+      "file": "26-hda-output.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "76cca2da23367f8b953a64e24c7f0a5f0a744d596aa15d60dece82c1ab16f97c",
+      "source_capture": "sound.ppm",
+      "source_sha256": "133d77a1a280df332f61267bca53591f11dc2cf5e40f643202ca3291ac3075c8",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "27-hda-muted",
+      "phase": "Merged master integration",
+      "title": "Mute applied",
+      "caption": "Pointer input enables mute, verified against the kernel audio state.",
+      "alt": "Mute applied in EmbLinkOS",
+      "file": "27-hda-muted.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "714532645e6a9888d5c52621f2fd3fb1a4264bcea3d8178cf818788ec613ba40",
+      "source_capture": "muted.ppm",
+      "source_sha256": "e6df7f8e27560fa0075f11ce438d2adddd190244ebb8350eea7def4b776f5c60",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "28-hda-volume",
+      "phase": "Merged master integration",
+      "title": "Saved output volume",
+      "caption": "Pointer input changes volume to 49%; the native test verifies kernel state and persistence after reboot.",
+      "alt": "Saved output volume in EmbLinkOS",
+      "file": "28-hda-volume.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "3dbb376bbcdfeab94a4ac0faad20cd3925475eff64d6d664921838a954741b8b",
+      "source_capture": "volume.ppm",
+      "source_sha256": "58c05f19377d98c777c0f49aa1a0e3dd7488aceb380070e487b7a7b1dd8c780d",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "29-merged-display",
+      "phase": "Merged master integration",
+      "title": "Display information",
+      "caption": "Settings reports 1280 × 800 VirtIO display and software rendering.",
+      "alt": "Display information in EmbLinkOS",
+      "file": "29-merged-display.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "c396adf50dcddc28fd58eb94f785d9b4de0244f8e8beb83d0ba899d9eacf9017",
+      "source_capture": "display.ppm",
+      "source_sha256": "74ba24781f07e903a64b11dd8b2a7b59df0845d2918e181603613fe506fbb004",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "30-merged-brightness",
+      "phase": "Merged master integration",
+      "title": "Brightness round trip",
+      "caption": "The synthetic ACPI backlight fixture changes from 60% to 40%; kernel state is checked independently.",
+      "alt": "Brightness round trip in EmbLinkOS",
+      "file": "30-merged-brightness.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "9463923f776117d7a2a7250a2f87757b5559ca82ecae0ee6ca59a76220b1b32b",
+      "source_capture": "brightness.ppm",
+      "source_sha256": "fbf239b8494fbd66b50c3959f201b932e9a09f7a4e9b7e5e4b85b6eaa0d62191",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "31-merged-power",
+      "phase": "Merged master integration",
+      "title": "Battery and power preferences",
+      "caption": "The pane uses synthetic ACPI batteries and lid data; mixed units leave total charge unavailable.",
+      "alt": "Battery and power preferences in EmbLinkOS",
+      "file": "31-merged-power.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "339dbabb831822c64dfb737e6b1f6a8f94318ff363fb6ab69e7a2ea51ec41301",
+      "source_capture": "power.ppm",
+      "source_sha256": "c97d89bbb6ddc4e8abd5b53c08c997be1ed00deddd7dc93ce1bcc1f5694f6572",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "32-keyboard-layouts",
+      "phase": "Merged master integration",
+      "title": "Keyboard settings",
+      "caption": "The incoming keyboard-layout pane remains accessible alongside the added laptop controls.",
+      "alt": "Keyboard settings in EmbLinkOS",
+      "file": "32-keyboard-layouts.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "7144d04171c086b870fe14d125907104fb1123c91f17089ba97517fd2bf101cc",
+      "source_capture": "keyboard.ppm",
+      "source_sha256": "30ed436c11675ba3a39e6cd167fcd86cd2c9fc2d73c101bfdccf4062ec734e72",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "33-notification-banner",
+      "phase": "Merged master integration",
+      "title": "Native notification banner",
+      "caption": "About EmbLink posts a real banner through the existing session notification service.",
+      "alt": "Native notification banner in EmbLinkOS",
+      "file": "33-notification-banner.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "2477f11cd4357069d2cf1c93b0f2e56d30165aa3c4d1e692b60da5846c6ae1bf",
+      "source_capture": "banner.ppm",
+      "source_sha256": "40dfbc7508a7c49640d5ab43113f4cb7ae13315e48f11e1b75c878a1e6ea8741",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "34-notification-history",
+      "phase": "Merged master integration",
+      "title": "Notification history",
+      "caption": "The same session message appears in the new history window.",
+      "alt": "Notification history in EmbLinkOS",
+      "file": "34-notification-history.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "133f89a1cdc777f17d187fc7b676993e59a308b47630416a08b7bbfd995494f1",
+      "source_capture": "notifications.ppm",
+      "source_sha256": "cff9cf3d47bb569ded7cf03ea22a5106deae7118760d64daeea399c7a6c493ac",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "35-merged-lock",
+      "phase": "Merged master integration",
+      "title": "Locked session",
+      "caption": "The native desktop owns the opaque password surface while the kernel gates other windows and input.",
+      "alt": "Locked session in EmbLinkOS",
+      "file": "35-merged-lock.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "2c9b79949f37495f36200a63ec69d8e05fb12aa9222e15b153d2719d5d0ac270",
+      "source_capture": "locked.ppm",
+      "source_sha256": "f2e98c10d3c5829850dbdd7cbc4a6ac2fb1785077f9fb398905bc725b102c54c",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "36-merged-rejection",
+      "phase": "Merged master integration",
+      "title": "Wrong password rejected",
+      "caption": "Authd refuses an incorrect password and the session stays locked.",
+      "alt": "Wrong password rejected in EmbLinkOS",
+      "file": "36-merged-rejection.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "b0af743ce7dc17b977ab450e48e1fd71740970988b5362f5257020b1f88e03ec",
+      "source_capture": "password-rejected.ppm",
+      "source_sha256": "1908f36179cc52aa0e45a13e7ad997013de7c19f3163484834e090d31997a07a",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "37-merged-logout",
+      "phase": "Merged master integration",
+      "title": "Logout reaches login",
+      "caption": "Ending the native session stops its descendants and returns to login.",
+      "alt": "Logout reaches login in EmbLinkOS",
+      "file": "37-merged-logout.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "613c7ed725842ab2cea3014b8932d53ff290f7dab3a746af8e41b7d7b346bbe0",
+      "source_capture": "logged-out.ppm",
+      "source_sha256": "98ae06dbdd2d9a69dc542cbc6c9503a7aef66b5a2bd2891bcc3670f782c77735",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "38-merged-persistence",
+      "phase": "Merged master integration",
+      "title": "Desktop after a separate boot",
+      "caption": "The saved account signs in after a separate NVMe boot; volume preferences survive and cold integrity passes.",
+      "alt": "Desktop after a separate boot in EmbLinkOS",
+      "file": "38-merged-persistence.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": true,
+      "width": 1280,
+      "height": 800,
+      "sha256": "f98c1c2d626b4248f11bb68dc6215e2db2b0c38de7712249c18e8eaa3d3f43e5",
+      "source_capture": "persistent-desktop.ppm",
+      "source_sha256": "a8331ad4663bd4073567cdc650c6396bb5c1248fae3f55ad5d49a539169598df",
+      "featured": true,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "39-merged-recovery",
+      "phase": "Merged master integration",
+      "title": "Recovery installation",
+      "caption": "Read-only recovery verifies and expands a disposable NVMe target while preserving the source image hash.",
+      "alt": "Recovery installation in EmbLinkOS",
+      "file": "39-merged-recovery.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": false,
+      "width": 800,
+      "height": 600,
+      "sha256": "8bda4da10169f71407fd56548a660da667a4bccb9d05085e4606eea99ccce61a",
+      "source_capture": "recovery.ppm",
+      "source_sha256": "f7aa1a5e3f60a2853aa8211ae13cd1dfaee3c2793df9216a3de231992d5d8eba",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
+    },
+    {
+      "id": "40-merged-installed",
+      "phase": "Merged master integration",
+      "title": "Installed disk boots alone",
+      "caption": "The installed disk boots without the source media through native NVMe into account setup.",
+      "alt": "Installed disk boots alone in EmbLinkOS",
+      "file": "40-merged-installed.png",
+      "capture_date": "2026-10-23",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, NVMe",
+      "synthetic_acpi_fixture": false,
+      "width": 800,
+      "height": 600,
+      "sha256": "c88e30344eb8d2249c5b4495e89f2c821186fd7b24e0e319158c080a58e49ac9",
+      "source_capture": "setup.ppm",
+      "source_sha256": "55c55d416a019148ad174826ca3d31c727e9ce5e68c11e075181a678c60c1a82",
+      "featured": false,
+      "milestone": "Integration with master a281865",
+      "historical": false
     }
   ]
 }

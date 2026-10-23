@@ -2,6 +2,7 @@
  * ui/declare primitives and pulls every dimension/colour from ui/theme. */
 
 #include "kit.h"
+#include "font.h"      /* glyph advances: a caret has to know where it is */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -378,30 +379,723 @@ void ui_text_field_emphasis(unsigned start, unsigned len) {
     g_emph_start = start; g_emph_len = len; g_emph_on = (len > 0);
 }
 
+/* KEYBOARD FOCUS TRAVERSAL -- Tab moves to the next field.
+ *
+ * A form you can only fill by clicking each field is not usable from the
+ * keyboard, and the login screen is exactly such a form. Immediate mode has no
+ * list of focusable widgets to walk, so traversal is built from what it does
+ * have: the order fields are emitted in, which IS the reading order.
+ *
+ *   Tab in the focused field  -> the NEXT field emitted this frame takes focus,
+ *                                and whatever was typed after the Tab goes to it
+ *   Tab in the LAST field     -> next frame, the FIRST field takes focus (wrap)
+ *
+ * Per-frame state, reset when ui_frame_serial() moves. */
+static uint64_t g_trav_frame;
+static bool     g_tab_pending;            /* hand focus to the next field emitted */
+static bool     g_focus_first;            /* wrapped: the first field of this frame takes it */
+static bool     g_seen_field;             /* a field has been emitted this frame */
+static char     g_carry[32];              /* keys typed after the Tab, for the next field */
+static int      g_carry_n;
+static bool     g_autofocus_next;         /* see ui_text_field_autofocus */
+
+void ui_text_field_autofocus(void) { g_autofocus_next = true; }
+
+/* --- THE CARET -----------------------------------------------------------
+ *
+ * Until this existed a text field in this system could only be APPENDED to.
+ * Typing went on the end, backspace came off the end, and the thing drawn as a
+ * caret was a 2px box emitted after the whole string -- so it was not a cursor,
+ * it was a decoration that happened to sit where the next character would go.
+ * A typo three characters back meant deleting everything after it. Every
+ * filename in the Open/Save panel, every search box, every setting in this OS
+ * was edited that way.
+ *
+ * ONE CARET, NOT ONE PER FIELD, because only the focused field can have one and
+ * exactly one field is focused. It is anchored to the BUFFER, not to the
+ * widget's instance handle: a field is identified by the text it edits, which
+ * is stable across frames by construction and survives the field moving in the
+ * tree -- where an instance handle need not. Focus a different field and the
+ * caret adopts it, at the end of its text, which is where someone clicking into
+ * a field to add to it expects to be.
+ *
+ * BYTES, NOT CHARACTERS. The stream is UTF-8 (kernel/drivers/input/keyboard.c),
+ * so the offset is a byte offset that is always kept on a character boundary --
+ * a caret between the two bytes of an é is a caret that can split it in half. */
+/* The focused field's rect, for anything outside the kit that has to aim at it
+ * -- the DSL's right-click menu asks whether a click landed in the field that
+ * would receive its commands. Kept here because this is the only place that
+ * knows which field is focused AND where it ended up on screen. */
+static float g_focus_rect[4];
+static int   g_focus_rect_ok;
+int ui_focused_field_rect(float *x, float *y, float *w, float *h) {
+    if (!g_focus_rect_ok) return 0;
+    if (x) *x = g_focus_rect[0];
+    if (y) *y = g_focus_rect[1];
+    if (w) *w = g_focus_rect[2];
+    if (h) *h = g_focus_rect[3];
+    return 1;
+}
+
+static char    *g_caret_buf;              /* whose caret g_caret is */
+static unsigned g_caret;                  /* byte offset into it */
+
+/* THE SELECTION is an ANCHOR plus the caret, not a start and an end.
+ *
+ * The anchor is where the selection was begun and the caret is where it has
+ * been dragged to, so the caret can be on either side of it -- which is the
+ * whole behaviour of shift-arrowing left past your starting point and back
+ * again. Storing a start and an end instead loses which end is moving, and a
+ * selection that cannot shrink from the side you grew it is one people
+ * immediately notice. `anchor == caret` means there is no selection. */
+static unsigned g_anchor;
+
+static unsigned sel_lo(void) { return g_anchor < g_caret ? g_anchor : g_caret; }
+static unsigned sel_hi(void) { return g_anchor < g_caret ? g_caret : g_anchor; }
+static bool     has_sel(void) { return g_anchor != g_caret; }
+
+static int (*g_clip_set)(const char *, unsigned);
+static int (*g_clip_get)(char *, unsigned);
+
+void ui_clipboard_provider(int (*set)(const char *, unsigned),
+                           int (*get)(char *, unsigned)) {
+    g_clip_set = set; g_clip_get = get;
+}
+int ui_clipboard_set(const char *buf, unsigned len) {
+    return g_clip_set ? g_clip_set(buf, len) : 0;
+}
+int ui_clipboard_get(char *buf, unsigned cap) {
+    return g_clip_get ? g_clip_get(buf, cap) : 0;
+}
+
+static unsigned (*g_mods_fn)(void);
+void     ui_mods_provider(unsigned (*fn)(void)) { g_mods_fn = fn; }
+unsigned ui_mods(void) { return g_mods_fn ? g_mods_fn() : 0u; }
+
+static uint64_t (*g_now_ms)(void);
+void     ui_clock_provider(uint64_t (*now)(void)) { g_now_ms = now; }
+uint64_t ui_now_ms(void) { return g_now_ms ? g_now_ms() : 0; }
+
+/* MULTI-CLICK, counted here so the single-line field and the DSL's multi-line
+ * editor agree about what a double-click is rather than each inventing a
+ * threshold.
+ *
+ * Both a TIME and a DISTANCE bound: two presses far apart on screen are two
+ * clicks however fast they were, and treating them as a double-click would
+ * make a quick correction at the other end of a line select a word you were
+ * not pointing at. 400 ms is the usual figure and 5 px is about as far as a
+ * hand moves while double-clicking deliberately.
+ *
+ * With no clock installed ui_now_ms() is a constant 0, so `now - last` is
+ * always 0 and every press would look like a continuation. Hence the explicit
+ * check: no clock means no multi-click, and single clicks still work. */
+/* 500 ms, not the textbook 400. The window has to cover the WHOLE path from
+ * the button going down to the widget counting it, and on a machine where a
+ * frame costs 77 ms that path is longer than on a desktop -- measured here as
+ * an intermittent failure at 400, where the same deliberate double-click
+ * paired on some runs and not others. 500 is also roughly what macOS ships as
+ * its default, so it is not a number invented to make a test pass. */
+#define UI_MULTICLICK_MS  500
+#define UI_MULTICLICK_PX  5.0f
+static int      g_click_run = 1;
+static uint64_t g_click_at;
+static float    g_click_x, g_click_y;
+
+int ui_click_run(void) { return g_click_run; }
+
+int ui_click_note(float x, float y) {
+    /* THE TIME THE PRESS WAS MADE, if the event loop knows it, and only
+     * otherwise the time right now. A press can arrive later than it happened
+     * -- the compositor replays clicks an app was too busy to see, one per
+     * poll -- so timing them by arrival measures the app's frame rate rather
+     * than the person's hand, and a slow app could never be double-clicked.
+     * Measured before this: two clicks 130 ms apart arrived 3.5 s apart. */
+    uint64_t ev = ui_pointer_time();
+    uint64_t now = ev ? ev : ui_now_ms();
+    float dx = x - g_click_x, dy = y - g_click_y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    if (g_now_ms && g_click_at && now - g_click_at <= UI_MULTICLICK_MS &&
+        dx <= UI_MULTICLICK_PX && dy <= UI_MULTICLICK_PX)
+        g_click_run++;
+    else
+        g_click_run = 1;
+    g_click_at = now;
+    g_click_x = x; g_click_y = y;
+    return g_click_run;
+}
+
+/* --- UNDO -----------------------------------------------------------------
+ *
+ * Every text field in this system could be typed into and none could be undone.
+ * Note++ has an undo stack of its own, so the OS's own editor was fine and
+ * every OTHER place text is entered -- the Open/Save filename, a search box,
+ * any setting -- had none: one stray keystroke over a selection and the text
+ * was simply gone.
+ *
+ * RECORDED BY DIFFING, not by instrumenting each edit. The field mutates its
+ * buffer in eight or nine places (typing, backspace, delete, cut, paste,
+ * replacing a selection...), and an undo log that has to be told about each one
+ * is an undo log that will silently miss the next one added. Instead the frame
+ * remembers the text before the keys are applied and compares afterwards: one
+ * place, and every mutation path is covered by construction, including any
+ * written later.
+ *
+ * A RECORD IS A SPLICE: at `pos`, `n_del` bytes went away and `n_ins` arrived.
+ * `data` holds the removed bytes followed by the inserted ones, so one record
+ * runs in both directions and redo is undo with the two swapped. */
+#define UI_UNDO_DEPTH 32
+#define UI_UNDO_ARENA 16384        /* the text the records hold, all together */
+struct ui_edit {
+    uint32_t pos, n_del, n_ins, caret;   /* caret = where it was BEFORE the edit */
+    uint32_t off;                        /* where this record's text sits in the arena */
+    uint64_t at;                         /* for coalescing a run of typing */
+};
+static struct ui_edit g_undo[UI_UNDO_DEPTH];
+static char  g_undo_arena[UI_UNDO_ARENA];
+static uint32_t g_undo_used;   /* bump pointer into the arena */
+static int   g_undo_n;         /* records held */
+static int   g_undo_at;        /* how many are applied; undo walks it down */
+static void *g_undo_owner;     /* whose history this is */
+
+/* AN ARENA, NOT A FIXED PAYLOAD PER RECORD, and that is what lets the
+ * multi-line editor share this. Fixed 64-byte payloads were fine for a
+ * 256-byte path field and wrong for a document: pasting a paragraph is exactly
+ * the edit you most want back, and it was exactly the one that did not fit.
+ *
+ * When the arena fills, the WHOLE history goes rather than the one record that
+ * would not fit -- for the same reason a too-big edit drops it: an undo that
+ * stepped over an edit and applied the one before it would put the buffer into
+ * a state that never existed. */
+static void undo_reset(void *owner) {
+    g_undo_owner = owner; g_undo_n = g_undo_at = 0; g_undo_used = 0;
+}
+void ui_undo_bind(void *owner) { if (g_undo_owner != owner) undo_reset(owner); }
+int  ui_undo_can_undo(void) { return g_undo_at > 0; }
+int  ui_undo_can_redo(void) { return g_undo_at < g_undo_n; }
+
+/* Fold a continuing run of the same kind of edit into the record before it, so
+ * undo takes back a word rather than a letter. Typing "hello" is one thing the
+ * person did, and five undos to remove it is five times as many as anyone
+ * wants. A pause, a move, or a change of direction ends the run. */
+#define UI_UNDO_RUN_MS 900
+
+static void undo_note(const char *before, unsigned blen,
+                      const char *after, unsigned alen, unsigned caret_before) {
+    /* The changed span: everything between the common head and the common tail. */
+    unsigned p = 0;
+    while (p < blen && p < alen && before[p] == after[p]) p++;
+    unsigned s = 0;
+    while (s < blen - p && s < alen - p &&
+           before[blen - 1 - s] == after[alen - 1 - s]) s++;
+    unsigned n_del = blen - p - s, n_ins = alen - p - s;
+    if (!n_del && !n_ins) return;                     /* nothing happened */
+
+    if (n_del + n_ins > UI_UNDO_ARENA) {
+        /* One edit larger than the whole arena. Dropping the HISTORY rather
+         * than the record: an undo that skipped one edit and applied the one
+         * before it would put the buffer into a state that never existed. */
+        undo_reset(g_undo_owner);
+        return;
+    }
+
+    uint64_t now = ui_now_ms();
+    /* Continuing a run: same direction, adjacent, and recent. */
+    if (g_undo_at > 0 && g_undo_at == g_undo_n) {
+        struct ui_edit *e = &g_undo[g_undo_at - 1];
+        int typing  = (n_del == 0 && e->n_del == 0 && p == (unsigned)(e->pos + e->n_ins));
+        int erasing = (n_ins == 0 && e->n_ins == 0 && p + n_del == (unsigned)e->pos);
+        /* Extending the newest record in place, which is only safe because it
+         * is the LAST thing in the arena -- nothing sits after it to overwrite. */
+        int is_last = (e->off + e->n_del + e->n_ins == g_undo_used);
+        if ((typing || erasing) && is_last && now - e->at <= UI_UNDO_RUN_MS &&
+            g_undo_used + n_del + n_ins <= UI_UNDO_ARENA) {
+            char *d = g_undo_arena + e->off;
+            if (typing) {
+                for (unsigned i = 0; i < n_ins; i++)
+                    d[e->n_del + e->n_ins + i] = after[p + i];
+                e->n_ins += n_ins;
+            } else {
+                /* Erasing backwards: the newly removed bytes belong BEFORE the
+                 * ones already recorded, and the splice starts further left. */
+                for (int i = (int)e->n_del - 1; i >= 0; i--) d[i + n_del] = d[i];
+                for (unsigned i = 0; i < n_del; i++) d[i] = before[p + i];
+                e->n_del += n_del;
+                e->pos    = p;
+            }
+            g_undo_used += n_del + n_ins;
+            e->at = now;
+            return;
+        }
+    }
+
+    /* A new edit invalidates anything that was undone: you cannot redo a future
+     * that no longer follows from the present. */
+    /* Out of room in either dimension: start again rather than keep a history
+     * with a hole in it. The person loses the ability to go further back, not
+     * the ability to trust what undo does. */
+    if (g_undo_at == UI_UNDO_DEPTH || g_undo_used + n_del + n_ins > UI_UNDO_ARENA)
+        undo_reset(g_undo_owner);
+
+    struct ui_edit *e = &g_undo[g_undo_at];
+    e->pos = p; e->n_del = n_del; e->n_ins = n_ins;
+    e->caret = caret_before; e->at = now;
+    e->off = g_undo_used;
+    for (unsigned i = 0; i < n_del; i++) g_undo_arena[e->off + i] = before[p + i];
+    for (unsigned i = 0; i < n_ins; i++) g_undo_arena[e->off + n_del + i] = after[p + i];
+    g_undo_used += n_del + n_ins;
+    g_undo_at++;
+    g_undo_n = g_undo_at;
+}
+
+/* Apply one record forwards (redo) or backwards (undo). Returns the new length,
+ * and writes the caret to leave behind. */
+static unsigned undo_apply(struct ui_edit *e, char *buf, unsigned len,
+                           unsigned long cap, int backwards, unsigned *out_caret) {
+    unsigned take = backwards ? e->n_ins : e->n_del;   /* what is there now */
+    unsigned put  = backwards ? e->n_del : e->n_ins;   /* what replaces it */
+    const char *src = g_undo_arena + e->off + (backwards ? 0 : e->n_del);
+    if (e->pos + take > len) return len;               /* buffer moved under us */
+    if (len - take + put >= cap) return len;
+    memmove(buf + e->pos + put, buf + e->pos + take, len - e->pos - take + 1);
+    for (unsigned i = 0; i < put; i++) buf[e->pos + i] = src[i];
+    len = len - take + put;
+    buf[len] = 0;
+    *out_caret = backwards ? e->caret : (unsigned)(e->pos + put);
+    return len;
+}
+
+/* --- the undo log, for editors outside the kit -----------------------------
+ *
+ * ui/dsl/em.c's multi-line editor shares this rather than growing a second
+ * one. It has the same shape of problem and would reach the same answers, and
+ * two undo logs in one toolkit is one more than anybody wants to reason about
+ * when they disagree. */
+void ui_undo_note(const char *before, unsigned blen,
+                  const char *after, unsigned alen, unsigned caret_before) {
+    undo_note(before, blen, after, alen, caret_before);
+}
+
+/* Step the buffer one record back (or forward). Returns 1 if anything moved,
+ * and writes the new length and where the caret should sit. */
+int ui_undo_step(int forward, char *buf, unsigned *len, unsigned long cap,
+                 unsigned *caret) {
+    if (!forward) {
+        if (g_undo_at <= 0) return 0;
+        *len = undo_apply(&g_undo[g_undo_at - 1], buf, *len, cap, 1, caret);
+        g_undo_at--;
+    } else {
+        if (g_undo_at >= g_undo_n) return 0;
+        *len = undo_apply(&g_undo[g_undo_at], buf, *len, cap, 0, caret);
+        g_undo_at++;
+    }
+    if (*caret > *len) *caret = *len;
+    return 1;
+}
+
+/* WHAT COUNTS AS A WORD. A run of letters, digits and underscore, or a run of
+ * anything else that is not a space -- so double-clicking in `foo_bar(baz)`
+ * gives you `foo_bar`, and double-clicking the `(` gives you the punctuation
+ * run rather than the whole line.
+ *
+ * Every byte >= 0x80 is a word byte: it is part of a multi-byte character, and
+ * this OS's fields hold real languages. Treating them as punctuation would cut
+ * "café" in two. */
+static bool word_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c >= 0x80;
+}
+
+/* The word around `pos`, as [*lo, *hi). Stops at either end of [start, end). */
+void ui_word_bounds(const char *s, unsigned start, unsigned end, unsigned pos,
+                    unsigned *lo, unsigned *hi) {
+    if (pos > end) pos = end;
+    if (pos < start) pos = start;
+    /* A caret sitting just after a word belongs to that word -- it is where a
+     * double-click at the end of one puts you. */
+    unsigned p = pos;
+    if (p == end && p > start) p--;
+    else if (p < end && s[p] == ' ' && p > start && s[p - 1] != ' ') p--;
+
+    if (p >= end || s[p] == ' ') { *lo = *hi = pos; return; }   /* in whitespace */
+
+    bool w = word_byte((unsigned char)s[p]);
+    unsigned a = p, b = p;
+    while (a > start && s[a - 1] != ' ' &&
+           word_byte((unsigned char)s[a - 1]) == w) a--;
+    while (b < end && s[b] != ' ' && word_byte((unsigned char)s[b]) == w) b++;
+    *lo = a; *hi = b;
+}
+
+/* Continuation bytes are 10xxxxxx: never a character's first byte. */
+static bool cp_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+
+static unsigned utf8_back(const char *s, unsigned i) {
+    if (i == 0) return 0;
+    i--;
+    while (i > 0 && cp_cont(s[i])) i--;
+    return i;
+}
+static unsigned utf8_fwd(const char *s, unsigned len, unsigned i) {
+    if (i >= len) return len;
+    i++;
+    while (i < len && cp_cont(s[i])) i++;
+    return i;
+}
+
+/* Width of the first `nbytes` of `s`. Steps the string with the RENDERER's own
+ * decoder -- anything that measures text differently from the way it is drawn
+ * puts the caret somewhere the glyphs are not. */
+float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nbytes) {
+    if (!s || !*s || nbytes == 0) return 0.0f;
+    struct font *f = font_for_handle(font_handle);
+    if (!f) return 0.0f;
+    unsigned limit = nbytes < 0 ? (unsigned)-1 : (unsigned)nbytes;
+    float w = 0;
+    for (unsigned i = 0; s[i] && i < limit; ) {
+        uint32_t cp;
+        int adv = font_utf8_decode(s + i, &cp);
+        if (adv <= 0) break;
+        struct glyph_cache_entry *e =
+            glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
+        if (e) w += e->advance_px;
+        i += (unsigned)adv;
+    }
+    return w;
+}
+
+/* The character boundary nearest `x`, measured from the text's left edge.
+ * NEAREST, not "the one it landed inside": clicking the right half of a letter
+ * must put the caret AFTER it, which is what everyone means by pointing between
+ * two characters. */
+static unsigned caret_from_x(const char *s, unsigned len, uint32_t font,
+                             float size_px, float dx) {
+    if (dx <= 0) return 0;
+    float prev = 0;
+    for (unsigned i = 0; i < len; ) {
+        unsigned nx = utf8_fwd(s, len, i);
+        float w = ui_text_width_n(font, size_px, s, (int)nx);
+        if (dx < (prev + w) * 0.5f) return i;
+        prev = w;
+        i = nx;
+    }
+    return len;
+}
+
+static void trav_new_frame(void) {
+    uint64_t f = ui_frame_serial();
+    if (f == g_trav_frame) return;
+    g_trav_frame = f;
+    if (g_tab_pending) {                  /* Tab in the last field last frame: wrap */
+        g_tab_pending = false;
+        g_focus_first = true;
+    }
+    g_seen_field = false;
+}
+
 static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool masked) {
     const struct ui_theme *t = TH;
     bool     emph  = g_emph_on;
     unsigned emph_s = g_emph_start, emph_n = g_emph_len;
     g_emph_on = false;                    /* consumed, whether or not it is used */
+    bool autofocus = g_autofocus_next;
+    g_autofocus_next = false;             /* one-shot, like the emphasis */
+    trav_new_frame();
+    bool first = !g_seen_field;
+    g_seen_field = true;
+
     ui_box_begin(0);
     struct instance_handle self = ui_open();
-    if (ui_consume_click(self)) ui_request_focus(self);
+    bool clicked = ui_consume_click(self);
+    if (clicked) ui_request_focus(self);
+    /* How this field came by focus decides where its keys come from. The typed
+     * queue is the FRAME's, not consumed per field: a field Tabbed into in the
+     * same frame must take only what followed the Tab (the carry) -- taking the
+     * queue again would replay everything, the Tab included, and bounce focus
+     * down the whole form. A field wrapped into on the NEXT frame takes the
+     * carry and then that frame's queue, which is new. */
+    enum { OWN_QUEUE, CARRY_ONLY, CARRY_THEN_QUEUE } keys = OWN_QUEUE;
+    if (g_tab_pending) {                  /* the previous field was Tabbed out of */
+        g_tab_pending = false;
+        ui_request_focus(self);
+        keys = CARRY_ONLY;
+    } else if (first && g_focus_first) {  /* wrapped around from the last field */
+        g_focus_first = false;
+        ui_request_focus(self);
+        keys = CARRY_THEN_QUEUE;
+    } else if (autofocus && !ui_any_focus()) {
+        ui_request_focus(self);           /* a form that opens ready to type */
+    }
     bool focused = ui_has_focus(self);
 
-    /* while focused, apply this frame's typed characters in place */
+    /* THE CARET FOLLOWS FOCUS, and a click puts it where the pointer is.
+     *
+     * The well's rect is last frame's geometry, which is exactly right: the
+     * click being handled happened over what was on screen then. The text
+     * starts one left padding in -- the same t->sp3 set on this box a few lines
+     * below, read here rather than guessed.
+     *
+     * A masked field gets the caret at the end wherever you click it: the
+     * glyphs are asterisks, so an offset measured against them would be an
+     * offset into a string that is not the one being edited. */
+    unsigned len = (unsigned)strlen(buf);
     if (focused) {
-        char in[32];
-        int n = ui_input_take(in, (int)sizeof in);
-        unsigned long len = strlen(buf);
-        for (int i = 0; i < n; i++) {
-            char c = in[i];
-            if (c == '\b') { if (len > 0) buf[--len] = 0; }
-            else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
-            else if (c == '\t') { /* single-line: no tab traversal yet */ }
-            else if ((unsigned char)c >= 32 && (unsigned char)c < 127 && len + 1 < cap) {
-                buf[len++] = c; buf[len] = 0;
+        { float fx, fy, fw, fh;
+          g_focus_rect_ok = ui_open_rect(&fx, &fy, &fw, &fh);
+          if (g_focus_rect_ok) { g_focus_rect[0] = fx; g_focus_rect[1] = fy;
+                                 g_focus_rect[2] = fw; g_focus_rect[3] = fh; } }
+        if (g_caret_buf != buf) {
+            g_caret_buf = buf; g_caret = len; g_anchor = len;
+            undo_reset(buf);          /* a different field has a different past */
+        }
+        if (g_caret > len) g_caret = len;
+        if (g_anchor > len) g_anchor = len;
+        /* The app may have rewritten the buffer under us (the file panel fills
+         * the name field when you click a file). Never leave the caret inside a
+         * character. */
+        while (g_caret > 0 && g_caret < len && cp_cont(buf[g_caret])) g_caret--;
+        while (g_anchor > 0 && g_anchor < len && cp_cont(buf[g_anchor])) g_anchor--;
+
+        if (clicked) {
+            float rx, ry, rw, rh, px, py;
+            if (!masked && ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
+                ui_pointer_pos(&px, &py);
+                (void)ry; (void)rh; (void)py;
+                g_caret = caret_from_x(buf, len, t->font_regular, t->text_body,
+                                       px - (rx + t->sp3));
+            } else {
+                g_caret = len;
+            }
+            /* SHIFT-CLICK EXTENDS from where the selection already starts,
+             * rather than beginning a new one -- the way you select a long run
+             * without dragging across it. The anchor is left exactly where it
+             * was and only the caret moves, which is the same rule the drag
+             * follows. Without an anchor to extend from (nothing selected and
+             * the caret elsewhere), the previous caret IS the anchor. */
+            int shift = (ui_mods() & UI_MOD_SHIFT) != 0;
+            if (!shift) g_anchor = g_caret;
+
+            /* HOW MANY presses landed, not whether one did.
+             *
+             * ui_consume_click answers a yes/no, and the declare layer's
+             * `g_clicked` remembers only the LAST instance pressed -- so two
+             * clicks that both land between two build frames are one `true`
+             * here, and a double-click made faster than the app renders was
+             * counted as a single click. Every layer below this one carried the
+             * pair faithfully (the driver queues press events, the compositor
+             * queues clicks, each with the time it happened); this was where
+             * the second one was dropped. ui_take_press_edges is the count that
+             * layer keeps for exactly this reason.
+             *
+             * They are all at the same spot and the same instant, so noting
+             * each in turn walks the run up: two edges make a double-click. */
+            float cx, cy; ui_pointer_pos(&cx, &cy);
+            int edges = ui_take_press_edges();
+            if (edges < 1) edges = 1;
+            int run = 1;
+            for (int e = 0; e < edges; e++) run = ui_click_note(cx, cy);
+            if (shift) {
+                /* A shift-click is never a double-click: it is a deliberate
+                 * second click somewhere else, and counting it would turn an
+                 * extend into a word-select. */
+            } else if (run == 2 && !masked) {
+                unsigned lo, hi;
+                ui_word_bounds(buf, 0, len, g_caret, &lo, &hi);
+                g_anchor = lo; g_caret = hi;
+            } else if (run >= 3) {
+                g_anchor = 0; g_caret = len;
             }
         }
+
+        /* A DRAG SELECTS, which is how nearly everyone selects text and what
+         * the keyboard-only version was missing.
+         *
+         * ui_is_active() is POINTER CAPTURE: true from the press on this field
+         * until the button comes back up, even once the pointer has slid off
+         * the field entirely. That is the behaviour worth having -- dragging
+         * past the end of a field keeps extending the selection to the end
+         * instead of stopping dead the moment you leave the box, which is what
+         * ui_is_pressed() would have given.
+         *
+         * Only the caret moves; the anchor was planted by the press above, and
+         * leaving it alone is the whole of what makes this a selection. */
+        /* ...but NOT while the current press is a double or triple click. The
+         * drag block runs on the press frame too (the button is down), so
+         * without this it immediately re-collapsed the caret onto the pointer
+         * and the word a double-click had just selected lasted no frames at
+         * all. A multi-click owns its selection until the next press. */
+        if (!masked && ui_click_run() == 1 && ui_is_active()) {
+            float rx, ry, rw, rh, px, py;
+            if (ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
+                ui_pointer_pos(&px, &py);
+                (void)ry; (void)rh; (void)py;
+                g_caret = caret_from_x(buf, len, t->font_regular, t->text_body,
+                                       px - (rx + t->sp3));
+            }
+        }
+    }
+
+    /* while focused, apply this frame's typed characters in place -- first
+     * whatever the field before this one saw typed after a Tab */
+    if (focused) {
+        char in[64];
+        int n = 0;
+        if (keys != OWN_QUEUE) {
+            memcpy(in, g_carry, (size_t)g_carry_n);
+            n = g_carry_n;
+            g_carry_n = 0;
+        }
+        if (keys != CARRY_ONLY)
+            n += ui_input_take(in + n, (int)sizeof in - n);
+
+        /* THE TEXT AS IT WAS, for the undo log to diff against once this
+         * frame's keys have been applied. 512 bytes covers every field in the
+         * system (the widest is a 256-byte path); a buffer beyond it simply
+         * gets no history rather than a wrong one. */
+        char undo_before[512];
+        unsigned undo_blen = len, undo_bcaret = g_caret;
+        int undo_track = (n > 0 && len < sizeof undo_before);
+        if (undo_track) { memcpy(undo_before, buf, len); undo_before[len] = 0; }
+        else if (n > 0) undo_reset(buf);
+        /* Cut the selection out, leaving the caret where it was. Every edit
+         * that writes goes through this first: typing over a selection, and
+         * backspace or delete with one, all mean "this text goes away". */
+        #define DROP_SEL() do { \
+            if (has_sel()) { \
+                unsigned lo = sel_lo(), hi = sel_hi(); \
+                memmove(buf + lo, buf + hi, len - hi + 1); \
+                len -= hi - lo; \
+                g_caret = g_anchor = lo; \
+            } \
+        } while (0)
+
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)in[i];
+            if (c == UI_KEY_SEL_LEFT)  { g_caret = utf8_back(buf, g_caret); }
+            else if (c == UI_KEY_SEL_RIGHT) { g_caret = utf8_fwd(buf, len, g_caret); }
+            else if (c == UI_KEY_SEL_HOME)  { g_caret = 0; }
+            else if (c == UI_KEY_SEL_END)   { g_caret = len; }
+            else if (c == UI_KEY_SEL_ALL)   { g_anchor = 0; g_caret = len; }
+            else if (c == UI_KEY_COPY || c == UI_KEY_CUT) {
+                /* Nothing selected is not an error and must not clear what is
+                 * already on the clipboard: a mis-aimed copy that wiped it
+                 * would lose the thing you were about to paste. */
+                if (has_sel() && g_clip_set && !masked)
+                    g_clip_set(buf + sel_lo(), sel_hi() - sel_lo());
+                /* A masked field never yields its text -- the point of masking
+                 * it is that it does not appear, and a clipboard is a place it
+                 * would appear. The caret and selection still work; only this
+                 * one operation refuses. */
+                if (c == UI_KEY_CUT && !masked) DROP_SEL();
+            }
+            else if (c == '\b') {
+                /* BACK OVER A WHOLE CHARACTER, not a byte. The stream is UTF-8
+                 * (kernel/drivers/input/keyboard.c), so é is two bytes and
+                 * deleting one of them leaves a half character the renderer
+                 * draws as a replacement box -- one backspace, one visible
+                 * thing removed, is the only behaviour anyone would call
+                 * correct. */
+                if (has_sel()) DROP_SEL();
+                else if (g_caret > 0) {
+                    unsigned p = utf8_back(buf, g_caret);
+                    memmove(buf + p, buf + g_caret, len - g_caret + 1);
+                    len -= g_caret - p;
+                    g_caret = p;
+                }
+                g_anchor = g_caret;
+            }
+            else if (c == UI_KEY_DEL) {
+                /* Delete is backspace's mirror: it takes the character AFTER
+                 * the caret. With an append-only field there was nothing after
+                 * the caret, so this key did nothing at all. */
+                if (has_sel()) DROP_SEL();
+                else if (g_caret < len) {
+                    unsigned nx = utf8_fwd(buf, len, g_caret);
+                    memmove(buf + g_caret, buf + nx, len - nx + 1);
+                    len -= nx - g_caret;
+                }
+                g_anchor = g_caret;
+            }
+            /* A plain arrow COLLAPSES a selection to the edge it moves
+             * toward, rather than moving the caret from wherever it happens to
+             * be. Pressing Left with three words selected means "put me at the
+             * start of them", which is what every editor does and what anyone
+             * who has just selected something and changed their mind expects. */
+            else if (c == UI_KEY_LEFT) {
+                g_caret = has_sel() ? sel_lo() : utf8_back(buf, g_caret);
+                g_anchor = g_caret;
+            }
+            else if (c == UI_KEY_RIGHT) {
+                g_caret = has_sel() ? sel_hi() : utf8_fwd(buf, len, g_caret);
+                g_anchor = g_caret;
+            }
+            else if (c == UI_KEY_HOME)  { g_caret = 0;   g_anchor = 0; }
+            else if (c == UI_KEY_END)   { g_caret = len; g_anchor = len; }
+            else if (c == UI_KEY_UP || c == UI_KEY_DOWN ||
+                     c == UI_KEY_PGUP || c == UI_KEY_PGDN) {
+                /* A one-line field has nowhere vertical to go. Swallowed rather
+                 * than fallen through, so they cannot be mistaken for text. */
+            }
+            else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
+            else if (c == '\t') {
+                /* The rest of this frame's keys belong to the next field. */
+                g_carry_n = 0;
+                for (int k = i + 1; k < n && g_carry_n < (int)sizeof g_carry; k++)
+                    g_carry[g_carry_n++] = in[k];
+                g_tab_pending = true;
+                break;
+            }
+            else if (c == UI_KEY_UNDO || c == UI_KEY_REDO) {
+                /* Undo is applied HERE rather than folded into the diff, and
+                 * then excluded from it below: an undo is not an edit, and a
+                 * log that recorded its own undos could never move backwards. */
+                if (c == UI_KEY_UNDO && g_undo_at > 0) {
+                    unsigned nc = g_caret;
+                    len = undo_apply(&g_undo[g_undo_at - 1], buf, len, cap, 1, &nc);
+                    g_undo_at--;
+                    g_caret = g_anchor = nc > len ? len : nc;
+                } else if (c == UI_KEY_REDO && g_undo_at < g_undo_n) {
+                    unsigned nc = g_caret;
+                    len = undo_apply(&g_undo[g_undo_at], buf, len, cap, 0, &nc);
+                    g_undo_at++;
+                    g_caret = g_anchor = nc > len ? len : nc;
+                }
+                undo_track = 0;            /* not an edit: do not record it */
+                if (undo_blen < sizeof undo_before) {
+                    memcpy(undo_before, buf, len); undo_before[len] = 0;
+                    undo_blen = len;       /* keep the diff below a no-op */
+                }
+            }
+            else if (c == UI_KEY_PASTE) {
+                /* The paste itself is the runtime's (ui/dsl/em_app.c): it holds
+                 * the clipboard and replays it through this same queue, so that
+                 * an app with a key hook -- a terminal, which must never let a
+                 * pasted newline execute anything -- gets a say. What arrives
+                 * here is the replayed text, one character at a time, and the
+                 * first of them replaces the selection like any other typing.
+                 * Swallowed rather than fallen through so the command byte
+                 * itself is never mistaken for text. */
+            }
+            else if ((c >= 32 && c < 127) || c >= 0x80) {
+                /* >= 0x80 is a UTF-8 byte of a real character -- é, €, a
+                 * dead-key composition. Each byte is inserted as it arrives;
+                 * they are contiguous in the queue and the caret advances one
+                 * byte at a time, so a multi-byte character lands intact and in
+                 * order. Rejecting them (the old `< 127` bound) is what made
+                 * every accented character vanish between the keyboard and the
+                 * field. */
+                DROP_SEL();                 /* typing over a selection replaces it */
+                if (len + 1 < cap) {
+                    memmove(buf + g_caret + 1, buf + g_caret, len - g_caret + 1);
+                    buf[g_caret++] = (char)c;
+                    len++;
+                    g_anchor = g_caret;
+                }
+            }
+        }
+        #undef DROP_SEL
+
+        if (undo_track) undo_note(undo_before, undo_blen, buf, len, undo_bcaret);
     }
 
     /* the input well */
@@ -448,22 +1142,60 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         }
         ui_flex_spacer();
     } else {
-        char hidden[128];
-        const char *shown = buf;
-        if (masked) {
-            unsigned long n = strlen(buf);
-            if (n >= sizeof hidden) n = sizeof hidden - 1;
-            for (unsigned long i = 0; i < n; i++) hidden[i] = '*';
-            hidden[n] = 0;
-            shown = hidden;
-        }
-        text_role(t->font_regular, t->text_body, CP(text, t->text), shown);
-        if (focused) {                    /* caret */
-            ui_box_begin(0);
-            ui_set_paint(solid(CP(focus, t->accent)));
-            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-            ui_box_end();
-        }
+        /* THE VALUE, SPLIT AROUND THE CARET.
+         *
+         * The caret used to be a 2px box emitted AFTER the whole string, which
+         * is why it could only ever sit at the end -- the widget had no way to
+         * put it anywhere else, so the field had no way to be edited anywhere
+         * else. Two text runs with the box between them puts it at a real
+         * offset and costs no measurement at all: the layout already knows how
+         * wide the first run is, because it just laid it out.
+         *
+         * A masked field is masked by CHARACTER, not by byte: one asterisk per
+         * character, so an accented password is as long on screen as it is in
+         * the hand. */
+        /* Up to three runs -- before the selection, the selection, after it --
+         * with the caret box emitted at whichever boundary the caret is on.
+         * The highlight is a property of the RUN (ui_set_text_bg) rather than a
+         * rectangle drawn at a computed x, so it lands exactly where layout put
+         * the words and needs no measurement to stay there. */
+        struct color fg = CP(text, t->text);
+        unsigned lo = focused ? sel_lo() : len;
+        unsigned hi = focused ? sel_hi() : len;
+        if (lo > len) lo = len;
+        if (hi > len) hi = len;
+
+        char run[256];
+        /* A masked field is masked by CHARACTER, not by byte: one asterisk per
+         * character, so an accented password is as long on screen as it is in
+         * the hand. */
+        #define EMIT(a, b, selected) do {                                       \
+            unsigned n_ = 0;                                                    \
+            for (unsigned i_ = (a); i_ < (b) && n_ < sizeof run - 1; i_++) {     \
+                if (masked) { if (!cp_cont(buf[i_])) run[n_++] = '*'; }          \
+                else        { run[n_++] = buf[i_]; }                            \
+            }                                                                   \
+            run[n_] = 0;                                                        \
+            if (run[0]) {                                                       \
+                if (selected) ui_set_text_bg(CP(selection, t->selection));      \
+                text_role(t->font_regular, t->text_body, fg, run);              \
+            }                                                                   \
+        } while (0)
+
+        #define CARET() do {                                                    \
+            ui_box_begin(0);                                                    \
+            ui_set_paint(solid(CP(focus, t->accent)));                          \
+            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));                   \
+            ui_box_end();                                                       \
+        } while (0)
+
+        EMIT(0, lo, 0);
+        if (focused && g_caret == lo) CARET();
+        EMIT(lo, hi, 1);
+        if (focused && g_caret == hi && hi != lo) CARET();
+        EMIT(hi, len, 0);
+        #undef EMIT
+        #undef CARET
         ui_flex_spacer();                 /* keep text left-aligned in the well */
     }
     ui_end_stack();
@@ -481,6 +1213,7 @@ struct color ui_ctl_color_(int which, struct color dflt) {
                    : which == UI_CTL_BORDER      ? g_ctl.border
                    : which == UI_CTL_FOCUS       ? g_ctl.focus
                    : which == UI_CTL_TEXT        ? g_ctl.text
+                   : which == UI_CTL_SELECTION   ? g_ctl.selection
                                                  : g_ctl.placeholder;
     return c.a > 0 ? c : dflt;
 }
@@ -497,29 +1230,102 @@ bool ui_password_field(char *buf, unsigned long cap, const char *placeholder) {
 
 static float *g_scroll_ptr;
 
+/* THE SCROLLBAR'S GUTTER, always reserved.
+ *
+ * Reserved rather than overlaid on purpose: a bar that appears only when the
+ * content outgrows the view makes the content REFLOW the moment a list gains a
+ * row, and a list that shuffles sideways as it fills is worse than a few pixels
+ * of empty margin. The gutter is narrow enough to read as margin when there is
+ * nothing in it. */
+#define UI_SCROLLBAR_W 10.0f
+#define UI_THUMB_MIN   28.0f
+
 void ui_scroll_begin(uint64_t key, float viewport_h, float *scroll_y) {
     const struct ui_theme *t = TH;
-    ui_begin_vstack(key);
-    /* wheel over the view scrolls it (40px per notch; wheel up -> content up) */
+    /* OUTER: the content column beside the bar. This is the box the caller's
+     * props land on (em_scroll_ applies them right after this returns), so it
+     * has to be the one that grows and carries the caller's background -- which
+     * is why the scroll offset and the clip live on the inner column instead. */
+    ui_begin_hstack(key);
+    /* wheel anywhere over the view -- bar included -- scrolls it
+     * (40px per notch; wheel up -> content up) */
     float w = ui_take_wheel();
     if (w != 0.0f) *scroll_y -= w * 40.0f;
     if (*scroll_y < 0) *scroll_y = 0;
     ui_set_size(sz_grow(), sz_fixed(viewport_h));
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(0);
+    g_scroll_ptr = scroll_y;
+
+    ui_begin_vstack(0);                 /* the clipped, offset content column */
+    ui_set_size(sz_grow(), sz_grow());
     ui_set_clip_children(true);
     ui_set_scroll_offset(*scroll_y);
     ui_set_spacing(t->sp2);
     ui_set_align(ALIGN_STRETCH);
-    g_scroll_ptr = scroll_y;
 }
+
 void ui_scroll_end(void) {
+    const struct ui_theme *t = TH;
     /* clamp to content using last frame's measured extents (one-frame lag is ok) */
     float content = 0, viewport = 0;
-    if (ui_open_content_extent(&content, &viewport)) {
-        float maxs = content - viewport;
+    int measured = ui_open_content_extent(&content, &viewport);
+    float maxs = 0;
+    if (measured) {
+        maxs = content - viewport;
         if (maxs < 0) maxs = 0;
         if (g_scroll_ptr && *g_scroll_ptr > maxs) { *g_scroll_ptr = maxs; ui_set_scroll_offset(maxs); }
     }
-    ui_end_stack();
+    ui_end_stack();                     /* content column */
+
+    /* THE BAR. Sized from the same extents the clamp above uses, so it cannot
+     * disagree with the thing it describes: the thumb is as much of the track
+     * as the viewport is of the content, and sits as far down as the scroll is
+     * through its range. Below a minimum it stops shrinking -- a one-pixel
+     * thumb on a long document is a bar you can see but not grab. */
+    ui_box_begin(0);
+    struct instance_handle track = ui_open();
+    ui_set_size(sz_fixed(UI_SCROLLBAR_W), sz_grow());
+    ui_set_padding(2, 2, 2, 2);
+
+    if (measured && maxs > 0.5f && viewport > 0) {
+        float frac = viewport / content;
+        if (frac > 1.0f) frac = 1.0f;
+        float th = viewport * frac;
+        if (th < UI_THUMB_MIN) th = UI_THUMB_MIN;
+        if (th > viewport) th = viewport;
+        float pos = (*g_scroll_ptr) / maxs;
+        if (pos < 0) pos = 0;
+        if (pos > 1) pos = 1;
+
+        /* DRAG THE THUMB. Pointer capture (ui_is_active) so a drag that wanders
+         * off the bar keeps scrolling instead of stopping dead -- the same rule
+         * the text selection follows, and for the same reason. */
+        if (ui_is_active()) {
+            float rx, ry, rw, rh, px, py;
+            if (ui_open_rect(&rx, &ry, &rw, &rh) && rh > th) {
+                ui_pointer_pos(&px, &py);
+                (void)rx; (void)rw;
+                float want = (py - ry - th * 0.5f) / (rh - th);
+                if (want < 0) want = 0;
+                if (want > 1) want = 1;
+                *g_scroll_ptr = want * maxs;
+                pos = want;
+            }
+        }
+
+        ui_box_begin(0);
+        ui_set_size(sz_grow(), sz_fixed(th));
+        ui_set_corner_radius(UI_SCROLLBAR_W * 0.5f);
+        ui_set_paint(solid(ui_is_hovered() || ui_is_active()
+                           ? t->text_secondary : t->border_strong));
+        ui_set_offset(0, pos * (viewport - th));
+        ui_box_end();
+    }
+    (void)track;
+    ui_box_end();                       /* track */
+
+    ui_end_stack();                     /* outer */
 }
 
 /* --- overlay / modal ---------------------------------------------------- */

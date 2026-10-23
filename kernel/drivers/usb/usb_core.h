@@ -54,6 +54,12 @@ struct usb_ep_info {
     uint8_t  attr;       // bmAttributes (transfer type in bits 1:0)
     uint16_t mps;
     uint8_t  interval;
+    /* THE PIPE'S JOB, when the device bothered to say. Four bulk endpoints
+     * are otherwise indistinguishable, and UAS has exactly four with four
+     * different meanings; the class-specific "pipe usage" descriptor (type
+     * 0x24) that follows each endpoint is where the device names them.
+     * 0 = the device said nothing, which is every non-UAS endpoint. */
+    uint8_t  pipe_id;    // UAS: 1 command, 2 status, 3 data-in, 4 data-out
 };
 
 struct usb_device {
@@ -62,6 +68,11 @@ struct usb_device {
     void *hc;         // controller-instance state (HCD-owned)
     void *hc_priv;    // per-device HCD state (HCD-owned)
 
+    // WHICH PORT IT IS ON, which nothing needed until a device could LEAVE.
+    // A rescan has to answer two questions -- "is there something new here"
+    // and "is the thing that was here gone" -- and neither is answerable from
+    // a device table that does not record where each device came from.
+    uint8_t port;     // 1-based, 0 = not attached to a root port
     uint8_t addr;     // assigned USB address (0 while defaulting)
     uint8_t speed;    // USB_SPEED_*
     uint8_t ep0_mps;
@@ -72,6 +83,10 @@ struct usb_device {
 
     struct usb_ep_info eps[USB_MAX_ENDPOINTS];
     uint8_t num_eps;
+    /* How many interfaces the configuration declared. The class triple above
+     * is the FIRST interface's; the endpoints are every interface's, because
+     * a CDC device keeps its class on one and its bulk pipes on another. */
+    uint8_t num_ifaces;
 
     // Data-toggle state per endpoint number, one bit each way (owned by the
     // core, used by UHCI/OHCI/EHCI to seed their TDs).
@@ -84,7 +99,6 @@ struct usb_device {
     uint8_t hid_ep;
     uint16_t hid_mps;
     uint8_t prev_keys[6];
-    uint8_t prev_modifiers;
 };
 
 #define USB_HID_KEYBOARD 0
@@ -107,6 +121,25 @@ struct usb_device *usb_alloc_device(const struct usb_hcd_ops *ops,
                                     void *hc, void *hc_priv, uint8_t speed);
 void usb_free_device(struct usb_device *dev);
 
+// The device currently on (controller, port), or NULL. A rescan uses this to
+// tell "something new appeared" from "the same thing is still there".
+struct usb_device *usb_device_on_port(void *hc, uint8_t port);
+
+// THE DEVICE LEFT. Detaches whatever class driver claimed it -- a mass-storage
+// device's block device is unregistered and its filesystems unmounted -- and
+// then frees the slot. Safe to call for a device no class driver claimed.
+void usb_device_gone(struct usb_device *dev);
+
+// How many devices are enumerated right now, for the hot-plug test.
+uint32_t usb_device_count(void);
+
+// A port holding something that would not enumerate. Without this a rescan
+// retries the same failure every half second for the life of the machine --
+// see usb_core.c. Cleared when the port reads disconnected.
+bool usb_port_is_dead(void *hc, uint8_t port);
+void usb_port_mark_dead(void *hc, uint8_t port);
+void usb_port_clear_dead(void *hc, uint8_t port);
+
 // Standard control request helper.
 int usb_control(struct usb_device *dev, uint8_t bmRequestType,
                 uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
@@ -122,5 +155,11 @@ void usb_core_poll(void);
 // type: 2 = bulk, 3 = interrupt; dir_in selects bit7 of the address.
 const struct usb_ep_info *usb_find_ep(struct usb_device *dev,
                                       uint8_t type, bool dir_in);
+
+/* USB Attached SCSI (kernel/drivers/usb/usb_uas.c). Returns false when the
+ * device is not UAS or could not be brought up -- the caller then has BOT to
+ * fall back on, which is the whole reason UAS devices still declare it. */
+bool usb_uas_attach(struct usb_device *dev);
+void usb_uas_detach(struct usb_device *dev);
 
 #endif /* __USB_CORE_H__ */

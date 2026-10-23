@@ -7,6 +7,33 @@ app rather than a command-line program, read
 build mode below (dynamic linking against `libembk.so`) in the context of
 actually writing a UI app; this file is the lower-level reference.
 
+## Where the programs live
+
+One directory per program, and the CATEGORY FOLDER IS THE CLASSIFICATION —
+there is no list anywhere else saying what a thing is:
+
+| Directory | What lives there |
+|-----------|------------------|
+| `user/apps/<name>/` | applications with a user interface |
+| `user/system/<name>/` | what makes the machine boot and log in (`init`, `login`, `setup`) |
+| `user/tools/<name>/` | command-line programs |
+| `user/tests/<name>/` | witnesses the kernel's self-tests spawn |
+| `user/examples/<name>/` | reference programs [the toolkit guide](../docs/EMUI_GUIDE.md) points at |
+
+A program's directory holds everything belonging to it: the source, its
+declared namespace (`.ns`), its capability manifest (`.caps`), its launcher
+entry (`.app`), its build manifest (`.build.ebm`). Nothing else in the tree
+needs to know where a program is — the Makefile's `$(call USER_SRC,<name>)`
+turns a name into a path, and moving a program between categories is moving
+its folder.
+
+Everything else under `user/` is a shared library rather than a program:
+`user/lib/` is the SDK and the newlib port described below, and `user/web/`,
+`user/note/`, `user/photos/`, `user/audio/`, `user/git/`, `user/httpd/`,
+`user/pkg/` and `user/emlibc/` are components more than one program draws on
+(the browser and the photo viewer share `user/web`'s image decoders, for
+instance).
+
 ## Layers
 
 | File | What it is | Who uses it |
@@ -45,9 +72,9 @@ for how the in-kernel loader actually resolves this at process-start time
 [docs/EMUI_GUIDE.md](../docs/EMUI_GUIDE.md) for the app-authoring side:
 `EM_APPLICATION`/`EM_WIDGET` and the component DSL built on top of all this.
 
-`make user/hello.elf` builds the newlib demo; `make user/init.elf` builds the
-freestanding self-test; `make build/v4demo.elf` builds the fullest
-dynamically-linked EmUI reference app.
+`make build/hello.elf` builds the newlib demo; `make build/init.elf` builds the
+freestanding pid 1; `make build/v4demo.elf` builds the fullest
+dynamically-linked EmUI reference app (`user/examples/v4demo/`).
 
 ## printf format support (fixed via a newlib rebuild)
 

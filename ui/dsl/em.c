@@ -179,8 +179,14 @@ static void em_apply_box(EmProps p) {
      * a default (Card, Sidebar, Window...) now pass it through p.background
      * above rather than pre-painting behind this function's back. */
     ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
-    if (p.corner > 0)       ui_set_corner_radius(p.corner);
-    if (p.border > 0)       ui_set_border(p.border, p.border_color.a > 0 ? p.border_color : TH->border);
+    if (em_set(p.corner))   ui_set_corner_radius(em_z(p.corner));
+    /* em_set, not `> 0`, for the reason the paint above spells out at length:
+     * a container that DROPS its border must be able to say so, or the reused
+     * instance keeps last frame's. Same one-way-highlight bug, one prop over --
+     * the dock's sockets light when an app runs and have to go dark when it
+     * exits. `.border = EmZero` is how a caller means no border. */
+    if (em_set(p.border))
+        ui_set_border(em_z(p.border), p.border_color.a > 0 ? p.border_color : TH->border);
     if (p.shadow > 0) {
         const struct ui_theme *t = TH;
         struct ui_shadow_spec s = p.shadow == 1 ? t->shadow_sm : p.shadow == 2 ? t->shadow_md : t->shadow_lg;
@@ -326,7 +332,7 @@ void em_scroll_end_(void) { em_flush(); ui_scroll_end(); }
 typedef enum { PK_NONE, PK_TEXT, PK_ICON, PK_LABEL, PK_BADGE, PK_TAG, PK_AVATAR,
                PK_BANNER, PK_PROGRESS, PK_BUTTON, PK_ICONBTN, PK_TOGGLE, PK_CHECK,
                PK_SLIDER, PK_STEPPER, PK_FIELD, PK_PASSWORD, PK_SEGMENTED, PK_LISTROW,
-               PK_CLOSEBTN, PK_MINBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
+               PK_CLOSEBTN, PK_MINBTN, PK_MAXBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
 
 static struct {
     int active; PKind kind; EmProps props; const char *id;
@@ -360,6 +366,7 @@ static void em_segmented_impl(const char *const *labels, int count, int *b, EmPr
 static bool em_listrow_impl(int cp, const char *title, const char *value, EmProps p, bool *hov);
 static bool em_closebtn_impl(bool *hov);
 static bool em_minbtn_impl(bool *hov);
+static bool em_maxbtn_impl(bool *hov);
 static bool em_search_impl(char *buf, size_t cap, const char *ph, bool *hov);
 static void em_spinner_impl(void);
 static bool em_dropdown_impl(const char *const *labels, int count, int *sel, bool *hov);
@@ -393,11 +400,17 @@ void em_flush(void) {
          * ui_text_field_submitted. */
         case PK_FIELD:    clicked = em_field_impl(P.buf, P.cap, P.str, pr, &hovered);
                           g_field_submit = ui_text_field_submitted(); break;
-        case PK_PASSWORD: clicked = em_password_impl(P.buf, P.cap, P.str, pr, &hovered); break;
+        /* The same edge for a password field. It was never read here, so
+         * .submitted() on a PasswordField was always false -- a sign-in form
+         * could not be finished with Return -- and the unread edge sat in the
+         * kit until the NEXT text field to be emitted reported it as its own. */
+        case PK_PASSWORD: clicked = em_password_impl(P.buf, P.cap, P.str, pr, &hovered);
+                          g_field_submit = ui_text_field_submitted(); break;
         case PK_SEGMENTED:em_segmented_impl(P.labels, P.count, (int *)P.bind, pr); break;
         case PK_LISTROW:  clicked = em_listrow_impl(P.cp, P.str, P.str2, pr, &hovered); break;
         case PK_CLOSEBTN: clicked = em_closebtn_impl(&hovered); break;
         case PK_MINBTN:   clicked = em_minbtn_impl(&hovered); break;
+        case PK_MAXBTN:   clicked = em_maxbtn_impl(&hovered); break;
         case PK_SEARCH:   clicked = em_search_impl(P.buf, P.cap, P.str, &hovered); break;
         case PK_SPINNER:  em_spinner_impl(); break;
         case PK_DROPDOWN: clicked = em_dropdown_impl(P.labels, P.count, (int *)P.bind, &hovered); break;
@@ -616,12 +629,14 @@ EmV em_checkbox(const char *l, bool *b){ EmV v = stage(PK_CHECK); P.str = l; P.b
 EmV em_slider(float *b){ EmV v = stage(PK_SLIDER); P.bind = b; return v; }
 EmV em_stepper(const char *l, int *b, int lo, int hi){ EmV v = stage(PK_STEPPER); P.str = l; P.bind = b; P.lo = lo; P.hi = hi; return v; }
 void em_field_emphasis(unsigned start, unsigned len){ em_flush(); ui_text_field_emphasis(start, len); }
+void em_field_autofocus(void){ em_flush(); ui_text_field_autofocus(); }
 EmV em_text_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_FIELD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_password_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_PASSWORD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_segmented(const char *const *labels, int count, int *b){ EmV v = stage(PK_SEGMENTED); P.labels = labels; P.count = count; P.bind = b; return v; }
 EmV em_listrow(int icon, const char *title, const char *value){ EmV v = stage(PK_LISTROW); P.cp = icon; P.str = title; P.str2 = value; return v; }
 EmV em_close_button(void){ EmV v = stage(PK_CLOSEBTN); P.id = "__em_win_close"; return v; }
 EmV em_min_button(void){ EmV v = stage(PK_MINBTN); P.id = "__em_win_min"; return v; }
+EmV em_max_button(void){ EmV v = stage(PK_MAXBTN); P.id = "__em_win_max"; return v; }
 EmV em_search_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_SEARCH); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_spinner(void){ return stage(PK_SPINNER); }
 EmV em_dropdown(const char *const *labels, int count, int *sel){ EmV v = stage(PK_DROPDOWN); P.labels = labels; P.count = count; P.bind = sel; return v; }
@@ -859,9 +874,56 @@ static void em_stepper_impl(const char *label, int *bind, int lo, int hi, EmProp
     ui_end_stack();
     ui_end_stack();
 }
+/* THE TEXT CONTEXT MENU, which every field gets without asking.
+ *
+ * Right-clicking text did nothing anywhere in this system -- the menu
+ * primitive existed and nothing had ever pointed it at a text field. The items
+ * do not reach into the field: they push the SAME command bytes the keyboard
+ * sends (ui_input_char), so there is exactly one implementation of cut, copy,
+ * paste, select-all and undo, and the menu cannot drift away from what GUI+X
+ * does. It also means the menu works on the multi-line editor for free.
+ *
+ * Only the FOCUSED field draws it, which is also the only field whose rect the
+ * kit knows -- so a window of ten fields emits one menu, not ten. */
+static bool g_fieldmenu_open;
+static float g_fieldmenu_x, g_fieldmenu_y;
+
+static void em_text_menu(void) {
+    float rx, ry, rw, rh, cx, cy;
+    if (!g_fieldmenu_open && ui_focused_field_rect(&rx, &ry, &rw, &rh) &&
+        em_right_peek(&cx, &cy) &&
+        cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh) {
+        em_right_take();
+        g_fieldmenu_open = true;
+        g_fieldmenu_x = cx; g_fieldmenu_y = cy;
+    }
+    if (!g_fieldmenu_open) return;
+
+    ContextMenu(&g_fieldmenu_open, g_fieldmenu_x, g_fieldmenu_y) {
+        /* The shortcut glyphs are the GUI key (U+2318) and shift (U+21E7),
+         * each spelled as its own string so the hex escape cannot run on into
+         * the letter after it -- "\xE2\x8C\x98" "A" is the command glyph and an
+         * A, while "\xE2\x8C\x98A" is one escape too wide and does not compile. */
+        #define CMD_  "\xE2\x8C\x98"
+        #define SHFT_ "\xE2\x87\xA7"
+        if (MenuItemK("Undo",       CMD_ "Z"))        ui_input_char(UI_KEY_UNDO);
+        if (MenuItemK("Redo",       SHFT_ CMD_ "Z"))  ui_input_char(UI_KEY_REDO);
+        MenuSeparator();
+        if (MenuItemK("Cut",        CMD_ "X"))        ui_input_char(UI_KEY_CUT);
+        if (MenuItemK("Copy",       CMD_ "C"))        ui_input_char(UI_KEY_COPY);
+        if (MenuItemK("Paste",      CMD_ "V"))        ui_input_char(UI_KEY_PASTE);
+        MenuSeparator();
+        if (MenuItemK("Select All", CMD_ "A"))        ui_input_char(UI_KEY_SEL_ALL);
+        #undef CMD_
+        #undef SHFT_
+    }
+}
+
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
     (void)p; if (out_hov) *out_hov = false;
-    return ui_text_field(buf, cap, ph);
+    bool f = ui_text_field(buf, cap, ph);
+    if (f) em_text_menu();
+    return f;
 }
 static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
     (void)p; if (out_hov) *out_hov = false;
@@ -1221,8 +1283,8 @@ void em_windowbar_end_(void) { em_flush(); ui_end_stack(); }
 
 /* The standard application title bar (see em.h). Deliberately NOT a variant of
  * WindowBar: WindowBar is the general "put what you like in a bar" container,
- * while this one is a house style with opinions -- lights leading in Mac
- * order, a centred title, a hairline under it -- and the point of a house
+ * while this one is a house style with opinions -- the control cluster
+ * leading, a centred title, a hairline under it -- and the point of a house
  * style is that apps do not get to disagree about it. */
 void em_appbar_(const char *title, EmProps p) {
     em_flush();
@@ -1236,9 +1298,7 @@ void em_appbar_(const char *title, EmProps p) {
     ui_set_border(0, t->border);
     em_apply_box(p);
 
-    /* the lights, leading */
-    em_close_button(); em_flush();
-    em_min_button();   em_flush();
+    em_window_controls();            /* leading: close, minimize, zoom */
 
     /* Title, centred in whatever space is left between the lights and the
      * app's own controls, and the drag zone at the same time -- so the bar is
@@ -1274,22 +1334,42 @@ void em_drag_handle_(EmProps p) {
 }
 void em_drag_handle_end_(void) { em_flush(); ui_end_stack(); }
 
-/* ---- window controls: traffic lights ------------------------------------ *
- * Colour IS the affordance, which is the whole point of the Mac design: red
- * means this window goes away, green means it comes back. That reads instantly
- * and at any size, where two identical grey pills distinguished only by a tiny
- * glyph do not -- you had to look at the symbol to know which was which.
+/* ---- window controls: the three lights ----------------------------------- *
  *
- * So the glyph is only shown on hover, and the resting state is pure colour.
- * The visible dot is small (13px, Mac's is 12) but the CONTROL is 24px: the
- * case is deliberately larger than the dot and completely transparent, so
- * Fitts' law is satisfied by the hit area while the eye sees a small tidy
- * light. That separation is why an oversized case is correct here -- it just
- * has to be invisible, and the dot has to be genuinely centred in it. */
+ * ROUND LIGHTS, because the shape is right: colour is legible at any size and
+ * from the corner of your eye, where a row of grey glyph-boxes is not. That is
+ * the Mac's insight and it is worth keeping.
+ *
+ * What is NOT kept is the rest of the Mac's version, and what replaces it is
+ * meant to be better rather than merely different:
+ *
+ *   * THE GLYPH IS ALWAYS DRAWN. The Mac shows its symbols only under the
+ *     pointer, which it can afford because a generation already knows which
+ *     colour does what. Nobody knows ours. A light that says what it does at
+ *     rest is strictly more useful, and the cost -- a little ink inside the
+ *     dot -- is one the design can pay.
+ *   * OUR PALETTE, NOT RED / AMBER / GREEN. Close is the danger tone, zoom is
+ *     the ACCENT (the one colour this OS spends boldness on, theme.h), and
+ *     minimize is a quiet slate. Two loud dots per window plus a neutral is a
+ *     calmer corner than three loud ones, and the accent ties the window's
+ *     controls to every other live thing on screen -- a running app's dock
+ *     socket carries the same colour.
+ *   * THE ZOOM LIGHT IS A DOOR, NOT A TOGGLE. Resting on it opens a small
+ *     board of PLACEMENTS -- halves, the work area, the whole display -- so
+ *     "make this bigger" stops being one guess about what you meant. See
+ *     em_zoom_board().
+ *
+ * The dot is 13px inside a 24px hit case: the case is deliberately larger than
+ * the light and completely transparent, so Fitts' law is satisfied by the hit
+ * area while the eye sees a small tidy light. */
 #define TL_DOT  13
 #define TL_HIT  24
 
-static bool em_light_impl(int cp, Color base, bool *out_hov) {
+/* The ink inside a light. Dark on the light dots, so it reads as a hole in the
+ * colour rather than as a second colour. */
+static Color tl_ink(void) { return (Color){ 0.f, 0.f, 0.f, 0.62f }; }
+
+static bool em_light_impl(int cp, Color base, bool *out_hov, float *out_rect) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
@@ -1301,28 +1381,280 @@ static bool em_light_impl(int cp, Color base, bool *out_hov) {
 
     ui_box_begin(1);
     ui_set_size(sz_fixed(TL_DOT), sz_fixed(TL_DOT));
-    ui_set_paint(solid(pressed ? shade(base, 0.80f) : hov ? shade(base, 1.10f) : base));
+    ui_set_paint(solid(pressed ? shade(base, 0.80f) : hov ? shade(base, 1.12f) : base));
     ui_set_corner_radius((float)TL_DOT / 2.0f);
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
-    /* the symbol appears only under the pointer -- at rest the colour says it */
-    if (hov) { EmProps ip = { .font = Caption, .color = { 0.f, 0.f, 0.f, 0.68f } };
-               em_icon_impl(cp, ip); }
+    { EmProps ip = { .font = Caption, .color = tl_ink() }; em_icon_impl(cp, ip); }
     ui_box_end();
 
     ui_end_stack();
+    /* Last frame's arranged geometry of the hit case -- what the zoom board
+     * hangs from. Read AFTER the box is closed, which is fine: the handle
+     * names a retained instance, not a stack position. */
+    if (out_rect) {
+        float x, y, w, h;
+        out_rect[0] = out_rect[1] = out_rect[2] = out_rect[3] = 0.f;
+        if (ui_rect_of(self, &x, &y, &w, &h)) {
+            out_rect[0] = x; out_rect[1] = y; out_rect[2] = w; out_rect[3] = h;
+        }
+    }
     return ui_consume_click(self);
 }
 
-/* #FF5F57 / #28C840 -- close is red, minimize green, as asked. */
+/* ---- the zoom board ------------------------------------------------------ *
+ *
+ * Six placements, drawn as six little SCREENS with the window's share filled
+ * in. Pictures rather than words because the answer to "where will it go" is a
+ * shape, and a shape is what the eye is asking; each still carries its name
+ * underneath, because a picture 44px wide can be guessed wrong.
+ *
+ * It opens on HOVER and closes when the pointer leaves both the light and the
+ * board -- with a margin, so crossing the gap between them does not dismiss
+ * the thing you are reaching for. It lives inside the window's own surface (an
+ * app cannot paint outside its window), which is why it hangs BELOW the light
+ * rather than above it. */
+static int      g_zoom_open;
+static float    g_zoom_rect[4];        /* last frame's board rect, for hit-testing */
+static int      g_zoom_have_rect;
+static float    g_zoom_anchor_x, g_zoom_anchor_y;
+static float    g_zoom_light[4];       /* the light's own rect, in window coords */
+
+/* One placement tile: a screen with the window's share filled. `cols`/`rows`
+ * say how the screen is split and `on` which cell the window takes; `inset`
+ * draws the bar and dock as the strips the window does NOT cover. */
+static bool em_zoom_tile(const char *label, int cols, int rows, int on, int inset) {
+    const struct ui_theme *t = TH;
+    /* EXPLICIT CELL ARITHMETIC, not grow/grow. The first version built the
+     * screen out of grow-sized rows and cells, and every diagram came out
+     * EMPTY -- six labelled boxes with nothing drawn in them, which is a
+     * picker that has stopped picturing anything. A leaf box with no content
+     * and nothing but grow on both axes has no size to grow from here. The
+     * screen is 46x30; dividing that by hand is three lines and cannot
+     * collapse. */
+    const float SCR_W = 46.0f, SCR_H = 30.0f;
+    const float pad   = inset ? 3.0f : 0.0f;        /* the bar and dock strips */
+    const float cw    = SCR_W / (float)cols;
+    const float chh   = (SCR_H - 2.0f * pad) / (float)rows;
+
+    bool clicked = false;
+    ui_begin_vstack((uint64_t)(uintptr_t)label);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered();
+    ui_set_size(sz_fixed(58), sz_intrinsic());
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(3);
+    ui_set_padding(4, 4, 4, 4);
+    ui_set_corner_radius(t->radius_sm);
+    ui_set_paint(hov ? solid(t->surface_alt) : (struct paint){ 0 });
+
+    /* the little screen */
+    ui_begin_vstack(1);
+    ui_set_size(sz_fixed(SCR_W), sz_fixed(SCR_H));
+    ui_set_paint(solid(t->bg));
+    ui_set_border(1, hov ? t->accent : t->border_strong);
+    ui_set_corner_radius(3);
+    ui_set_padding(pad, 0, pad, 0);
+    ui_set_spacing(0);
+    for (int r = 0; r < rows; r++) {
+        ui_begin_hstack((uint64_t)(r + 1));
+        ui_set_size(sz_fixed(SCR_W), sz_fixed(chh));
+        ui_set_spacing(0);
+        ui_set_paint((struct paint){ 0 });
+        for (int c = 0; c < cols; c++) {
+            int idx = r * cols + c;
+            int lit = (on < 0) || (idx == on);
+            ui_box_begin((uint64_t)(idx + 1));
+            ui_set_size(sz_fixed(cw), sz_fixed(chh));
+            ui_set_paint(lit ? solid(tint(t->accent, hov ? 1.0f : 0.75f))
+                             : (struct paint){ 0 });
+            ui_box_end();
+        }
+        ui_end_stack();
+    }
+    ui_end_stack();
+
+    { EmProps lp = { .font = Caption, .color = hov ? t->text : t->text_secondary };
+      em_text_impl(label, lp); }
+
+    if (ui_consume_click(self)) clicked = true;
+    ui_end_stack();
+    return clicked;
+}
+
+/* The menu machinery, declared early: the board is built on the SAME overlay
+ * the menus use. See em_zoom_board for why. */
+static void em_menu_panel_open(uint64_t key, float ax, float ay);
+static int  em_menu_panel_close(void);
+
+static void em_zoom_board(void) {
+    if (!g_zoom_open) { g_zoom_have_rect = 0; return; }
+
+    /* BUILT ON THE MENU PANEL, and that is a correction rather than a
+     * convenience. The first version hand-rolled its own overlay -- window
+     * sized, layer 2, a panel positioned with ui_set_offset -- copying the
+     * shape of em_menu_panel_open without using it. It DREW correctly and was
+     * completely dead to the pointer, and the reason took a trace inside the
+     * guest to see: the panel's arranged rect stayed 0x0 (`ZOOMDBG panel ok=1
+     * 0,0 0x0`) even while its children painted in the right places. An
+     * out-of-flow box that is never given geometry is never hit either.
+     *
+     * The menus have solved this in this exact position -- an overlay hanging
+     * out of a 26px bar -- for a long time. Using their opener means the board
+     * inherits that, and means a future fix to overlay positioning fixes both
+     * rather than one of them. */
+    em_flush();
+    em_menu_panel_open(0x2004B, g_zoom_anchor_x - 8.0f, g_zoom_anchor_y + 6.0f);
+
+    EmWinLayout pick = EmWinNormal;
+    int picked = 0;
+    for (int row = 0; row < 2; row++) {
+        ui_begin_hstack((uint64_t)(0x10 + row));
+        ui_set_spacing(2);
+        ui_set_paint((struct paint){ 0 });
+        if (row == 0) {
+            if (em_zoom_tile("Left",   2, 1,  0, 0)) { pick = EmWinLeft;   picked = 1; }
+            if (em_zoom_tile("Right",  2, 1,  1, 0)) { pick = EmWinRight;  picked = 1; }
+            if (em_zoom_tile("Top",    1, 2,  0, 0)) { pick = EmWinTop;    picked = 1; }
+        } else {
+            if (em_zoom_tile("Bottom", 1, 2,  1, 0)) { pick = EmWinBottom; picked = 1; }
+            if (em_zoom_tile("Fill",   1, 1, -1, 1)) { pick = EmWinFill;   picked = 1; }
+            if (em_zoom_tile("Full",   1, 1, -1, 0)) { pick = EmWinFull;   picked = 1; }
+        }
+        ui_end_stack();
+    }
+    em_flush();
+    int outside = em_menu_panel_close();
+
+    if (picked) {
+        em_window_post_layout(pick);
+        g_zoom_open = 0;
+    } else if (outside) {
+        /* A CLICK ON THE LIGHT ITSELF still means "fill". The board's scrim
+         * covers the whole window, the light included, so the light's own
+         * handler never sees that press -- and since the board opens on hover,
+         * that is the state every click on the light is made in. */
+        float px, py; ui_pointer_pos(&px, &py);
+        int on_light = px >= g_zoom_light[0] && px <= g_zoom_light[2] &&
+                       py >= g_zoom_light[1] && py <= g_zoom_light[3];
+        if (on_light) em_window_post_layout(EmWinFill);
+        g_zoom_open = 0;
+    }
+}
+
+/* Close the board once the pointer has left both it and the light it hangs
+ * from. The extent is COMPUTED from the anchor rather than read back from the
+ * panel: the panel is the menus' and its arranged rect is not ours to trust
+ * (see em_zoom_board). Generous margins, because the gap between the light and
+ * the board is a place the pointer legitimately passes through on its way to
+ * the thing it is reaching for. */
+#define ZB_W 200.0f
+#define ZB_H 130.0f
+static void em_zoom_track(void) {
+    if (!g_zoom_open) return;
+    float px, py; ui_pointer_pos(&px, &py);
+
+    /* TWO RECTS, NOT THEIR BOUNDING BOX. The first version kept the board open
+     * anywhere in the union of the light and the board, and that union is a
+     * tall rectangle whose top-left corner covers the OTHER TWO LIGHTS -- so
+     * with the board up, the scrim ate every click on minimize and close.
+     * (Measured: minimize stopped working the moment the board existed.)
+     *
+     * Being inside the light, inside the board, or in the small gap between
+     * them keeps it open. Anywhere else -- including the neighbouring lights,
+     * eight pixels away -- closes it. */
+    int in_light = px >= g_zoom_light[0] - 4.0f && px <= g_zoom_light[2] + 4.0f &&
+                   py >= g_zoom_light[1] - 4.0f && py <= g_zoom_light[3] + 4.0f;
+
+    float bx0 = g_zoom_anchor_x - 8.0f, by0 = g_zoom_anchor_y + 6.0f;
+    const float m = 12.0f;
+    int in_board = px >= bx0 - m && px <= bx0 + ZB_W + m &&
+                   py >= by0 - m && py <= by0 + ZB_H + m;
+
+    if (!in_light && !in_board) g_zoom_open = 0;
+}
+
 static bool em_closebtn_impl(bool *out_hov) {
-    return em_light_impl(IconClose, (Color){ 1.00f, 0.373f, 0.341f, 1.f }, out_hov);
+    /* The danger tone, not the Mac's #FF5F57. Close is the one control whose
+     * colour has to be learned from nothing, so it borrows the one the rest of
+     * the OS already uses to mean "this destroys something". */
+    return em_light_impl(IconClose, TH->danger, out_hov, 0);
 }
 static bool em_minbtn_impl(bool *out_hov) {
-    return em_light_impl(IconMinus, (Color){ 0.157f, 0.784f, 0.251f, 1.f }, out_hov);
+    /* A quiet slate where the Mac has amber: minimizing is the least eventful
+     * thing a window does, and a third loud dot in every corner of the screen
+     * buys nothing. */
+    return em_light_impl(IconMinus, TH->text_tertiary, out_hov, 0);
 }
+static bool em_maxbtn_impl(bool *out_hov) {
+    bool hov = false;
+    /* U+25A1 WHITE SQUARE -- checked against DejaVuSans's cmap (gid 3705), the
+     * way the icon table above demands, rather than assumed. U+26F6 (the
+     * "square four corners" that would have been the obvious pick) is NOT in
+     * the font and would have drawn a tofu box in every title bar. */
+    float r[4];
+    bool clicked = em_light_impl(0x25A1, TH->accent, &hov, r);
+    if (out_hov) *out_hov = hov;
+    if (r[3] > 0.f) {
+        g_zoom_light[0] = r[0]; g_zoom_light[1] = r[1];
+        g_zoom_light[2] = r[0] + r[2]; g_zoom_light[3] = r[1] + r[3];
+    }
+    if (hov && r[3] > 0.f) {
+        /* Anchor the board under THIS light, in window coordinates. Refreshed
+         * while hovered rather than latched once: the bar moves when the
+         * window is dragged or resized, and a board pinned to where the light
+         * USED to be is a board floating in the middle of the app. */
+        g_zoom_anchor_x = r[0]; g_zoom_anchor_y = r[1] + r[3];
+        g_zoom_open = 1;
+    }
+    return clicked;
+}
+
+/* The three lights, for a bar an app assembles itself (Note++ and Vellum put
+ * their window controls at the head of a TAB STRIP rather than in an AppBar).
+ * Exposed as one call so those bars cannot end up with a different set or a
+ * different order. */
+void em_window_controls(void) {
+    em_close_button(); em_flush();
+    em_min_button();   em_flush();
+    em_max_button();   em_flush();
+    em_zoom_track();
+    em_zoom_board();
+}
+
 int em_window_closed(void) { return Clicked("__em_win_close"); }
 int em_window_minimized(void) { return Clicked("__em_win_min"); }
+int em_window_maximized(void) { return Clicked("__em_win_max"); }
+
+/* The maximize button fires DURING the view, and the resize has to happen at
+ * the top of an iteration (it remaps the shared pixel pages the view is in the
+ * middle of drawing into). So it is posted here and taken there -- the same
+ * one-frame hand-off the close path uses. */
+static int         g_want_layout;
+static EmWinLayout g_layout_want = EmWinNormal;
+
+void em_window_post_layout(EmWinLayout want) { g_layout_want = want; g_want_layout = 1; }
+int  em_window_take_layout(EmWinLayout *out) {
+    if (!g_want_layout) return 0;
+    if (out) *out = g_layout_want;
+    g_want_layout = 0;
+    return 1;
+}
+
+static int g_want_maximize;
+void em_window_post_maximize(void) {
+    /* NO em_request_frame() HERE, and that is a measured decision rather than
+     * an omission. Asking for an extra pass looked like the obvious safety --
+     * the runtime only iterates when something says the UI changed -- and it
+     * BROKE the button: the extra pass ran the view again with the click still
+     * latched, posted the flag a second time, and the window maximized and
+     * un-maximized in the same gesture. The screen-change check caught it
+     * exactly (32.3% of the screen with the flag posted once, 0.1% with it
+     * posted twice). Nothing is needed: the click that set this flag is itself
+     * an input event, and an input event already drives the next iteration. */
+    g_want_maximize = 1;
+}
+int  em_window_take_maximize(void) { int w = g_want_maximize; g_want_maximize = 0; return w; }
 
 /* ---- Spinner: phase-animated dots (indeterminate activity) ------------- */
 static void em_spinner_impl(void) {
@@ -2586,8 +2918,16 @@ void em_feed_pointer(float x, float y, int left_down, int right_down,
         /* Timestamp the press AT THE PRESS. ui_pointer has just run, so if the
          * total moved, the edge happened in this sample -- microseconds ago,
          * not whenever the next frame gets around to noticing. */
+        /* THE PRESS'S OWN TIME when the loop knows it. em_now_ms() is when we
+         * SAMPLED, which for a press the compositor had to hold back (the app
+         * was mid-render) is late by however long the app took -- and that is
+         * exactly the case double-click has to survive. */
         { int t = ui_press_edge_total();
-          if (t != g_prev_left_down) { g_prev_left_down = t; g_press_at_ms = em_now_ms(); } }
+          if (t != g_prev_left_down) {
+              g_prev_left_down = t;
+              uint64_t ev = ui_pointer_time();
+              g_press_at_ms = ev ? ev : em_now_ms();
+          } }
         if (wheel) ui_wheel((float)wheel);
     } else {
         ui_pointer(-100.0f, -100.0f, false);
@@ -2612,6 +2952,17 @@ void em_feed_right_button(float x, float y, bool down) {
     if (down && !g_rbtn_prev) { g_rclick_pending = 1; g_rclick_x = x; g_rclick_y = y; }
     g_rbtn_prev = down ? 1 : 0;
 }
+/* PEEK without taking. A right-click has to be offered to whichever widget it
+ * landed in, and em_right_clicked() consumes -- so the first field asked would
+ * swallow a click meant for the third. Peek, decide, then take. */
+int em_right_peek(float *ox, float *oy) {
+    if (!g_rclick_pending) return 0;
+    if (ox) *ox = g_rclick_x;
+    if (oy) *oy = g_rclick_y;
+    return 1;
+}
+void em_right_take(void) { g_rclick_pending = 0; }
+
 int em_right_clicked(float *ox, float *oy) {
     if (!g_rclick_pending) return 0;
     g_rclick_pending = 0;
@@ -2655,6 +3006,8 @@ void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
  * With one keyed container per menu the list shape never changes, and every
  * property that DIFFERS between the two states is set explicitly in BOTH
  * branches, so a state flip can never inherit the other state's leftovers. */
+static float g_menu_panel_w = 200.0f;   /* what the NEXT panel should be wide */
+
 static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     const struct ui_theme *t = TH;
     ui_begin_vstack(key);                 /* the out-of-flow overlay layer */
@@ -2676,6 +3029,19 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
      * invisible: the menu is not on screen the frame it opens. */
     float ovx = 0, ovy = 0, ovw, ovh;
     if (!ui_open_rect(&ovx, &ovy, &ovw, &ovh)) { ovx = 0; ovy = 0; }
+
+    /* KEEP IT ON THE SCREEN. The anchor is where the pointer was, and a menu
+     * near the right edge ran straight off it -- the calendar behind the clock,
+     * which is as far right as anything gets, was half a screen wide and half
+     * of that was past the edge. The panel's width is known here (it is set,
+     * not measured), so the anchor can simply be pulled back until it fits.
+     * Pulled, never flipped: a menu that jumps to the other side of the thing
+     * you clicked is a menu you have to look for. */
+    { float vw = em_viewport_width();
+      float maxx = vw - g_menu_panel_w - 6.0f;
+      if (maxx < 6.0f) maxx = 6.0f;
+      if (ax > maxx) ax = maxx;
+      if (ax < 6.0f)  ax = 6.0f; }
     /* drop-in motion: the panel fades in while settling down its last 8px.
      * Keyed on WHICH menu is open, so switching between menus re-plays it;
      * with no clock (host renders) it snaps to settled, like em_nav. */
@@ -2700,7 +3066,7 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
     ui_set_padding(t->sp1, t->sp1, t->sp1, t->sp1);
-    ui_set_size(sz_fixed(200), sz_intrinsic());
+    ui_set_size(sz_fixed(g_menu_panel_w), sz_intrinsic());
 }
 /* returns 1 if the transparent scrim (outside the panel) was clicked */
 static int em_menu_panel_close(void) {
@@ -2757,6 +3123,10 @@ void em_menu_(const char *label, EmProps p) {
         is_open = (g_menu_open == (const void *)label);
     }
     g_menu_cur_open = is_open;
+    /* .width on a Menu sizes its DROPDOWN, not its label -- the label is what
+     * it is. 200 was hard-coded and is right for a list of verbs; a month grid
+     * needs more, and clipping it produced a calendar with the year cut off. */
+    g_menu_panel_w = (p.width > 0) ? p.width : 200.0f;
     if (is_open) em_menu_panel_open((uint64_t)(uintptr_t)label, g_menu_ax, g_menu_ay);
     else         em_menu_hidden_open((uint64_t)(uintptr_t)label);
 }
@@ -2857,6 +3227,24 @@ void em_context_menu_end_(void) {
 #define EMK_HOME  0x02
 #define EMK_END   0x05
 #define EMK_DEL   0x7F
+/* The editing commands, delivered in this same byte stream at values that can
+ * never occur in valid UTF-8. Kept in step with UI_KEY_* (ui/kit/kit.h) and
+ * EK_* (kernel/drivers/input/keyboard.h).
+ *
+ * THEY MUST BE NAMED HERE OR THEY BECOME TEXT. This editor's default case
+ * inserts any byte >= 0x80 -- which is right for é and € and exactly wrong for
+ * these -- so the moment the driver started sending them, GUI+C in Note++ would
+ * have typed a garbage character into the document instead of copying. */
+#define EMK_SEL_LEFT  0xF8
+#define EMK_SEL_RIGHT 0xF9
+#define EMK_SEL_HOME  0xFA
+#define EMK_SEL_END   0xFB
+#define EMK_SEL_ALL   0xFC
+#define EMK_COPY      0xFD
+#define EMK_CUT       0xFE
+#define EMK_PASTE     0xFF
+#define EMK_UNDO      0xF6
+#define EMK_REDO      0xF7
 
 /* ---- editing primitives on a NUL-terminated buffer + byte cursor -------- */
 static void te_insert(char *buf, size_t cap, int *len, int *cur, char c) {
@@ -2865,15 +3253,39 @@ static void te_insert(char *buf, size_t cap, int *len, int *cur, char c) {
     buf[*cur] = c;
     (*cur)++; (*len)++;
 }
+/* ONE CHARACTER, NOT ONE BYTE. The key stream is UTF-8 (the keyboard driver
+ * encodes codepoints now, so é arrives as two bytes and € as three). An editor
+ * that erases, steps over or counts BYTES splits those sequences, and a split
+ * sequence draws as a replacement box -- so every one of these walks whole
+ * characters. Continuation bytes are the ones matching 10xxxxxx. */
+static int te_is_cont(const char *buf, int i) {
+    return ((unsigned char)buf[i] & 0xC0) == 0x80;
+}
+static int te_prev(const char *buf, int cur) {
+    if (cur <= 0) return 0;
+    cur--;
+    while (cur > 0 && te_is_cont(buf, cur)) cur--;
+    return cur;
+}
+static int te_next(const char *buf, int len, int cur) {
+    if (cur >= len) return len;
+    cur++;
+    while (cur < len && te_is_cont(buf, cur)) cur++;
+    return cur;
+}
 static void te_backspace(char *buf, int *len, int *cur) {
     if (*cur <= 0) return;
-    memmove(buf + *cur - 1, buf + *cur, (size_t)(*len - *cur + 1));
-    (*cur)--; (*len)--;
+    int p = te_prev(buf, *cur);
+    int n = *cur - p;
+    memmove(buf + p, buf + *cur, (size_t)(*len - *cur + 1));
+    *cur = p; *len -= n;
 }
 static void te_delete(char *buf, int *len, int *cur) {
     if (*cur >= *len) return;
-    memmove(buf + *cur, buf + *cur + 1, (size_t)(*len - *cur));
-    (*len)--;
+    int e = te_next(buf, *len, *cur);
+    int n = e - *cur;
+    memmove(buf + *cur, buf + e, (size_t)(*len - e + 1));
+    *len -= n;
 }
 static int te_line_start(const char *buf, int cur) {
     int i = cur;
@@ -2898,8 +3310,89 @@ void em_editor_gutter(int on) { g_gutter = on; }
  * caret box dropped in at `caret` (-1 for none) -- splitting whichever span it
  * lands inside, so the line being edited keeps its colours. Drawing that line
  * plain would make the one line you are looking at the only uncoloured one. */
+/* One run of the line, in one colour, either selected or not.
+ *
+ * The highlight is set as the one-shot text background immediately before the
+ * text node -- em_text_impl's non-wrapping path emits exactly one ui_text and
+ * nothing before it, so the one-shot cannot land on the wrong node. It is NOT
+ * passed as EmProps.background, which would be read as a request for a BOX
+ * (props_wrap) and paint a filled rectangle instead of a highlight behind the
+ * glyphs. */
+static void te_run(const char *src, int a, int b, Color col, int selected,
+                   const struct ui_theme *t) {
+    if (b <= a) return;
+    char tmp[512];
+    int n = b - a;
+    if (n > (int)sizeof tmp - 1) n = (int)sizeof tmp - 1;
+    memcpy(tmp, src + a, (size_t)n); tmp[n] = 0;
+    if (selected) ui_set_text_bg(t->selection);
+    EmProps tp = { .font = Body, .color = col };
+    em_text_impl(tmp, tp);
+}
+
+static void te_caret_box(const struct ui_theme *t, float h) {
+    ui_box_begin(0);
+    ui_set_paint(solid(t->accent));
+    ui_set_size(sz_fixed(2), sz_fixed(h));
+    ui_box_end();
+}
+
+/* WHERE THE POINTER IS, as a byte offset into the buffer.
+ *
+ * The editor had no click-to-place at all: a click focused it and left the
+ * caret wherever it happened to be, so the only way to reach a line was to
+ * arrow to it. This is the missing half.
+ *
+ * Both axes are measured the way the text is actually DRAWN -- the line pitch
+ * from the resolved Body size (not the theme's raw text_body, which misses the
+ * app's own text scale), and the column with the renderer's decoder through
+ * ui_text_width_n. Measuring differently from the drawing is how a caret ends
+ * up a character off at the end of a long line. */
+static int te_hit(const char *buf, int len, float px, float py,
+                  float rx, float ry, int gutter, float scroll,
+                  uint32_t fh, float sz, const struct ui_theme *t) {
+    float line_h = sz + 5.0f;
+    float y0 = ry + t->sp2 - scroll;
+    int want = (int)((py - y0) / line_h);
+    if (want < 0) want = 0;
+
+    /* Walk to that line; a click below the last one lands on the last one. */
+    int i = 0, l = 0;
+    while (l < want) {
+        int e = i;
+        while (e < len && buf[e] != '\n') e++;
+        if (e >= len) break;
+        i = e + 1; l++;
+    }
+    int e = i;
+    while (e < len && buf[e] != '\n') e++;
+
+    float x0 = rx + t->sp3;
+    if (gutter) {
+        char num[16];
+        snprintf(num, sizeof num, "%4d ", l + 1);
+        x0 += ui_text_width_n(fh, sz, num, -1);
+    }
+    float dx = px - x0;
+    if (dx <= 0) return i;
+
+    /* Nearest boundary, so the right half of a letter means after it. */
+    float prev = 0;
+    for (int p = i; p < e; ) {
+        int nx = te_next(buf, e, p);
+        float w = ui_text_width_n(fh, sz, buf + i, nx - i);
+        if (dx < (prev + w) * 0.5f) return p;
+        prev = w;
+        p = nx;
+    }
+    return e;
+}
+
+/* `slo`/`shi` are ABSOLUTE buffer offsets and may lie entirely outside this
+ * line; the intersection is taken per span. */
 static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
-                         int gutter, const struct ui_theme *t) {
+                         int gutter, int slo, int shi, float sz,
+                         const struct ui_theme *t) {
     char tmp[512];
     ui_begin_hstack((uint64_t)(lineno + 1));
     ui_set_align(ALIGN_CENTER);
@@ -2919,40 +3412,35 @@ static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
     if (g_syn_fn && n > 0) ns = g_syn_fn(buf + i, n, spans, 128, g_syn_ud);
     if (ns <= 0) { spans[0].len = n; spans[0].color = t->text; ns = n > 0 ? 1 : 0; }
 
+    /* The line is cut at every boundary that matters -- where a syntax span
+     * ends, where the selection starts or stops, and where the caret is -- and
+     * each piece emitted with the colour and highlight in force there. Walking
+     * boundaries rather than nesting "is the caret in this span / is the
+     * selection in this span" keeps the caret and the selection from having to
+     * know about each other. */
     int off = 0;
     for (int k = 0; k < ns; k++) {
         int sl = spans[k].len;
         if (off + sl > n) sl = n - off;
         if (sl <= 0) continue;
-        int rel = caret - off;                 /* caret position within this span */
-        if (caret >= 0 && rel >= 0 && rel < sl) {
-            if (rel > 0) {
-                memcpy(tmp, buf + i + off, (size_t)rel); tmp[rel] = 0;
-                EmProps tp = { .font = Body, .color = spans[k].color };
-                em_text_impl(tmp, tp);
-            }
-            ui_box_begin(0);
-            ui_set_paint(solid(t->accent));
-            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-            ui_box_end();
-            int rest = sl - rel;
-            memcpy(tmp, buf + i + off + rel, (size_t)rest); tmp[rest] = 0;
-            EmProps tp = { .font = Body, .color = spans[k].color };
-            em_text_impl(tmp, tp);
-        } else {
-            memcpy(tmp, buf + i + off, (size_t)sl); tmp[sl] = 0;
-            EmProps tp = { .font = Body, .color = spans[k].color };
-            em_text_impl(tmp, tp);
+        int send = off + sl;
+
+        int p = off;
+        while (p < send) {
+            if (caret == p) te_caret_box(t, sz);
+            int sel = (i + p >= slo && i + p < shi);
+            /* The next place anything changes. */
+            int q = send;
+            if (caret > p && caret < q) q = caret;
+            if (sel) { if (shi - i > p && shi - i < q) q = shi - i; }
+            else     { if (slo - i > p && slo - i < q) q = slo - i; }
+            te_run(buf + i, p, q, spans[k].color, sel, t);
+            p = q;
         }
-        off += sl;
+        off = send;
     }
     /* caret at (or past) the end of the line, including an empty line */
-    if (caret >= 0 && caret >= off) {
-        ui_box_begin(0);
-        ui_set_paint(solid(t->accent));
-        ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-        ui_box_end();
-    }
+    if (caret >= 0 && caret >= off) te_caret_box(t, sz);
     /* An all-empty row collapses in an ALIGN_CENTER hstack, so an empty,
      * caret-less line still needs something with a height. */
     if (!off && caret < 0 && !gutter) {
@@ -2974,30 +3462,186 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     if (cur > len) cur = len;
     if (cur < 0) cur = 0;
 
+    /* THE SELECTION ANCHOR. The caret itself belongs to the CALLER (it is the
+     * `cursor` argument, so an app can put it where it likes and keep it across
+     * documents); the anchor is ours, and is remembered per BUFFER so that
+     * switching documents does not carry a stale selection into the new one.
+     * anchor == cur means nothing is selected. */
+    static const char *ted_buf;
+    static int ted_anchor;
+    /* THE SCROLL THE LINES WERE LAID OUT WITH, kept from the previous frame.
+     * A click is answered against the geometry the person was looking at when
+     * they clicked, and this frame's scroll is not yet that -- it is
+     * recomputed below from where the caret ends up, which the click is about
+     * to change. Using it would make a click on a scrolled document land a
+     * line or two out. */
+    static float ted_scroll;
+    if (ted_buf != buf) { ted_buf = buf; ted_anchor = cur; ted_scroll = 0; }
+    ui_undo_bind(buf);          /* a different document has a different past */
+    if (ted_anchor > len) ted_anchor = len;
+    if (ted_anchor < 0) ted_anchor = 0;
+
     ui_begin_vstack(0);
     struct instance_handle self = ui_open();
-    if (ui_consume_click(self)) ui_request_focus(self);
+    uint32_t efh; float esz; em_resolve_font(Body, &efh, &esz);
+    bool clicked = ui_consume_click(self);
+    if (clicked) ui_request_focus(self);
     bool focused = ui_has_focus(self);
+
+    /* THE MOUSE CAN PLACE THE CARET, and drag to select.
+     *
+     * A click used to do nothing but focus, so the only way to reach a line
+     * was to arrow to it -- in a code editor. ui_is_active() is pointer
+     * capture: true from the press until the release even once the pointer has
+     * left the box, so dragging past the bottom keeps extending the selection
+     * instead of stopping at the edge.
+     *
+     * The rect is last frame's arranged geometry, which is what the click
+     * happened over. */
+    /* A drag extends from the press -- except while the press was a double or
+     * triple click, which owns its selection: the drag block runs on the press
+     * frame and every frame after it, and would otherwise collapse the word or
+     * line straight back onto the pointer. */
+    if (clicked || (focused && ui_click_run() == 1 && ui_is_active())) {
+        float rx, ry, rw, rh, px, py;
+        if (ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
+            ui_pointer_pos(&px, &py);
+            cur = te_hit(buf, len, px, py, rx, ry, gutter, ted_scroll, efh, esz, t);
+            if (clicked) {
+                /* Shift-click EXTENDS from where the selection already is, the
+                 * way you take a long run without dragging across it. */
+                int shift = (ui_mods() & UI_MOD_SHIFT) != 0;
+                if (!shift) ted_anchor = cur;   /* a plain press starts fresh */
+                /* Twice is a word, three times is the LINE -- not the whole
+                 * document, which is what a triple-click means in a one-line
+                 * field but would be a surprise in a file. */
+                /* The same count the field takes, and for the same reason:
+                 * a yes/no click cannot tell one press from three. */
+                int run = 1;
+                if (!shift) {
+                    int edges = ui_take_press_edges();
+                    if (edges < 1) edges = 1;
+                    for (int e = 0; e < edges; e++) run = ui_click_note(px, py);
+                }
+                if (run == 2) {
+                    unsigned wlo, whi;
+                    ui_word_bounds(buf, (unsigned)te_line_start(buf, cur),
+                                   (unsigned)te_line_end(buf, len, cur),
+                                   (unsigned)cur, &wlo, &whi);
+                    ted_anchor = (int)wlo; cur = (int)whi;
+                } else if (run >= 3) {
+                    ted_anchor = te_line_start(buf, cur);
+                    cur = te_line_end(buf, len, cur);
+                }
+            }
+        }
+    }
 
     if (focused) {
         char in[64];
         int n = ui_input_take(in, (int)sizeof in);
+
+        /* THE DOCUMENT AS IT WAS, for the undo log to diff against once this
+         * frame's keys have been applied -- the same recording-by-diff the
+         * single-line field uses, and for the same reason: this editor mutates
+         * `buf` through te_insert, te_backspace, te_delete, the selection drop
+         * and the paste loop, and a log that has to be TOLD about each one will
+         * miss the next one somebody writes.
+         *
+         * A copy of the whole document per keystroke FRAME sounds expensive and
+         * is not: it happens only when keys actually arrived, and a memcpy of
+         * the edit app's 32 KB costs a few microseconds against a frame that
+         * costs tens of milliseconds. A document larger than the snapshot gets
+         * NO history rather than a wrong one. */
+        static char undo_before[65536];
+        unsigned undo_blen = (unsigned)len, undo_bcaret = (unsigned)cur;
+        int undo_track = (n > 0 && (size_t)len < sizeof undo_before);
+        if (undo_track) { memcpy(undo_before, buf, (size_t)len); undo_before[len] = 0; }
+        else if (n > 0) ui_undo_bind(NULL);      /* too big to hold: no history */
+
+        /* Remove the selected text, leaving the caret where it was. Every edit
+         * that writes runs this first: typing over a selection, backspace and
+         * delete with one, and a paste all mean "this goes away". */
+        #define TED_DROP() do {                                                 \
+            if (ted_anchor != cur) {                                            \
+                int lo = ted_anchor < cur ? ted_anchor : cur;                   \
+                int hi = ted_anchor < cur ? cur : ted_anchor;                   \
+                memmove(buf + lo, buf + hi, (size_t)(len - hi + 1));            \
+                len -= hi - lo;                                                 \
+                cur = ted_anchor = lo;                                          \
+            }                                                                   \
+        } while (0)
+
         for (int i = 0; i < n; i++) {
             unsigned char c = (unsigned char)in[i];
+            int lo = ted_anchor < cur ? ted_anchor : cur;
+            int hi = ted_anchor < cur ? cur : ted_anchor;
             switch (c) {
-                case '\b':      te_backspace(buf, &len, &cur); break;
-                case EMK_DEL:   te_delete(buf, &len, &cur); break;
-                case '\n': case '\r': te_insert(buf, cap, &len, &cur, '\n'); break;
-                case '\t':      te_insert(buf, cap, &len, &cur, ' ');
-                                te_insert(buf, cap, &len, &cur, ' '); break;
-                case EMK_LEFT:  if (cur > 0) cur--; break;
-                case EMK_RIGHT: if (cur < len) cur++; break;
-                case EMK_HOME:  cur = te_line_start(buf, cur); break;
-                case EMK_END:   cur = te_line_end(buf, len, cur); break;
+                case EMK_SEL_LEFT:  cur = te_prev(buf, cur); break;
+                case EMK_SEL_RIGHT: cur = te_next(buf, len, cur); break;
+                case EMK_SEL_HOME:  cur = te_line_start(buf, cur); break;
+                case EMK_SEL_END:   cur = te_line_end(buf, len, cur); break;
+                case EMK_SEL_ALL:   ted_anchor = 0; cur = len; break;
+                case EMK_COPY: case EMK_CUT:
+                    /* Nothing selected must not CLEAR the clipboard: a
+                     * mis-aimed copy that wiped it would lose the thing you
+                     * were about to paste. */
+                    if (hi > lo) ui_clipboard_set(buf + lo, (unsigned)(hi - lo));
+                    if (c == EMK_CUT) TED_DROP();
+                    break;
+                case EMK_UNDO: case EMK_REDO: {
+                    /* Applied here and then excluded from the diff below: an
+                     * undo is not an edit, and a log that recorded its own
+                     * undos could never move backwards. */
+                    unsigned ul = (unsigned)len, uc = (unsigned)cur;
+                    if (ui_undo_step(c == EMK_REDO, buf, &ul, cap, &uc)) {
+                        len = (int)ul; cur = (int)uc; ted_anchor = cur;
+                    }
+                    undo_track = 0;
+                    break;
+                }
+                case EMK_PASTE: {
+                    /* Unlike the single-line field, this editor pastes ITSELF.
+                     * The runtime's app-wide replay flattens newlines to spaces
+                     * -- correct for a terminal, where a pasted newline would
+                     * execute something, and wrong here, where it silently
+                     * collapses a pasted block onto one line. An editor is
+                     * exactly the case that has to handle its own. */
+                    char clip[2048];
+                    int got = ui_clipboard_get(clip, (unsigned)sizeof clip);
+                    if (got > 0) {
+                        TED_DROP();
+                        for (int k = 0; k < got; k++)
+                            te_insert(buf, cap, &len, &cur, clip[k]);
+                        ted_anchor = cur;
+                    }
+                    break;
+                }
+                case '\b':      if (hi > lo) TED_DROP(); else te_backspace(buf, &len, &cur);
+                                ted_anchor = cur; break;
+                case EMK_DEL:   if (hi > lo) TED_DROP(); else te_delete(buf, &len, &cur);
+                                ted_anchor = cur; break;
+                case '\n': case '\r': TED_DROP(); te_insert(buf, cap, &len, &cur, '\n');
+                                ted_anchor = cur; break;
+                case '\t':      TED_DROP();
+                                te_insert(buf, cap, &len, &cur, ' ');
+                                te_insert(buf, cap, &len, &cur, ' ');
+                                ted_anchor = cur; break;
+                /* A plain arrow COLLAPSES a selection to the edge it moves
+                 * toward, rather than moving from wherever the caret happens to
+                 * be -- what anyone who has just selected something and changed
+                 * their mind expects. */
+                case EMK_LEFT:  cur = hi > lo ? lo : te_prev(buf, cur);
+                                ted_anchor = cur; break;
+                case EMK_RIGHT: cur = hi > lo ? hi : te_next(buf, len, cur);
+                                ted_anchor = cur; break;
+                case EMK_HOME:  cur = te_line_start(buf, cur); ted_anchor = cur; break;
+                case EMK_END:   cur = te_line_end(buf, len, cur); ted_anchor = cur; break;
                 case EMK_UP: {
                     int ls = te_line_start(buf, cur), col = cur - ls;
                     if (ls > 0) { int pls = te_line_start(buf, ls - 1), ple = ls - 1;
                                   cur = pls + (col < ple - pls ? col : ple - pls); }
+                    ted_anchor = cur;
                     break;
                 }
                 case EMK_DOWN: {
@@ -3005,13 +3649,29 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                     int le = te_line_end(buf, len, cur);
                     if (le < len) { int nls = le + 1, nle = te_line_end(buf, len, nls);
                                     cur = nls + (col < nle - nls ? col : nle - nls); }
+                    ted_anchor = cur;
                     break;
                 }
                 default:
-                    if (c >= 32 && c < 127) te_insert(buf, cap, &len, &cur, (char)c);
+                    /* >= 0x80 is a byte of a real character: é, €, a dead-key
+                     * composition. They arrive contiguously and are inserted in
+                     * order, so the sequence lands intact at the cursor.
+                     *
+                     * The command bytes are ABOVE this range and every one of
+                     * them is handled by a case above, which is what keeps them
+                     * out of the document -- see EMK_SEL_LEFT's comment. */
+                    if ((c >= 32 && c < 127) || (c >= 0x80 && c < EMK_UNDO)) {
+                        TED_DROP();
+                        te_insert(buf, cap, &len, &cur, (char)c);
+                        ted_anchor = cur;
+                    }
                     break;
             }
         }
+        #undef TED_DROP
+
+        if (undo_track)
+            ui_undo_note(undo_before, undo_blen, buf, (unsigned)len, undo_bcaret);
         if (cursor) *cursor = cur;
         em_request_frame();   /* keep the loop live while typing */
     }
@@ -3026,11 +3686,12 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     ui_set_size(sz_grow(), sz_fixed(height));
 
     /* auto-scroll: shift the lines up so the cursor line stays visible */
-    float line_h = t->text_body + 5.0f;
+    float line_h = esz + 5.0f;
     int cur_line = 0; for (int i = 0; i < cur; i++) if (buf[i] == '\n') cur_line++;
     float caret_y = (cur_line + 1) * line_h;
     float view_h = height - 2 * t->sp2;
     float scroll = caret_y > view_h ? caret_y - view_h : 0.0f;
+    ted_scroll = scroll;              /* what the NEXT frame's click is measured against */
 
     ui_begin_vstack(0);
     ui_set_align(ALIGN_STRETCH);
@@ -3046,8 +3707,10 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
         while (i <= len) {
             int e = i; while (e < len && buf[e] != '\n') e++;
             int is_cur = (cur >= i && cur <= e);
+            int slo = focused ? (ted_anchor < cur ? ted_anchor : cur) : 0;
+            int shi = focused ? (ted_anchor < cur ? cur : ted_anchor) : 0;
             te_draw_line(buf, i, e, (is_cur && focused) ? cur - i : -1,
-                         line, gutter, t);
+                         line, gutter, slo, shi, esz, t);
             line++;
             i = e + 1;
             if (e == len) break;

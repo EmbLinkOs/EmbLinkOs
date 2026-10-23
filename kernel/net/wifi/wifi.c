@@ -204,6 +204,7 @@ static void worker(void) {
             need_dhcp=0;net_unlock();int ok=net_dhcp();net_lock();
             if(station.state==WIFI_STA_UP && want_join) {
                 if(ok) {
+                    net_address_ready();
                     uint64_t renew=net_dhcp_renew_after_ms();
                     if(renew!=UINT64_MAX) {need_dhcp=1;dhcp_retry_at=time_get_us()/1000+renew;}
                 } else {

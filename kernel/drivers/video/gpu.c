@@ -1,5 +1,7 @@
 #include "drivers/video/gpu.h"
+#if defined(__x86_64__)
 #include "drivers/video/intel_display.h"
+#endif
 #include "drivers/char/serial.h"
 
 #include "include/kprintf.h"
@@ -15,7 +17,9 @@ void gpu_init(void) {
     if (!g_gpu) {
         g_gpu = bochs_gpu_probe();
     }
+#if defined(__x86_64__)
     if (!g_gpu) g_gpu=intel_display_probe();
+#endif
 
     if (g_gpu) {
         kprintf("GPU: using %s driver\n", g_gpu->name);

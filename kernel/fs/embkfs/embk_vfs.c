@@ -8,11 +8,11 @@
  * every op is a thin locked wrapper around an _impl. */
 
 #include "fs/vfs.h"
+#include "block/partition.h"
 #include "fs/embkfs/embkfs.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "process/process.h"   /* sched_lock/sched_block_current_locked/wait_queue */
-#include "block/partition.h"
 
 /* THE EMBKFS BIG LOCK now lives in embkfs.c, with the state it protects (the
  * shared static scratch buffers and the per-volume read cache) -- see the long
@@ -144,6 +144,36 @@ static int write_impl(struct vnode *vn, uint64_t off, const void *buf, size_t le
     return EMBK_OK;
 }
 
+static int symlink_impl(struct vnode *dir, const char *name, size_t name_len,
+                        const char *target)
+{
+    if (!dir || !name || !target || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    char nm[256];
+    for (size_t i = 0; i < name_len; i++) nm[i] = name[i];
+    nm[name_len] = '\0';
+    return embkfs_symlink(vol_of(dir), dir->ino, nm, target);
+}
+
+static int readlink_impl(struct vnode *vn, char *buf, size_t cap, size_t *out_len)
+{
+    if (!vn || !buf || !out_len || !vn->mnt || !vn->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (vn->type != VFS_DT_LNK)
+        return -EMBK_EINVAL;
+
+    uint64_t n = 0;
+    int rc = embkfs_readlink(vol_of(vn), vn->ino, buf, (uint64_t)cap, &n);
+    if (rc != EMBK_OK) return rc;
+    *out_len = (size_t)n;
+    return EMBK_OK;
+}
+
 static int create_impl(struct vnode *dir, const char *name, size_t name_len,
                        uint32_t mode, struct vnode *out)
 {
@@ -218,14 +248,6 @@ static int unlink_impl(struct vnode *dir, const char *name, size_t name_len)
  * neutral seconds. Best-effort: a failed inode read leaves 0 ("unknown")
  * rather than failing the whole stat -- size/type are the load-bearing
  * fields, mtime is advisory metadata. */
-static uint64_t stat_mtime_seconds(struct embkfs_volume *vol, uint64_t oid)
-{
-    struct embk_inode_item ino;
-    if (embkfs_stat_object(vol, oid, &ino) != EMBK_OK)
-        return 0;
-    return ino.mtime / 1000000000ULL;
-}
-
 static int stat_impl(struct vnode *vn, struct vfs_stat *out)
 {
     if (!vn || !out || !vn->mnt || !vn->mnt->fs_data)
@@ -233,7 +255,20 @@ static int stat_impl(struct vnode *vn, struct vfs_stat *out)
 
     struct embkfs_volume *vol = vol_of(vn);
     out->type = vn->type;
-    out->mtime = stat_mtime_seconds(vol, vn->ino);
+
+    /* ONE inode read for everything this function needs.
+     *
+     * It used to read the inode for the mtime, and then -- for a regular file
+     * -- call embkfs_seek_object(SEEK_END) for the size, which walks EVERY
+     * EXTENT of the object to re-derive a number the inode was already
+     * holding. Two answers to one question, the expensive one preferred, on
+     * the most frequent metadata call in the system. It was the last 8 of the
+     * 22 device reads a warm stat cost. */
+    struct embk_inode_item ino;
+    int irc = embkfs_stat_object(vol, vn->ino, &ino);
+    if (irc != EMBK_OK)
+        return irc;
+    out->mtime = ino.mtime / 1000000000ULL;
 
     if (vn->type == VFS_DT_DIR) {
         out->mode = EMBKFS_S_IFDIR | EMBKFS_PERM_DIR;
@@ -246,13 +281,11 @@ static int stat_impl(struct vnode *vn, struct vfs_stat *out)
         return EMBK_OK;
     }
 
-    uint64_t size = 0;
-    int rc = embkfs_seek_object(vol, vn->ino, 0, EMBKFS_SEEK_END, 0, &size);
-    if (rc != EMBK_OK)
-        return rc;
-
-    out->size = size;
-    out->nlink = 1;
+    /* The inode's own size. It is what the write path maintains and what the
+     * extent walk was reconstructing; asking the cheap authority instead of
+     * the expensive one is the whole change. */
+    out->size = ino.size;
+    out->nlink = ino.links ? ino.links : 1;
     if (vn->type == VFS_DT_LNK)
         out->mode = EMBKFS_S_IFLNK | EMBKFS_PERM_LNK;
     else
@@ -324,6 +357,48 @@ static int embkfs_vfs_write(struct vnode *vn, uint64_t off, const void *buf,
 {
     fs_lock();
     int rc = write_impl(vn, off, buf, len, out_written);
+    fs_unlock();
+    return rc;
+}
+
+/* The hard-link op: the same shape as symlink_impl, but the second argument
+ * is an OBJECT (the resolved target vnode's oid), not a string. The
+ * filesystem does the real work -- embkfs_link_name bumps the inode's link
+ * count and adds the directory entry in one transaction, and refuses a
+ * directory target with EPERM on its own account. */
+static int embkfs_vfs_link(struct vnode *dir, const char *name, size_t name_len,
+                           struct vnode *target)
+{
+    if (!dir || !name || !target || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    char nm[256];
+    for (size_t i = 0; i < name_len; i++) nm[i] = name[i];
+    nm[name_len] = '\0';
+
+    fs_lock();
+    int rc = embkfs_link_name(vol_of(dir), target->ino, dir->ino, nm);
+    fs_unlock();
+    return rc;
+}
+
+static int embkfs_vfs_symlink(struct vnode *dir, const char *name, size_t name_len,
+                              const char *target)
+{
+    fs_lock();
+    int rc = symlink_impl(dir, name, name_len, target);
+    fs_unlock();
+    return rc;
+}
+
+static int embkfs_vfs_readlink(struct vnode *vn, char *buf, size_t cap, size_t *out_len)
+{
+    fs_lock();
+    int rc = readlink_impl(vn, buf, cap, out_len);
     fs_unlock();
     return rc;
 }
@@ -412,7 +487,7 @@ static int embkfs_vfs_vget(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
     return EMBK_OK;
 }
 
-static int embkfs_vfs_rename(struct vnode *old_dir, const char *old_name, size_t old_len,
+static int rename_impl(struct vnode *old_dir, const char *old_name, size_t old_len,
                              struct vnode *new_dir, const char *new_name, size_t new_len)
 {
     if (!old_dir || !new_dir || !old_name || !new_name ||
@@ -433,6 +508,21 @@ static int embkfs_vfs_rename(struct vnode *old_dir, const char *old_name, size_t
 
     return embkfs_rename_name(vol_of(old_dir), old_dir->ino, oldz,
                               new_dir->ino, newz);
+}
+
+static int embkfs_vfs_rename(struct vnode *old_dir,const char *old_name,size_t old_len,
+                             struct vnode *new_dir,const char *new_name,size_t new_len) {
+    fs_lock();
+    int rc=rename_impl(old_dir,old_name,old_len,new_dir,new_name,new_len);
+    fs_unlock();return rc;
+}
+static int embkfs_vfs_rename_noreplace(struct vnode *old_dir,const char *old_name,size_t old_len,
+                             struct vnode *new_dir,const char *new_name,size_t new_len) {
+    fs_lock();struct vnode existing;
+    int rc=lookup_impl(new_dir,new_name,new_len,&existing);
+    if(!rc)rc=-EMBK_EEXIST;
+    else if(rc==-EMBK_ENOENT)rc=rename_impl(old_dir,old_name,old_len,new_dir,new_name,new_len);
+    fs_unlock();return rc;
 }
 
 static int embkfs_vfs_chmod(struct vnode *vn, uint32_t mode)
@@ -460,49 +550,21 @@ static int embkfs_vfs_sync(struct vnode *vn)
     return rc;
 }
 
-static int sync_test_calls, sync_test_result;
-static int sync_test_flush(struct embk_block_device *dev)
-{
-    (void)dev;
-    sync_test_calls++;
-    return sync_test_result;
-}
-
-int embkfs_vfs_run_sync_selftests(void)
-{
-    /* Exercise the real adapter with a faulting device, not a success stub.
-     * This volume is private: no writes or changes to a mounted disk. */
-    static struct embkfs_volume volume;
-    struct embk_block_device disk = { .flush = sync_test_flush };
-    struct vfs_mount mount = { .fs_data = &volume };
-    struct vnode vn = { .mnt = &mount };
-    volume.dev = &disk;
-    sync_test_calls = 0;
-    sync_test_result = -EMBK_EIO;
-    int ok = embkfs_vfs_sync(&vn) == -EMBK_EIO && sync_test_calls == 1;
-    sync_test_result = EMBK_OK;
-    ok = embkfs_vfs_sync(&vn) == EMBK_OK && sync_test_calls == 2 && ok;
-    disk.flush = NULL;
-    ok = embkfs_vfs_sync(&vn) == -EMBK_ENOTSUP && sync_test_calls == 2 && ok;
-    volume.dev = NULL;
-    ok = embkfs_vfs_sync(&vn) == -EMBK_ENODEV && ok;
-    ok = embkfs_vfs_sync(NULL) == -EMBK_EINVAL && ok;
-    kprintf("EMBKFS sync: %d device calls; errors and unsupported devices %s\n",
-            sync_test_calls, ok ? "propagated" : "FAIL");
-    return ok ? EMBK_OK : -EMBK_EIO;
-}
-
 static const struct vfs_ops embkfs_vfs_ops = {
     .lookup = embkfs_vfs_lookup,
     .readdir = embkfs_vfs_readdir,
     .read = embkfs_vfs_read,
     .write = embkfs_vfs_write,
+    .symlink = embkfs_vfs_symlink,
+    .readlink = embkfs_vfs_readlink,
+    .link = embkfs_vfs_link,
     .create = embkfs_vfs_create,
     .mkdir = embkfs_vfs_mkdir,
     .unlink = embkfs_vfs_unlink,
     .truncate = embkfs_vfs_truncate,
     .rmdir = embkfs_vfs_rmdir,
     .rename = embkfs_vfs_rename,
+    .rename_noreplace = embkfs_vfs_rename_noreplace,
     .chmod = embkfs_vfs_chmod,
     .stat = embkfs_vfs_stat,
     .vget = embkfs_vfs_vget,

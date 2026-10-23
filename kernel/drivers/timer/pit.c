@@ -1,5 +1,7 @@
 #include "drivers/timer/pit.h"
 #include "include/io.h"
+#include "include/types.h"
+#include "drivers/timer/timer.h"
 
 #define PIT_FREQUENCY 1193182  // PIT input clock frequency in Hz
 
@@ -14,6 +16,14 @@
 // Run one one-shot cycle of exactly `count` PIT ticks (count must be <=
 // PIT_MAX_COUNT -- not re-checked here, only pit_delay_us below calls this
 // and it already clamps every cycle to that bound).
+static bool g_pit_dead;      /* it never finished a cycle: stop asking it */
+
+static inline uint64_t pit_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static void pit_oneshot_ticks(uint16_t count)
 {
     // Enable channel 2 gate by setting bit 0 of port 0x61
@@ -32,9 +42,12 @@ static void pit_oneshot_ticks(uint16_t count)
     port61 |= 0x01; // Set bit 0 to enable gate and start counting
     outb(0x61, port61);
 
-    // Wait for the PIT to finish counting by polling bit 5 of port 0x61
-    while (!(inb(0x61) & 0x20)) {
-        // Still counting
+    // Wait for the PIT to finish counting by polling bit 5 of port 0x61 --
+    // BOUNDED. Recent Intel platforms clock-gate the 8254; its output then
+    // never rises and this loop, unbounded, was the end of the boot. A cycle
+    // is at most 55 ms, which is well inside the bound on any real machine.
+    for (uint32_t spin = 0; !(inb(0x61) & 0x20); spin++) {
+        if (spin > 3000000u) { g_pit_dead = true; return; }
     }
 }
 
@@ -59,7 +72,36 @@ static void pit_delay_us(uint64_t us)
     }
 }
 
+/* ONCE THE TSC'S FREQUENCY IS KNOWN, IT DOES THE WAITING. This function has
+ * forty-odd callers across the USB, SMP and storage code, all of which wanted
+ * "busy-wait this long" and none of which cared that it was the PIT. A TSC
+ * busy-wait cannot hang, is exact, and works on the machines whose PIT is
+ * gated off -- so every one of those callers is fixed here instead of in
+ * forty places. Before calibration the PIT is still used, bounded. */
+static void delay_us(uint64_t us)
+{
+    uint64_t hz = tsc_get_freq_hz();
+    if (hz) {
+        uint64_t ticks = us * (hz / 1000000ULL);
+        uint64_t t0 = pit_rdtsc();
+        while (pit_rdtsc() - t0 < ticks)
+            __asm__ volatile ("pause" ::: "memory");
+        return;
+    }
+    if (g_pit_dead) return;
+    pit_delay_us(us);
+}
+
 void pit_delay_ms(uint32_t ms)
 {
+    delay_us((uint64_t)ms * 1000ULL);
+}
+
+/* The PIT itself, for calibration: false if it never finished a cycle, so a
+ * zero-length "10 ms" is not mistaken for a measurement. */
+bool pit_delay_ms_checked(uint32_t ms)
+{
+    if (g_pit_dead) return false;
     pit_delay_us((uint64_t)ms * 1000ULL);
+    return !g_pit_dead;
 }

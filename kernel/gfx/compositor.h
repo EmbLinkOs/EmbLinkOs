@@ -28,7 +28,7 @@
 
 struct process;   /* fwd decl -- compositor.h must not include process.h */
 
-#define COMP_MAX_WINDOWS   32
+#define COMP_MAX_WINDOWS   8
 #define COMP_TITLEBAR_H    26     /* px; kernel-drawn chrome above the content */
 #define COMP_BORDER        1      /* px; 1px frame around the whole window     */
 #define COMP_TITLE_MAX     31
@@ -49,7 +49,7 @@ int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32
 
 /* Full-screen chromeless HOME/desktop window for `client`: sized to the
  * framebuffer, pinned at the back (z=0), no title bar or border, zero-copy. The
- * screen dimensions are returned via out_w and out_h so the app needn't hardcode
+ * screen dimensions are returned via *out_w and *out_h so the app needn't hardcode
  * them. Returns a window id (>0) or -EMBK_*. */
 int64_t compositor_win_create_desktop(struct process *client, uint64_t *out_client_va,
                                       uint32_t *out_w, uint32_t *out_h);
@@ -93,8 +93,82 @@ int compositor_win_is_shared(int pid, uint32_t id);
  * window read its own mouse. */
 /* pid owning the FRONT window -- who the keyboard belongs to (0 = none). */
 uint32_t compositor_focused_pid(void);
+/* The composed screen as 0x00RRGGBB pixels, row-major, into a caller-sized
+ * buffer. Returns pixels written or -1. The syscall above it is capability
+ * gated: this is the one call that shows one application what every other one
+ * is displaying. */
+int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t cap);
 /* exit-time: hide + repaint a dying pid's windows (reap frees them later) */
 void compositor_exit_pid(int pid);
+/* WHAT WINDOWS EXIST -- the view a switcher, a taskbar, or a bar that names
+ * the focused application all need, and which nothing could ask for before.
+ *
+ * The compositor is the only part of the kernel that knows a window's TITLE,
+ * which is why this lives here rather than beside process_list().
+ *
+ * Layers a person cannot switch to are left out: the desktop (the wallpaper),
+ * widgets, translucent strips (the menu bar and the notifier), and anything
+ * with no title. A switcher offering "the wallpaper" as a destination would be
+ * listing the furniture. */
+#define COMP_WIN_MINIMIZED  0x1
+#define COMP_WIN_FOCUSED    0x2
+
+struct comp_win_info {
+    uint32_t pid;
+    uint32_t id;
+    uint32_t flags;                    /* COMP_WIN_* */
+    char     title[COMP_TITLE_MAX + 1];
+
+    /* WHAT PROGRAM this is, and the compositor does not fill it in -- it
+     * leaves it empty and the syscall layer annotates the snapshot, exactly
+     * as it does the session filter. The compositor deals in windows; which
+     * binary a pid came from is the process model's business.
+     *
+     * Two names, because they answer different questions. The TITLE is what
+     * the app calls this window and it changes as you work -- open a file in
+     * the editor and it becomes the file's name. The APP name is the basename
+     * of the binary, and it never changes, which is what makes it the thing
+     * you can MATCH on: the dock holds exec paths, so this is how it learns
+     * that a tile's app is running even though it was not the dock that
+     * started it. Show the title; compare the app. */
+    char     app[24];                  /* EXEC_NAME_MAX + 1 */
+};
+
+/* Fills up to `max` entries, front-most first, and returns how many. */
+int  compositor_win_list(struct comp_win_info *out, int max);
+
+/* GUI+Tab: raise the window behind the front one, sending the old front to the
+ * back of the cycle so that pressing it repeatedly walks every window rather
+ * than flipping between the top two. 1 if anything moved. */
+int  compositor_cycle_window(void);
+/* GUI+W: close the front window, the same way its close light does -- by ASKING
+ * it to. Returns 0; nothing is killed here. */
+int  compositor_close_front(void);
+/* GUI+Q: ask every window the FRONT window's process owns to close, so the
+ * application ends rather than one of its windows. Returns how many were
+ * asked. */
+int  compositor_quit_front(void);
+
+/* DRAG AND DROP, the compositor's half of it: it knows only that a drag is in
+ * flight and where the pointer was when it ended. The payload lives in the
+ * session's drag buffer, like the clipboard -- the compositor deals in windows
+ * and pixels and has no business with the contents.
+ *
+ * It exists because POINTER CAPTURE makes a cross-application drop impossible
+ * otherwise: a press routes every later motion to the window it landed on,
+ * which is right for a slider and wrong for carrying something to another
+ * program. The capture stays; the drop is resolved separately at the release. */
+void compositor_drag_set(int on, uint32_t pid);
+int  compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly);
+
+/* How long a window has to take itself down after being asked, before it is
+ * killed. Long enough to write a file out, short enough that a hung app does
+ * not leave a window you cannot get rid of. */
+#define COMP_CLOSE_GRACE_MS 4000
+/* Pids of windows that were asked to close and did not. The caller kills them
+ * OUTSIDE the compositor lock -- process_kill reaps, which re-enters here. */
+int  compositor_close_overdue(int *out, int max);
+
 /* Un-minimize and raise a process's windows (the dock's click-to-restore). */
 int  compositor_restore_pid(int pid);
 /* An app parking its own window (chromeless apps have no kernel button). */
@@ -104,14 +178,24 @@ int  compositor_win_minimize(int pid, uint32_t id);
  * is drawn by the desktop process, and at z=0 it opened behind whatever the
  * user already had open. Refused for any process but the layer's owner. */
 int  compositor_desktop_front(int pid, int on);
+/* 1 while that layer is in front -- a full-screen shell surface (the launcher,
+ * the screen lock) is covering everything. The kernel's own key shortcuts stop
+ * working then; see compositor.c. */
+int  compositor_shell_modal(void);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
+/* `when` is the millisecond the reported button state was MADE, which for a
+ * replayed press is when the finger went down and not when this poll happened.
+ * Anything timing a double-click needs that: replayed clicks arrive one per
+ * poll, so on a slow app two real clicks 130 ms apart arrive half a second
+ * apart and look like two separate ones. */
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
-                         uint32_t *buttons, uint32_t *win, int32_t *wheel);
+                         uint32_t *buttons, uint32_t *win, int32_t *wheel,
+                         uint32_t *when);
 
 /* Hand back the kernel content buffer for (pid,id) so the syscall layer can
  * copy_from_user client pixels straight into it, plus its dims. NULL if no
@@ -141,7 +225,7 @@ void    compositor_reap_pid(int pid);
  * iteration of the kernel's main shell loop (thread context, so the plain
  * compositor spinlock is safe -- never call this from an IRQ handler). */
 void    compositor_pointer_tick(void);
+
 void compositor_session_changed(void);
-int compositor_cycle_window(int reverse);
 
 #endif /* __GFX_COMPOSITOR_H__ */

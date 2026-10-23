@@ -48,7 +48,7 @@ A window app is a `view` function plus one declaration that **replaces
 `main()` entirely**:
 
 ```c
-/* user/bin/hello_ui.c */
+/* user/apps/hello_ui/hello_ui.c */
 #include "embk.h"
 #include "ui.h"
 #include "em.h"
@@ -114,6 +114,13 @@ VStack(.spacing = 16, .padding = 20, .align = Fill) {
 }
 ```
 
+`ScrollView` shows a **scrollbar**: a thumb sized to the viewport's share of
+the content and positioned by the scroll, which you can drag. The gutter is
+always reserved, even when the content fits and no thumb is drawn — a bar that
+appeared only on overflow would make the content reflow the moment a list gained
+a row, and a list that shuffles sideways as it fills is worse than a few pixels
+of margin.
+
 Available containers: `VStack`, `HStack`, `ZStack`, `Card` (surface + border +
 shadow + padding preset), `Screen` (full-size root), `Section(title)` (a
 labeled group), `Row`, `NavBar(title)`, `ScrollView(&scroll_offset, height)`,
@@ -139,6 +146,57 @@ Slider(&g_volume);
 Stepper("Devices", &g_devices, /*lo=*/1, /*hi=*/10);
 TextField(g_name, sizeof g_name, "Your name");
 ```
+
+### What a TextField can do
+
+It is a real editable field, not a box you append to. The caret moves with
+**Left / Right / Home / End**, **Backspace** takes the character before it and
+**Delete** the one after, typing inserts wherever the caret is, and **clicking
+in the text puts the caret between the two characters you pointed between**.
+Everything is measured in characters, not bytes: the stream is UTF-8, so one
+Left steps over the whole of `é` and one Backspace removes all of it.
+
+Focusing a field (Tab, autofocus) puts the caret at the end of its text, which
+is where someone arriving to add something expects it; a click is how you get
+anywhere else. There is one caret because exactly one field is focused.
+
+**Selecting and the clipboard.** Shift+Left/Right/Home/End extend a selection,
+and the clipboard is on the **GUI (Cmd/Super) key**: GUI+A select all, GUI+C
+copy, GUI+X cut, GUI+V paste. Typing or backspace over a selection replaces it;
+a plain arrow collapses it to the edge it moves toward. A password field lets
+you select and edit but never copies its text out.
+
+The clipboard is **not** on Ctrl+C, and will not be: `0x03` is this OS's console
+interrupt and is consumed before any application sees it
+(`docs/INTERRUPTION.md`). The rule is *Ctrl belongs to the terminal, the GUI key
+belongs to the interface*. Ctrl+V still pastes, for the apps that always used it.
+
+**Undo.** `GUI+Z` undoes and `GUI+Shift+Z` (or `GUI+Y`) redoes, in every
+single-line field **and in the multi-line `TextEditor`**, with nothing for the
+app to call. A *run* of typing undoes as
+one thing rather than letter by letter, and a pause of about a second ends the
+run — so one undo takes back a word, not a keystroke. The case it exists for is
+select-all-then-type: one key and the text is gone, and `GUI+Z` brings it back.
+
+Both share one log, so two editors in the same toolkit cannot disagree about
+what undo means. Note++ draws its own text and carries its own.
+
+**The mouse.** A press places the caret and a drag extends a selection, in both
+the single-line field and the multi-line editor. A drag keeps going after the
+pointer leaves the widget (pointer capture), so dragging off the end selects to
+the end. Double-click selects a word (`foo_bar` whole, `café` uncut); a third click
+takes the field, or in the multi-line editor the line. **Shift-click** extends
+the selection from where it already starts, so you can take a long run without
+dragging across it.
+
+**Right-click** opens a text menu — Undo, Redo, Cut, Copy, Paste, Select All —
+in any field, with nothing for the app to do. Its items push the same command
+bytes the keyboard sends, so there is one implementation of each and the menu
+cannot drift away from what `⌘X` does.
+
+An app gets all of this for free — there is nothing to call. If your app
+installs a key hook, note that it sees the paste replay and can refuse it (this
+is how the terminal stops a pasted newline from executing anything).
 
 Text has five font roles (`.title() .heading() .body() .bold() .caption()`)
 and color roles (`.secondary() .tertiary() .accent()`). A leaf you want to
@@ -238,8 +296,8 @@ ContextMenu(&ctx, cx, cy) {
 ```
 
 The `EM_APPLICATION` runtime feeds the right mouse button in for you, so
-`RightClicked()` fires anywhere in the content. `v6demo.c` (the "Menus" home
-tile) is the reference app.
+`RightClicked()` fires anywhere in the content. `user/examples/v6demo/v6demo.c`
+is the reference app — run it with `run /data/apps/v6demo/v6demo.elf`.
 
 ## Text editor (V7)
 
@@ -261,8 +319,9 @@ VStack(.spacing = 10, .padding = 16, .align = Fill) {
 
 The arrow/Home/End keys arrive as `EMBK_KEY_*` codes the kernel keyboard driver
 emits for the extended scancodes; under `EM_APPLICATION` the runtime grabs the
-keyboard and forwards everything, so no extra wiring is needed. `v7demo.c` (the
-"Editor" home tile) is the reference app.
+keyboard and forwards everything, so no extra wiring is needed.
+`user/examples/v7demo/v7demo.c` is the reference app
+(`run /data/apps/v7demo/v7demo.elf`).
 
 ## Materials: glass
 
@@ -311,7 +370,7 @@ That's the whole change — your view still renders normally (opaque); the
 compositor does the frosting (`EMBK_WINF_GLASS`, a kernel-side blur + uniform
 alpha). The blur runs when the window paints, so a still window is cheap; a
 *drag* re-blurs each step (fine under a GPU, a little heavier under plain QEMU).
-`v7demo.c` (the "Editor" tile) is an Acrylic window.
+`v7demo.c` is an Acrylic window.
 
 ## App-owned chrome: chromeless windows
 
@@ -344,7 +403,7 @@ runtime wires this up automatically. `CloseButton()` is one round control
 that tints red on hover; put whatever you want next to it (a menu, more
 icons) — the bar is yours. `em_window_closed()` is what the runtime checks to
 know your own close control fired; you don't call it yourself unless you're
-hand-rolling the loop (see [`user/bin/home.c`](../user/bin/home.c) for that
+hand-rolling the loop (see [`user/apps/home/home.c`](../user/apps/home/home.c) for that
 lower-level pattern).
 
 Add `.resize = Resizable` and `Window()` draws a small corner grip; dragging
@@ -359,7 +418,7 @@ wallpaper, always below every app window, so apps naturally float over it.
 Use `EM_WIDGET` instead of `EM_APPLICATION`:
 
 ```c
-/* user/bin/clockw.c (shipped as the reference widget) */
+/* user/apps/clockw/clockw.c (shipped as the reference widget) */
 #include "embk.h"
 #include "ui.h"
 #include "em.h"
@@ -419,21 +478,21 @@ else runs.
 
 ## Wiring your app into the boot image
 
-**Just drop the `.c` file in `user/bin/` and rebuild — that's it.** The build
-system auto-discovers apps: any `user/bin/*.c` (except the two special-linked
+**Just drop the `.c` file in `user/apps/<name>/` and rebuild — that's it.** The build
+system auto-discovers apps: any `user/apps/*/*.c` (except the two special-linked
 programs `init.c` and `hello.c`) is treated as a dynamically-linked EmUI app,
 built by a Makefile pattern rule and packed onto the boot image by
 `mkfs_embkfs.py`'s `discover_userland_objects()` (which globs `build/*.elf`).
 No per-app Makefile rule, no mkfs edit.
 
 ```
-# create user/bin/hello_ui.c with a view + EM_APPLICATION, then:
+# create user/apps/hello_ui/hello_ui.c with a view + EM_APPLICATION, then:
 make embkfs.img            # discovers, builds, and packs hello_ui.elf automatically
 make run-embkfs-cow        # boots to the desktop; see CONTRIBUTING.md for run targets
 ```
 
 The **only** optional manual step is a home-screen tile: in
-[`user/bin/home.c`](../user/bin/home.c)'s tile grid, add
+[`user/apps/home/home.c`](../user/apps/home/home.c)'s tile grid, add
 `tile("Hello UI", "/hello_ui.elf");` if you want to launch it by click rather
 than by `run /hello_ui.elf` at the shell.
 
@@ -489,8 +548,13 @@ straight to the home launcher and click your tile.
 
 - [EMUI_INTERNALS.md](EMUI_INTERNALS.md) — how the layers underneath this
   guide actually work, for anyone extending the toolkit itself.
-- [`user/bin/v4demo.c`](../user/bin/v4demo.c) — the fullest reference app:
+The reference apps live in `user/examples/` and are **not** on the desktop's
+launcher — they are installed and run from the terminal
+(`run /data/apps/<name>/<name>.elf`). Only programs under `user/apps/` get a
+launcher entry; move one there and it appears.
+
+- [`user/examples/v4demo/v4demo.c`](../user/examples/v4demo/v4demo.c) — the fullest reference app:
   chromeless chrome, tabs, split view, every V4/V5 component in one place.
-- [`user/bin/clockw.c`](../user/bin/clockw.c) — the minimal widget reference.
+- [`user/apps/clockw/clockw.c`](../user/apps/clockw/clockw.c) — the minimal widget reference.
 - [`ui/dsl/showcase_v2.c`](../ui/dsl/showcase_v2.c) — every component
   exercised for the host-render test loop.

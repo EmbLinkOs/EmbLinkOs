@@ -18,11 +18,19 @@
  * so a caller does not depend on the background RX kthread being scheduled. */
 
 #include "net/net.h"
+#include "process/ksync.h"
+#if defined(__x86_64__)
+#include "net/wifi/wifi.h"
+static bool wifi_device_init(uint8_t mac[6]) {return wifi_init(mac)!=0;}
+static int wifi_device_link(void);
+#endif
+#include "net/ntp.h"
+#if defined(__x86_64__)
+#include "net/usb_net.h"
+#endif
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"   /* process_create_kthread, schedule */
-#include "net/wifi/wifi.h"
-#include "process/ksync.h"
 
 struct netif g_netif;
 
@@ -51,12 +59,9 @@ static int               g_net_depth = 0;
 static struct wait_queue g_net_wq;         /* threads waiting to ACQUIRE net_lock */
 static struct net_lockstat g_net_stat;
 static struct mutex g_net_service=MUTEX_INIT;
-
-/* DHCP and DNS share the legacy kernel UDP capture. Keep one service request
- * active across net_wait(), which releases the stack monitor so RX can run.
- * Try/wait avoids sleeping on a mutex while retaining an outer net_lock depth. */
 void net_service_lock(void) {while(!mutex_trylock(&g_net_service)) net_wait();}
 void net_service_unlock(void) {mutex_unlock(&g_net_service);}
+
 
 /* Event-driven RX (replaces busy-polling). The RX kthread sleeps on g_net_rx_wq
  * until the NIC interrupt (or the 10 ms timer tick) wakes it, then delivers and
@@ -93,7 +98,7 @@ void net_lock(void) {
  * At the outermost hold (depth 1) this genuinely releases; a nested caller
  * (e.g. an ARP resolve inside a connect) stays held, which is brief and rare. */
 void net_yield(void) {
-    net_poll();     /* atomic drain under the held lock */
+    net_dev_poll();        /* atomic drain under the held lock */
     net_unlock();          /* release across the yield -- the anti-camping move */
     schedule();
     net_lock();            /* reacquire; the caller re-checks state next iteration */
@@ -188,19 +193,7 @@ void net_rx(const uint8_t *frame, uint32_t len) {
     uint32_t plen = len - ETH_HLEN;
     net_lock();                          /* protects arp cache / tcbs / capture */
     if (et == ETH_P_ARP)     arp_input(payload, plen);
-    else if (et == ETH_P_IP) {
-        if (plen >= sizeof(struct ip_hdr)) {
-            const struct ip_hdr *ip = (const struct ip_hdr *)payload;
-            uint32_t ihl = (ip->ver_ihl & 15) * 4;
-            uint32_t total = ntohs(ip->total_len);
-            if ((ip->ver_ihl >> 4) == 4 && ihl >= sizeof(*ip) && ihl <= plen
-                && total >= ihl && total <= plen && ntohl(ip->dst) == g_netif.ip
-                && !(ntohs(ip->flags_frag) & 0x3fff) && net_checksum(ip, ihl) == 0
-                && memcmp(e->dst, g_netif.mac, ETH_ALEN) == 0)
-                arp_learn_ipv4_neighbor(ntohl(ip->src), e->src);
-        }
-        ip_input(payload, plen);
-    }
+    else if (et == ETH_P_IP) ip_input(payload, plen);
     net_unlock();
 }
 
@@ -213,7 +206,7 @@ void net_rx(const uint8_t *frame, uint32_t len) {
 static void net_rx_thread(void) {
     for (;;) {
         net_lock();
-        net_poll();          /* drain + deliver everything pending */
+        net_dev_poll();             /* drain + deliver everything pending */
         net_unlock();
         sched_lock();
         wait_queue_wake_all(&g_net_event_wq);   /* clients re-check their state */
@@ -221,40 +214,110 @@ static void net_rx_thread(void) {
     }
 }
 
-static bool using_virtio;
-static bool using_wifi;
-int net_send_frame(const void *frame, uint32_t len) {
-    if(using_wifi) return wifi_tx(frame,len);
-    return using_virtio ? virtio_net_tx(frame, len) : pci_net_tx(frame, len);
+/* Every card this kernel can drive, in the order they are tried. */
+static const struct net_driver g_drivers[] = {
+    { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll, virtio_net_link },
+    /* igb BEFORE e1000: both match Intel ethernet parts, and the newer
+     * descriptor format is the specific case. e1000.c skips igb's device ids
+     * as well, so the ordering is a preference rather than the thing that
+     * keeps them apart. */
+    { "igb",        igb_init,        igb_tx,        igb_poll,        igb_link        },
+    { "e1000",      e1000_init,      e1000_tx,      e1000_poll,      e1000_link      },
+    { "i8255x",     i8255x_init,     i8255x_tx,     i8255x_poll,     i8255x_link     },
+    { "rtl8139",    rtl8139_init,    rtl8139_tx,    rtl8139_poll,    rtl8139_link    },
+    /* LAST ON PURPOSE. A USB adapter is the fallback, not the preference: a
+     * machine with a real NIC should use it, and the dongle is what you reach
+     * for when there is nothing else. It is also the only entry whose probe
+     * depends on something that happened EARLIER in boot -- usb_init has
+     * already enumerated by the time net_init runs, so `up` is a fact by then
+     * rather than a race. */
+#if defined(__x86_64__)
+    /* x86 ONLY, because the USB host controllers are. aarch64's machine has
+     * no UHCI/OHCI/EHCI/xHCI in this tree, so usb_core is not compiled there
+     * and neither is anything that calls into it -- the same per-architecture
+     * split audio.c's driver table makes, and for the same reason. */
+    { "usb-net",    usb_net_drv_init, usb_net_drv_tx, usb_net_drv_poll, usb_net_drv_link },
+    { "AX200 Wi-Fi",wifi_device_init, wifi_tx, wifi_poll, wifi_device_link },
+#endif
+};
+static const struct net_driver *g_dev;
+#if defined(__x86_64__)
+static int wifi_device_link(void) {return g_netif.up?1:0;}
+#endif
+
+int net_dev_tx(const void *frame, uint32_t len) {
+    return g_dev ? g_dev->tx(frame, len) : -1;
 }
-void net_poll(void) {
-    if(using_wifi) {wifi_poll();return;}
-    if (using_virtio) virtio_net_poll(); else pci_net_poll();
+void net_dev_poll(void) {
+    if (g_dev) g_dev->poll();
 }
+const char *net_dev_name(void) { return g_dev ? g_dev->name : ""; }
+int net_dev_link(void) { return (g_dev && g_dev->link) ? g_dev->link() : -1; }
+
+/* The boot-time clock sync, off the boot path -- see the call site.
+ *
+ * It ENDS, unlike every other kthread in this system, and a kthread that ends
+ * has to say so: kthread_trampoline() does not handle a return, so falling off
+ * the end of this function jumps to whatever the poison pattern in a fresh
+ * kernel stack decodes as. Measured, the first time this was written without
+ * the line below: "RIP: 0xC5C5C5C5C5C5C5C5", a general protection fault
+ * moments after a perfectly successful sync. */
+static void net_ntp_boot_thread(void) {
+    if (!net_ntp_sync_default())
+        kprintf("ntp: no time server answered; keeping the hardware clock\n");
+    process_exit_self(0);
+}
+
+static unsigned ntp_started;
+void net_address_ready(void) {
+    if(!g_netif.up || !g_netif.ip)return;
+    unsigned expected=0;
+    if(!__atomic_compare_exchange_n(&ntp_started,&expected,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
+    if(!process_create_kthread(net_ntp_boot_thread,0))__atomic_store_n(&ntp_started,0,__ATOMIC_RELEASE);
+}
+
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
-    using_wifi=wifi_init(g_netif.mac);
-    if(using_wifi) {
-        process_create_kthread(net_rx_thread,0);
-        wifi_start_worker();return;
+    g_dev = 0;
+    for (unsigned i = 0; i < sizeof g_drivers / sizeof g_drivers[0]; i++) {
+        if (g_drivers[i].init(g_netif.mac)) { g_dev = &g_drivers[i]; break; }
     }
-    using_virtio = virtio_net_init(g_netif.mac);
-    if (!using_virtio && !pci_net_init(g_netif.mac)) {
+    if (!g_dev) {
         kprintf("net: no NIC -- networking disabled\n");
         return;
     }
+    kprintf("net: using %s\n", g_dev->name);
     process_create_kthread(net_rx_thread, 0);   /* background RX poller */
+#if defined(__x86_64__)
+    if(g_dev->init==wifi_device_init) {
+        g_netif.up=false;
+        wifi_start_worker();
+        return; /* DHCP follows WPA2 authorization, never radio discovery. */
+    }
+#endif
     g_netif.up = true;
 
-    /* Lease an address (M2). Fall back to the M1 static config so the stack is
-     * still usable if no DHCP server answers. */
+    /* A failed lease leaves the interface unconfigured. */
     if (net_dhcp()) {
         kprintf("net: DHCP lease  ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
                 IP_OCTETS(g_netif.ip), IP_OCTETS(g_netif.gateway), IP_OCTETS(g_netif.dns));
     } else {
-        g_netif.ip      = IPV4(10, 0, 2, 15);
-        g_netif.netmask = IPV4(255, 255, 255, 0);
-        g_netif.gateway = IPV4(10, 0, 2, 2);
-        kprintf("net: DHCP failed -- static 10.0.2.15/24 gw 10.0.2.2\n");
+        kprintf("net: DHCP failed -- interface has no address\n");
     }
+
+    /* AND ASK SOMETHING WHAT TIME IT IS. Every timestamp this system writes
+     * came from a CMOS chip with nothing to check itself against, and a clock
+     * that is years out cannot verify a certificate -- TLS refuses one that is
+     * not yet valid, so a wrong clock looks exactly like an attack.
+     *
+     * ON A THREAD, NOT HERE. Measured before it was: the gateway does not
+     * answer NTP under an emulator, so the first query waits out the stack's
+     * whole 3 s timeout, and resolving pool.ntp.org can spend another one --
+     * six seconds of a boot spent on an answer nothing is waiting for. The
+     * desktop does not need the date to come up, and a machine that boots
+     * slower to be right about the clock is not the trade anyone wants.
+     *
+     * Failure is not an error: a machine with no route to a time server keeps
+     * the clock it has, which is what it would have had anyway. */
+    net_address_ready();
 }

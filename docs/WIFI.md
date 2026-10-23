@@ -32,7 +32,7 @@ other channels requires disconnection. The nearby list describes the last
 passive scan; it does not invent signal-strength readings. Unsupported security
 modes are visible without offering to join them. Hidden SSIDs remain unsupported.
 
-Changes require `network_admin` (ID 12), separate from ordinary socket access.
+Changes require `network_admin` (ID 14), separate from ordinary socket access.
 The worker derives the PMK outside the network lock and wipes passphrases.
 The read API returns SSIDs and public status, never keys. The bounded, versioned
 `/data/system/wifi.profiles` store holds PMKs with mode 0600 outside the desktop
@@ -70,8 +70,8 @@ wifi scan
 `reconnect` joins the preferred saved network. A builder profile is imported
 only if no runtime store exists; an intentionally empty store after forgetting
 all networks suppresses import. No passphrase is passed through or echoed by
-the console. A ready AX200 is selected as the OS's single interface at boot;
-without a ready AX200, the existing PCI/virtio Ethernet selection remains.
+the console. The existing Ethernet/USB selection runs first. AX200 is selected only when
+no earlier supported interface is ready; one interface remains active at a time.
 See [LAPTOP_DESKTOP.md](LAPTOP_DESKTOP.md) for the Settings/service ABI.
 
 ## Supported mode and remaining limits

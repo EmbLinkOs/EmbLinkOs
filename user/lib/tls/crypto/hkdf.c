@@ -5,7 +5,7 @@
  * kernel crypto compiles and works in userspace. */
 #include "hkdf.h"
 #include "crypto/hmac.h"   /* hmac_sha256() -- reused from kernel/crypto */
-#include <string.h>
+#include "include/kstring.h"   /* memcpy/memset/memcmp -- kshim forwards to <string.h> on hosted builds */
 
 void hkdf_extract(const uint8_t *salt, size_t salt_len,
                   const uint8_t *ikm,  size_t ikm_len,

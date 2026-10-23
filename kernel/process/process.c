@@ -1,24 +1,34 @@
-#include "fs/embkfs/embkfs.h"
-#include "process/session.h"
+#include "boot/boot_protocol.h"
 #include "process/process.h"
-#include "drivers/audio/audio.h"
+#include "power/power.h"   /* idle residency accounting */
+#include "process/sched.h"    /* the policy seam: WHICH thread runs next */
+#include "include/arch_ipi.h"  /* IPI_RESCHEDULE: waking a halted core */
+#include "include/arch_irq.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
+#include "drivers/audio/audio.h"
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
 #include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
 #include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/vma.h"
+#include "kworker/kworker.h"
+#include "ipc/clipboard.h"     /* clipboard_session_ended */   /* the address space of a dead process is torn down there */
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
-#include "arch/x86_64/syscall/elf.h"
-#include "arch/x86_64/syscall/embx.h"   /* EMBX loader dispatch */
-#include "arch/x86_64/cpu/gdt.h"
-#include "arch/x86_64/cpu/fsbase.h"   /* fsbase_set() -- the thread pointer, reinstalled per switch */
-#include "arch/x86_64/cpu/kcontext.h"
-#include "arch/x86_64/irq/lapic.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "loader/elf.h"
+#include "loader/embx.h"   /* EMBX loader dispatch */
+#include "include/arch_thread.h"   /* struct kcontext + the four things a
+                                    * scheduler needs from a CPU: the context
+                                    * switch, the thread pointer, the kernel
+                                    * stack, and this core's id */
+#include "drivers/timer/timer.h"    /* timer_sched_ticks() -- the preempting clock */
+#include "lib/random.h"             /* process_layout_roll: ASLR offsets */
+#include "mm/vma.h"                 /* USER_MMAP_BASE */
+#include "loader/elf.h"             /* DYLIB_VA_BASE */
+#include "include/spinlock.h"
 #include "process/ksync.h"       /* mutex_init for each process's fd_lock */
 #include "process/debug.h"       /* debug_session_spawn, debug_notify_exit */
 
@@ -31,6 +41,7 @@
  * scene traversal / glyph rasterisation with multi-KB frames). Map this many
  * pages ending at USER_STACK_TOP so the stack has room to grow. */
 #define USER_STACK_PAGES 128                   /* 512 KiB main stack */
+
 
 /* Phase 5 (ring-3 threads): per-thread user stacks for every thread BEYOND
  * a process's own main one (which keeps using USER_STACK_VA/TOP above,
@@ -73,7 +84,10 @@
  * thread; thread_create() is the new primitive that lets a process have
  * more than one. */
 static struct process process_table[MAX_PROCESSES];
-static struct thread   thread_table[MAX_THREADS];
+/* NOT static any more: a scheduler POLICY (process/sched.h) that decides by
+ * scanning needs to see the threads. Declared in process.h so the seam is
+ * explicit rather than an extern smuggled into one file. */
+struct thread   thread_table[MAX_THREADS];
 // current_thread is now a macro (process.h) reading through
 // this_cpu()->current_thread (kernel/cpu/percpu.h) -- no plain global
 // definition lives here anymore. Storage lives in cpu_table[], populated by
@@ -103,6 +117,13 @@ static uint32_t next_pid = 1;  // Start PIDs from 1, 0 is reserved for "free slo
 // rather than released before it).
 static spinlock_t g_sched_lock = SPINLOCK_INIT;
 
+/* Live threads that have declared a scheduling period. Defined here rather
+ * than beside the function that maintains it because thread_reap_slot() gives
+ * one back and runs long before that point in this file. The reasoning for why
+ * a count is safe at all is with recount_declared_locked(). */
+static uint32_t g_declared_count;
+static void recount_declared_locked(void);   /* defined with sched_declare_period() */
+
 
 /* Forward declarations: the trampoline is the fabricated ctx.rip - where
  * a brand-new thread "resumes" the first time the scheduler switches to it. */
@@ -116,6 +137,7 @@ static void kthread_trampoline(void);
  * schedule()'s own comment for why releasing the lock in between, even
  * briefly, is a real cross-core race, not a theoretical one. */
 static void schedule_locked(void);
+static void sched_kick_idle(void);
 
 /* First free PROCESS slot (pid == 0 marks free -- see the struct's own
  * comment in process.h). Self-locking (not "assumes caller holds the
@@ -124,6 +146,51 @@ static void schedule_locked(void);
  * own first step, none of them already hold g_sched_lock at that point,
  * and without a lock here two cores calling process_create() concurrently
  * could both claim the SAME free slot. */
+/* --- ASLR: the windows above, made per-process ---------------------------
+ * See struct user_layout in process.h for the table and the reasoning. The
+ * constants stay: they are the window BASES, and the roll adds a random,
+ * page-aligned offset inside each window. */
+#define ASLR_EXEC_BASE      0x0000100000000000ULL      /* PIE text, below the dylib */
+#define ASLR_EXEC_SPAN      (64ull << 30)
+#define ASLR_DYLIB_SPAN     (16ull << 30)
+#define ASLR_SHARED_BASE    0x0000400000000000ULL      /* off the mmap base */
+#define ASLR_SHARED_SPAN    (64ull << 30)
+#define ASLR_MMAP_SPAN      (64ull << 30)
+#define ASLR_MMAP_WINDOW    (256ull << 30)
+#define ASLR_HEAP_SPAN      (16ull << 30)
+#define ASLR_HEAP_WINDOW    (1ull << 30)
+#define ASLR_STACK_SPAN     (16ull << 30)
+#define ASLR_TSTACK_SPAN    (16ull << 30)
+
+static uint64_t aslr_offset(uint64_t span) {
+    /* Page-granular: the low 12 bits of an address are not entropy, they are
+     * alignment, and an offset that breaks alignment breaks the mapping. */
+    return random_below(span >> 12) << 12;
+}
+
+void process_layout_roll(struct process *proc) {
+    struct user_layout *l = &proc->layout;
+    l->exec_base         = ASLR_EXEC_BASE       + aslr_offset(ASLR_EXEC_SPAN);
+    l->dylib_base        = DYLIB_VA_BASE        + aslr_offset(ASLR_DYLIB_SPAN);
+    l->shared_base       = ASLR_SHARED_BASE     + aslr_offset(ASLR_SHARED_SPAN);
+    l->mmap_base         = USER_MMAP_BASE       + aslr_offset(ASLR_MMAP_SPAN);
+    l->mmap_max          = l->mmap_base + ASLR_MMAP_WINDOW;
+    l->heap_base         = USER_HEAP_VA_BASE    + aslr_offset(ASLR_HEAP_SPAN);
+    l->heap_max          = l->heap_base + ASLR_HEAP_WINDOW;
+    l->stack_top_page    = USER_STACK_VA        - aslr_offset(ASLR_STACK_SPAN);
+    l->thread_stack_base = USER_THREAD_STACK_BASE + aslr_offset(ASLR_TSTACK_SPAN);
+}
+
+int process_layout_of(uint32_t pid, struct user_layout *out) {
+    if (!out) return -1;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    if (!p) { spin_unlock(&g_sched_lock); return -1; }
+    *out = p->layout;
+    spin_unlock(&g_sched_lock);
+    return 0;
+}
+
 static struct process *process_alloc(void) {
     spin_lock(&g_sched_lock);
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -132,17 +199,32 @@ static struct process *process_alloc(void) {
             process_table[i].live_thread_count = 0;
             process_table[i].thread_list = NULL;
             /* EmbDBG v2 lifetime: stamp creation; clear exit (slots are reused). */
-            process_table[i].born_tick = lapic_timer_get_ticks();
+            process_table[i].born_tick = timer_sched_ticks();
             process_table[i].exit_tick = 0;
             /* MUST be reset: slots are REUSED after reaping, so a stale `true`
              * from the previous occupant would make this process born cancelled
              * -- every blocking syscall failing -ECANCELED before it ran a line. */
             process_table[i].cancelled = false;
-            process_table[i].session_id = 0;process_table[i].constructing=false;
+            /* Same reasoning, same hazard: a reused slot must not be born
+             * catching interrupts it never asked for, nor holding a backlog
+             * of the previous occupant's. */
+            process_table[i].intr_catch   = false;
+            process_table[i].intr_pending = 0;
             /* Default to kernel authority. Overwritten by process_create_caps
              * for user processes (attenuated from the parent); left as-is for
              * kernel threads, which ARE the kernel and hold the full set. */
             process_table[i].cap_set = EMBK_CAP_ALL;
+            /* The system session until process_create_caps says otherwise:
+             * kernel threads and the adopted console context belong to no
+             * user. A reused slot must not inherit its last occupant's. */
+            process_table[i].session_id = 0;
+            process_table[i].session_user[0] = 0;
+            process_table[i].session_leader = false;
+            process_table[i].session_live = false;
+            /* Same hazard as the session fields: a reused slot showing the
+             * PREVIOUS occupant's program name is worse than showing none --
+             * the dock would light a tile for an app that has exited. */
+            process_table[i].exec_name[0] = 0;
             /* Namespace: default INACTIVE (global-mount fallback) -- the safe
              * reset for a REUSED slot and the resting state for kernel threads.
              * process_create_caps installs the real per-process view for user
@@ -161,6 +243,15 @@ static struct process *process_alloc(void) {
              * every thread of the previous process is gone.) */
             mutex_init(&process_table[i].fd_lock);
             spin_unlock(&g_sched_lock);
+            /* EVERY process gets a layout here -- the one place all of them pass
+             * through. The first version rolled it in process_create_caps() and left
+             * adopted contexts (the kernel console's own process among them) with an
+             * all-zero layout, so their mmap window was empty and vma_mmap() refused
+             * everything with EINVAL. A kthread does not need one and gets one anyway:
+             * 48 bytes of RNG output is cheaper than a second path that can be
+             * forgotten. For the earliest kthreads this runs before random_init();
+             * random_bytes() self-seeds and nothing consults those layouts. */
+            process_layout_roll(&process_table[i]);
             return &process_table[i];
         }
     }
@@ -183,7 +274,7 @@ static struct thread *thread_alloc(void) {
     spin_lock(&g_sched_lock);
     for (int i = 0; i < MAX_THREADS; i++) {
         if (thread_table[i].state == PROCESS_UNUSED) {
-            thread_table[i].state = PROCESS_BLOCKED;
+            thread_table[i].state = PROCESS_BLOCKED;   /* slot init, not a transition */
             thread_table[i].running_cpu = -1;
             thread_table[i].pinned_cpu = -1;
             spin_unlock(&g_sched_lock);
@@ -201,7 +292,70 @@ static struct thread *thread_alloc(void) {
  * an overflow silently corrupts whatever heap allocation happens to sit
  * next to it instead of faulting at the overflow site. */
 static uint64_t alloc_kernel_stack(void) {
-    return vmm_alloc_kernel_stack(KSTACK_SIZE);
+    uint64_t top = vmm_alloc_kernel_stack(KSTACK_SIZE);
+    if (!top)
+        return 0;
+    /* PAINT IT, so the question "how close did that thread come to the guard
+     * page?" has an answer other than a guess. The guard page turns an
+     * overflow into a fault, which is the right thing to do about one that
+     * already happened; it says nothing about a thread sitting at 31 KiB of 32
+     * and about to. A known pattern costs one memset per thread and makes the
+     * high-water mark readable at any moment -- see thread_kstack_used().
+     *
+     * aarch64's allocator already zeroes these pages and x86-64's does not, so
+     * zero is not a pattern that means anything. This one is not a plausible
+     * value for a pointer, a length or a small integer, which is what stacks
+     * are mostly made of. */
+    uint64_t *w = (uint64_t *)(uintptr_t)(top - KSTACK_SIZE);
+    for (uint64_t i = 0; i < KSTACK_SIZE / sizeof *w; i++)
+        w[i] = KSTACK_PAINT;
+    return top;
+}
+
+/* WHICH THREAD'S KERNEL STACK an address lies in, or -1 for none. Fills
+ * *top_out with that stack's top and *off_out with how far below the top the
+ * address sits.
+ *
+ * DELIBERATELY LOCK-FREE. Its only caller is the exception reporter, which
+ * runs after something has already gone wrong and may well be holding
+ * g_sched_lock -- taking it here would turn a printable fault into a silent
+ * deadlock, which is a strictly worse machine to debug. The table is a static
+ * array and the read is a comparison; a torn kstack_top is a wrong ANSWER in a
+ * diagnostic, not a wrong MEMORY ACCESS. */
+int thread_kstack_owner(uint64_t addr, uint64_t *top_out, uint64_t *off_out) {
+    for (int i = 0; i < MAX_THREADS; i++) {
+        uint64_t top = thread_table[i].kstack_top;
+        if (!top || thread_table[i].state == PROCESS_UNUSED)
+            continue;
+        if (addr < top && addr >= top - KSTACK_SIZE) {
+            if (top_out) *top_out = top;
+            if (off_out) *off_out = top - addr;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* How much of a thread's kernel stack has ever been touched, in bytes: the
+ * distance from the top down to the lowest word that is no longer the paint.
+ * Scanning UP from the base finds the deepest the thread has been, which is
+ * the number that matters -- the current SP only says where it is now, and a
+ * thread that nearly died two seconds ago looks perfectly healthy by that
+ * measure.
+ *
+ * Returns 0 for a thread with no allocated stack: the boot context and each
+ * secondary's run on the static stack boot.S set up and record kstack_top = 0,
+ * and painting somebody else's memory to measure it would be worse than not
+ * knowing. */
+uint64_t thread_kstack_used(uint64_t kstack_top) {
+    if (!kstack_top)
+        return 0;
+    const uint64_t *w = (const uint64_t *)(uintptr_t)(kstack_top - KSTACK_SIZE);
+    uint64_t words = KSTACK_SIZE / sizeof *w;
+    for (uint64_t i = 0; i < words; i++)
+        if (w[i] != KSTACK_PAINT)
+            return (words - i) * sizeof *w;
+    return 0;
 }
 
 /* The shared second half of thread setup: give an ALREADY-ALLOCATED thread
@@ -222,7 +376,6 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
         return false;
     }
 
-    t->syscall_depth=0;
     t->kstack_top = kstack_top;
     t->entry_point = entry_point;
     t->user_rsp = user_rsp;
@@ -235,12 +388,16 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->fs_base = 0;
     t->proc = proc;
     t->priority = PRIORITY_NORMAL;
+    t->base_priority = PRIORITY_NORMAL;
+    t->is_idle = false;
     t->ticks_since_scheduled = 0;
     t->suspended = false;         /* slots are reused -- a stale true would freeze a fresh thread */
+    t->killed    = false;         /* ... and a stale kill would end it at its first syscall */
+    t->in_kernel = 0;
     t->dispatch_count = 0;
     t->migrations = 0;
     t->last_ran_cpu = -1;         /* never run yet */
-    t->born_tick = lapic_timer_get_ticks();  /* 0 for pre-timer boot threads */
+    t->born_tick = timer_sched_ticks();  /* 0 for pre-timer boot threads */
     t->exit_tick = 0;             /* still alive */
     t->wait_next = NULL;
     t->wait_queue = NULL;
@@ -263,48 +420,33 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
      * FXRSTOR (schedule_locked(), on its first-ever dispatch) is what reads
      * this buffer -- see struct thread::fpu_state's comment (process.h). */
     memset(t->fpu_state, 0, sizeof(t->fpu_state));
+#if defined(__x86_64__)
+    /* MXCSR at byte 24 and FCW at byte 0 of the FXSAVE image. Both offsets are
+     * x86's, and so are the values, which is why they are behind this guard:
+     * on aarch64 those two byte ranges are v0 and v1 -- ordinary vector
+     * registers -- and writing them there seeds a new thread with two garbage
+     * SIMD registers and no control word at all. */
     *(uint32_t *)(t->fpu_state + 24) = 0x1F80;
     *(uint16_t *)(t->fpu_state + 0) = 0x037F;
+#else
+    /* aarch64: all-zero IS the correct initial state. FPCR (at offset 520)
+     * zero means every IEEE trap disabled and round-to-nearest, which is the
+     * AAPCS64 startup state -- the exact opposite of x86, where an all-zero
+     * MXCSR would leave every exception UNmasked. Nothing to write. */
+#endif
 
     /* FABRICATE the kernel context so the first schedule()-in lands the
      * thread at the trampoline, on its own kernel stack. This is the
-     * "make ctx look like a freshly interrupted context" trick. */
-    t->ctx.rbx = t->ctx.rbp = 0;
-    t->ctx.r12 = t->ctx.r13 = t->ctx.r14 = t->ctx.r15 = 0;
-    t->ctx.rip = ctx_rip;
-    /* kstack_top - 8, not kstack_top: kernel_ctx_switch (kcontext.asm) enters
-     * a brand-new thread's trampoline (kthread_trampoline/process_trampoline,
-     * ctx_rip above) via a raw `jmp`, not a `call` -- there's no synthetic
-     * return address on the stack. kstack_top is page-aligned (0 mod 16,
-     * vmm_alloc_kernel_stack), but GCC compiles the trampoline as an
-     * ORDINARY C function, which always assumes the standard x86-64 SysV
-     * "entered via call" convention: RSP === 8 mod 16 at the function's own
-     * first instruction (as if a call just pushed an 8-byte return address).
-     * Left as kstack_top verbatim, every aligned-stack local variable
-     * anywhere in that thread's initial call chain -- not just in the
-     * trampoline itself, arbitrarily deep, e.g. a kthread's own locals --
-     * ends up 8 bytes off from where GCC assumed, and any aligned SSE
-     * store/load (movdqa, FXSAVE/FXRSTOR's implicit stack-neutral operands
-     * are fine, but a thread's OWN aligned locals are not) #GP's. Silent
-     * until now because nothing had ever used an aligned SSE instruction
-     * inside a kthread; the FPU/SSE selftest (process_test_fpu) is what
-     * first hit it. Sacrificing 8 bytes off the very top of a stack that
-     * never uses them (the trampoline's `ret` never executes -- both
-     * trampolines end in a noreturn call + __builtin_unreachable()) costs
-     * nothing and makes the real entry RSP match what GCC assumes. */
-    t->ctx.rsp = kstack_top - 8;
-    /* IF=0 (0x002), NOT 1 (0x202), on purpose: kernel_ctx_switch's popfq
-     * restores THIS rflags value into the LIVE flags register before
-     * jumping to ctx.rip -- if IF were already 1 here, interrupts would go
-     * live a few instructions before the trampoline reaches its own
-     * spin_unlock(&g_sched_lock) (its first action), opening a real window
-     * where this core's own next timer tick fires, re-enters schedule() on
-     * a lock this exact core still holds, and spins on it forever --
-     * observed directly under -smp 4 (docs §16, Bug 15). spin_unlock() is
-     * what turns interrupts back on (via its own saved RFLAGS from
-     * whoever originally called schedule()), at the point that's
-     * actually safe. */
-    t->ctx.rflags = 0x002;
+     * "make ctx look like a freshly interrupted context" trick.
+     *
+     * The two subtleties this used to spell out inline -- why the stack
+     * pointer is kstack_top MINUS EIGHT, and why the flags say interrupts-off
+     * -- are properties of one machine's calling convention and interrupt
+     * model, and they now live with that machine, in
+     * arch/<arch>/cpu/kcontext.c. aarch64 gets both answers different (SP
+     * aligned exactly at the entry point; interrupts ON) for reasons just as
+     * specific, which is why this line cannot decide them. */
+    kernel_ctx_prepare(&t->ctx, (void (*)(void))(uintptr_t)ctx_rip, kstack_top);
 
     // Link onto proc's thread list + bump the live count -- under
     // g_sched_lock since another thread of the SAME process (or a killer)
@@ -360,8 +502,33 @@ static void thread_reap_slot(struct thread *t) {
     }
 
     vmm_free_kernel_stack(t->kstack_top, KSTACK_SIZE);
+    /* A thread that died still holding a declaration gives it back here -- by
+     * RECOUNTING, never by decrementing.
+     *
+     * This used to be `g_declared_count--`, and that made the deadline policy
+     * switch itself off, intermittently, for entire runs. The count is
+     * recomputed from scratch on every declaration, and that recount SKIPS
+     * zombies. So: thread A declares (count 1), A exits and becomes a zombie,
+     * thread B declares (recount skips A: count 1, correct) -- and THEN A's
+     * slot is reaped, the decrement fires because A still carries period_ms,
+     * and the count reads 0 with B alive and declared. dl_pick() treats 0 as
+     * "nobody declared" and hands every decision to round-robin, so B runs its
+     * whole life unscheduled by the policy it asked for. Whether it happened
+     * depended only on whether A's reap landed before or after B's
+     * declaration: the aarch64 boot test's deadline check failed on about one
+     * run in five, with the deadline run's histogram indistinguishable from
+     * round-robin's (mean 16.8 ms, 27 of 60 periods missed).
+     *
+     * A decrement can only be right if it knows whether the last recount
+     * counted this thread, and it cannot know. A recount is right by
+     * construction. We hold g_sched_lock here (both callers take it), and it
+     * only runs for a thread that had declared, so the scan costs nothing
+     * anywhere else. */
+    bool had_period = t->period_ms != 0;
     memset(t, 0, sizeof(*t));
     t->state = PROCESS_UNUSED;
+    if (had_period)
+        recount_declared_locked();
 }
 
 /* Reclaim a PROCESS's address space and return its slot to free (pid = 0).
@@ -399,12 +566,72 @@ static void process_reap_slot(struct process *proc) {
      * teardown below doesn't free them out from under the compositor. */
     compositor_reap_pid((int)proc->pid);
 
-    vmm_destroy_address_space(proc->pml4_phys);
+    /* THE ADDRESS SPACE GOES TO THE KWORKER. Every mapping has an object now
+     * -- the heap and the stacks included -- and an object letting go of its
+     * pages takes the page cache's sleeping lock, which this path, holding
+     * g_sched_lock, cannot take. (It could not before either: a process that
+     * exited with a file still mapped would have slept here. None of the
+     * tests did, so it was never seen.) The list is detached now, under the
+     * lock, so the slot can be reused; the worker unmaps, drops the objects'
+     * references and frees the page tables the moment it runs. Nothing is
+     * waiting on that memory: no thread of this process exists. */
+    kworker_defer_address_space_locked(proc->pml4_phys, vma_detach_all(proc));
+
+    /* THE THREADS NOBODY JOINED. A joinable thread that exits while siblings
+     * are still alive is deliberately NOT reaped -- its slot and kernel stack
+     * have to survive so a later thread_join() can collect its exit code (see
+     * the keep_for_join decision in schedule_locked()). If no one ever joins
+     * it, that wait is forever: the slot stays ZOMBIE and the stack stays
+     * allocated for the life of the machine.
+     *
+     * Nothing can join them now. This process is being reclaimed, which means
+     * every thread of it is dead, so the only possible joiner is gone. Reaping
+     * them here is the last moment anything knows they exist -- the memset
+     * below erases the process they point at.
+     *
+     * NOT A THEORETICAL LEAK. user/tests/jitter spawns six worker threads,
+     * never joins them, and exits -- exactly what a thread pool does. Each run
+     * leaked six slots out of MAX_THREADS. The aarch64 boot runs it twice, so a
+     * single boot leaked twelve and nobody noticed; a build that ran it
+     * twenty-five times ran the table dry and thread creation started FAILING,
+     * which is how this was found. */
+    int orphans = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        struct thread *t = &thread_table[i];
+        if (t->state != PROCESS_ZOMBIE || t->proc != proc || t->running_cpu != -1)
+            continue;
+
+        /* NOT ONE ANOTHER CORE IS STILL ABOUT TO REAP. A core that switched
+         * off a dying thread reaps that thread's slot at its OWN next
+         * schedule(), from this_cpu()->pending_thread_reap -- it cannot happen
+         * any earlier, because until the switch completes the core is still
+         * executing on that very stack. Reaping such a thread here frees the
+         * slot, thread_alloc() hands it to a NEW thread, and the core's stale
+         * pointer then reaps a live one.
+         *
+         * That is not hypothetical: the first version of this loop lacked the
+         * check and the very next boot printed "thread_reap: a thread of pid 20
+         * is not a zombie (state=1), refusing" -- thread_reap_slot's own guard
+         * catching a live READY thread about to be destroyed -- and then hung
+         * with all four cores in spin_lock. */
+        bool claimed = false;
+        for (uint32_t c = 0; c < cpu_count && c < MAX_CPUS; c++)
+            if (cpu_table[c].pending_thread_reap == t)
+                claimed = true;
+        if (claimed)
+            continue;
+
+        thread_reap_slot(t);
+        orphans++;
+    }
 
     uint32_t reaped_pid = proc->pid;
     keyboard_release_grab_pid(reaped_pid);   /* free the kbd grab if this proc held it */
     memset(proc, 0, sizeof(*proc));
     proc->pid = 0;
+    if (orphans)
+        kprintf("process_reap: pid %u: %d unjoined thread slot(s) reclaimed\n",
+                (unsigned int)reaped_pid, orphans);
 
     kprintf("process_reap: pid %u reclaimed\n", (unsigned int)reaped_pid);
 }
@@ -552,7 +779,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
      * here), so stamping exit_tick once here covers them all. Idempotent: a
      * second call (already unlinked) just overwrites with the same-ish tick. */
     if (t->exit_tick == 0)
-        t->exit_tick = lapic_timer_get_ticks();
+        t->exit_tick = timer_sched_ticks();
 
     bool was_linked = false;
     struct thread **link = &proc->thread_list;
@@ -568,9 +795,16 @@ static struct process *thread_zombie_locked(struct thread *t) {
 
     if (was_linked) {
         proc->live_thread_count--;
+        /* THE LEADER IS GONE, so the session is over: whatever it started and
+         * left running dies too. Deferred to the kworker because this runs
+         * under the scheduler lock and ending a session takes it (once per
+         * process killed). The session id is captured now; the slot may be
+         * reused before the worker runs. */
+        if (proc->live_thread_count == 0 && proc->session_leader && proc->session_id)
+            kworker_defer_session_end_locked(proc->session_id);
         if (proc->live_thread_count == 0) {
-            /* The speaker is released at exit, before the parent waits. The
-             * sink uses a bounded, non-sleeping lock on this scheduler path. */
+            /* Release the sink at death, before proc_alive can report false;
+             * parent-owned zombies may remain until wait, possibly forever. */
             audio_reap_pid(proc->pid);
             /* Snapshot NOW, before the switch-away (schedule_locked()'s
              * own prev-demotion section) clears the thread's own
@@ -580,7 +814,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
             /* EmbDBG v2 lifetime: the process itself is now exiting (its last
              * thread just died) -- stamp the process-level death here. */
             if (proc->exit_tick == 0)
-                proc->exit_tick = lapic_timer_get_ticks();
+                proc->exit_tick = timer_sched_ticks();
         }
         /* Phase 5: wake anyone thread_join()-ing a sibling of this process
          * -- including the common case where THIS thread isn't the last
@@ -661,7 +895,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
  * -------------------------------------------------------------------- */
 
 void wait_queue_block(struct wait_queue *wq, struct thread *t) {
-    t->state = PROCESS_BLOCKED;
+    sched_set_blocked(t);
     t->running_cpu = -1;   // no longer running anywhere -- same invariant
                            // schedule_locked()'s own RUNNING->READY demotion
                            // maintains; `t` is always the CALLER's own
@@ -688,7 +922,7 @@ void wait_queue_block(struct wait_queue *wq, struct thread *t) {
  * (which then sets ZOMBIE). Keeping removal separate from the state change
  * means a killed-while-blocked thread can't leave a dangling entry that a
  * later wait_queue_wake_*() call would walk into. */
-static void wait_queue_remove(struct wait_queue *wq, struct thread *t) {
+void wait_queue_remove(struct wait_queue *wq, struct thread *t) {
     struct thread **link = &wq->head;
     while (*link) {
         if (*link == t) {
@@ -707,13 +941,312 @@ void wait_queue_wake_one(struct wait_queue *wq) {
     }
     struct thread *t = wq->head;
     wait_queue_remove(wq, t);
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
+    sched_kick_idle();      /* a halted core may be the one to run it */
 }
 
 void wait_queue_wake_all(struct wait_queue *wq) {
     while (wq->head) {
         wait_queue_wake_one(wq);
     }
+}
+
+/* --------------------------------------------------------------------
+ * TIMED SLEEP -- waiting on a clock instead of spending the CPU to watch one.
+ *
+ * The kernel had no way to do this, and the consequence was systemic rather
+ * than local: with nothing to block on, every periodic thing in the tree was
+ * written as `do { yield(); } while (now < deadline)`. A yield loop is
+ * RUNNABLE. schedule() therefore always found work, the per-core idle threads
+ * (PRIORITY_BACKGROUND, and correctly so) never ran, and no core ever executed
+ * a single `hlt`.
+ *
+ * That was invisible until kernel/power/power.h started counting halts, and
+ * then it was unmissable: 0% idle, four cores, an idle machine.
+ *
+ * ONE UNSORTED QUEUE, walked on every tick. Sorted insertion would make the
+ * tick O(1) instead of O(sleepers), and it is not worth it yet: the sleepers
+ * are the writeback thread, whatever kthreads follow it, and however many
+ * user threads are between frames -- tens, not thousands. The tick already
+ * walks the whole thread table to pick a candidate. When that stops being
+ * true, this becomes a sorted list or a timer wheel, and the shape of the
+ * change is contained here.
+ * -------------------------------------------------------------------- */
+static struct wait_queue g_sleep_wq;
+
+/* The earliest deadline on that queue, cached so an idling core can ask
+ * "when must somebody wake?" WITHOUT TAKING THE SCHEDULER LOCK.
+ *
+ * It was a locked walk of the queue, on every halt -- and a core halts
+ * thousands of times a second, so that was thousands of acquisitions of the
+ * one global scheduler lock purely to READ. Measured at idle: 23% of all
+ * acquisitions were contended.
+ *
+ * Racy on purpose. A stale value can only be too EARLY (a sleeper was added
+ * with a nearer deadline and we have not seen it yet) or too LATE by at most
+ * one queue change -- and both are bounded by the idle cap, and both are
+ * corrected by the very next scheduling decision. 0 means "no deadline at
+ * all", which is the common case on a quiet machine. */
+static volatile uint64_t g_earliest_wake_ms;
+
+/* THE SAME CACHE, NARROWED TO THREADS THAT DECLARED A PERIOD.
+ *
+ * Waking a busy core early for a sleeper is what removes the half-tick of
+ * lateness (see sched_next_wake_in_ms), and it is not free: every early wake is
+ * an extra timer interrupt and an extra trip through schedule(), on every core.
+ * Under TCG that cost is large enough to push the aarch64 boot self-test past
+ * its budget, which is how it got noticed.
+ *
+ * But almost nothing that sleeps NEEDS to be punctual. A poll loop asking for
+ * 100 ms does not care about five of them; a compositor owing a frame every
+ * 16 ms does, and an audio thread with a 15 ms buffer does. Those are exactly
+ * the threads that declared a period -- they said so, in the one place the
+ * kernel asks. So the early wake is spent on them and on nothing else, and a
+ * machine where nothing has declared pays nothing at all.
+ *
+ * That is the same rule the deadline policy's scan follows: do not charge every
+ * machine for a feature it is not using. */
+static volatile uint64_t g_earliest_periodic_wake_ms;
+
+void sched_sleep_ms(uint64_t ms) {
+    if (ms == 0) {
+        sys_yield();
+        return;
+    }
+
+    uint64_t deadline = timer_uptime_ms() + ms;
+
+    for (;;) {
+        if (timer_uptime_ms() >= deadline)
+            return;
+
+        sched_lock();
+        struct thread *t = current_thread;
+        if (!t) {                       /* no scheduler yet: fall back */
+            sched_unlock();
+            timer_delay_ms((uint32_t)ms);
+            return;
+        }
+        /* USER THREADS TOO, now. This was gated to kernel threads for two
+         * commits because letting user threads block killed aarch64 on four
+         * cores -- and the gate was a throttle on a scheduler bug, not a
+         * boundary around a broken path. The bug is fixed at its source: see
+         * "UNDO A BLOCK THAT DID NOT HAPPEN" in schedule_locked(). */
+
+        t->wake_at_ms = deadline;
+        /* Under the lock, so this cannot race the drain below. */
+        if (!g_earliest_wake_ms || deadline < g_earliest_wake_ms)
+            __atomic_store_n(&g_earliest_wake_ms, deadline, __ATOMIC_RELAXED);
+        if (t->period_ms &&
+            (!g_earliest_periodic_wake_ms || deadline < g_earliest_periodic_wake_ms))
+            __atomic_store_n(&g_earliest_periodic_wake_ms, deadline, __ATOMIC_RELAXED);
+        /* Returns UNLOCKED -- it released the lock to switch away. The loop
+         * re-checks the clock rather than trusting the wake, because a
+         * cancellation wakes a blocked thread too and this must not turn into
+         * a busy loop when that happens: the deadline check above ends it. */
+        sched_block_current_locked(&g_sleep_wq);
+        /* Cancellation is per-PROCESS (docs/INTERRUPTION.md): a cancelled
+         * process must not be held in a sleep it asked for before it was told
+         * to stop. Kernel threads have a process too, so this is uniform. */
+        if (t->proc && t->proc->cancelled) {
+            t->wake_at_ms = 0;
+            return;
+        }
+    }
+}
+
+/* --- TICKLESS IDLE ---------------------------------------------------------
+ *
+ * Which cores are halted right now. A core sets its bit on the way into the
+ * idle halt and clears it on the way out, so a thread becoming runnable knows
+ * whether anybody needs telling.
+ *
+ * Read and written without the scheduler lock, atomically. It is a HINT: a
+ * stale bit costs one unnecessary IPI, and a missed bit is impossible in the
+ * direction that matters -- a core sets its bit BEFORE arming its timer and
+ * halting, so a waker that races it either sees the bit (and IPIs) or the core
+ * has not halted yet (and will re-run the scheduler on its way in). */
+static volatile uint32_t g_idle_cpus;
+
+void sched_idle_enter(void) {
+    __atomic_or_fetch(&g_idle_cpus, 1u << (this_cpu()->cpu_index & 31), __ATOMIC_SEQ_CST);
+}
+void sched_idle_exit(void) {
+    __atomic_and_fetch(&g_idle_cpus, ~(1u << (this_cpu()->cpu_index & 31)), __ATOMIC_SEQ_CST);
+}
+
+/* Somebody became runnable. Drag the halted cores out so one of them picks it
+ * up, instead of leaving it until a timer that may be a second away.
+ *
+ * Only when a core is ACTUALLY halted: on a busy machine this is a load of one
+ * word and a branch, and sends nothing. That matters, because this sits on
+ * every wake path in the kernel. */
+static void sched_kick_idle(void) {
+    uint32_t mask = __atomic_load_n(&g_idle_cpus, __ATOMIC_RELAXED);
+    if (!mask)
+        return;                          /* nobody halted: nothing to tell */
+
+    /* EXACTLY ONE CORE. One thread became runnable, so one core needs to run
+     * it, and interrupting the rest to hand it to one of them is a thundering
+     * herd -- measured on four cores, broadcasting here cost MORE than the
+     * 100 Hz tick tickless idle was removing: system idle fell from 98% to
+     * 87%. That measurement is the reason arch_ipi_send exists.
+     *
+     * The lowest set bit, deliberately arbitrary: which idle core takes it
+     * does not matter, and any policy worth having (cache affinity, the core
+     * the thread last ran on) needs per-core run queues to act on. */
+    uint32_t cpu = (uint32_t)__builtin_ctz(mask);
+    if (cpu != this_cpu()->cpu_index)
+        (void)arch_ipi_send(cpu, IPI_RESCHEDULE);
+}
+
+/* How long THIS core may sleep: until the earliest sleeper's deadline, capped.
+ *
+ * THE CAP IS NOT A SAFETY NET, it is an admission. Everything that can make a
+ * thread runnable is supposed to kick the idle cores, and if that were
+ * complete the cap could be minutes. It is one second because "supposed to" is
+ * a claim about code I have not enumerated exhaustively -- a wake path added
+ * later that forgets to kick would hang the machine, and instead costs one
+ * wasted wakeup per second. Lower it when the kick paths are provably total;
+ * do not raise it because nothing has hung yet. */
+#define SCHED_IDLE_CAP_MS 1000
+
+/* How long a BUSY core may run before its next timer interrupt.
+ *
+ * THE QUANTUM IS NOT THE ONLY DEADLINE A RUNNING CORE HAS. A sleeping thread
+ * becomes runnable only inside wake_expired_locked(), which runs inside
+ * schedule() -- so on a machine with more runnable work than cores, where no
+ * core is idle, nothing notices a sleeper coming due until the next tick. It
+ * is not late because the wrong thread was picked; it was not yet a CANDIDATE
+ * when the decision was made.
+ *
+ * That is worth roughly half a tick on average, and it is exactly the residual
+ * the deadline policy could not explain away: worst-case lateness fell from
+ * 78 ms to 13 ms with the policy, but the MEAN stayed near 5 ms against a
+ * period of 16, and no policy can fix a thread that is not a candidate.
+ *
+ * So a busy core arms for whichever comes first: its quantum, or the next
+ * sleeper. This returns the SLEEPER half -- 0 when nothing is sleeping, which
+ * is the common case and the cheapest answer -- and the caller combines it
+ * with its own quantum deadline. It is split that way because the two arches
+ * track their quantum differently and because an early fire must not be
+ * COUNTED as a tick: `ticks` is a clock and net_tick() is a 10 ms clock, and
+ * both would run fast if an extra interrupt looked like an extra tick.
+ *
+ * Never returns 0 when something IS due: on the LAPIC an initial count of zero
+ * stops the timer rather than firing it, which would stop the core's clock
+ * dead, and 1 ms is the smallest honest "now".
+ *
+ * CAPPED AT THE QUANTUM because a core that has work is going to be
+ * interrupted then anyway; asking for longer would be asking to be preempted
+ * later, which is a different change and not this one.
+ *
+ * READS THE LOCK-FREE CACHE, deliberately. This is called at the very top of
+ * the timer interrupt, before the re-arm, where taking the scheduler lock
+ * would be both a deadlock risk and an absurd cost. g_earliest_wake_ms is racy
+ * by design (see its comment); stale-late here means arming for the quantum
+ * and catching the sleeper one tick later, which is exactly the behaviour this
+ * replaces and therefore not a regression. Stale-EARLY cannot storm: every
+ * fire leads to schedule(), and schedule_locked() calls wake_expired_locked()
+ * unconditionally, which recomputes the cache. */
+uint32_t sched_next_wake_in_ms(void) {
+    /* THE PERIODIC CACHE, NOT THE GENERAL ONE. See its definition: a thread
+     * that never said it needs a cadence is not worth an extra interrupt on
+     * every core, and almost nothing that sleeps has said so. */
+    uint64_t earliest = __atomic_load_n(&g_earliest_periodic_wake_ms,
+                                        __ATOMIC_RELAXED);
+    if (!earliest)
+        return 0;                       /* nothing periodic is sleeping */
+
+    uint64_t now = timer_uptime_ms();
+    if (earliest <= now)
+        return 1;                       /* already due */
+
+    uint64_t ms = earliest - now;
+    return ms >= TIMER_QUANTUM_MS ? TIMER_QUANTUM_MS : (uint32_t)ms;
+}
+
+uint32_t sched_idle_next_ms(void) {
+    uint64_t now = timer_uptime_ms();
+    uint64_t best = now + SCHED_IDLE_CAP_MS;
+
+    uint64_t earliest = __atomic_load_n(&g_earliest_wake_ms, __ATOMIC_RELAXED);
+    if (earliest && earliest < best)
+        best = earliest;
+
+    if (best <= now)
+        return 1;                       /* already due: wake immediately */
+    uint64_t ms = best - now;
+    if (ms > SCHED_IDLE_CAP_MS) ms = SCHED_IDLE_CAP_MS;
+
+    /* SKEW BY CORE, or they all wake at the same instant.
+     *
+     * Every idle core computes the SAME answer -- the earliest sleeper's
+     * deadline is a property of the system, not of the core asking -- so
+     * without this they arm for one moment, wake together, and pile into the
+     * scheduler lock at once. Measured, and it is not small: at idle the lock
+     * was 23% CONTENDED with 156 spin iterations per collision, while the same
+     * lock under a four-thread load was 2%. An idle machine contending harder
+     * than a busy one is the signature of lockstep, and this is the change
+     * that introduced it -- before tickless the cores ticked at whatever
+     * phases they happened to boot with.
+     *
+     * A few milliseconds apart is enough to de-phase them. It costs the later
+     * cores a slightly longer sleep, which is the wrong direction only if they
+     * were the one that had to service the deadline -- and they are not: any
+     * core that wakes drains the timer queue, and a thread made runnable kicks
+     * an idle core directly. */
+    ms += (uint64_t)(this_cpu()->cpu_index & 3) * 2;
+    return (uint32_t)ms;
+}
+
+/* Wake every sleeper whose deadline has passed. CALLER MUST HOLD g_sched_lock,
+ * and that requirement is the entire point of this function's shape.
+ *
+ * It used to take the lock itself, from the timer tick, immediately before
+ * schedule() took it again -- and that extra acquire/release on the tick path
+ * corrupted a resuming thread on four cores. g_sched_lock is HELD ACROSS a
+ * context switch and released by whichever core resumes next, so its saved
+ * interrupt flags are a single slot written by one core and consumed by
+ * another; process.c has a long comment on that hazard for exactly this
+ * reason. Adding a second lock/unlock cycle to the tick, between the switch
+ * and its release, was enough to break it: the symptom was a PC-alignment
+ * fault at EL1 with a garbage ELR -- a thread resumed onto a context that was
+ * not finished being saved.
+ *
+ * Folding the scan INTO schedule()'s existing critical section removes the
+ * cycle entirely. It is also simply better: one acquisition per tick instead
+ * of two, and the wake is now atomic with the scheduling decision that acts on
+ * it. */
+static void wake_expired_locked(void) {
+    if (!g_sleep_wq.head)
+        return;                        /* the common case, and now lock-free */
+
+    uint64_t now = timer_uptime_ms();
+    bool woke = false;
+    uint64_t earliest = 0, earliest_p = 0;
+    struct thread *t = g_sleep_wq.head;
+    while (t) {
+        struct thread *next = t->wait_next;
+        if (t->wake_at_ms && now >= t->wake_at_ms) {
+            wait_queue_remove(&g_sleep_wq, t);
+            t->wake_at_ms = 0;
+            sched_set_ready(t);
+            woke = true;
+        } else if (t->wake_at_ms) {
+            if (!earliest || t->wake_at_ms < earliest)
+                earliest = t->wake_at_ms;
+            if (t->period_ms && (!earliest_p || t->wake_at_ms < earliest_p))
+                earliest_p = t->wake_at_ms;
+        }
+        t = next;
+    }
+    /* Recomputed from the walk we were doing anyway -- the caches are exact
+     * again here, whatever they drifted to between drains. */
+    __atomic_store_n(&g_earliest_wake_ms, earliest, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_earliest_periodic_wake_ms, earliest_p, __ATOMIC_RELAXED);
+    if (woke)
+        sched_kick_idle();
 }
 
 /* --------------------------------------------------------------------
@@ -757,12 +1290,68 @@ int process_cancel(uint32_t pid) {
     for (struct thread *t = proc->thread_list; t; t = t->proc_thread_next) {
         if (t->state == PROCESS_BLOCKED && t->wait_queue) {
             wait_queue_remove(t->wait_queue, t);
-            t->state = PROCESS_READY;
+            sched_set_ready(t);
         }
     }
 
     spin_unlock(&g_sched_lock);
     return EMBK_OK;
+}
+
+/* See the comment on intr_catch in process.h for why this exists alongside
+ * process_cancel() rather than replacing it. */
+int process_raise_interrupt(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+
+    struct process *proc = process_find(pid);
+    if (!proc) {
+        spin_unlock(&g_sched_lock);
+        return -EMBK_EINVAL;
+    }
+    if (!proc->intr_catch) {
+        spin_unlock(&g_sched_lock);
+        return 0;                 /* caller falls back to cancelling */
+    }
+    if (proc->live_thread_count == 0) {
+        spin_unlock(&g_sched_lock);
+        return 1;                 /* already stopped; nothing to interrupt */
+    }
+
+    proc->intr_pending++;
+
+    /* Wake every blocked thread so it re-checks, exactly as a cancellation
+     * does. An interrupt that only took effect the next time the process
+     * happened to run would not interrupt anything that was waiting -- which
+     * is most of what anyone wants to interrupt. */
+    for (struct thread *t = proc->thread_list; t; t = t->proc_thread_next) {
+        if (t->state == PROCESS_BLOCKED && t->wait_queue) {
+            wait_queue_remove(t->wait_queue, t);
+            sched_set_ready(t);
+        }
+    }
+
+    spin_unlock(&g_sched_lock);
+    return 1;
+}
+
+void process_set_intr_catch(bool on) {
+    spin_lock(&g_sched_lock);
+    if (current_process) {
+        current_process->intr_catch = on;
+        if (!on) current_process->intr_pending = 0;   /* opting out drops the backlog */
+    }
+    spin_unlock(&g_sched_lock);
+}
+
+uint32_t process_take_interrupts(void) {
+    spin_lock(&g_sched_lock);
+    uint32_t n = 0;
+    if (current_process) {
+        n = current_process->intr_pending;
+        current_process->intr_pending = 0;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
 }
 
 int process_is_cancelled(uint32_t pid) {
@@ -778,7 +1367,14 @@ int process_is_cancelled(uint32_t pid) {
  * not gated on the (much larger, not-yet-built) message-port IPC model).
  * -------------------------------------------------------------------- */
 
-static void process_kill_locked(uint32_t pid,bool drain_syscalls) {
+static void end_every_thread_locked(struct process *proc, int code);
+
+void process_kill(uint32_t pid) {
+    process_kill_code(pid, -1);
+}
+
+void process_kill_code(uint32_t pid, int code) {
+    spin_lock(&g_sched_lock);
 
     struct process *proc = process_find(pid);
     if (!proc) {
@@ -787,14 +1383,32 @@ static void process_kill_locked(uint32_t pid,bool drain_syscalls) {
         return;
     }
 
-    if(drain_syscalls && proc->constructing) {spin_unlock(&g_sched_lock);return;}
     if (proc->live_thread_count == 0) {
         spin_unlock(&g_sched_lock);
         return;   // already fully exited; nothing left to force
     }
 
-    proc->exit_code = -1;   // killed, not a normal exit -- set once, for
-                             // whenever the process (every thread) actually finishes
+    end_every_thread_locked(proc, code);
+}
+
+/* END THE WHOLE PROCESS: every thread of `proc`, whoever asked.
+ *
+ * Called with g_sched_lock held, and RELEASES it on every path -- including
+ * the one that never comes back here at all, when the caller's own thread is
+ * one of the ones ending.
+ *
+ * Both ways a process can end come through here. A kill from outside
+ * (process_kill_code) and the process ending ITSELF (process_exit_self) differ
+ * only in who chose the exit code and in the bookkeeping done before the lock
+ * is taken; what has to happen to the threads is identical, and when it was
+ * written twice, only one of the two copies did it. */
+static void end_every_thread_locked(struct process *proc, int code) {
+    proc->exit_code = code; // killed, not a normal exit (-1 unless the killer says
+                             // otherwise -- a logout) -- set once, for whenever the
+                             // process (every thread) actually finishes
+    proc->cancelled = true;  // a killed process is certainly cancelled: every
+                             // interruptible sleep in the kernel returns, and the
+                             // thread reaches its exit
 
     /* Snapshot the thread list NOW: thread_zombie_locked() below unlinks
      * each thread as it's processed, and killing current_thread hands off
@@ -813,10 +1427,6 @@ static void process_kill_locked(uint32_t pid,bool drain_syscalls) {
     int was_current_idx = -1;
     for (int i = 0; i < n; i++) {
         struct thread *t = threads[i];
-        /* Session teardown lets in-flight kernel work release its locks and
-         * finish the current transaction before exiting at dispatch return. */
-        if(drain_syscalls && (t->syscall_depth ||
-           (t->state==PROCESS_BLOCKED && !t->wait_queue)))continue;
         if (t == current_thread) {
             was_current_idx = i;
             continue;
@@ -825,35 +1435,29 @@ static void process_kill_locked(uint32_t pid,bool drain_syscalls) {
             continue;   // already dying; nothing left to force
         }
 
-        /* RUNNING on a DIFFERENT core right now -- must NOT touch its
-         * kernel stack synchronously: nothing guarantees it isn't still
-         * executing there this exact instant. Marking it ZOMBIE is enough:
-         * that core's OWN next schedule() call (at most one timer tick
-         * away, ~10ms) sees state == PROCESS_ZOMBIE at its own entry and
-         * runs the exact same hand-off/defer-reap logic schedule() already
-         * has, regardless of which core forced the transition. No IPI
-         * needed -- see docs/architecture/process-and-scheduling.md's SMP
-         * phase for why this is sufficient rather than a shortcut. */
-        bool running_elsewhere = (t->state == PROCESS_RUNNING);
-
+        /* A KILL IS A FLAG, AND THE THREAD DIES AT ITS NEXT SAFE POINT. The
+         * first version reaped a blocked thread's kernel stack right here and
+         * abandoned a running one at its core's next schedule() -- wherever it
+         * was. A thread asleep on the filesystem's lock inside fsync, or
+         * preempted holding the page cache's, took the lock to its grave, and
+         * every later file operation in the system waited on a dead owner:
+         * `test kill io` could not even load its second witness from disk.
+         *
+         * Now the thread finishes whatever kernel path it is on and dies at
+         * its return to user mode -- the syscall or fault exit -- or, if the
+         * tick found it in user mode, in the scheduler right there; a kernel
+         * thread, which has no user mode and holds nothing across its own
+         * schedule() calls, dies at its next schedule() as before. A blocked
+         * thread is woken: every indefinite sleep in the kernel checks
+         * `cancelled`, which a kill implies, and returns; a wait for a lock is
+         * bounded and simply completes. A suspended thread (job control, the
+         * debugger) is unfrozen -- a kill overrides a stop. The program cannot
+         * catch any of this; only the kernel's own bookkeeping gets to finish. */
+        t->killed = true;
+        t->suspended = false;
         if (t->state == PROCESS_BLOCKED && t->wait_queue) {
             wait_queue_remove(t->wait_queue, t);
-        }
-        t->state = PROCESS_ZOMBIE;
-        struct process *needs_reap = thread_zombie_locked(t);
-
-        if (running_elsewhere) {
-            continue;
-        }
-
-        /* Not running anywhere (READY or was BLOCKED) -- safe to reap
-         * this thread's stack synchronously right now. If it was also the
-         * LAST thread of its process (no live parent), the process's
-         * address space is definitively safe to free too: nothing was
-         * ever executing on it this instant. */
-        thread_reap_slot(t);
-        if (needs_reap) {
-            process_reap_slot(needs_reap);
+            sched_set_ready(t);
         }
     }
 
@@ -881,6 +1485,129 @@ static void process_kill_locked(uint32_t pid,bool drain_syscalls) {
 }
 
 /* --------------------------------------------------------------------
+ * Sessions -- see struct process::session_id.
+ * -------------------------------------------------------------------- */
+
+int process_session_of(uint32_t pid, uint32_t *out_session) {
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    int rc = -EMBK_ENOENT;
+    if (p && p->live_thread_count > 0) {
+        if (out_session) *out_session = p->session_id;
+        rc = EMBK_OK;
+    }
+    spin_unlock(&g_sched_lock);
+    return rc;
+}
+
+int process_exec_name(uint32_t pid, char *out, int cap) {
+    if (out && cap > 0) out[0] = 0;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    int rc = -EMBK_ENOENT;
+    if (p && p->live_thread_count > 0) {
+        if (out && cap > 0) {
+            int k = 0;
+            while (p->exec_name[k] && k < cap - 1) { out[k] = p->exec_name[k]; k++; }
+            out[k] = 0;
+        }
+        rc = EMBK_OK;
+    }
+    spin_unlock(&g_sched_lock);
+    return rc;
+}
+
+int session_end(uint32_t sid, bool logout) {
+    if (sid == 0)
+        return -EMBK_EPERM;              /* the system session is not a user's to end */
+
+    int killed = 0;
+    bool self_in = current_thread && current_process->session_id == sid;
+    bool self_leader = self_in && current_process->session_leader;
+
+    /* ROUNDS, because a kill is a flag the victim acts on at its next safe
+     * point: a member in the middle of a spawn finishes it before it dies, and
+     * the child it made is in the session too. So every round kills what is
+     * NEW -- each process exactly once -- and the loop runs until a round
+     * finds nothing new and every process already killed is gone (or ~1 s
+     * has passed: a victim blocked on a lock completes its path and dies, it
+     * is not waited for forever). Members before the leader within a round:
+     * the leader's death is what its waiter sees. The caller, if it is in the
+     * session, is left for the very end. */
+    uint32_t done[MAX_PROCESSES];
+    int nd = 0;
+    for (int round = 0; round < 100; round++) {
+        uint32_t fresh[MAX_PROCESSES];
+        uint32_t leader = 0;
+        int nf = 0, alive = 0;
+        spin_lock(&g_sched_lock);
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            struct process *p = &process_table[i];
+            if (p->pid == 0 || p->live_thread_count == 0 || p->session_id != sid)
+                continue;
+            if (current_thread && p == current_process)
+                continue;
+            bool seen = false;
+            for (int k = 0; k < nd && !seen; k++) seen = (done[k] == p->pid);
+            if (seen) { alive++; continue; }
+            if (p->session_leader) leader = p->pid;
+            else fresh[nf++] = p->pid;
+        }
+        spin_unlock(&g_sched_lock);
+        if (nf == 0 && leader == 0) {
+            if (alive == 0)
+                break;
+            if (current_thread) sched_sleep_ms(10);   /* the killed are on their way out */
+            continue;
+        }
+        for (int i = 0; i < nf; i++) {
+            process_kill_code(fresh[i], -1);
+            done[nd++] = fresh[i];
+            killed++;
+        }
+        if (leader) {
+            process_kill_code(leader, logout ? EMBK_EXIT_LOGOUT : -1);
+            done[nd++] = leader;
+            killed++;
+        }
+    }
+
+    /* What the session left in shared kernel state. */
+    clipboard_session_ended(sid);
+
+    if (self_in) {
+        /* Last, and never returns: process_kill of the current process hands
+         * this core to the scheduler. */
+        process_kill_code(current_process->pid, (self_leader && logout) ? EMBK_EXIT_LOGOUT : -1);
+    }
+    return killed;
+}
+
+int session_list(struct session_row *out, int max) {
+    int n = 0;
+    spin_lock(&g_sched_lock);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        struct process *p = &process_table[i];
+        if (p->pid == 0 || p->live_thread_count == 0 || p->session_id == 0)
+            continue;
+        int k = 0;
+        while (k < n && out[k].id != p->session_id) k++;
+        if (k == n) {
+            if (n == max) continue;
+            out[n].id = p->session_id;
+            out[n].leader_pid = 0;
+            out[n].procs = 0;
+            memcpy(out[n].user, p->session_user, sizeof out[n].user);
+            n++;
+        }
+        out[k].procs++;
+        if (p->session_leader) out[k].leader_pid = p->pid;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+/* --------------------------------------------------------------------
  * Real blocking wait() (docs/architecture/process-and-scheduling.md §7.4/
  * §17's Phase D item -- replaces the earlier busy-poll sys_wait).
  * -------------------------------------------------------------------- */
@@ -905,8 +1632,7 @@ int process_wait(uint32_t pid) {
      * forever -- a real observed hang, intermittent only because the
      * blocking path itself is (the zombie is often already handed off by
      * the time we look, and the non-blocking path never switches). */
-    uint64_t entry_flags;
-    __asm__ volatile ("pushfq; pop %0" : "=r"(entry_flags) :: "memory");
+    uint64_t entry_flags = arch_irq_flags();
 
     for (;;) {
 retry:
@@ -933,7 +1659,7 @@ retry:
                  * nothing would ever wake us again). */
                 if (z->running_cpu != -1) {
                     spin_unlock(&g_sched_lock);
-                    __asm__ volatile ("pause");
+                    arch_cpu_relax();
                     goto retry;
                 }
                 *link = z->zombie_next;   // unlink from our zombie list
@@ -965,6 +1691,35 @@ retry:
             return -EMBK_ECHILD;
         }
 
+        /* STOPPED IS NOT FINISHED, and waiting for a stopped process to exit
+         * is waiting for something that is not going to happen. ^Z at the
+         * console suspends the routed child; a debugger freezes one. Either
+         * way the parent has to get its prompt back and say so, which it
+         * cannot do from inside a block that nothing will ever end.
+         *
+         * CHECKED AFTER THE ZOMBIE SCAN, deliberately, and for the same reason
+         * the cancellation check above is: if the child has already exited its
+         * status is a real result and the caller gets it. A process cannot be
+         * both, but the ordering is what guarantees that rather than a claim
+         * about it.
+         *
+         * Every thread suspended means the process is stopped. One of several
+         * suspended is a debugger freezing a single thread, which is not a
+         * stopped JOB and must not take the parent's wait away. */
+        if (target->live_thread_count > 0) {
+            int frozen = 0, live = 0;
+            for (struct thread *t = target->thread_list; t; t = t->proc_thread_next) {
+                if (t->state == PROCESS_ZOMBIE || t->state == PROCESS_UNUSED)
+                    continue;
+                live++;
+                if (t->suspended) frozen++;
+            }
+            if (live > 0 && frozen == live) {
+                spin_unlock(&g_sched_lock);
+                return -EMBK_ESTOPPED;
+            }
+        }
+
         /* It's our child and still running/ready/blocked -- block until
          * SOME child of ours exits (child_wait doesn't say which), then
          * loop back and re-check. Harmless if it wasn't this pid: we just
@@ -981,7 +1736,7 @@ retry:
          * the interrupt state our caller actually had, since neither the
          * context switch nor spin_unlock could know it. */
         if (entry_flags & (1ULL << 9)) {
-            __asm__ volatile ("sti" ::: "memory");
+            arch_irq_enable();
         }
     }
 }
@@ -1001,6 +1756,7 @@ int process_set_priority(uint32_t pid, uint8_t priority) {
      * assignment the pre-split code made directly. */
     for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
         t->priority = priority;
+        t->base_priority = (uint8_t)priority;
         t->ticks_since_scheduled = 0;   // don't let a stale aging counter from
                                         // the old band immediately re-bump it
     }
@@ -1009,6 +1765,11 @@ int process_set_priority(uint32_t pid, uint8_t priority) {
 }
 
 int process_list(struct process_info *out, int max) {
+    /* ONE clock read for the whole listing. Sampling it per row would make the
+     * rows disagree about "now", so a long list would show later processes
+     * with slightly more running fragment than earlier ones for no reason. */
+    const uint64_t list_now_ns = time_get_ns();
+
     spin_lock(&g_sched_lock);
     int n = 0;
     for (int i = 0; i < MAX_PROCESSES && n < max; i++) {
@@ -1027,6 +1788,19 @@ int process_list(struct process_info *out, int max) {
         out[n].priority = p->thread_list ? p->thread_list->priority : 0;
         out[n].exit_code = p->exit_code;
         out[n].is_kthread = (p->pml4_phys == vmm_get_kernel_pml4());
+        out[n].session_id = p->session_id;
+        {
+            int k = 0;
+            while (p->exec_name[k] && k < EXEC_NAME_MAX) { out[n].name[k] = p->exec_name[k]; k++; }
+            out[n].name[k] = 0;
+        }
+        out[n].cpu_ns = 0;
+        for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+            out[n].cpu_ns += t->cpu_ns;
+            if (t->state == PROCESS_RUNNING && t->dispatched_ns &&
+                list_now_ns > t->dispatched_ns)
+                out[n].cpu_ns += list_now_ns - t->dispatched_ns;
+        }
         n++;
     }
     spin_unlock(&g_sched_lock);
@@ -1085,6 +1859,20 @@ int process_inspect(uint32_t pid, struct process_detail *out,
         n++;
     }
     out->thread_count = n;
+
+    /* CPU consumed, summed here while the lock is already held and the thread
+     * list is already walked -- including the fragment the running threads
+     * have earned since their last dispatch. */
+    {
+        uint64_t now_ns = time_get_ns();
+        out->cpu_ns = 0;
+        for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+            out->cpu_ns += t->cpu_ns;
+            if (t->state == PROCESS_RUNNING && t->dispatched_ns &&
+                now_ns > t->dispatched_ns)
+                out->cpu_ns += now_ns - t->dispatched_ns;
+        }
+    }
     spin_unlock(&g_sched_lock);
     return 0;
 }
@@ -1121,8 +1909,8 @@ int thread_inspect(uint32_t tid, struct thread_detail *out) {
     out->user_rsp = t->user_rsp;
     out->kstack_top = t->kstack_top;
     out->fs_base = t->fs_base;
-    out->ctx_rip = t->ctx.rip;
-    out->ctx_rbp = t->ctx.rbp;
+    out->ctx_rip = kernel_ctx_pc(&t->ctx);
+    out->ctx_rbp = kernel_ctx_fp(&t->ctx);
     /* Only a NOT-running thread has a meaningful saved context: a RUNNING thread's
      * ctx is stale (its live registers are on a CPU, not in the TCB), so walking
      * it would symbolize wherever it was LAST parked, not where it is now. */
@@ -1150,10 +1938,10 @@ int process_fds_snapshot(uint32_t pid, struct fd_snap_info *out, int max) {
         out[n].pos = 0;
         out[n].vtype = 0;
         out[n].pipe_side = -1;
-        if (f->backing == FD_BACKING_VNODE) {
-            out[n].ino = f->u.file.vn.ino;
-            out[n].vtype = f->u.file.vn.type;
-            out[n].pos = f->u.file.pos;
+        if (f->backing == FD_BACKING_VNODE && f->u.file.of) {
+            out[n].ino = f->u.file.of->vn.ino;
+            out[n].vtype = f->u.file.of->vn.type;
+            out[n].pos = f->u.file.of->pos;
         } else if (f->backing == FD_BACKING_PIPE) {
             out[n].pipe_side = f->u.pipe.side;
         }
@@ -1236,7 +2024,7 @@ int ipc_handles_snapshot(struct ipc_handle_snap *out, int max) {
 #define SCHED_EVENT_RING 64  /* power of two; recent-switch history depth */
 
 struct sched_event {
-    uint64_t ts;        /* lapic_timer_get_ticks() at the switch */
+    uint64_t ts;        /* timer_sched_ticks() at the switch */
     uint32_t from_tid;  /* thread_table index we switched away from */
     uint32_t to_tid;    /* thread_table index we switched to */
     uint16_t cpu;       /* core the switch happened on */
@@ -1262,7 +2050,7 @@ static void sched_record_switch(struct thread *prev, struct thread *next, int cp
     next->last_ran_cpu = cpu;
 
     struct sched_event *e = &g_sched_ring[g_sched_ring_head & (SCHED_EVENT_RING - 1)];
-    e->ts       = lapic_timer_get_ticks();
+    e->ts       = timer_sched_ticks();
     e->from_tid = (uint32_t)(prev - thread_table);
     e->to_tid   = (uint32_t)(next - thread_table);
     e->cpu      = (uint16_t)cpu;
@@ -1293,6 +2081,13 @@ int thread_list(struct thread_info *out, int max) {
         out[n].last_ran_cpu = t->last_ran_cpu;
         out[n].born_tick = t->born_tick;
         out[n].exit_tick = t->exit_tick;
+        /* Scanned HERE, under the lock, because that is what guarantees the
+         * stack is still mapped: a thread that exits between the snapshot and
+         * the scan would have had its pages freed, and reading them would
+         * fault inside a debug command. The cost is the lock held for a scan
+         * that early-exits at the first used word -- microseconds per thread,
+         * paid only by whoever asks. */
+        out[n].kstack_used = thread_kstack_used(t->kstack_top);
         n++;
     }
     spin_unlock(&g_sched_lock);
@@ -1356,6 +2151,21 @@ static int set_process_suspended(uint32_t pid, bool val) {
     spin_unlock(&g_sched_lock);
     return n;
 }
+/* Wake everything blocked in process_wait() on `pid`'s children.
+ *
+ * The wake itself says nothing -- child_wait never says WHICH child -- so this
+ * is only ever "go and look again". That is exactly what is needed when a child
+ * has been suspended rather than has exited: the waiter re-checks, finds it
+ * frozen, and gets -EMBK_ESTOPPED instead of blocking on an exit that is not
+ * coming. Called from the keyboard IRQ, so it takes the lock itself and does
+ * nothing that can sleep. */
+void process_wake_child_waiters(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    if (p) wait_queue_wake_all(&p->child_wait);
+    spin_unlock(&g_sched_lock);
+}
+
 int process_suspend(uint32_t pid) { return set_process_suspended(pid, true); }
 int process_resume(uint32_t pid)  { return set_process_suspended(pid, false); }
 
@@ -1453,7 +2263,6 @@ int process_handle_reap_dead(struct process *owner) {
  * anything else really does become READY). Never returns. */
 __attribute__((noreturn))
 void process_exit_self(int code) {
-    current_process->exit_code = code;
     /* Make the death VISIBLE now: hide + repaint this process's windows while
      * we are still an ordinary syscall context (framebuffer work is fine
      * here). The reap runs later under the scheduler lock and only reclaims
@@ -1465,12 +2274,32 @@ void process_exit_self(int code) {
      * we zombie-and-switch-away, so the event and status are recorded while the
      * process is still fully valid. */
     debug_notify_exit(current_process, code);
-    current_thread->state = PROCESS_ZOMBIE;
-    schedule();
 
-    __asm__ volatile("sti");
+    /* EXIT ENDS THE PROCESS, NOT THE THREAD THAT CALLED IT. This used to
+     * zombie only the calling thread and leave every sibling running, which
+     * is not what exit() means in any operating system and is not what the
+     * program that called it intends: main() returning is the program saying
+     * it is finished.
+     *
+     * WHAT IT COST. user/tests/jitter starts six worker threads and, if one
+     * fails to start, exits with an error -- leaving the workers spinning in
+     * user space with no syscall and no fault ever again. Nothing marked them
+     * killed, so the tick's scheduler had no reason to stop them (it ends a
+     * killed thread it finds in user mode -- see schedule_locked -- but they
+     * were not killed), the process never reached zero live threads, and the
+     * parent's process_wait() never returned. The machine kept running and the
+     * boot never finished: found on aarch64, where the boot runs jitter, but
+     * neither the bug nor its consequence is architecture-specific.
+     *
+     * A thread that wants to end only ITSELF calls thread_exit_self(); that
+     * distinction is the whole point of having both. */
+    spin_lock(&g_sched_lock);
+    end_every_thread_locked(current_process, code);   /* releases the lock */
+
+    /* Only reachable if the scheduler somehow came back to a ZOMBIE. */
+    arch_irq_enable();
     for (;;) {
-        __asm__ volatile("hlt");
+        arch_cpu_idle();
     }
 }
 
@@ -1523,10 +2352,22 @@ int process_create_caps(const char *path, char *const argv[], int argc,
      * fallible steps below, so the parent link is always correct even if
      * process_create() fails partway through (the failure paths just reset
      * pid to 0; they don't need to touch parent/parent_pid). */
-    proc->constructing=true;
     proc->parent = current_thread ? current_process : NULL;
     proc->parent_pid = current_thread ? current_process->pid : 0;
-    proc->session_id = proc->parent ? proc->parent->session_id : 0;
+
+    /* The program's name, for anything that has to SHOW this process to a
+     * person -- see struct process::exec_name for why it is a basename and why
+     * nothing is allowed to make a decision with it. Recorded here, with the
+     * parent link, because `path` is not kept anywhere else: by the time the
+     * child is running, the string belonged to the caller's stack. */
+    {
+        const char *base = path ? path : "";
+        for (const char *c = base; *c; c++)
+            if (*c == '/') base = c + 1;
+        int k = 0;
+        while (base[k] && k < EXEC_NAME_MAX) { proc->exec_name[k] = base[k]; k++; }
+        proc->exec_name[k] = 0;
+    }
 
     /* Attenuate from the parent (EMBX §6 step 9, kernel side). The grantor is
      * the spawning process; with no current process this is the kernel creating
@@ -1590,17 +2431,66 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
     }
 
+    /* The session -- whose this process is. Inherited from the spawner, like
+     * everything else a process is born with; replaced only by a NEW_SESSION
+     * action, which only a holder of EMBK_CAP_SESSION may make and which
+     * STRIPS that capability from the child: a session can never open another
+     * one. Checked here, before the address space exists, so a refusal is
+     * just "release the slot" like the capability and namespace refusals
+     * above. See struct process::session_id. */
+    {
+        if (current_thread) {
+            proc->session_id = current_process->session_id;
+            proc->session_live = current_process->session_live;
+            memcpy(proc->session_user, current_process->session_user, sizeof proc->session_user);
+        }
+        for (int i = 0; i < n_count; i++) {
+            if (actions[i].kind != SPAWN_ACTION_NEW_SESSION)
+                continue;
+            if (current_thread && !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_SESSION))) {
+                proc->pid = 0;
+                return -EMBK_EPERM;
+            }
+            /* A username, and only a username: [a-z0-9_-], 1..31. The same
+             * rule the account store enforces, repeated here because this is
+             * the identity every gate compares, and "the caller checked" is
+             * not a property of the kernel. */
+            const char *u = actions[i].path;
+            size_t ul = 0;
+            while (ul < sizeof proc->session_user && u[ul]) ul++;   /* bounded: the kernel has no strnlen */
+            bool valid = ul > 0 && ul < sizeof proc->session_user;
+            for (size_t k = 0; valid && k < ul; k++)
+                valid = (u[k] >= 'a' && u[k] <= 'z') || (u[k] >= '0' && u[k] <= '9') ||
+                        u[k] == '_' || u[k] == '-';
+            if (!valid) {
+                proc->pid = 0;
+                return -EMBK_EINVAL;
+            }
+            static uint32_t g_next_session_id = 1;
+            proc->session_id = __atomic_fetch_add(&g_next_session_id, 1, __ATOMIC_RELAXED);
+            memset(proc->session_user, 0, sizeof proc->session_user);
+            memcpy(proc->session_user, u, ul);
+            if(actions[i].flags&~SPAWN_SESSION_LIVE || (actions[i].flags && boot_protocol_get()->boot_mode!=BOOT_MODE_LIVE)) {
+                proc->pid=0;return -EMBK_EINVAL;
+            }
+            proc->session_live=(actions[i].flags&SPAWN_SESSION_LIVE)!=0;
+            proc->session_leader = true;
+            proc->cap_set &= ~EMBK_CAP_BIT(EMBK_CAP_SESSION);
+            break;
+        }
+    }
     proc->zombie_next = NULL;
+    proc->vma_list = 0;   /* no mappings until mmap() makes one */
     proc->zombie_head = NULL;
     proc->child_list = NULL;
     proc->child_next = NULL;
     proc->exit_code = 0;
-    proc->heap_brk = USER_HEAP_VA_BASE;   // sbrk_(0) queries this before any real
+    proc->heap_brk = proc->layout.heap_base;   // sbrk_(0) queries this before any real
                                            // growth; must start at the heap's base,
                                            // not 0 (which also fails process_sbrk()'s
                                            // own USER_HEAP_VA_BASE bound check on the
                                            // very first growth request)
-    proc->heap_mapped_top = USER_HEAP_VA_BASE;   // nothing mapped yet, but tracked
+    proc->heap_mapped_top = proc->layout.heap_base;   // nothing mapped yet, but tracked
                                                   // from the same base heap_brk starts
                                                   // at (process_sbrk() only maps pages
                                                   // between heap_mapped_top and the new
@@ -1609,7 +2499,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                                                   // below the real heap)
     memset(proc->handles, 0, sizeof(proc->handles));
     memset(proc->obj_handles, 0, sizeof(proc->obj_handles));
-    proc->shared_next_va = USER_SHARED_VA_BASE;   /* surface-mapping VA window */
+    proc->shared_next_va = proc->layout.shared_base;   /* surface-mapping VA window, its OWN now */
 
     /* Register ourselves on our parent's live-children list (ps tree view
      * only -- see child_list's comment in process.h). */
@@ -1646,7 +2536,8 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         rc = embx_load_from_file(path, pml4, parent_caps, &entry_point, &granted);
         if (rc == EMBK_OK) proc->cap_set = granted;   /* declared + granted */
     } else {
-        rc = elf_load_from_file(path, pml4, &entry_point);
+        rc = elf_load_from_file_at(path, pml4, proc->layout.exec_base,
+                                   proc->layout.dylib_base, &entry_point);
     }
     if (rc != EMBK_OK) {
         vmm_destroy_address_space(pml4);
@@ -1753,6 +2644,8 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         } else if (act->kind == SPAWN_ACTION_NS_BIND) {
             /* Not a file action -- the namespace grant was already built and
              * installed into proc->ns at creation (below the cap grant). Skip. */
+        } else if (act->kind == SPAWN_ACTION_NEW_SESSION) {
+            /* Not a file action -- the session was granted at creation. Skip. */
         } else if (act->kind == SPAWN_ACTION_DEBUG) {
             /* Born under debug (§6.2). Only note it here; the session is
              * created and the child parked at the very end, once its thread and
@@ -1771,23 +2664,32 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
     }
 
-    // 3. Allocate a user stack page and map it into the process's address space
-    uint64_t stack_phys = pmm_alloc_page();
+    // 3. The main stack: USER_STACK_PAGES ending with the top page, as ONE
+    // anonymous mapping. Demand-paged and zero on first touch -- the eager
+    // version mapped all 128 frames up front and, below the top page, handed
+    // them over UNZEROED, so a frame recycled from another process arrived on
+    // this one's stack with that process's data in it. And it can be paged
+    // out now, like everything else that is a mapping. The guard below it is
+    // the absence of a mapping: a fault there is declined and fatal.
+    uint64_t stack_lo = proc->layout.stack_top_page + PAGE_SIZE
+                      - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
+    if (vma_map_anon_at(proc, stack_lo, (uint64_t)USER_STACK_PAGES * PAGE_SIZE,
+                        PROT_READ | PROT_WRITE) != 0) {
+        vma_destroy_all(proc);
+        vmm_destroy_address_space(pml4);
+        proc->pid = 0;
+        return -EMBK_ENOMEM;
+    }
+
+    // 3.1 argv/envp are written into the TOP page below, through the direct
+    // map, before the process has ever run -- so that one page is faulted in
+    // now, by the same path its first touch would have taken.
+    uint64_t stack_phys = vma_prefault(proc, proc->layout.stack_top_page);
     if (!stack_phys) {
+        vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_ENOMEM;  // Failed to allocate user stack
-    }
-
-    vmm_map_in(pml4, USER_STACK_VA, stack_phys, VMM_NX | VMM_WRITABLE | VMM_USER);
-
-    // 3.1 Give the main stack room to grow down: map (USER_STACK_PAGES-1) more
-    // pages BELOW the top page. argv still lives in the top page (below).
-    for (int i = 1; i < USER_STACK_PAGES; i++) {
-        uint64_t ph = pmm_alloc_page();
-        if (!ph) { vmm_destroy_address_space(pml4); proc->pid = 0; return -EMBK_ENOMEM; }
-        vmm_map_in(pml4, USER_STACK_VA - (uint64_t)i * 0x1000, ph,
-                   VMM_NX | VMM_WRITABLE | VMM_USER);
     }
 
     // 3.5 Lay out argv on the child's stack, via the SAME direct-map trick
@@ -1809,7 +2711,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     for (int i = 0; i < argc; i++) argv_bytes += strlen(argv[i]) + 1;
     if (STACK_ROOM_NEEDED(argv_bytes, argc) + STACK_ROOM_NEEDED(env_bytes, envc)
             > PAGE_SIZE) {
-        pmm_free_page(stack_phys);
+        vma_destroy_all(proc);          /* the stack's frame is its object's, not ours to free */
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_E2BIG;
@@ -1821,7 +2723,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         size_t slen = strlen(argv[i]) + 1;  // include null terminator
         off -= slen;
         memcpy((void *)(child_kva + off), argv[i], slen);
-        argv_child_uva[i] = USER_STACK_VA + off;                 // the child's stack VA
+        argv_child_uva[i] = proc->layout.stack_top_page + off;   // the child's stack VA -- the ROLLED one
                                                                  // not the kernel alias,
                                                                  // we just wrote through
     }
@@ -1832,12 +2734,12 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         size_t slen = strlen(envp[i]) + 1;
         off -= slen;
         memcpy((void *)(child_kva + off), envp[i], slen);
-        envp_child_uva[i] = USER_STACK_VA + off;
+        envp_child_uva[i] = proc->layout.stack_top_page + off;
     }
 
     off &= ~0x7ULL;           // 8-align before the pointer array
     off -= (argc + 1) * sizeof(uint64_t);  // space for the argv array + null terminator
-    uint64_t argv_array_child_uva = USER_STACK_VA + off;
+    uint64_t argv_array_child_uva = proc->layout.stack_top_page + off;
     uint64_t *argv_array_child_kva = (uint64_t *)(child_kva + off);
     for (int i = 0; i < argc; i++) {
         argv_array_child_kva[i] = argv_child_uva[i];
@@ -1852,7 +2754,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     if (envp) {
         off &= ~0x7ULL;
         off -= (envc + 1) * sizeof(uint64_t);
-        envp_array_child_uva = USER_STACK_VA + off;
+        envp_array_child_uva = proc->layout.stack_top_page + off;
         uint64_t *envp_array_child_kva = (uint64_t *)(child_kva + off);
         for (int i = 0; i < envc; i++) {
             envp_array_child_kva[i] = envp_child_uva[i];
@@ -1862,7 +2764,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
 
     off &= ~0xFULL;            // 16-align before the initial RSP push
 
-    uint64_t child_user_rsp = USER_STACK_VA + off;
+    uint64_t child_user_rsp = proc->layout.stack_top_page + off;
 
 
     // 4. Allocate the first (and, for this phase, only) thread: kernel
@@ -1871,6 +2773,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                                          entry_point, child_user_rsp);
     if (!t) {
         pmm_free_page(stack_phys);
+        vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_EIO;  // Failed to allocate kernel stack
@@ -1900,16 +2803,16 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         if (!s) {
             /* No session slot -- fail the spawn cleanly rather than run a
              * child the debugger asked to hold. */
-            vmm_destroy_address_space(pml4);
+            vma_destroy_all(proc);
+        vmm_destroy_address_space(pml4);
             proc->pid = 0;
             return -EMBK_ENOMEM;
         }
         proc->debug_session = s;
         /* t->state was left BLOCKED by debug_session_spawn's wait_queue_block. */
+    } else {
+        sched_set_ready(t);
     }
-    sched_lock();proc->constructing=false;
-    if(!want_debug)t->state=PROCESS_READY;
-    sched_unlock();
     return (int)proc->pid;
 }
 
@@ -1937,8 +2840,6 @@ static void process_trampoline(void) {
      * kthread_trampoline() below for the exact same fix on the kthread
      * side. */
     spin_unlock(&g_sched_lock);
-    if (!session_may_spawn(current_process)) thread_exit_self(-EMBK_ECANCELED);
-
 
     uint64_t entry = current_thread->entry_point;
     uint64_t user_rsp = current_thread->user_rsp;
@@ -1948,113 +2849,60 @@ static void process_trampoline(void) {
      * loading it unconditionally here is harmless for the common case --
      * see struct thread::user_arg's comment (process.h). */
     if (current_thread->has_argv) {
-       uint64_t argc = current_thread->argc;
-       uint64_t argv = current_thread->argv_uva;
-       uint64_t envp = current_thread->envp_uva;   /* 0 == no environment */
-
-       /* Set up the user stack and jump to the entry point.
-        * SysV: main(argc, argv, envp) == rdi, rsi, rdx. */
-        __asm__ volatile(
-        "movq %4, %%rdi\n"      // argc -> rdi, BEFORE the pushes below (which
-                                 // must not themselves land in rdi/rdx -- see the
-                                 // clobber list forcing the compiler to pick
-                                 // other registers for the other operands)
-        "movq %5, %%rsi\n"       // argv -> rsi
-        "movq %6, %%rdx\n"       // envp -> rdx
-        "pushq %0\n"            // ss = user data | 3
-        "pushq %1\n"            // rsp = user stack top
-        "pushq $0x202\n"        // rflags = IF=1
-        "pushq %2\n"            // cs = user code | 3
-        "pushq %3\n"            // rip = entry point
-        "iretq\n"               // return to user mode
-        :
-        : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(argc), "r"(argv), "r"(envp)
-        : "rdi", "rdx", "memory"
-    );
+        /* SysV main(argc, argv, envp) -- the process's own first thread. */
+        arch_enter_user_mode(entry, user_rsp,
+                             current_thread->argc,
+                             current_thread->argv_uva,
+                             current_thread->envp_uva);   /* 0 == no environment */
     } else {
-        uint64_t arg = current_thread->user_arg;
-        /* Set up the user stack and jump to the entry point */
-        __asm__ volatile(
-        "movq %4, %%rdi\n"      // arg -> rdi, BEFORE the pushes below (which
-                                 // must not themselves land in rdi -- see the
-                                 // "rdi" clobber forcing the compiler to pick
-                                 // other registers for the other operands)
-        "pushq %0\n"            // ss = user data | 3
-        "pushq %1\n"            // rsp = user stack top
-        "pushq $0x202\n"        // rflags = IF=1
-        "pushq %2\n"            // cs = user code | 3
-        "pushq %3\n"            // rip = entry point
-        "iretq\n"               // return to user mode
-        :
-        : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(arg)
-        : "rdi", "memory"
-        );
-
+        /* A thread created by thread_create_user(): one `void *arg`, mirroring
+         * pthread_create. Always 0 for a process's main thread, which never
+         * sets user_arg -- see struct thread::user_arg (process.h). */
+        arch_enter_user_mode(entry, user_rsp, current_thread->user_arg, 0, 0);
     }
 
-    
     __builtin_unreachable();  // Should never return
 }
 
-/* sys_sbrk's kernel side. Cortex-M-style, Matching newlib's _sbrk(ptrdiff_t
- * increment) directly: ONE call, a relative increment, returns the OLD break (the
- * newly available region starts there) or -1 -- not Linux's two-call brk(addr)
- * No shrink-side unmappaing: heap_mapped_top only ever grows, same reasoning
- * USER_THREAD_STACK_BASE already uses for its own never-unmapped
- * per-thread stacks. */
+/* sys_sbrk's kernel side. Cortex-M-style, matching newlib's _sbrk(ptrdiff_t
+ * increment) directly: ONE call, a relative increment, returns the OLD break
+ * (the newly available region starts there) or -errno -- not Linux's two-call
+ * brk(addr).
+ *
+ * THE HEAP IS A MAPPING NOW. It used to be frames allocated and zeroed here,
+ * eagerly, one per page of growth, that the fault handler never saw -- so
+ * malloc's memory could not be paged out, and a shrink never gave anything
+ * back. Growth now moves the end of an anonymous mapping (vma_heap_set_end);
+ * the pages appear on first touch, zero, through the same object path every
+ * other mapping uses, and a shrink frees them -- frames, swap slots and all.
+ * heap_mapped_top is the page-aligned end of that mapping. */
 int64_t process_sbrk(struct process *proc, int64_t increment){
     uint64_t old_brk = proc->heap_brk;
     uint64_t new_brk = old_brk + (uint64_t)increment;
 
     if (increment == 0) {
         return (int64_t)old_brk;  // pure query -- malloc() does this first
-    
     }
 
     if (increment > 0 && new_brk < old_brk) {
         return -EMBK_EOVERFLOW;  // increment overflowed new_brk
     }
 
-    if (new_brk < USER_HEAP_VA_BASE || new_brk > USER_HEAP_VA_MAX) {
+    if (new_brk < proc->layout.heap_base || new_brk > proc->layout.heap_max) {
         return -EMBK_ENOMEM;  // out of bounds -- no more heap to give (matches
                                // newlib's own _sbrk()/POSIX brk() convention:
                                // failure means ENOMEM, not EINVAL)
     }
 
-    if (new_brk > proc->heap_mapped_top) {
-        uint64_t map_to = (new_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);  // round up to page boundary
-        // Map new pages from heap_mapped_top to map_to
-        for (uint64_t addr = proc->heap_mapped_top; addr < map_to; addr += PAGE_SIZE) {
-            uint64_t phys_page = pmm_alloc_page();
-            if (!phys_page) {
-                proc->heap_mapped_top = addr;  // update to the last successfully mapped page
-                return -EMBK_ENOMEM;  // physical memory exhausted
-            }
-            // ZERO IT BEFORE IT IS USER-VISIBLE. pmm_alloc_page() hands back
-            // whatever the last owner left, so a page recycled from another
-            // process arrived in this one's heap with that process's data
-            // still in it -- readable by anyone who called malloc() and did
-            // not initialise. That is an information leak between processes
-            // first and a correctness problem second: brk(2) specifies the
-            // new space as zero-filled, and code that trusts it is entitled
-            // to. Zeroed through the direct map, which is how the kernel
-            // reaches a physical page it has not mapped anywhere else.
-            memset((void *)P2V(phys_page), 0, PAGE_SIZE);
-            if (vmm_map_in(proc->pml4_phys, addr, phys_page, VMM_WRITABLE | VMM_USER) < 0) {
-                pmm_free_page(phys_page);
-                proc->heap_mapped_top = addr;   // don't claim a page we failed to map
-                return -EMBK_ENOMEM;
-            }
-        }
-        proc->heap_mapped_top = map_to;
+    uint64_t new_top = (new_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (new_top != proc->heap_mapped_top) {
+        int rc = vma_heap_set_end(proc, proc->heap_mapped_top, new_top);
+        if (rc != 0)
+            return -EMBK_ENOMEM;
+        proc->heap_mapped_top = new_top;
     }
-    
-    // Shrinking: just move heap_brk down; heap_mapped_top remains as is (pages are not unmapped)
     proc->heap_brk = new_brk;
     return (int64_t)old_brk;
-
 }
 
 /* The kthread equivalent of process_trampoline() above -- same reason it
@@ -2094,7 +2942,7 @@ static void kthread_trampoline(void) {
      * scheduler critical section, is supposed to have interrupts on --
      * this makes that unconditionally true instead of conditional on
      * whatever ISR context happened to dispatch it. */
-    __asm__ volatile ("sti");
+    arch_irq_enable();
 
     void (*entry)(void) = (void (*)(void))(uintptr_t)current_thread->entry_point;
     entry();
@@ -2160,6 +3008,11 @@ void schedule(void) {
      * theoretical one, on any kernel with more than one core actually
      * contending for this lock. */
     spin_lock(&g_sched_lock);
+    /* Inside the SAME critical section that is about to pick the next thread:
+     * a sleeper whose deadline just passed is a candidate for this very
+     * decision, and waking it in a separate one cost a corrupted resume (see
+     * wake_expired_locked). */
+    wake_expired_locked();
     schedule_locked();
 }
 
@@ -2193,36 +3046,11 @@ static void schedule_locked(void) {
      * gets bumped up one band (floor PRIORITY_REALTIME) and its counter
      * resets -- the standard fix for strict priority scheduling's one real
      * flaw (a full high band starving everything below it forever). */
-    for (int i = 0; i < MAX_THREADS; i++) {
-        struct thread *t = &thread_table[i];
-        if (t == current_thread || t->state != PROCESS_READY) {
-            continue;
-        }
-        /* Pinned infrastructure (each core's idle kthread and adopted
-         * bootstrap context, process.h) is exempt from aging: an idle
-         * sits READY almost permanently by design, so aging would walk it
-         * up to PRIORITY_REALTIME within a few hundred ticks -- and under
-         * strict band priority, an idle in band 0 doesn't just waste a
-         * slice, it STARVES every real thread in the lower bands
-         * outright. Aging exists to protect real, transiently-starved
-         * work; "waiting" is the idles' entire job. */
-        if (t->pinned_cpu >= 0) {
-            continue;
-        }
-        /* A suspended thread (EmbDBG v2 control) is frozen by intent, not
-         * starved — the same reasoning that exempts the idles above. Aging it
-         * would walk its priority up to REALTIME while frozen and, on resume,
-         * let it starve everything below it (the shell that issued `resume`
-         * included). Freeze means freeze: no run, no aging. */
-        if (t->suspended) {
-            continue;
-        }
-        if (++t->ticks_since_scheduled >= PRIORITY_AGE_TICKS) {
-            if (t->priority > PRIORITY_REALTIME) {
-                t->priority--;
-            }
-            t->ticks_since_scheduled = 0;
-        }
+    /* Priority aging, timeslice accounting -- whatever the POLICY does with a
+     * tick. It used to be an inlined loop here; see process/sched.h. */
+    {
+        const struct sched_policy *pol = sched_policy_get();
+        if (pol->tick) pol->tick(current_thread);
     }
 
     /* If the OUTGOING thread is a zombie, its hand-off (or deferred
@@ -2247,6 +3075,18 @@ static void schedule_locked(void) {
     struct thread *dying_thread_needing_deferred_reap = NULL;
     struct process *dying_process_needing_deferred_reap = NULL;
 
+    /* A killed thread found in USER mode -- no syscall or fault of its own in
+     * flight on its kernel stack -- or a kernel thread, which never leaves
+     * kernel mode and holds nothing across its schedule() calls, dies here.
+     * One inside a kernel path dies at that path's exit instead: see
+     * process_kill(). */
+    if (current_thread->state == PROCESS_RUNNING && current_thread->killed &&
+        (current_thread->in_kernel == 0 ||
+         (current_thread->proc && current_thread->proc->pml4_phys == vmm_get_kernel_pml4()))) {
+        current_thread->exit_code = -1;
+        current_thread->state = PROCESS_ZOMBIE;
+    }
+
     if (current_thread->state == PROCESS_ZOMBIE) {
         /* Always defer THIS thread's own kstack free -- the ACTUAL
          * assignment into this_cpu()->pending_thread_reap only happens
@@ -2266,67 +3106,12 @@ static void schedule_locked(void) {
      * current_thread (just handled above) can never match this scan's
      * READY/RUNNING check, so it can't come back as `next == current_thread`
      * the way a still-alive thread legitimately can. */
-    int start = 0;
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (&thread_table[i] == current_thread) {
-            start = i;
-            break;
-        }
-    }
-    struct thread *next = NULL;
-    for (int band = 0; band < SCHED_PRIORITY_BANDS && !next; band++) {
-        for (int off = 1; off <= MAX_THREADS; off++) {
-            struct thread *candidate = &thread_table[(start + off) % MAX_THREADS];
-            /* pinned_cpu: an adopted per-core idle/shell context may only
-             * ever be dispatched by its own core -- see process.h for why
-             * this is a liveness invariant, not a preference. */
-            if (candidate->pinned_cpu >= 0 &&
-                candidate->pinned_cpu != (int)this_cpu()->cpu_index) {
-                continue;
-            }
-            /* A suspended thread (process/thread suspend, EmbDBG v2 control) is
-             * frozen: never a scheduling candidate, whatever its state. This
-             * includes the current thread if it was suspended while RUNNING —
-             * the scan then skips it and this core switches to its pinned idle
-             * (never suspendable), so a fully-frozen core still has something to
-             * run. Resume just clears the flag and it is a candidate again. */
-            if (candidate->suspended) {
-                continue;
-            }
-            /* candidate == current_thread ADDS the self-fallback that lets
-             * the wrap-around land back on ourselves when nothing else is
-             * runnable in any band -- see the loop's own comment above. It
-             * must be combined with state == PROCESS_RUNNING, not used
-             * instead of a state check entirely: current_thread can be
-             * ZOMBIE here (process_exit_self() sets that before calling
-             * schedule()), and a zombie must never be re-selected as `next`
-             * regardless of what else is runnable -- the block above this
-             * loop already gave it its one, final disposition (hand off or
-             * defer-reap). Matching on identity alone let a zombie select
-             * itself via this fallback, hit the "next == current_thread"
-             * early return below, and simply resume executing as itself
-             * past process_exit_self() -- __builtin_unreachable() territory,
-             * seen hanging under -smp 4 once the two other kthreads in
-             * "test sched roundrobin" had already exited and self was the
-             * only "candidate" left. On single-core this whole distinction
-             * was invisible: current_thread was the only RUNNING thread
-             * that could ever exist, so state == PROCESS_RUNNING and
-             * candidate == current_thread were equivalent checks. Under
-             * SMP they're not: every other core has its own RUNNING thread
-             * at the same time, and matching on state alone (the ORIGINAL
-             * bug this comment used to describe) let this scan pick SOME
-             * OTHER CORE's live thread as `next` instead -- a real double
-             * fault seen bringing up AP 3 under -smp 4. Both failure modes
-             * are real; this condition is the intersection that avoids
-             * both. */
-            if ((candidate->state == PROCESS_READY ||
-                 (candidate == current_thread && candidate->state == PROCESS_RUNNING))
-                && candidate->priority == band) {
-                next = candidate;
-                break;
-            }
-        }
-    }
+    /* WHICH thread runs next is the POLICY's decision, and the only thing
+     * asked of it. Everything around this call -- the lock held across the
+     * switch, the zombie hand-off above, the address-space swap below -- is
+     * mechanism that does not care what it answers. process/sched.h. */
+    struct thread *next = sched_policy_get()->pick(this_cpu()->cpu_index,
+                                                   current_thread);
 
     if (!next || next == current_thread) {
         /* No other thread to switch to, or only the current one is
@@ -2352,6 +3137,40 @@ static void schedule_locked(void) {
          * (harmless to repeat, see thread_zombie_locked()'s own comment)
          * -- the reap only actually happens once a real switch below has
          * moved this core off of it. */
+        /* --- UNDO A BLOCK THAT DID NOT HAPPEN -------------------------------
+         *
+         * If the caller had already marked this thread BLOCKED and put it on a
+         * wait queue (sched_block_current_locked does both BEFORE calling
+         * here), that state is now a LIE: we never switched away, so the
+         * thread is still physically executing on this core.
+         *
+         * Leaving the lie in place is a two-core disaster. Another core's
+         * waker finds the thread on the queue, marks it READY, and the
+         * candidate scan -- which matches on READY -- dispatches it. But this
+         * thread never reached kernel_ctx_switch, so it has no saved context:
+         * the other core resumes it onto a stale one while this core is still
+         * running it. Two cores, one kernel stack. The symptom is a thread
+         * coming back with a garbage ELR and dying of a PC-alignment fault at
+         * EL1, which is exactly the aarch64 crash docs/TODO.md has been
+         * carrying, and why sched_sleep_ms had to gate user threads out.
+         *
+         * So: unqueue it and put it back to RUNNING. The block simply did not
+         * take. Every caller of sched_block_current_locked already loops on
+         * its own predicate -- process_wait's retry loop is documented as
+         * relying on exactly this "returned without switching" case -- so a
+         * caller that wakes without its condition met just tries again.
+         *
+         * ZOMBIE is deliberately NOT touched: the long comment above owns that
+         * case, and a zombie must stay a zombie. */
+        if (current_thread->state == PROCESS_BLOCKED) {
+            if (current_thread->wait_queue)
+                wait_queue_remove(current_thread->wait_queue, current_thread);
+            current_thread->state       = PROCESS_RUNNING;
+            current_thread->running_cpu = (int)this_cpu()->cpu_index;
+            current_thread->wake_at_ms  = 0;
+            current_thread->futex_key   = 0;
+        }
+
         spin_unlock(&g_sched_lock);
         return;
     }
@@ -2381,7 +3200,7 @@ static void schedule_locked(void) {
 
     struct thread *prev = current_thread;
     if (prev->state == PROCESS_RUNNING) {
-        prev->state = PROCESS_READY;  // Mark the previous thread as READY
+        sched_set_ready(prev);        // now runnable again; tell the policy
         prev->running_cpu = -1;       // no longer running anywhere
     } else if (prev->state == PROCESS_ZOMBIE) {
         /* The zombie's hand-off/defer-reap was decided above; the switch
@@ -2400,9 +3219,60 @@ static void schedule_locked(void) {
             prev->proc->running_cpu = -1;
         }
     }
+    /* THIS CORE IS NO LONGER IDLE. It halted inside power_idle_enter's
+     * bracket, an interrupt woke it, and the handler is now switching to a
+     * different thread -- so the halt is over, and the core will not return to
+     * power_idle_exit until the halting thread is scheduled again, which may
+     * be seconds away.
+     *
+     * Without this, the idle interval stayed open for the entire time some
+     * OTHER thread ran, and every core reported itself idle while working. It
+     * is why `power` said 99% idle on a machine whose own CPU accounting said
+     * a process was using half a core -- the two numbers disagreed by more
+     * than ten times, and the idle one was wrong. Idempotent: the halting
+     * thread's own power_idle_exit later finds the interval already closed. */
+    power_idle_exit();
+
+    /* --- CPU ACCOUNTING, at the one place a switch happens -----------------
+     * Bill the outgoing thread for the turn it just finished and stamp the
+     * incoming one. Exact rather than sampled: a thread that blocks between
+     * two timer ticks is still charged for the time it ran, which is
+     * precisely the case a tick-sampled counter loses -- and precisely the
+     * threads (short, frequent, latency-sensitive) whose cost matters most. */
+    {
+        uint64_t now_ns = time_get_ns();
+        if (prev && prev->dispatched_ns && now_ns > prev->dispatched_ns)
+            prev->cpu_ns += now_ns - prev->dispatched_ns;
+        next->dispatched_ns = now_ns;
+    }
+
     next->state = PROCESS_RUNNING;  // Mark the next thread as RUNNING
     next->running_cpu = (int)this_cpu()->cpu_index;
+
+    /* A CORE LEAVING IDLE MUST GET ITS QUANTUM BACK. The idle loop arms this
+     * core's timer for the next thing due -- up to SCHED_IDLE_CAP_MS, a whole
+     * second -- and halts. What wakes it early (a reschedule IPI, a device
+     * interrupt) runs schedule() from inside that interrupt and switches
+     * straight to real work, and the idle loop's own exit path does not run
+     * until much later. Without this, the thread dispatched here keeps the
+     * idle loop's long arm: it runs up to a second unpreempted, and when every
+     * core got there the same way -- four idle cores kicked awake to run a
+     * burst of new threads -- nothing ran schedule() anywhere, and a periodic
+     * thread missed its deadlines by 800-1600 ms. Found by the deadline test
+     * on `virt,gic-version=2` (docs/RPI4.md P3); on a desktop it is a stutter.
+     * Whether or not the core was idle is exactly what g_idle_cpus says. */
+    {
+        uint32_t bit = 1u << (this_cpu()->cpu_index & 31);
+        if (__atomic_load_n(&g_idle_cpus, __ATOMIC_RELAXED) & bit) {
+            sched_idle_exit();
+            timer_arm_this_cpu_ms(TIMER_QUANTUM_MS);
+        }
+    }
     next->ticks_since_scheduled = 0;  // it's getting CPU time now; aging clock resets
+    /* And the band it was aged into is given back: the boost bought it this
+     * turn, which is all it was for. Without this line every busy thread ended
+     * at REALTIME for good (see base_priority in process.h). */
+    next->priority = next->base_priority;
     /* EmbDBG v2: log this switch (counter + ring + per-thread dispatch/migration).
      * prev is the outgoing thread; reads next->last_ran_cpu before updating it. */
     sched_record_switch(prev, next, next->running_cpu);
@@ -2416,14 +3286,14 @@ static void schedule_locked(void) {
      * then needs neither). safe window: kernel half is shared, so flapping CR3 while
      * still on prev's kernel stack keeps executing fine. */
     vmm_switch_address_space(next->proc->pml4_phys);
-    tss_set_rsp0(next->kstack_top);
+    arch_kernel_stack_set(next->kstack_top);
     /* The thread pointer is per-CPU state (an MSR), not per-thread, so it must
      * be reinstalled here with CR3 and rsp0 -- otherwise the next thread would
      * keep running against the PREVIOUS one's TLS block and quietly read and
      * write another thread's variables. No matching save on the way out: ring 3
      * cannot WRFSBASE (CR4.FSGSBASE is off), so next->fs_base is authoritative.
      * See cpu/fsbase.h. */
-    fsbase_set(next->fs_base);
+    arch_tls_base_set(next->fs_base);
 
     kernel_ctx_switch(&prev->ctx, &current_thread->ctx,
                        prev->fpu_state, current_thread->fpu_state);
@@ -2456,6 +3326,219 @@ void sys_yield(void) {
  * lock RELEASED once woken); restore IF; loop. Waking is via the existing
  * wait_queue_wake_one/all (process.h), which must be called under sched_lock.
  * -------------------------------------------------------------------- */
+/* Every thread's consumed time, plus whatever the running ones have earned
+ * since their last dispatch. Without that fragment a compute-bound thread that
+ * has not yet been switched away reads as having used nothing -- which is the
+ * one process anybody looking at this number is trying to find. */
+/* --- pausing the charge across a HALT --------------------------------------
+ *
+ * A thread that halts is still the one dispatched on this core, so charging it
+ * for wall time would bill it for doing nothing -- and the first `ps` said
+ * exactly that: 97 SECONDS of CPU used on a machine reporting 97% idle, with
+ * the four adopted idle contexts at the top of the list. Dispatched time and
+ * CPU time are not the same quantity on a machine that sleeps.
+ *
+ * So the halt is bracketed. The idle paths already call power_idle_enter/exit
+ * around every one of the three places a core can halt; those now also stop
+ * and restart the clock on whatever thread is dispatched. The result is time
+ * spent EXECUTING, which is the number anybody reading `ps` is asking for.
+ *
+ * No lock: both only ever touch the CURRENT thread on THIS core, which no
+ * other core may be writing -- the same argument the spinlock counters make. */
+void sched_account_pause(void) {
+    struct thread *t = current_thread;
+    if (!t || !t->dispatched_ns) return;
+    uint64_t now = time_get_ns();
+    if (now > t->dispatched_ns) t->cpu_ns += now - t->dispatched_ns;
+    t->dispatched_ns = 0;               /* the halt is charged to nobody */
+}
+
+void sched_account_resume(void) {
+    struct thread *t = current_thread;
+    if (t) t->dispatched_ns = time_get_ns();
+}
+
+/* CPU consumed by the CALLING thread, including the fragment it is running
+ * right now.
+ *
+ * NO LOCK, and it is safe for exactly one reason: this reads the thread that
+ * is asking, and cpu_ns is written only by whichever core is switching AWAY
+ * from a thread. That cannot be happening while the thread itself is executing
+ * this. `dispatched_ns` was written when this core dispatched us. Both are
+ * therefore stable for the duration of the read, which is not true of any
+ * OTHER thread and is why this takes no argument.
+ *
+ * It exists because WALL TIME IS NOT COST on a busy machine. A UI toolkit
+ * measuring how long a frame took in order to declare an honest budget
+ * measures mostly preemption if it uses the clock -- on a contended emulated
+ * machine that read 40 ms for a frame whose actual work was a few
+ * milliseconds, and the app then refused to declare a cadence it could
+ * comfortably have kept. */
+/* WHICH THREAD AM I. The thread_table index, which is what thread_create
+ * returns and what thread_join takes, so a program can compare the two.
+ *
+ * It exists because userspace needs an identity to build a RECURSIVE lock on,
+ * and the allocator needs a recursive lock (newlib's own malloc stub uses one).
+ * Without it, "am I already holding this?" is unanswerable and the only
+ * implementable mutex is one that deadlocks the first time malloc re-enters. */
+int thread_self_tid(void) {
+    struct thread *t = current_thread;
+    if (!t) return -1;
+    return (int)(t - thread_table);
+}
+
+uint64_t sched_self_cpu_ns(void) {
+    struct thread *t = current_thread;
+    if (!t) return 0;
+    uint64_t v = t->cpu_ns;
+    uint64_t d = t->dispatched_ns;
+    if (d) {
+        uint64_t now = time_get_ns();
+        if (now > d) v += now - d;
+    }
+    return v;
+}
+
+uint64_t process_cpu_ns(uint32_t pid) {
+    uint64_t total = 0;
+    uint64_t now_ns = time_get_ns();
+
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    if (p) {
+        for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+            total += t->cpu_ns;
+            if (t->state == PROCESS_RUNNING && t->dispatched_ns &&
+                now_ns > t->dispatched_ns)
+                total += now_ns - t->dispatched_ns;
+        }
+    }
+    spin_unlock(&g_sched_lock);
+    return total;
+}
+
+/* ==========================================================================
+ * RATE DECLARATIONS AND ADMISSION CONTROL.
+ *
+ * This lives here rather than in a policy file because period/budget are
+ * attributes of a THREAD, not of whoever is scheduling it: round-robin stores
+ * them and ignores them, the deadline policy acts on them, and a third policy
+ * could weigh them differently again. The declaration must mean the same thing
+ * whichever one is installed, or a `sched policy` command would silently
+ * change what an application already asked for.
+ *
+ * The sum is recomputed by scanning rather than kept incrementally, on
+ * purpose. An incremental total has to be decremented on every path a thread
+ * can leave by -- exit, kill, the parent reaping a whole process, a thread
+ * that faults -- and a single missed one leaks reservation permanently until
+ * reboot, at which point the machine refuses work it could do. A scan of
+ * MAX_THREADS on a syscall nobody calls in a loop cannot drift. */
+/* HOW MANY LIVE THREADS HAVE DECLARED A PERIOD.
+ *
+ * Exists so the deadline policy can skip its scan when the answer is none,
+ * which is the state of every machine most of the time -- measured, the empty
+ * scan was 11.6 us of a 97 us scheduling decision on this emulated host, and
+ * that is a price the default policy should not charge for a feature nobody on
+ * the machine is using.
+ *
+ * A COUNT RATHER THAN A SCAN IS SAFE HERE, and the reasoning is worth stating
+ * because the sum next door deliberately refuses the same trick. Two things
+ * make it different. The count is only ever a HINT to skip work: too high and
+ * the policy does a scan it did not need (correct, slower). Too LOW is the
+ * dangerous direction -- dl_pick() reads 0 as "nobody declared" and stops
+ * applying the policy at all -- and it WAS reachable: thread_reap_slot() used to
+ * decrement for a zombie this very recount had already left out, taking the
+ * count to 0 under a live declared thread. It recounts now instead (see there).
+ * No path sets period_ms except the one function below, and thread_reap_slot()
+ * memsets the whole slot, so a recycled thread cannot inherit a declaration. And it is
+ * recomputed from scratch on every declaration, so any drift lasts until the
+ * next one rather than until reboot, which was the objection to an incremental
+ * reservation total. */
+uint32_t sched_declared_count(void) { return g_declared_count; }
+
+static void recount_declared_locked(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const struct thread *t = &thread_table[i];
+        if (t->state == PROCESS_UNUSED || t->state == PROCESS_ZOMBIE) continue;
+        if (t->period_ms) n++;
+    }
+    g_declared_count = n;
+}
+
+static uint32_t reserved_permille_locked(const struct thread *except) {
+    uint32_t sum = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const struct thread *t = &thread_table[i];
+        if (t == except) continue;
+        if (t->state == PROCESS_UNUSED || t->state == PROCESS_ZOMBIE) continue;
+        if (!t->period_ms) continue;
+        sum += (uint32_t)((uint64_t)t->budget_ms * 1000u / t->period_ms);
+    }
+    return sum;
+}
+
+uint32_t sched_reserved_permille(void) {
+    spin_lock(&g_sched_lock);
+    uint32_t v = reserved_permille_locked(NULL);
+    spin_unlock(&g_sched_lock);
+    return v;
+}
+
+int sched_declare_period(uint32_t period_ms, uint32_t budget_ms) {
+    struct thread *t = current_thread;
+    if (!t) return -EMBK_EINVAL;
+
+    /* Clearing is always allowed and can never fail -- giving a reservation
+     * back must not be able to be refused. */
+    if (period_ms == 0) {
+        spin_lock(&g_sched_lock);
+        t->period_ms     = 0;
+        t->budget_ms     = 0;
+        t->deadline_ms   = 0;
+        t->period_cpu_ns = 0;
+        recount_declared_locked();
+        spin_unlock(&g_sched_lock);
+        return EMBK_OK;
+    }
+
+    if (period_ms < SCHED_MIN_PERIOD_MS || period_ms > SCHED_MAX_PERIOD_MS)
+        return -EMBK_EINVAL;
+
+    /* Half the period by default. A caller that knows its own work -- a
+     * compositor that spends 2 ms drawing a 16 ms frame -- should say so and
+     * leave the rest of the machine admissible; half is the value that is
+     * generous enough to be right when nobody thought about it. */
+    if (budget_ms == 0)
+        budget_ms = period_ms / 2 ? period_ms / 2 : 1;
+    if (budget_ms > period_ms)
+        return -EMBK_EINVAL;
+
+    uint32_t want = (uint32_t)((uint64_t)budget_ms * 1000u / period_ms);
+
+    spin_lock(&g_sched_lock);
+    /* `t` is excluded from the sum so RE-declaring is not refused by the
+     * caller's own existing reservation -- changing 16/8 to 16/4 must be
+     * possible on a machine that is exactly full. */
+    if (reserved_permille_locked(t) + want > SCHED_MAX_RESERVED_PERMILLE) {
+        spin_unlock(&g_sched_lock);
+        return -EMBK_EBUSY;
+    }
+    t->period_ms     = period_ms;
+    t->budget_ms     = budget_ms;
+    /* The first period opens NOW, spending nothing. Leaving deadline_ms at 0
+     * would make this thread infinitely urgent until its next wakeup. */
+    t->deadline_ms   = timer_uptime_ms() + period_ms;
+    t->period_cpu_ns = t->cpu_ns;
+    recount_declared_locked();
+    spin_unlock(&g_sched_lock);
+    return EMBK_OK;
+}
+
+void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins) {
+    spin_stats(&g_sched_lock, acquires, contended, spins);
+}
+
 void sched_lock(void)   { spin_lock(&g_sched_lock); }
 void sched_unlock(void) { spin_unlock(&g_sched_lock); }
 
@@ -2482,7 +3565,7 @@ void sched_block_current_locked(struct wait_queue *wq) {
      * is correct by contract: callers are voluntary process-context sleepers
      * (an IRQ handler cannot sleep), and none can mean to sleep with IF=0 --
      * on a single core it could never be woken. */
-    __asm__ volatile ("sti" ::: "memory");
+    arch_irq_enable();
 }
 
 void process_init(void) {
@@ -2542,7 +3625,7 @@ struct thread *process_create_kthread(void (*entry)(void), struct process *paren
         return NULL;
     }
 
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     return t;
 }
 
@@ -2552,7 +3635,7 @@ struct thread *thread_create(struct process *proc, void (*entry)(void)) {
     if (!t) {
         return NULL;
     }
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     return t;
 }
 
@@ -2579,24 +3662,23 @@ int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg)
      * fresh address space of its own; that sharing is the entire point of
      * a "thread" versus a "process". VMM_NX: a stack should never be
      * executable. */
-    uint64_t slot_top = USER_THREAD_STACK_BASE + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT;
-    for (int i = 0; i < USER_THREAD_STACK_PAGES; i++) {
-        uint64_t phys = pmm_alloc_page();
-        if (!phys) {
-            /* Rare, bounded (<= USER_THREAD_STACK_PAGES-1) OOM mid-mapping.
-             * Deliberately not unwound page-by-page here: whatever got
-             * mapped so far is still only reachable through proc's own
-             * page tables, and is reclaimed for free the moment `proc`
-             * itself is eventually torn down (vmm_destroy_address_space()
-             * frees every user-half frame unconditionally) -- the same
-             * "don't build a rollback path for a rare edge case when the
-             * eventual owner-teardown already covers it" call this
-             * function's whole stack-lifetime design makes, see below. */
-            t->state = PROCESS_UNUSED;
-            return -EMBK_ENOMEM;
-        }
-        uint64_t va = slot_top - (uint64_t)(i + 1) * PAGE_SIZE;
-        vmm_map_in(proc->pml4_phys, va, phys, VMM_WRITABLE | VMM_USER | VMM_NX);
+    uint64_t slot_top = proc->layout.thread_stack_base + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT;
+    uint64_t slot_len = (uint64_t)USER_THREAD_STACK_PAGES * PAGE_SIZE;
+    uint64_t slot_lo  = slot_top - slot_len;
+
+    /* The slot is per THREAD-TABLE INDEX, and a dead thread's stack is not
+     * unmapped when it dies (the reap runs under the scheduler lock, where an
+     * object cannot let go of its pages). So it is reclaimed HERE, when the
+     * index is next used: whatever the previous occupant left -- frames,
+     * swap slots -- goes back before the new stack is placed. Bounded by
+     * MAX_THREADS stacks per process, and every one of them pageable; the
+     * eager version leaked the frames until process exit and could not page
+     * them. Nothing mapped there is the common case and not an error. */
+    (void)vma_munmap(proc, slot_lo, slot_len);
+
+    if (vma_map_anon_at(proc, slot_lo, slot_len, PROT_READ | PROT_WRITE) != 0) {
+        t->state = PROCESS_UNUSED;
+        return -EMBK_ENOMEM;
     }
 
     /* THE ABI, and it is not optional. SysV x86-64 says a function sees
@@ -2628,7 +3710,7 @@ int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg)
         return -EMBK_ENOMEM;
     }
 
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     return tid;
 }
 
@@ -2668,8 +3750,7 @@ int thread_join(struct process *proc, int tid) {
      * from schedule_locked() with no iretq/int-0x80-frame to restore the
      * caller's interrupt state from, so it has to snapshot and restore it
      * itself. */
-    uint64_t entry_flags;
-    __asm__ volatile ("pushfq; pop %0" : "=r"(entry_flags) :: "memory");
+    uint64_t entry_flags = arch_irq_flags();
 
     for (;;) {
 retry:
@@ -2688,23 +3769,37 @@ retry:
              * hasn't yet confirmed it switched away. */
             if (t->running_cpu != -1) {
                 spin_unlock(&g_sched_lock);
-                __asm__ volatile ("pause");
+                arch_cpu_relax();
                 goto retry;
             }
             int code = t->exit_code;
             thread_reap_slot(t);
             spin_unlock(&g_sched_lock);
+
+            /* THE STACK GOES BACK HERE, not at the reap: the reap runs under
+             * the scheduler lock, where an object cannot let go of its pages,
+             * and a thread that dies with siblings alive is otherwise a slot
+             * whose stack lingers until the slot is next used. The joiner is
+             * a sibling, so the process is alive by construction, and this is
+             * ordinary process context. A thread nobody joins keeps its stack
+             * until reuse or exit -- the bounded case thread_create_user
+             * describes. Nothing mapped there (a thread that never ran, or a
+             * slot already reclaimed) is not an error. */
+            (void)vma_munmap(proc,
+                             proc->layout.thread_stack_base + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT
+                                 - (uint64_t)USER_THREAD_STACK_PAGES * PAGE_SIZE,
+                             (uint64_t)USER_THREAD_STACK_PAGES * PAGE_SIZE);
             return code;
         }
 
-        if (proc->cancelled) {
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
             spin_unlock(&g_sched_lock);
             return -EMBK_ECANCELED;
         }
         wait_queue_block(&proc->join_wait, current_thread);
         schedule_locked();
         if (entry_flags & (1ULL << 9)) {
-            __asm__ volatile ("sti" ::: "memory");
+            arch_irq_enable();
         }
     }
 }
@@ -2721,16 +3816,25 @@ retry:
  * thread's code always wins") because nothing yet needs that. */
 __attribute__((noreturn))
 void thread_exit_self(int code) {
-    /* Keep this thread's final state and handoff in one scheduler critical
-     * section, including when returning from a drained syscall. */
-    sched_lock();
-    struct thread *self=current_thread;
-    self->proc->exit_code=code;self->exit_code=code;self->state=PROCESS_ZOMBIE;
-    schedule_locked();
+    current_process->exit_code = code;
+    current_thread->exit_code = code;
+    current_thread->state = PROCESS_ZOMBIE;
+    schedule();
 
-    __asm__ volatile("sti");
+    arch_irq_enable();
     for (;;) {
-        __asm__ volatile("hlt");
+        arch_cpu_idle();
+    }
+}
+
+void thread_die_killed(void) {
+    current_thread->exit_code = -1;      /* the process's is the kill's, set by process_kill */
+    current_thread->state = PROCESS_ZOMBIE;
+    schedule();
+
+    arch_irq_enable();
+    for (;;) {
+        arch_cpu_idle();
     }
 }
 
@@ -2740,7 +3844,29 @@ void thread_exit_self(int code) {
  * which is exactly what re-enters schedule(). */
 static void idle_kthread_entry(void) {
     for (;;) {
-        __asm__ volatile ("hlt");
+        /* TICKLESS. Arm this core's timer for the next thing actually due
+         * instead of for the next 10 ms quantum -- there is nothing to preempt
+         * on a core that is about to halt, so the only reason to wake is a
+         * deadline, and waking anyway is a hundred interrupts a second spent
+         * confirming there is nothing to do.
+         *
+         * The order matters: announce idle BEFORE arming and halting, so a
+         * waker that races us either sees the announcement and sends an IPI,
+         * or has not published its thread yet and this core runs the scheduler
+         * on its way in. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(sched_idle_next_ms());
+
+        /* Bracket the halt so the time this core spends NOT working is
+         * measured. A halted core costs almost nothing and a core spinning in
+         * a poll loop costs everything, and the difference is invisible unless
+         * somebody counts it -- which is exactly how a poll loop gets added
+         * and never noticed. kernel/power/power.h. */
+        power_idle_enter();
+        arch_cpu_idle();
+        power_idle_exit();
+
+        sched_idle_exit();
     }
 }
 
@@ -2773,6 +3899,8 @@ struct thread *process_create_idle_for_cpu(uint32_t cpu_index) {
     spin_lock(&g_sched_lock);
     idle->pinned_cpu = (int)cpu_index;
     idle->priority = PRIORITY_BACKGROUND;
+    idle->base_priority = PRIORITY_BACKGROUND;
+    idle->is_idle = true;
     spin_unlock(&g_sched_lock);
     return idle;
 }
@@ -2808,6 +3936,7 @@ struct thread *process_adopt_current(void) {
     self->user_rsp = 0;
     self->proc = proc;
     self->priority = PRIORITY_NORMAL;
+    self->base_priority = PRIORITY_NORMAL;
     self->ticks_since_scheduled = 0;
     self->wait_next = NULL;
     self->wait_queue = NULL;
@@ -2888,9 +4017,29 @@ static void selftest_release_self(struct thread *self, bool did_adopt) {
 }
 
 static void selftest_wait_ticks(uint64_t ticks) {
-    uint64_t start = lapic_timer_get_ticks();
-    while (lapic_timer_get_ticks() < start + ticks) {
-        __asm__ volatile("hlt");
+    uint64_t start = timer_sched_ticks();
+    /* A wait that overruns its budget five times over says so, on WALL time
+     * (the HPET, independent of the scheduler tick it is waiting on), with
+     * enough state to tell "this thread never runs" from "the tick counter
+     * stopped": the two look identical from outside and are nothing alike. */
+    uint64_t t0 = timer_uptime_ms();
+    int warned = 0;
+    while (timer_sched_ticks() < start + ticks) {
+        arch_cpu_idle();
+        uint64_t wall = timer_uptime_ms() - t0;
+        if (warned < 3 && wall > (ticks * 10) * 5 + 2000 * (uint64_t)(warned + 1)) {
+            warned++;
+            kprintf("selftest_wait_ticks: %llu ticks asked; %llu ms of wall time, sched ticks %llu -> %llu; "
+                    "this thread %p: state %d prio %d pinned %d cpu %d killed %d suspended %d\n",
+                    (unsigned long long)ticks, (unsigned long long)wall,
+                    (unsigned long long)start, (unsigned long long)timer_sched_ticks(),
+                    (void *)current_thread, current_thread ? (int)current_thread->state : -1,
+                    current_thread ? (int)current_thread->priority : -1,
+                    current_thread ? (int)current_thread->pinned_cpu : -1,
+                    current_thread ? (int)current_thread->running_cpu : -1,
+                    current_thread ? (int)current_thread->killed : -1,
+                    current_thread ? (int)current_thread->suspended : -1);
+        }
     }
 }
 
@@ -2950,6 +4099,68 @@ int process_test_roundrobin(void) {
  * so only timer preemption can give it CPU) — but here we SUSPEND it midway
  * and watch the counter stop dead, then resume and watch it climb again. A
  * suspended thread getting ANY forward progress would fail this. */
+/* ==========================================================================
+ * WHAT A POLICY COSTS WHEN NOBODY IS USING IT.
+ *
+ * The deadline policy scans every thread slot looking for a live deadline
+ * before falling through to round-robin, and on a machine where nothing has
+ * declared one -- which is every machine, most of the time -- that scan finds
+ * nothing and the fall-through does the whole job again. Making it the default
+ * therefore has to be paid for by something, and "it is only a loop" is the
+ * kind of claim this kernel does not accept from itself.
+ *
+ * MEASURED ON THE CALLING THREAD, WITH NO HELPER. The first version of this
+ * ran a kthread that re-entered the scheduler while this thread spun waiting
+ * for it, and divided wall time by the KTHREAD's iteration count -- so the
+ * answer was inflated by however small a share of the machine that thread got,
+ * and reported 186 microseconds for a decision that cannot cost more than a
+ * fraction of one. Two threads racing is also two threads' worth of switching,
+ * which is not what is being measured.
+ *
+ * With the caller doing it directly and nothing else runnable, pick() selects
+ * this thread again and schedule() returns without switching -- so each
+ * iteration is one scheduling DECISION and nothing else, which is exactly the
+ * thing the two policies differ in. The absolute value is a statement about
+ * the host; the comparison is the result.
+ *
+ * A FIXED COUNT, NOT A DEADLINE. Running until the clock says stop meant
+ * reading the clock once per iteration, and on this machine that is an HPET
+ * access -- a device trap under emulation, and far more expensive than the
+ * decision it was timing. It reported 91 microseconds per decision, which was
+ * almost entirely the measurement. The clock is read twice now, at the ends.
+ * ======================================================================== */
+/* WHAT THE TWO CLOCKS COST, because the answer above turned out to be about
+ * them rather than about either policy.
+ *
+ * time_get_ns() is rdtsc plus arithmetic. timer_uptime_ms() reads the HPET,
+ * which is an MMIO access -- a device trap under emulation, and not free on
+ * real hardware either. Both are called from the scheduler's hot path, and
+ * knowing which one dominates decides whether there is anything worth fixing.
+ * Returns nanoseconds per call in *ms_cost and *ns_cost. */
+void sched_clock_cost_ns(uint32_t iters, uint64_t *ms_cost, uint64_t *ns_cost) {
+    if (!iters) return;
+    volatile uint64_t sink = 0;
+
+    uint64_t a0 = time_get_ns();
+    for (uint32_t i = 0; i < iters; i++) sink += timer_uptime_ms();
+    uint64_t a1 = time_get_ns();
+
+    for (uint32_t i = 0; i < iters; i++) sink += time_get_ns();
+    uint64_t a2 = time_get_ns();
+
+    (void)sink;
+    if (ms_cost) *ms_cost = (a1 - a0) / iters;
+    if (ns_cost) *ns_cost = (a2 - a1) / iters;
+}
+
+uint64_t sched_pick_cost_ns(uint32_t iters) {
+    if (!iters) return 0;
+    uint64_t t0 = time_get_ns();
+    for (uint32_t i = 0; i < iters; i++)
+        schedule();
+    return (time_get_ns() - t0) / iters;
+}
+
 static volatile uint64_t g_susp_counter;
 static volatile bool     g_susp_stop;
 static void susp_spinner(void) { while (!g_susp_stop) { g_susp_counter++; } process_exit_self(0); }
@@ -3019,14 +4230,14 @@ static void fpu_kthread_body(const uint8_t *pattern, volatile uint64_t *iters,
                               volatile bool *corrupt) {
     uint8_t observed[16] __attribute__((aligned(16)));
     while (!g_fpu_stop) {
-        __asm__ volatile ("movdqa (%0), %%xmm0" :: "r"(pattern) : "memory");
+        arch_fpu_pattern_load(pattern);
 
         /* Deliberately plain C work here, no asm -- gives the timer plenty
          * of chances to preempt with xmm0 "in flight", which is exactly the
          * window kernel_ctx_switch has to get right. */
         (*iters)++;
 
-        __asm__ volatile ("movdqa %%xmm0, (%0)" :: "r"(observed) : "memory");
+        arch_fpu_pattern_store(observed);
 
         for (int i = 0; i < 16; i++) {
             if (observed[i] != pattern[i]) {
@@ -3302,8 +4513,8 @@ int process_test_priority(void) {
     bool ok = (trt != NULL && tbg != NULL);
 
     if (ok) {
-        trt->priority = PRIORITY_REALTIME;
-        tbg->priority = PRIORITY_BACKGROUND;
+        trt->priority = PRIORITY_REALTIME; trt->base_priority = PRIORITY_REALTIME;
+        tbg->priority = PRIORITY_BACKGROUND; tbg->base_priority = PRIORITY_BACKGROUND;
 
         /* Long enough for: rt to dominate early, self's own aging to let
          * it resume at all, and bg's (slower, starting one band further
@@ -3353,10 +4564,10 @@ static void smp_sched_kthread_entry(void) {
      * entry points. */
     uint32_t slot = __atomic_fetch_add(&g_smp_sched_started, 1, __ATOMIC_RELAXED);
     if (slot < SMP_SCHED_KTHREADS) {
-        g_smp_sched_core[slot] = lapic_get_id();
+        g_smp_sched_core[slot] = arch_cpu_id();
     }
     while (!g_smp_sched_stop) {
-        __asm__ volatile ("pause");
+        arch_cpu_relax();
     }
     process_exit_self(0);
 }
@@ -3535,7 +4746,7 @@ static volatile uint64_t g_thread_smp_shared_counter;   // written by ALL thread
 static void thread_smp_entry(void) {
     uint32_t slot = __atomic_fetch_add(&g_thread_smp_started, 1, __ATOMIC_RELAXED);
     if (slot < THREAD_SMP_COUNT) {
-        g_thread_smp_core[slot] = lapic_get_id();
+        g_thread_smp_core[slot] = arch_cpu_id();
     }
     while (!g_thread_smp_stop) {
         __atomic_fetch_add(&g_thread_smp_shared_counter, 1, __ATOMIC_RELAXED);
@@ -3648,12 +4859,12 @@ int process_test_thread_smp(void) {
  * switch just widened the window enough to hit it regularly.) */
 static volatile bool g_thread_exit_a_go;
 static void thread_exit_entry_a(void) {
-    while (!g_thread_exit_a_go) { __asm__ volatile ("pause"); }
+    while (!g_thread_exit_a_go) { arch_cpu_relax(); }
     process_exit_self(0);
 }
 static volatile bool g_thread_exit_b_stop;
 static void thread_exit_entry_b(void) {
-    while (!g_thread_exit_b_stop) { __asm__ volatile ("pause"); }
+    while (!g_thread_exit_b_stop) { arch_cpu_relax(); }
     process_exit_self(0);
 }
 
@@ -3729,58 +4940,4 @@ int process_test_thread_exit(void) {
 
     selftest_release_self(self, did_adopt);
     return ok ? 0 : -1;
-}
-
-void process_kill(uint32_t pid) {
-    spin_lock(&g_sched_lock);process_kill_locked(pid,false);
-}
-int process_end_session(uint32_t epoch,uint32_t controller) {
-    for(unsigned i=0;i<MAX_PROCESSES;i++) {
-        uint32_t pid=0;
-        sched_lock();
-        if(process_table[i].pid && process_table[i].pid!=controller && process_table[i].session_id==epoch)
-            pid=process_table[i].pid;
-        sched_unlock();if(pid) {
-            process_cancel(pid);
-            sched_lock();process_kill_locked(pid,true);
-        }
-    }
-    int live=0;sched_lock();
-    for(unsigned i=0;i<MAX_PROCESSES;i++)
-        if(process_table[i].pid && process_table[i].pid!=controller &&
-           process_table[i].session_id==epoch && (process_table[i].live_thread_count || process_table[i].constructing)) live++;
-    sched_unlock();return live;
-}
-
-/* Native teardown regression: a victim owns the real filesystem lock while
- * marked inside a syscall. END must leave it runnable until it releases it. */
-#define DRAIN_TEST_EPOCH 0xfffffff0u
-static unsigned drain_entered,drain_release,drain_done;
-static volatile unsigned drain_cycles;
-static void session_drain_victim(void) {
-    sched_lock();current_process->session_id=DRAIN_TEST_EPOCH;current_thread->syscall_depth=1;sched_unlock();
-    embkfs_lock();__atomic_store_n(&drain_entered,1,__ATOMIC_RELEASE);
-    while(!__atomic_load_n(&drain_release,__ATOMIC_ACQUIRE)) {drain_cycles++;sys_yield();}
-    embkfs_unlock();
-    sched_lock();current_thread->syscall_depth=0;sched_unlock();
-    __atomic_store_n(&drain_done,1,__ATOMIC_RELEASE);process_exit_self(0);
-}
-int process_test_session_drain(void) {
-    if(!embkfs_live_volume())return -EMBK_ENODEV;
-    drain_entered=drain_release=drain_done=drain_cycles=0;
-    struct thread *t=process_create_kthread(session_drain_victim,NULL);
-    if(!t)return -EMBK_ENOMEM;
-    uint32_t pid=t->proc->pid;
-    for(unsigned i=0;i<500 && !__atomic_load_n(&drain_entered,__ATOMIC_ACQUIRE);i++)selftest_wait_ticks(1);
-    if(!drain_entered) {drain_release=1;return -EMBK_EIO;}
-    int pending=process_end_session(DRAIN_TEST_EPOCH,0);
-    unsigned before=drain_cycles;selftest_wait_ticks(2);
-    int continued=drain_cycles!=before && process_alive(pid);
-    __atomic_store_n(&drain_release,1,__ATOMIC_RELEASE);
-    for(unsigned i=0;i<500 && !__atomic_load_n(&drain_done,__ATOMIC_ACQUIRE);i++)selftest_wait_ticks(1);
-    for(unsigned i=0;i<50 && process_alive(pid);i++)selftest_wait_ticks(1);
-    int rc=pending>0 && continued && drain_done && !process_end_session(DRAIN_TEST_EPOCH,0)?0:-EMBK_EIO;
-    if(!rc) {embkfs_lock();embkfs_unlock();}
-    kprintf("session drain: pending=%d, owner continued=%d, lock released=%u\n",pending,continued,drain_done);
-    return rc;
 }
