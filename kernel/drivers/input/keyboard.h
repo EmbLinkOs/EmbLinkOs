@@ -87,9 +87,12 @@ enum {
     SYSKEY_NONE = 0,
     SYSKEY_NEXT_WINDOW,      /* GUI+Tab */
     SYSKEY_CLOSE_WINDOW,     /* GUI+W   */
-    SYSKEY_QUIT_APP,         /* GUI+Q   */
+    SYSKEY_QUIT_APP,
+    SYSKEY_LAUNCHER, SYSKEY_SPACE_PREVIOUS, SYSKEY_SPACE_NEXT,
+    SYSKEY_SPACE_1=16, SYSKEY_MOVE_SPACE_1=32,
 };
 /* Take the pending system shortcut, if any, and clear it. */
+void keyboard_set_shortcut_modifier(unsigned mode);
 int keyboard_take_syskey(void);
 
 /* ---- the KEY EVENT stream -----------------------------------------------

@@ -135,6 +135,8 @@ typedef struct {
      * libembk.so, and a field inserted in the middle silently reinterprets
      * every positional initializer that already exists. */
     const char *key;
+    int icon, menu_above;
+    const char *tooltip;
 } EmProps;
 
 /* ------------------------------------------------------------------------- */
@@ -222,6 +224,12 @@ void em_card_(EmProps p);
 void em_glass_(EmProps p);
 void em_screen_(EmProps p);
 void em_section_(const char *title, EmProps p);
+void em_tooltip(const char *label); /* call while the anchor container is open */
+void em_tooltip_host(void);
+int em_tooltip_visible(void);
+void em_mono_begin(void);
+void em_mono_end(void);
+#define CodeSurface() EM_SCOPE_(em_mono_begin(),em_mono_end())
 void em_scroll_(float *scroll_y, float viewport_h, EmProps p);
 void em_scroll_end_(void);
 void em_end_(void);
@@ -246,6 +254,7 @@ struct EmV {
     EmV (*title)(void);   EmV (*heading)(void); EmV (*body)(void);
     EmV (*bold)(void);    EmV (*caption)(void); EmV (*font)(EmFont);
     /* colour -- kind-aware (text colour, or a control's variant/tone) */
+    EmV (*tooltip)(const char *);
     EmV (*color)(Color);
     EmV (*secondary)(void); EmV (*tertiary)(void); EmV (*accent)(void);
     EmV (*primary)(void);   EmV (*ghost)(void);    EmV (*destructive)(void);
@@ -702,6 +711,7 @@ typedef struct {
                                   * brightness). 0 = input/animation only, the
                                   * default and right answer for most apps.
                                   * Same meaning as EmWidget's field. */
+    struct { int w,h; } min_size; /* zero retains the standard 200x160 floor */
 } EmApp;
 
 void  em_set_viewport(float w, float h);   /* the app runtime feeds this */
@@ -716,6 +726,7 @@ int   em_take_clicks(uint64_t *when_ms);
 
 void  em_feed_pointer(float x, float y, int left_down, int right_down,
                       int wheel, int focused);
+void em_shell_band(int bottom, int height); /* translucent shell strip geometry */
 void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
 float em_viewport_width(void);
 float em_viewport_height(void);
@@ -940,5 +951,13 @@ void em_dialog_end_(void);
 #define IconTrash     0x2327  /* X in a rectangle = delete */
 #define IconCloud     0x2601
 #define IconReload    0x27F3   /* clockwise open circle arrow */
+#define IconNetwork 57600
+#define IconVolume 57601
+#define IconBattery 57602
+#define IconWindow 57603
+#define IconDisplay 57604
+#define IconKeyboard 57605
+#define IconPalette 57606
+#define IconCursor 57607
 
 #endif /* __EMBLINK_EM_UI_H__ */

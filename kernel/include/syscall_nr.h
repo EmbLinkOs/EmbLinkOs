@@ -341,6 +341,7 @@
 #define SYS_win_menu 144
 #define SYS_win_close_ack 145
 #define SYS_key_poll_input 146
+#define SYS_desktop_control 147
 
 
 

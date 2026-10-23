@@ -190,6 +190,8 @@ static void keyboard_deliver(char c);
 /* The pending system shortcut, decided in IRQ context and performed by the
  * kernel's main loop -- see SYSKEY_* in keyboard.h. */
 static volatile int g_syskey;
+static volatile unsigned g_shortcut_modifier;
+void keyboard_set_shortcut_modifier(unsigned mode){g_shortcut_modifier=mode;}
 int keyboard_take_syskey(void) { int k = g_syskey; g_syskey = SYSKEY_NONE; return k; }
 void        kbd_translate(uint8_t make, int pressed);   /* the testable seam */
 static void keyboard_deliver_cp(uint32_t cp);   /* one codepoint, as UTF-8 */
@@ -457,15 +459,26 @@ void kbd_translate(uint8_t make, int pressed) {
      * values, not codepoints, and encoding 0xFD as UTF-8 would turn one command
      * into the two bytes of ý. Unclaimed GUI+letter combinations fall through
      * and type their letter, so the key is not a hole. */
+    if(g_shortcut_modifier?((g_mods&(EKM_CTRL|EKM_ALT))==(EKM_CTRL|EKM_ALT)):(g_mods&EKM_GUI)) {
+        char system=base;
+        if(system>='A' && system<='Z')system+=32;
+        if(system=='\t'){g_syskey=SYSKEY_NEXT_WINDOW;return;}
+        if(system=='w'){g_syskey=SYSKEY_CLOSE_WINDOW;return;}
+        if(system=='q'){g_syskey=SYSKEY_QUIT_APP;return;}
+        if(system==' '){g_syskey=SYSKEY_LAUNCHER;return;}
+        if(system=='['){g_syskey=SYSKEY_SPACE_PREVIOUS;return;}
+        if(system==']'){g_syskey=SYSKEY_SPACE_NEXT;return;}
+        if(system>='1' && system<='6') {g_syskey=((g_mods&EKM_SHIFT)?SYSKEY_MOVE_SPACE_1:SYSKEY_SPACE_1)+system-'1';return;}
+    }
     if (g_mods & EKM_GUI) {
         uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
         /* SYSTEM shortcuts first, and they are swallowed: see SYSKEY_* in
          * keyboard.h for why an application must not be able to see -- and so
          * decline -- the window switcher. Recorded, not performed: this is IRQ
          * context and the compositor is not safe to call from one. */
-        if (low == '\t') { g_syskey = SYSKEY_NEXT_WINDOW;  return; }
-        if (low == 'w')   { g_syskey = SYSKEY_CLOSE_WINDOW; return; }
-        if (low == 'q')   { g_syskey = SYSKEY_QUIT_APP;     return; }
+
+
+
         char cmd = 0;
         switch (low) {
             case 'a': cmd = (char)EK_SEL_ALL; break;

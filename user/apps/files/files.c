@@ -553,7 +553,7 @@ static void sidebar_item(int icon, const char *label, const char *path) {
     const struct ui_theme *t = ui_theme();
     bool here = path && !strcmp(path, g_cwd);
     HStack(.spacing = 7, .align = Center, .px = 7, .py = 1, .corner = 5, .grow = 1,
-           .background = here ? (Color){ .r=.24f, .g=.26f, .b=.34f, .a=1.f }
+           .background = here ? t->accent_soft
                               : (Color){ 0, 0, 0, 0 }) {
         Icon(icon).caption().color(here ? t->accent : t->text_secondary);
         /* .py(1): the row's height was never the HStack's to give. A ghost
@@ -659,7 +659,7 @@ static void app(void) {
             Segmented(views, 2, &g_view);
         }
 
-        Split(212) {
+        Split(em_viewport_width()<760?168:208) {
             SidebarPane() {
                 Text("Favourites").caption().tertiary();
                 sidebar_item(IconHome,   "Home",      home);
@@ -687,7 +687,7 @@ static void app(void) {
                     if (IconButton(IconChevronR).clicked()) go_forward();
                     if (IconButton(IconChevronU).clicked()) go_up();
                     Card(.padding = 5, .grow = 1, .corner = 6,
-                         .background = { .r=.12f, .g=.125f, .b=.145f, .a=1.f }) {
+                         .background = T.surface_alt) {
                         Text(g_cwd).caption();
                     }
                     if (g_naming) {
@@ -922,6 +922,7 @@ static void app(void) {
 
 EM_APPLICATION {
     .title  = "Files",
+    .min_size = { 540, 360 },
     /* Fits the work area: 768 less the 26px menu bar and the dock's band.
      * A default window that runs under the dock is a window that ships with
      * its own status bar hidden. */

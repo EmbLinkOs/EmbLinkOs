@@ -24,6 +24,7 @@ static struct paint solid(struct color c) {
     struct paint p; p.kind = PAINT_SOLID; p.solid = c; p.n_stops = 0; return p;
 }
 
+static int g_control_adjustment;
 /* --- structure ---------------------------------------------------------- */
 
 void ui_screen_begin(void) {
@@ -42,7 +43,7 @@ void ui_card_begin(uint64_t key) {
     ui_set_paint(solid(t->surface));
     ui_set_corner_radius(t->radius_lg);
     ui_set_border(1.0f, t->border);
-    ui_set_shadow(true, t->shadow_md.dx, t->shadow_md.dy, t->shadow_md.blur, t->shadow_md.color);
+    ui_set_shadow(false, 0, 0, 0, t->shadow_md.color);
     ui_set_padding(t->sp5, t->sp5, t->sp5, t->sp5);
     ui_set_spacing(t->sp4);
     ui_set_size(sz_intrinsic(), sz_intrinsic());
@@ -129,12 +130,13 @@ static bool button_impl(const char *label, struct color fill, struct color text_
         ui_set_paint(solid((struct color){0, 0, 0, 0}));   /* reset: un-hover cleanly */
     }
     ui_set_corner_radius(t->radius_md);
-    if (border_w > 0) ui_set_border(border_w, hovered ? t->accent : border_c);
-    ui_set_padding(t->sp2 + 1, t->sp4, t->sp2 + 1, t->sp4);
+    ui_set_border(border_w,hovered?t->accent:border_c);
+    ui_set_padding(t->control_py, t->control_px, t->control_py, t->control_px);
     ui_set_align(ALIGN_CENTER);
-    text_role(t->font_bold, t->text_body, text_c, label);
+    text_role(t->font_regular, t->text_body, text_c, label);
+    bool clicked=ui_control_interact(self);
     ui_box_end();
-    return ui_consume_click(self);
+    return clicked;
 }
 bool ui_button_primary(const char *label) {
     const struct ui_theme *t = TH;
@@ -162,6 +164,7 @@ bool ui_toggle(bool on) {
     if (ui_is_hovered()) track = shade(track, 1.12f);   /* brighten on hover */
     ui_set_paint(solid(track));
     ui_set_corner_radius(t->radius_pill);
+    ui_set_border(0,t->border);
     ui_set_size(sz_fixed(42), sz_fixed(24));
     ui_set_padding(3, 3, 3, 3);
     ui_set_align(ALIGN_CENTER);
@@ -172,8 +175,9 @@ bool ui_toggle(bool on) {
     ui_set_corner_radius(t->radius_pill);
     ui_set_size(sz_fixed(18), sz_fixed(18));
     ui_box_end();
+    bool clicked=ui_control_interact(self);
     ui_end_stack();
-    return ui_consume_click(self);
+    return clicked;
 }
 
 /* --- checkbox / radio --------------------------------------------------- */
@@ -194,8 +198,9 @@ bool ui_checkbox(bool on) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     if (on) text_role(t->font_bold, t->text_caption, t->on_accent, "\xE2\x9C\x93");  /* U+2713 check */
+    bool clicked=ui_control_interact(self);
     ui_end_stack();
-    return ui_consume_click(self);
+    return clicked;
 }
 
 bool ui_radio(bool selected) {
@@ -217,8 +222,9 @@ bool ui_radio(bool selected) {
         ui_set_size(sz_fixed(10), sz_fixed(10));
         ui_box_end();
     }
+    bool clicked=ui_control_interact(self);
     ui_end_stack();
-    return ui_consume_click(self);
+    return clicked;
 }
 
 /* --- progress / slider -------------------------------------------------- */
@@ -252,7 +258,7 @@ float ui_slider(float value) {
     if (value < 0) value = 0;
     if (value > 1) value = 1;
     ui_begin_hstack(0);
-    (void)ui_open();
+    struct instance_handle self=ui_open();
     float out = value;
     if (ui_is_active()) {
         float rx, ry, rw, rh, px, py;
@@ -265,6 +271,10 @@ float ui_slider(float value) {
     }
     ui_set_size(sz_grow(), sz_fixed(24));     /* tall hit strip */
     ui_set_align(ALIGN_CENTER);
+    ui_set_border(0,t->border);
+    ui_control_interact(self);
+    out+=g_control_adjustment*.05f;if(out<0)out=0;if(out>1)out=1;
+    value=out;
     ui_box_begin(0);                          /* filled leading portion */
     ui_set_paint(solid(t->accent));
     ui_set_corner_radius(t->radius_pill);
@@ -291,6 +301,8 @@ int ui_segmented(const char *const *labels, int count, int selected) {
     const struct ui_theme *t = TH;
     int result = selected;
     ui_begin_hstack(0);
+    ui_set_size(sz_intrinsic(),sz_intrinsic());
+    ui_set_border(0,t->border);
     ui_set_paint(solid(t->surface_alt));
     ui_set_corner_radius(t->radius_md);
     ui_set_padding(3, 3, 3, 3);
@@ -298,6 +310,7 @@ int ui_segmented(const char *const *labels, int count, int selected) {
     for (int i = 0; i < count; i++) {
         ui_box_begin((uint64_t)(i + 1));
         struct instance_handle seg = ui_open();
+        ui_set_size(sz_intrinsic(),sz_intrinsic());
         bool sel = (i == selected);
         if (sel) {
             ui_set_paint(solid(t->surface));
@@ -307,13 +320,14 @@ int ui_segmented(const char *const *labels, int count, int selected) {
         } else {
             ui_set_paint(solid((struct color){0, 0, 0, 0}));   /* reset: un-hover cleanly */
         }
-        ui_set_corner_radius(t->radius_sm);
+        ui_set_corner_radius(t->radius_sm);ui_set_border(0,t->border);
         ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp3);
         ui_set_align(ALIGN_CENTER);
         ui_set_justify(JUSTIFY_CENTER);
-        text_role(t->font_bold, t->text_body, sel ? t->text : t->text_secondary, labels[i]);
+        text_role(sel?t->font_bold:t->font_regular,t->text_body,sel?t->text:t->text_secondary,labels[i]);
+        bool clicked=ui_control_interact(seg);
         ui_box_end();
-        if (ui_consume_click(seg)) result = i;
+        if(clicked)result=i;
     }
     ui_end_stack();
     return result;
@@ -791,6 +805,43 @@ static void trav_new_frame(void) {
         g_focus_first = true;
     }
     g_seen_field = false;
+}
+
+/* Shared focus traversal for non-text controls. It uses the same carry stream
+ * as fields, so Tab followed by Return in one queued batch activates exactly
+ * the next control. Enter/Space never leak into a later text field. */
+bool ui_control_interact(struct instance_handle self) {
+    g_control_adjustment=0;
+    trav_new_frame();bool first=!g_seen_field;g_seen_field=true;
+    int keys=0; /* own queue, carry only, carry then queue */
+    bool clicked=ui_consume_click(self);
+    if(clicked)ui_request_focus(self);
+    if(g_tab_pending){g_tab_pending=false;ui_request_focus(self);keys=1;}
+    else if(first && g_focus_first){g_focus_first=false;ui_request_focus(self);keys=2;}
+    bool focused=ui_has_focus(self);
+    char in[64];int n=0;
+    if(!ui_any_focus()) {
+        char queued[32];int count=ui_input_take(queued,sizeof queued);
+        for(int i=0;i<count;i++)if(queued[i]=='\t') {
+            ui_request_focus(self);focused=true;keys=1;
+            g_carry_n=count-i-1;memcpy(g_carry,queued+i+1,(size_t)g_carry_n);break;
+        }
+    }
+    if(focused) {
+        if(keys){n=g_carry_n;memcpy(in,g_carry,(size_t)n);g_carry_n=0;}
+        if(keys!=1)n+=ui_input_take(in+n,(int)sizeof in-n);
+        for(int i=0;i<n;i++) {
+            if(in[i]=='\t') {
+                g_carry_n=0;for(int j=i+1;j<n && g_carry_n<(int)sizeof g_carry;j++)g_carry[g_carry_n++]=in[j];
+                g_tab_pending=true;break;
+            }
+            if(in[i]==UI_KEY_LEFT || in[i]==UI_KEY_DOWN)g_control_adjustment--;
+            if(in[i]==UI_KEY_RIGHT || in[i]==UI_KEY_UP)g_control_adjustment++;
+            if(in[i]=='\n' || in[i]=='\r' || in[i]==' ')clicked=true;
+        }
+        ui_set_border(1.5f,TH->accent);
+    }
+    return clicked;
 }
 
 static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool masked) {
@@ -1350,6 +1401,7 @@ bool ui_overlay_end(void) {
 void ui_dialog_begin(uint64_t key) {
     ui_card_begin(key);
     g_dialog_h = ui_open();
+    const struct ui_theme *t=TH;ui_set_shadow(true,t->shadow_lg.dx,t->shadow_lg.dy,t->shadow_lg.blur,t->shadow_lg.color);
 }
 void ui_dialog_end(void) {
     ui_consume_click(g_dialog_h);           /* absorb clicks on the dialog so they don't dismiss */

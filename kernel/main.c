@@ -2304,7 +2304,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
              * locked, GUI+Tab would raise an application window over the lock
              * -- which is the session, handed to whoever is standing there --
              * and GUI+W/GUI+Q would close and quit the absent user's work. */
-            if (sk && compositor_shell_modal()) {
+            if(sk && compositor_shell_modal() && (sk!=SYSKEY_LAUNCHER || session_input_owner())) {
                 /* Said out loud, because "the shortcut did nothing" and "the
                  * keystroke never arrived" look identical from outside the
                  * machine -- and one of them is a screen lock that can be
@@ -2313,7 +2313,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                         "shell surface is up\n", sk);
                 sk = 0;
             }
-            if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            if(sk==SYSKEY_LAUNCHER)compositor_request_launcher();
+            else if(sk>=SYSKEY_SPACE_1 && sk<SYSKEY_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_SPACE_1,0);
+            else if(sk>=SYSKEY_MOVE_SPACE_1 && sk<SYSKEY_MOVE_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_MOVE_SPACE_1,1);
+            else if(sk==SYSKEY_SPACE_PREVIOUS || sk==SYSKEY_SPACE_NEXT)compositor_workspace_key(sk==SYSKEY_SPACE_PREVIOUS?-1:-2,0);
+            else if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();

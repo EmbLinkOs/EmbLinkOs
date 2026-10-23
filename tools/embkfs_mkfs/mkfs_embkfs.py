@@ -973,6 +973,15 @@ def discover_userland_objects(build_dir="build"):
     font = _read_font("DejaVuSans.ttf")
     if font is not None:
         objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
+    for source, destination in [("DejaVuSansMono-Bold.ttf", "mono-bold.ttf"),
+                                ("DejaVuSans-Bold.ttf", "bold.ttf"),
+                                ("DejaVuSansCondensed.ttf", "condensed.ttf"),
+                                ("DejaVuSansCondensed-Bold.ttf", "condensed-bold.ttf"),
+                                ("DejaVuSerif.ttf", "serif.ttf"),
+                                ("DejaVuSerif-Bold.ttf", "serif-bold.ttf")]:
+        face = _read_font(source)
+        if face is not None:
+            objects.append((("system/fonts/" + destination).encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, face))
     # The terminal's MONOSPACE face (same DejaVu family, so the same
     # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
     mono = _read_font("DejaVuSansMono.ttf")
@@ -1278,6 +1287,7 @@ def discover_userland_objects(build_dir="build"):
                         # -- sysinfo.c and embbuild.c #include them, so
                         # declaring the ABI joins the ABI (BUILD.md's rule).
                         ("user/lib/document.h",            b"system/abi/include/document.h"),
+                        ("user/lib/embk_desktop.h",        b"system/abi/include/embk_desktop.h"),
                         ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
                         ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
                         ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),

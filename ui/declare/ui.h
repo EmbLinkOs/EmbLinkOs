@@ -35,6 +35,8 @@ void ui_set_opacity(float opacity);   /* 0..1; wraps the subtree in a group */
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);
+void ui_set_hit_passthrough(bool enabled);
+void ui_hit_passthrough_for(struct instance_handle node,bool enabled);
 void ui_set_overlay(bool on);   /* fill parent, out of flow (modal/popover layer) */
 /* CSS top/right/bottom/left on the open box. `set` is a bitmask -- bit 0 top,
  * 1 right, 2 bottom, 3 left -- because 0 is an ordinary offset and has to be

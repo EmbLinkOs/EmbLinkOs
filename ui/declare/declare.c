@@ -580,6 +580,12 @@ void ui_set_layer(int l) {
     scene_set_layer(g_sa, b->scene_node, (uint8_t)(l < 0 ? 0 : l > 3 ? 3 : l));
 }
 
+void ui_hit_passthrough_for(struct instance_handle node,bool enabled) {
+    struct instance *i=instance_resolve(node);
+    struct scene_node *n=i?scene_resolve(g_sa,i->scene_node):0;
+    if(n)n->hit_passthrough=enabled;
+}
+void ui_set_hit_passthrough(bool enabled){ui_hit_passthrough_for(ui_open(),enabled);}
 void ui_set_overlay(bool on) {
     struct instance *b = cur_box(); if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
@@ -990,6 +996,7 @@ static void hit_rec(struct hit_ctx *c, struct node_handle h, const float wparent
                     float cx0, float cy0, float cx1, float cy1, int layer) {
     struct scene_node *n = scene_resolve(g_sa, h);
     if (!n) return;
+    if(n->hit_passthrough)return;
     float local[16], world[16];
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);

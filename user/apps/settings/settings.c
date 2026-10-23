@@ -1,23 +1,4 @@
-/* user/apps/settings/settings.c -- System Settings.
- *
- * The rule this app is built to: every control here CHANGES SOMETHING. A
- * settings window full of switches that only move themselves is worse than no
- * settings window, because it teaches the user that the OS lies to them. So
- * the panes are short and each one is real:
- *
- *   Appearance      accent + light/dark, applied to THIS window the instant
- *                   you pick it, written to /data/settings.conf, and worn by
- *                   every application at launch (em_app_run reads the same
- *                   file -- see user/lib/oscfg.h).
- *   Desktop & Dock  dock icon size and the running indicator, which the
- *                   desktop re-reads live: the dock changes under you.
- *   System          measured, not typed: uptime, resolution, live process
- *                   count, all read from the kernel each second.
- *   About           what this actually is.
- *
- * There is no "Apply" button. A preference that needs confirming is a
- * preference the program was not confident enough to show you.
- */
+/* Contour Settings: searchable navigation, live appearance and bounded preferences. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,17 +7,25 @@
 #include <time.h>
 
 #include "embk.h"
-#include "oscfg.h"
+#include "appearance.h"
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
 #include "system_status.h"
 
-enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_WIFI, PANE_SOUND, PANE_DISPLAY, PANE_POWER, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_ABOUT, PANE_N };
+enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_WINDOWS, PANE_ACCESS, PANE_WIFI, PANE_SOUND, PANE_DISPLAY, PANE_POWER, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_ABOUT, PANE_N };
 
-static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "Wi-Fi", "Sound", "Displays", "Battery & Power", "Keyboard", "Date & Time", "System", "About" };
-static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconCloud, IconBell, IconGrid, IconBolt, IconList, IconClock, IconBolt, IconInfo };
-
+static const char *g_pane_name[PANE_N]={"Appearance","Desktop & Dock","Windows & Workspaces","Accessibility","Wi-Fi","Sound","Displays","Battery & Power","Keyboard","Date & Time","System","About"};
+static const int g_pane_icon[PANE_N]={IconPalette,IconGrid,IconWindow,IconUser,IconNetwork,IconVolume,IconDisplay,IconBattery,IconKeyboard,IconClock,IconBolt,IconInfo};
+static const char *g_pane_description[PANE_N]={
+    "A coordinated workspace, with room for your own taste.","Arrange the command strip, dock and desktop.",
+    "Choose how windows look, move and share the display.","Make the desktop easier to read and calmer to use.",
+    "Connect and manage your saved networks.","Choose the level for your audio output.",
+    "Your screen and its available controls.","Battery readings and energy preferences.",
+    "Layout and the shortcuts used across the desktop.","The clock and your local time zone.",
+    "Live information about this computer.","EmbLink OS and its system preferences."};
+static char g_search[64],g_surface_hex[8],g_accent_hex[8];
+static bool g_reset_confirm;
 static int   g_pane = PANE_APPEARANCE;
 static struct embk_audio_info g_audio;
 static struct embk_display_info g_display;
@@ -64,11 +53,8 @@ static char g_local[48]  = "--";     /* the clock, in the chosen zone */
 static char g_utc[48]    = "--";     /* and the clock the kernel actually keeps */
 
 static void apply_now(void) {
-    ui_theme_use_dark(g_cfg.dark != 0);
-    ui_theme_set_scale((float)g_cfg.ui_scale / 100.0f);
-    const struct oscfg_accent *a = &oscfg_accents[g_cfg.accent];
-    ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
-    em_request_frame();
+    oscfg_clamp(&g_cfg);oscfg_apply_appearance(&g_cfg);
+    em_structure_changed();em_request_frame();
 }
 
 /* Every setter goes through here: change, apply, persist. Splitting those
@@ -137,196 +123,208 @@ static void setting_label(const char *title, const char *why) {
     }
 }
 
-static void pane_appearance(void) {
-    const struct ui_theme *t = ui_theme();
-    static const char *modes[] = { "Light", "Dark" };
-    int dark = g_cfg.dark ? 1 : 0;
-
-    Section("Theme") {
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Appearance", "Light or dark ground for every window.");
-            Segmented(modes, 2, &dark);
-        }
-        if (dark != (g_cfg.dark ? 1 : 0)) { g_cfg.dark = dark; commit(); }
-    }
-
-    /* THE DESKTOP PICTURE. A name and a live preview rather than a name alone:
-     * the whole point of a wallpaper is what it looks like, and four words in a
-     * row ask you to remember which one "Dusk" was. The preview is the same
-     * file the desktop draws, so what is shown here is what you get. */
-    Section("Desktop picture") {
-        int wpick = (g_cfg.wallpaper >= 0 && g_cfg.wallpaper < OSCFG_WALLPAPERS)
-                    ? g_cfg.wallpaper : 0;
-        const int NPIC = OSCFG_WALLPAPER_PICTURES;
-        const int NCOL = OSCFG_WALLPAPERS - OSCFG_WALLPAPER_PICTURES;
-
-        /* TWO ROWS, ONE VALUE. Eight labels in a single segmented control is
-         * eight unreadable labels at this width. Split by what they ARE --
-         * photographs, and colours the desktop draws -- and let the row that
-         * does not hold the current choice show none selected, which is what
-         * `-1` means to the control. */
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Picture", "What the desktop shows behind everything.");
-        }
-        {
-            const char *names[OSCFG_WALLPAPERS];
-            for (int i = 0; i < NPIC; i++) names[i] = oscfg_wallpapers[i].label;
-            int pick = (wpick < NPIC) ? wpick : -1, was = pick;
-            Segmented(names, NPIC, &pick);
-            Sync();                 /* the staged element writes pick at the FLUSH */
-            if (pick != was && pick >= 0) { g_cfg.wallpaper = pick; commit(); wpick = pick; }
-        }
-        {
-            const char *names[OSCFG_WALLPAPERS];
-            for (int i = 0; i < NCOL; i++) names[i] = oscfg_wallpapers[NPIC + i].label;
-            int pick = (wpick >= NPIC) ? wpick - NPIC : -1, was = pick;
-            Segmented(names, NCOL, &pick);
-            Sync();
-            if (pick != was && pick >= 0) {
-                g_cfg.wallpaper = NPIC + pick; commit(); wpick = NPIC + pick;
-            }
-        }
-
-        /* The preview is the same thing the desktop draws, by the same rule:
-         * the file if there is one, the gradient if there is not. A preview
-         * that approximates the result is a preview that can be wrong. */
-        {
-            const struct oscfg_wallpaper *wp = &oscfg_wallpapers[wpick];
-            if (wp->path) {
-                Image(wp->path, .height = 132, .corner = 10);
-            } else {
-                em_flush();
-                ui_box_begin(0x5E77B6C0ULL);
-                ui_set_paint(em_lgrad3(
-                    (Color){ wp->a[0], wp->a[1], wp->a[2], 1.f },
-                    (Color){ wp->b[0], wp->b[1], wp->b[2], 1.f },
-                    (Color){ wp->c[0], wp->c[1], wp->c[2], 1.f }, wp->angle));
-                ui_set_corner_radius(10);
-                ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
-                            (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 132 });
-                ui_box_end();
-            }
-        }
-    }
-
-    Section("Interface size") {
-        /* The base size everything else is derived from -- text, and so every
-         * box measured around text, including the Terminal's character grid.
-         * Three steps rather than a slider: this is a legibility decision with
-         * two or three right answers, not a continuous quantity, and a slider
-         * would invite pixel-hunting for a value that does not exist. */
-        static const char *sizes[] = { "Small", "Default", "Large" };
-        int step = g_cfg.ui_scale <= 90 ? 0 : g_cfg.ui_scale >= 115 ? 2 : 1;
-        int was = step;
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Text and controls",
-                          "Scales the whole interface, not just this window.");
-            Segmented(sizes, 3, &step);
-        }
-        if (step != was) {
-            g_cfg.ui_scale = step == 0 ? 88 : step == 2 ? 118 : 100;
-            commit();
-        }
-    }
-
-    Section("Accent") {
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Highlight colour",
-                          "Selection, focus and active controls -- and nothing else.");
-        }
-        /* The swatches are the control. A dropdown listing colour NAMES would
-         * make you imagine the colour; showing them lets you choose one. */
-        HStack(.spacing = 8, .align = Center, .py = 2) {
-            for (int i = 0; i < OSCFG_ACCENTS; i++) {
-                const struct oscfg_accent *a = &oscfg_accents[i];
-                bool on = (g_cfg.accent == i);
-                VStack(.spacing = 4, .align = Center, .width = 66) {
-                    if (Button(on ? "\xE2\x9C\x93" : " ")
-                            .bg((Color){ a->r, a->g, a->b, 1.f })
-                            .color(on ? (Color){ 1,1,1,1 } : (Color){ a->r, a->g, a->b, 1.f })
-                            .frame(40, 28).corner(7)
-                            .id(a->name).clicked()) {
-                        g_cfg.accent = i; commit();
-                    }
-                    Text(a->name).caption().color(on ? t->accent : t->text_secondary);
-                }
-            }
+/* Bind controls and flush before reading staged DSL values. */
+static void choice(const char *title,const char *detail,const char *const *labels,int n,int *value) {
+    HStack(.spacing=16,.align=Center,.py=4,.grow=1) {
+        setting_label(title,detail);
+        int pick=*value;Segmented(labels,n,&pick);Sync();
+        if(pick!=*value) {
+            *value=pick;
+            uintptr_t target=(uintptr_t)value,begin=(uintptr_t)&g_cfg;
+            if(target>=begin && target<begin+sizeof g_cfg)commit();
         }
     }
 }
+static void switch_row(const char *title,const char *detail,int *value) {
+    HStack(.spacing=16,.align=Center,.py=4,.grow=1) {
+        setting_label(title,detail);bool on=!!*value;Toggle("",&on);Sync();
+        if(on!=!!*value){*value=on;commit();}
+    }
+}
+static int rgb_parse(const char *s,int *value) {
+    if(strlen(s)!=6)return 0;
+    for(int i=0;i<6;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='A'&&s[i]<='F')||(s[i]>='a'&&s[i]<='f')))return 0;
+    *value=(int)strtoul(s,0,16);return 1;
+}
+static void colour_editor(const char *label,char *buffer,int *value,int *enabled) {
+    HStack(.spacing=12,.align=Center) {
+        setting_label(label,"Six hexadecimal digits, without #.");
+        TextField(buffer,8,"RRGGBB").width(112);
+        if(Button("Use colour").secondary().clicked()) {
+            int rgb;
+            if(rgb_parse(buffer,&rgb)){*value=rgb;if(enabled)*enabled=1;commit();}
+            else snprintf(g_saved,sizeof g_saved,"Enter six hexadecimal digits");
+        }
+    }
+}
+static void apply_preset(int preset) {
+    oscfg_preset(&g_cfg,preset);
+    snprintf(g_surface_hex,sizeof g_surface_hex,"%06X",g_cfg.custom_surface);
+    snprintf(g_accent_hex,sizeof g_accent_hex,"%06X",g_cfg.custom_accent);
+    commit();
+}
+static void appearance_preview(void) {
+    const struct ui_theme *t=ui_theme();
+    VStack(.spacing=EmZero,.background=t->surface,.border=1,.border_color=t->border,.corner=8,.align=Fill) {
+        HStack(.background=t->chrome,.px=14,.py=8,.spacing=8) {
+            Icon(IconWindow).color(t->accent);Text("Your workspace").caption();Spacer();Text("Live preview").caption().secondary();
+        }
+        Divider();
+        HStack(.spacing=18,.padding=16,.align=Center) {
+            VStack(.spacing=4,.grow=1) {Text("A clear place to begin").title();Text("Readable text, quiet surfaces and a considered accent.").caption().secondary();}
+            Badge("Selected");
+        }
+    }
+}
+static void pane_appearance(void) {
+    static const char *modes[]={"Light","Dark"};
+    static const char *surfaces[]={"Mineral","Linen","Slate","Custom"};
+    static const char *fonts[]={"Sans","Condensed","Serif"};
+    static const char *density[]={"Compact","Balanced","Comfortable"};
+    static const char *scales[]={"90%","100%","115%","130%"};
+    Section("Curated workspaces") {
+        HStack(.spacing=8) {
+            for(int i=0;i<OSCFG_PRESETS;i++)if(Button(oscfg_preset_names[i]).secondary().clicked()) {
+                apply_preset(i);
+            }
+        }
+        Text("A complete starting point. Your sound, time and keyboard choices are kept.").caption().secondary();
+        appearance_preview();
+    }
+    Divider();
+    Section("Palette") {
+        choice("Appearance","A light or dark foundation.",modes,2,&g_cfg.dark);
+        choice("Surfaces","Coordinate every window and temporary panel.",surfaces,4,&g_cfg.surface_style);
+        if(g_cfg.surface_style==3)colour_editor("Surface colour",g_surface_hex,&g_cfg.custom_surface,0);
+        HStack(.spacing=8,.align=Center) {
+            setting_label("Accent","Coordinated for readable selection, focus and actions.");
+            for(int i=0;i<OSCFG_ACCENTS;i++) {
+                const struct oscfg_accent *a=&oscfg_accents[i];Color c={a->r,a->g,a->b,1};
+                if(Button(i==g_cfg.accent&&!g_cfg.accent_custom?"•":" ").width(25).height(25).px(EmZero).py(3).bg(c).corner(5).clicked()) {
+                    g_cfg.accent=i;g_cfg.accent_custom=0;commit();
+                }
+            }
+        }
+        colour_editor("Custom accent",g_accent_hex,&g_cfg.custom_accent,&g_cfg.accent_custom);
+    }
+    Divider();
+    Section("Typography & rhythm") {
+        choice("Interface font","Real regular and bold faces.",fonts,3,&g_cfg.font);
+        int scale=g_cfg.ui_scale>=125?3:g_cfg.ui_scale>=110?2:g_cfg.ui_scale<=95?0:1,was=scale;
+        choice("Interface scale","Scale the shared type and control metrics.",scales,4,&scale);
+        if(scale!=was){static const int values[]={90,100,115,130};g_cfg.ui_scale=values[scale];commit();}
+        choice("Density","Control padding and the space between shared controls.",density,3,&g_cfg.density);
+    }
+    Divider();
+    Section("Materials") {
+        static const char *trans[]={"Opaque","Subtle","Translucent"};
+        int opacity=g_cfg.transparency==0?0:g_cfg.transparency<=20?1:2,was=opacity;
+        choice("Transparency","An opaque fallback is always available.",trans,3,&opacity);
+        if(opacity!=was){g_cfg.transparency=opacity==0?0:opacity==1?18:35;commit();}
+        static const char *blur[]={"Off","6 px","12 px"};int step=g_cfg.blur==0?0:g_cfg.blur<=6?1:2,old=step;
+        choice("Backdrop blur","Bounded to temporary panels; no full-screen blur.",blur,3,&step);
+        if(step!=old){g_cfg.blur=step==0?0:step==1?6:12;commit();}
+    }
+    Divider();
+    if(Button("Reset appearance…").secondary().clicked())g_reset_confirm=true;
+}
 
 static void pane_desktop(void) {
+    static const char *edges[]={"Bottom","Left","Right"};
+    static const char *sizes[]={"Small","Medium","Large"};
+    static const char *bar_edges[]={"Top","Bottom"};
+    static const char *bar_sizes[]={"Compact","Balanced","Tall"};
+    static const char *order[]={"Status → Clock","Clock → Status"};
+    static const char *icons[]={"Colour","Monochrome"};
     Section("Dock") {
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Icon size", "How large the apps in the dock are drawn.");
-            char v[16]; snprintf(v, sizeof v, "%d px", g_cfg.dock_size);
-            Text(v).caption().secondary();
-        }
-        /* A slider, because size is a quantity you tune by eye, not a value you
-         * type. It commits on release rather than per-pixel: writing the file
-         * on every frame of a drag would be a hundred writes for one decision. */
-        float f = (float)(g_cfg.dock_size - 28) / 32.0f;
-        static bool dragging = false;
-        Slider(&f);
-        Sync();                 /* the slider writes f when it is EMITTED, not
-                                 * when it is called -- read it before the flush
-                                 * and the dock size never moves. */
-        int want = 28 + (int)(f * 32.0f + 0.5f);
-        if (want != g_cfg.dock_size) { g_cfg.dock_size = want; dragging = true; apply_now(); }
-        else if (dragging) { dragging = false; commit(); }
-
-        bool dots = g_cfg.dock_dots != 0, was = dots;
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Running indicator",
-                          "An app that is open sits in a lit socket, so the dock "
-                          "tells the truth about what is running.");
-            Toggle("", &dots);
-        }
-        if (dots != was) { g_cfg.dock_dots = dots ? 1 : 0; commit(); }
+        choice("Placement","Reserve one edge for your applications.",edges,3,&g_cfg.dock_edge);
+        int size=g_cfg.dock_size<36?0:g_cfg.dock_size>46?2:1,was=size;
+        choice("Icon size","Stable targets; no magnification under the pointer.",sizes,3,&size);
+        if(size!=was){g_cfg.dock_size=size==0?30:size==1?38:52;commit();}
+        switch_row("Auto-hide","Reveal when the pointer enters the reserved dock band.",&g_cfg.dock_autohide);
+        switch_row("Running indicators","A short accent rail marks open applications.",&g_cfg.dock_dots);
+        switch_row("Application labels","Show the name beside the hovered icon.",&g_cfg.dock_labels);
     }
-    /* THE MENU BAR. Four independent switches rather than a "style" preset:
-     * each is a question someone actually has an opinion about, and a preset
-     * would invent combinations nobody asked for. Every one of them is read by
-     * a DIFFERENT process -- the bar reads the copy the desktop publishes into
-     * /run, because its namespace does not name the user's home and should not. */
-    Section("Menu bar") {
-        bool h24 = g_cfg.bar_24h != 0,     h24_was = h24;
-        bool sec = g_cfg.bar_seconds != 0, sec_was = sec;
-        bool dat = g_cfg.bar_date != 0,    dat_was = dat;
-        bool cpu = g_cfg.bar_cpu != 0,     cpu_was = cpu;
-
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("24-hour clock", "13:00 rather than 1 pm.");
-            Toggle("", &h24);
-        }
-        if (h24 != h24_was) { g_cfg.bar_24h = h24 ? 1 : 0; commit(); }
-
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Show seconds", "The clock ticks once a second either way.");
-            Toggle("", &sec);
-        }
-        if (sec != sec_was) { g_cfg.bar_seconds = sec ? 1 : 0; commit(); }
-
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Show the date", "The day and month beside the time.");
-            Toggle("", &dat);
-        }
-        if (dat != dat_was) { g_cfg.bar_date = dat ? 1 : 0; commit(); }
-
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Show processor load",
-                          "What fraction of one core the machine is using.");
-            Toggle("", &cpu);
-        }
-        if (cpu != cpu_was) { g_cfg.bar_cpu = cpu ? 1 : 0; commit(); }
+    Divider();
+    Section("Command strip") {
+        switch_row("Auto-hide strip","Reveal at its screen edge; menus stay visible while open.",&g_cfg.bar_autohide);
+        choice("Screen edge","Menus open toward the display's interior.",bar_edges,2,&g_cfg.bar_edge);
+        int size=g_cfg.bar_size<=30?0:g_cfg.bar_size>=40?2:1,was=size;
+        choice("Strip height","Compact controls, with a readable material behind them.",bar_sizes,3,&size);
+        if(size!=was){g_cfg.bar_size=size==0?28:size==1?34:42;commit();}
+        choice("Status order","Choose which group sits at the outer edge.",order,2,&g_cfg.bar_order);
+        switch_row("Workspaces","Switch spaces and move the current window.",&g_cfg.bar_workspaces);
+        switch_row("Network","Show the network menu.",&g_cfg.bar_network);
+        switch_row("Sound","Show output controls.",&g_cfg.bar_sound);
+        switch_row("Power","Show battery availability and the lock command.",&g_cfg.bar_power);
+        switch_row("Processor load","Measured use of one CPU core; hidden on narrow screens.",&g_cfg.bar_cpu);
+        switch_row("24-hour time","Use 13:00 rather than 1 pm.",&g_cfg.bar_24h);
+        switch_row("Show date","Include the current day and month.",&g_cfg.bar_date);
+        switch_row("Show seconds","Update the clock once a second.",&g_cfg.bar_seconds);
     }
-
+    Divider();
     Section("Desktop") {
-        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
-            setting_label("Icon arrangement",
-                          "Icons stay wherever you drop them; the desktop menu tidies them.");
-            Text("Free").caption().secondary();
-        }
+        choice("Application icons","One original family, in colour or a single ink.",icons,2,&g_cfg.icon_theme);
+        switch_row("Desktop icons","Keep desktop items visible without changing their layout.",&g_cfg.desktop_icons);
+        int size=g_cfg.desktop_icon_size<=36?0:g_cfg.desktop_icon_size>=60?2:1,was=size;
+        choice("Desktop icon size","Independent of the dock.",sizes,3,&size);
+        if(size!=was){g_cfg.desktop_icon_size=size==0?32:size==1?48:64;commit();}
+        const char *labels[OSCFG_WALLPAPERS];for(int i=0;i<OSCFG_WALLPAPERS;i++)labels[i]=oscfg_wallpapers[i].label;
+        Text("Desktop background").caption();
+        Dropdown(labels,OSCFG_WALLPAPERS,&g_cfg.wallpaper);Sync();
+        static int previous=-1;
+        if(previous!=g_cfg.wallpaper){if(previous>=0)commit();previous=g_cfg.wallpaper;}
+        const struct oscfg_wallpaper *wp=&oscfg_wallpapers[g_cfg.wallpaper];
+        if(wp->path)Image(wp->path,.height=120,.corner=6);
+    }
+}
+static void pane_windows(void) {
+    static const char *decorations[]={"Contour","Classic","Outline"};
+    static const char *radii[]={"Square","Subtle","Rounded"};
+    static const char *shadows[]={"None","Soft","Defined"};
+    static const char *counts[]={"1","2","3","4","5","6"};
+    Section("Window frame") {
+        choice("Controls","A coherent frame across native applications.",decorations,3,&g_cfg.decoration);
+        int radius=g_cfg.window_radius==0?0:g_cfg.window_radius<=8?1:2,was=radius;
+        choice("Corners","Shape applied by the toolkit and compositor.",radii,3,&radius);
+        if(radius!=was){g_cfg.window_radius=radius==0?0:radius==1?8:12;commit();}
+        choice("Window shadows","Keep overlapping windows distinct.",shadows,3,&g_cfg.shadows);
+        switch_row("Edge snapping","Snap a dragged window at work-area edges.",&g_cfg.snap);
+    }
+    Divider();
+    Section("Workspaces") {
+        int count=g_cfg.workspace_count-1,was=count;
+        choice("Number of spaces","Keep separate groups of open windows.",counts,6,&count);
+        if(count!=was){g_cfg.workspace_count=count+1;commit();}
+        switch_row("Wrap workspace navigation","Cycle from the last space to the first with keyboard navigation.",&g_cfg.workspace_wrap);
+        Text("The command strip switches spaces and moves the current window. Reducing the count gathers windows into the last remaining space.").caption().secondary();
+    }
+    Divider();
+    Section("Motion") {switch_row("Reduce motion","Show windows and menus without animated transitions.",&g_cfg.reduce_motion);}
+}
+static void pane_access(void) {
+    static const char *contrast[]={"Standard","Increased","High"};
+    static const char *cursors[]={"Light","Dark","Accent"};
+    static const char *cursor_sizes[]={"Standard","Large"};
+    static const char *text_sizes[]={"100%","115%","130%"};
+    Section("Readability") {
+        choice("Contrast","Strengthen text and separators without changing the accent.",contrast,3,&g_cfg.contrast);
+        int size=g_cfg.text_scale>=125?2:g_cfg.text_scale>=110?1:0,was=size;
+        choice("Text size","Increase the shared type scale independently.",text_sizes,3,&size);
+        if(size!=was){g_cfg.text_scale=size==0?100:size==1?115:130;commit();}
+        choice("Pointer colour","A contrasting outline keeps the pointer visible.",cursors,3,&g_cfg.cursor_style);
+        choice("Pointer size","Same hotspot, larger rendered silhouette.",cursor_sizes,2,&g_cfg.cursor_size);
+    }
+    Divider();
+    Section("Calmer effects") {
+        switch_row("Reduce motion","Disable menu and window animations.",&g_cfg.reduce_motion);
+        if(Button("Use opaque surfaces").secondary().clicked()){g_cfg.transparency=0;g_cfg.blur=0;commit();}
+    }
+    Divider();
+    Section("Keyboard navigation") {
+        static const char *modifiers[]={"Super","Ctrl + Alt"};
+        choice("System modifier","Choose the modifier used for system shortcuts.",modifiers,2,&g_cfg.shortcut_modifier);
+        Text("Tab moves between text fields; Super+A selects text. The system modifier with Tab switches windows, W closes and Q quits. Modifier+Space opens Applications; modifier+1…6 selects a workspace, Shift moves the current window there, and [ / ] walks spaces. Editor document commands use Ctrl+S, Ctrl+O and Ctrl+N.").caption().secondary();
     }
 }
 
@@ -677,49 +675,63 @@ static void app(void) {
     if (!g_loaded) { oscfg_load(&g_cfg); g_loaded = true; apply_now(); }
     sample_system();
 
+    if(!g_surface_hex[0])snprintf(g_surface_hex,sizeof g_surface_hex,"%06X",g_cfg.custom_surface);
+    if(!g_accent_hex[0])snprintf(g_accent_hex,sizeof g_accent_hex,"%06X",g_cfg.custom_accent);
     Window("Settings") {
-        AppBar("Settings") {
-            if (g_saved[0]) Text(g_saved).caption().tertiary();
-        }
-        Split(206) {
+        AppBar("Settings") {if(g_saved[0])Text(g_saved).caption().secondary();}
+        Split(em_viewport_width()<760?184:226) {
             SidebarPane() {
-                const struct ui_theme *t = ui_theme();
-                for (int i = 0; i < PANE_N; i++) {
-                    bool on = (g_pane == i);
-                    HStack(.spacing = 7, .align = Center, .px = 7, .py = 1, .corner = 5,
-                           .grow = 1,
-                           .background = on ? (Color){ .r=.24f, .g=.26f, .b=.34f, .a=1.f }
-                                            : (Color){ 0, 0, 0, 0 }) {
-                        Icon(g_pane_icon[i]).caption().color(on ? t->accent : t->text_secondary);
-                        if (Button(g_pane_name[i]).ghost().font(Caption).py(1)
-                                .color(on ? t->text : t->text_secondary)
-                                .grow().leading().clicked()) { g_pane = i; g_scroll = 0; g_saved[0] = 0; }
+                SearchField(g_search,sizeof g_search,"Find a setting");
+                Divider();
+                for(int i=0;i<PANE_N;i++) {
+                    if(g_search[0]) {
+                        int match=0;for(const char *p=g_pane_name[i];*p;p++) {
+                            const char *a=p,*b=g_search;
+                            while(*a&&*b&&((*a|32)==(*b|32))){a++;b++;}if(!*b){match=1;break;}
+                        }
+                        if(!match)continue;
+                    }
+                    bool on=g_pane==i;
+                    HStack(.spacing=9,.align=Center,.px=9,.py=7,.corner=5,.grow=1,
+                           .background=on?T.accent_soft:T.clear,.border=EmZero,.key=g_pane_name[i]) {
+                        struct instance_handle row=ui_open();
+                        Icon(g_pane_icon[i]).caption().color(on?T.accent:T.secondary);
+                        Text(g_pane_name[i]).caption().color(on?T.text:T.secondary);Spacer();
+                        if(ui_control_interact(row)){g_pane=i;g_scroll=0;g_saved[0]=0;em_structure_changed();}
                     }
                 }
-                Spacer();
-                Text("EmbLink OS").caption().tertiary();
+                Spacer();Text("Contour · EmbLink OS").caption().secondary();
             }
-            ContentPane(.padding = 0) {
-                /* measured, not guessed -- see the note in files.c */
-                ScrollView(&g_scroll, em_viewport_height() - 58.0f) {
-                    /* No page heading. The window's title bar already says
-                     * "Settings" and the sidebar says which pane -- a third
-                     * copy in 26pt type is the Android pattern of restating
-                     * the screen name inside the screen. */
-                    VStack(.spacing = 4, .align = Fill, .padding = 16) {
-                        switch (g_pane) {
-                            case PANE_APPEARANCE: pane_appearance(); break;
-                            case PANE_DESKTOP:    pane_desktop();    break;
-                            case PANE_SOUND:      pane_sound();      break;
-                            case PANE_DISPLAY:    pane_display();    break;
-                            case PANE_POWER:      pane_power();      break;
-                            case PANE_WIFI:       pane_wifi();       break;
-                            case PANE_KEYBOARD:   pane_keyboard();   break;
-                            case PANE_TIME:       pane_time();       break;
-                            case PANE_SYSTEM:     pane_system();     break;
-                            default:              pane_about();      break;
+            ContentPane(.padding=EmZero) {
+                ScrollView(&g_scroll,em_viewport_height()-48) {
+                    VStack(.spacing=16,.padding=22,.align=Fill,.key=g_pane_name[g_pane]) {
+                        VStack(.spacing=4) {Text(g_pane_name[g_pane]).title();Text(g_pane_description[g_pane]).caption().secondary();}
+                        Divider();
+                        switch(g_pane) {
+                        case PANE_APPEARANCE:pane_appearance();break;
+                        case PANE_DESKTOP:pane_desktop();break;
+                        case PANE_WINDOWS:pane_windows();break;
+                        case PANE_ACCESS:pane_access();break;
+                        case PANE_WIFI:pane_wifi();break;
+                        case PANE_SOUND:pane_sound();break;
+                        case PANE_DISPLAY:pane_display();break;
+                        case PANE_POWER:pane_power();break;
+                        case PANE_KEYBOARD:pane_keyboard();break;
+                        case PANE_TIME:pane_time();break;
+                        case PANE_SYSTEM:pane_system();break;
+                        default:pane_about();break;
                         }
                     }
+                }
+            }
+        }
+        if(g_reset_confirm)Overlay() {
+            Dialog(.width=400,.padding=22,.spacing=14) {
+                Text("Reset appearance?").title();
+                Text("Restore the Contour palette, layout, typography and effects. Other system preferences are kept.").body().secondary();
+                HStack(.spacing=10) {
+                    Spacer();if(Button("Cancel").secondary().clicked())g_reset_confirm=false;
+                    if(Button("Reset").primary().clicked()){apply_preset(0);g_reset_confirm=false;}
                 }
             }
         }
@@ -728,7 +740,8 @@ static void app(void) {
 
 EM_APPLICATION {
     .title      = "Settings",
-    .size       = { 860, 600 },
+    .min_size = { 640, 420 },
+    .size       = { 980, 660 },
     .theme      = Dark,
     .chrome     = Chromeless,
     .resize     = Resizable,

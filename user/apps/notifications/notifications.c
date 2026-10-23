@@ -15,10 +15,11 @@ static void app(void) {
             ScrollView(&scroll,em_viewport_height()-80) {
                 VStack(.spacing=12,.grow=1,.align=Fill) {
                     if(rc)Text("Notifications are unavailable for this session.").secondary();
-                    else if(!history.count)Text("You're all caught up.").secondary();
+                    else if(!history.count)EmptyState(IconBell,"All caught up","New notifications will appear here.");
                     else for(unsigned i=0;i<history.count && i<EMBK_NOTIFY_MAX;i++) {
                         const struct embk_notice *n=&history.entries[i];
                         char key[32];snprintf(key,sizeof key,"notice%llu",(unsigned long long)n->sequence);
+                        Divider();
                         Section(n->title,.key=key) {
                             Text(n->body).body();
                             char age[48];
@@ -32,4 +33,5 @@ static void app(void) {
     }
 }
 EM_APPLICATION {.title="Notifications",.size={520,520},.theme=Dark,
+    .min_size = { 400, 300 },
     .chrome=Chromeless,.resize=Resizable,.refresh_ms=1000,.view=app};

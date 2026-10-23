@@ -3512,3 +3512,9 @@ service-test:
 doc-model-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/note user/note/doc.c user/note/syntax.c user/note/doc_test.c -o $(BUILD)/doc_model_test
 	$(BUILD)/doc_model_test
+
+.PHONY: contour-test
+contour-test:
+	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 $(UI_INC) -Iuser/lib \
+	    ui/theme/theme.c tests/desktop/appearance_test.c -lm -o $(BUILD)/contour_test
+	$(BUILD)/contour_test

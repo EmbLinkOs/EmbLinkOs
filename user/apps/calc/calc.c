@@ -200,7 +200,7 @@ static void app(void) {
             /* The display. Trailing, large, and the only thing here that is
              * allowed to be big -- it is the answer, and everything else is a
              * way of asking. */
-            HStack(.height = 64, .corner = 12, .background = t->surface_alt,
+            HStack(.height = 64, .corner = 6, .background = t->surface_alt,
                    .px = 14, .align = Center) {
                 Spacer();
                 Text(g_entry).font(Heading)

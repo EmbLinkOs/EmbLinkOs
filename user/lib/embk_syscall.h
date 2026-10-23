@@ -201,6 +201,7 @@
 #define EMBK_SYS_win_menu 144
 #define EMBK_SYS_win_close_ack 145
 #define EMBK_SYS_key_poll_input 146
+#define EMBK_SYS_desktop_control 147
 
 
 

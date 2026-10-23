@@ -165,6 +165,25 @@ static float seg_x_for_change(void) {
     return -1;
 }
 
+static int under_clicked;
+static void under_frame(void) {
+    ui_frame_begin();
+    if(Button("Under").width(100).height(30).clicked())under_clicked++;
+    em_flush();ui_begin_vstack(0xdec047);
+    ui_set_overlay(true);ui_set_layer(3);ui_set_hit_passthrough(true);
+    ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=120},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=40});
+    ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid={1,0,0,1}});
+    ui_end_stack();ui_frame_end();ui_run_layout(400,100);
+}
+
+static bool chrome_closed;
+static void chrome_frame(void) {
+    ui_frame_begin();em_new_frame();
+    Window("Chrome regression"){AppBar("Chrome regression"){} Spacer();}
+    em_flush();em_tooltip_host();chrome_closed=em_window_closed();
+    ui_frame_end();ui_run_layout(400,300);
+}
+
 int main(void) {
     printf("=== em-test: the multi-line editor ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -414,6 +433,27 @@ int main(void) {
         CHECK(seg_applied == 0 && seg_cfg == 0,
               "without it the change is read a flush too early and thrown away");
     }
+
+    char query[32]="";bool submitted=false;
+    /* A search field forwards its own submit edge, exactly once. */
+    for(int pass=0;pass<3;pass++) {
+        if(pass==2){ui_input_char('o');ui_input_char('k');ui_input_char('\n');}
+        ui_frame_begin();VStack(.key="search-submit") {
+            em_field_autofocus();submitted=SearchField(query,sizeof query,"Search").submitted();
+        }
+        em_flush();ui_frame_end();ui_run_layout(400,100);
+    }
+    CHECK(!strcmp(query,"ok") && submitted,"SearchField forwards Return to its submitted binding");
+
+    under_clicked=0;under_frame();under_frame();
+    ui_pointer(20,12,true);under_frame();ui_pointer(20,12,false);under_frame();
+    CHECK(under_clicked==1,"a decorative overlay passes pointer clicks to its underlying control");
+
+    em_set_viewport(400,300);chrome_frame();chrome_frame();
+    em_feed_pointer(84,18,0,0,0,1);chrome_frame();g_ms+=700;chrome_frame();chrome_frame();
+    em_feed_pointer(20,18,1,0,0,1);chrome_frame();
+    CHECK(chrome_closed,"leaving the layout board for Close does not swallow the close press");
+    em_feed_pointer(20,18,0,0,0,1);chrome_frame();
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

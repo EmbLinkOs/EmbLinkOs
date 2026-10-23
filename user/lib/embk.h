@@ -982,6 +982,10 @@ static inline int embk_key_event_poll(struct embk_key_event *ev) {
 /* Same character queue as key_poll, with modifiers captured when that byte
  * was produced. Zero means empty; bits 0..7 are the byte, 8..15 EMBK_KM_*.
  * This distinguishes queued Ctrl+S from Up after Ctrl has been released. */
+#include "embk_desktop.h"
+static inline int embk_desktop_control(unsigned operation,struct embk_desktop *state) {
+    return (int)embk_syscall3(EMBK_SYS_desktop_control,operation,(int64_t)(uintptr_t)state,sizeof *state);
+}
 static inline int embk_key_poll_input(void) {
     return (int)embk_syscall0(EMBK_SYS_key_poll_input);
 }
@@ -1227,6 +1231,7 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * sit in its window unread. The runtime turns this into a frame; the payload
  * still comes from embk_drop_take. */
 #define EMBK_WIN_ACTION_DROP      0x80000003u
+#define EMBK_WIN_ACTION_LAUNCHER  0x80000007u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *

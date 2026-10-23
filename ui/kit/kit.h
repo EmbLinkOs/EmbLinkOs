@@ -39,6 +39,8 @@ void ui_secondary(const char *fmt, ...);
 void ui_caption(const char *fmt, ...);
 
 /* --- controls (return true on the frame they were clicked) --- */
+bool ui_control_interact(struct instance_handle control);
+
 bool ui_button_primary(const char *label);
 bool ui_button_secondary(const char *label);
 bool ui_button_ghost(const char *label);

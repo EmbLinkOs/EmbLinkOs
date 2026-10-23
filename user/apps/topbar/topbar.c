@@ -1,32 +1,5 @@
-/* topbar.c -- the system menu bar.
- *
- * Modelled on the Mac menu bar, which is a very particular thing: it SPANS the
- * display, sits flush in the top-left corner with no margin and no rounding,
- * and is thin. It is part of the screen rather than an object on it. It was
- * previously a floating rounded 880px pill you could drag around and pin to
- * anchors -- which is a nice widget, and reads as a widget, which is exactly
- * what a menu bar must not read as.
- *
- * So: full width, flush, 26px, no corners, no drag, no pin. Left is the
- * launcher mark then the menus, with the owning app's name BOLD (that weight
- * difference is how a menu bar says whose menus these are). Right is bare
- * status glyphs and the clock -- glyphs, not chips: boxing each status item
- * turned the bar into a row of widgets.
- *
- * The window is TRANSLUCENT and only the top strip paints; the rest is
- * transparent canvas the dropdowns render into.
- *
- * The strip itself paints NOTHING now -- no fill, no frost. The menu bar is
- * just its text and glyphs sitting directly on the wallpaper, which is the
- * most confident version of this and the one that makes the desktop feel like
- * a single surface rather than a stack of panels.
- *
- * With no background, legibility is the wallpaper's problem, so the bar ASKS:
- * embk_screen_luma samples what is composed just below the strip and the bar
- * inks itself dark over a light wallpaper and light over a dark one. That is
- * how a transparent bar stays readable without reintroducing the panel it was
- * trying not to be. Sampled about twice a second -- a wallpaper does not
- * change at frame rate, and reading pixels is not free. */
+/* Contour command strip. A readable material, compact commands, independent
+ * status groups and a real workspace switcher. Shell snapshots never block a frame. */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -39,7 +12,7 @@
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
-#include "oscfg.h"   /* the menu bar wears the user's preferences too */
+#include "appearance.h"   /* the menu bar wears the user's preferences too */
 
 /* Which machine this is, decided where it is actually known -- at compile
  * time. A binary cannot be wrong about its own architecture. */
@@ -53,32 +26,7 @@
 
 #define BAR_W 1024   /* replaced at startup by the real display width */
 /* Thin like a real menu bar: the strip is chrome, not a panel. */
-#define BAR_H 26
-
-/* Ink for everything in the strip: dark over a light wallpaper, light over a
- * dark one. Sampled from the band immediately BELOW the bar -- the bar's own
- * pixels are in the framebuffer too, so sampling its own row would measure its
- * own text. Hysteresis around the midpoint: a wallpaper that sits near the
- * threshold must not make the bar flicker between inks. */
-static Color g_ink = { .r=.90f, .g=.91f, .b=.93f, .a=1.f };
-static int   g_ink_dark = 0;
-static uint64_t g_ink_next = 0;
-
-static void bar_ink_update(void) {
-    uint64_t now = em_now_ms();
-    /* Not before the desktop exists. The very first sample used to land during
-     * boot, while the screen still held the kernel console, and latch an ink
-     * chosen from white-on-black text that no user ever saw. */
-    if (now < 2500) return;
-    if (now < g_ink_next) return;
-    g_ink_next = now + 500;
-    int l = embk_screen_luma(0, BAR_H, (int)em_viewport_width(), 6);
-    if (l < 0) return;
-    if (!g_ink_dark && l > 150)      g_ink_dark = 1;
-    else if (g_ink_dark && l < 120)  g_ink_dark = 0;
-    g_ink = g_ink_dark ? (Color){ .r=.08f, .g=.08f, .b=.09f, .a=1.f }
-                       : (Color){ .r=.90f, .g=.91f, .b=.93f, .a=1.f };
-}
+#define BAR_H 34
 
 /* status-chip ids (icon codepoints); the user reorders / removes these live */
 /* WHAT THE MACHINE IS DOING, and it is measured.
@@ -182,26 +130,6 @@ static const char *ip_text(uint32_t ip) {
     return b;
 }
 
-static void meter(int pct) {
-    float frac = (float)pct / 100.0f;
-    if (frac > 1.0f) frac = 1.0f;
-    if (frac < 0.0f) frac = 0.0f;
-    Color track = g_ink; track.a = 0.22f;
-    HStack(.width = 24, .height = 4, .corner = 2, .background = track,
-           .align = Fill, .justify = Leading) {
-        /* ALWAYS EMITTED, never conditional, and at least a pixel wide. Two
-         * reasons and they point the same way: a bar that rounds a live
-         * machine down to nothing reads as "no data" rather than "idle"; and a
-         * child that comes and goes is the retained-instance trap this toolkit
-         * has paid for twice (em_apply_box has the story). A box that is
-         * always there cannot be reused as something else. */
-        float w = frac * 24.0f;
-        if (w < 1.0f) w = 1.0f;
-        HStack(.width = w, .height = 4, .corner = 2, .background = g_ink) {}
-    }
-}
-
-
 /* Live date + time. The bar used to read a hard-coded "9:41" -- Apple's
  * marketing time -- which is exactly the kind of decorative lie the rest of the
  * shell avoids. The OS can report the real clock, so it does. */
@@ -229,23 +157,16 @@ static void bar_cfg_apply(void) {
     next = g_bar_pending;
     embk_mutex_unlock(&g_bar_cfg_lock);
     static int applied;
-    int changed = !applied || next.dark != g_bar_cfg.dark ||
-                  next.accent != g_bar_cfg.accent || next.ui_scale != g_bar_cfg.ui_scale;
-    g_bar_cfg = next;
-    if (changed) {
-        applied = 1;
-        ui_theme_use_dark(next.dark != 0);
-        ui_theme_set_scale((float)next.ui_scale / 100.0f);
-        const struct oscfg_accent *a = &oscfg_accents[next.accent];
-        ui_theme_set_accent((Color){a->r,a->g,a->b,1.0f});
-        em_structure_changed();
-    }
+    int changed=!applied || memcmp(&next,&g_bar_cfg,sizeof next);
+    g_bar_cfg=next;
+    if(changed){applied=1;oscfg_apply_appearance(&next);em_structure_changed();}
+
 }
 static void bar_cfg_thread(long arg) {
     (void)arg;
     for (;;) {
         struct oscfg c;
-        oscfg_load(&c);
+        oscfg_snapshot(&c);
         embk_mutex_lock(&g_bar_cfg_lock);
         g_bar_pending = c;
         embk_mutex_unlock(&g_bar_cfg_lock);
@@ -393,7 +314,7 @@ static void request_apps(void) {
  *
  * Now it says the truth: the focused application's name, and a menu of
  * everything open that switches to it. */
-#define WINS_MAX 16
+#define WINS_MAX 32
 static struct embk_win_info g_wins[WINS_MAX];
 static int      g_win_n;
 static char     g_focus_name[32];
@@ -414,203 +335,122 @@ static void wins_sample(void) {
         }
 }
 
-static void bar(void) {
-    bar_cfg_apply();
-    const struct ui_theme *t = ui_theme();
+static struct embk_power_info g_power;
+static struct embk_audio_info g_audio;
+static struct embk_desktop g_space;
 
-    /* park at the top-center the first time we're drawn */
-    static int first = 1;
-    if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
-    bar_ink_update();
-    cpu_sample();
-    net_sample();      /* once per frame == once per refresh_ms == once a second */
-    wins_sample();     /* who is in front, and what else is open */
-
-    /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
-     * only while a menu is open. So the view fills the whole window, but only
-     * the top strip paints a bar -- the rest stays transparent (revealing the
-     * desktop) and holds the room a dropdown needs to render OUTSIDE the bar. */
-    VStack(.width = em_viewport_width(), .height = em_viewport_height(),
-           .align = Fill, .spacing = 0) {
-        /* Tighter spacing and a fuller round than a panel would use: at 32px the
-         * strip reads as chrome the content sits under, not a box on top of it. */
-        /* REAL glass: the compositor frosts the desktop behind the strip's
-         * rect (and only the strip -- the dropdown canvas below must stay a
-         * sharp view of the desktop). The fill drops to a tint so the frost
-         * reads through: the same material as the dock and the launcher. */
-        /* No blur rect declared: frosting the strip would be a material, and
-         * the point is that there is no material. No corner radius and no
-         * border either -- the bar meets the screen edges, so an outline would
-         * only draw a box around the top of the display. */
-        HStack(.height = BAR_H, .align = Center, .spacing = 6, .px = 8) {
-            /* The leading mark IS the Apps launcher button (like a Start menu).
-             * Real art rather than a font glyph, but drawn as a STENCIL in the
-             * accent colour: it keeps the bar's controls one coherent palette
-             * and follows a theme change, which baked-in art could not. */
-            if (ImageButtonTinted("/system/images/launcher.eic", 17, t->accent))
-                request_apps();
-            MenuBar() {
-                /* Where the bar sits belongs in the system menu, not on the bar.
-                 * A visible "pinned"/"free" text button was the one control
-                 * shouting its own implementation at the user; a menu bar should
-                 * carry menus and status, nothing else. */
-                /* BOLD: the leading menu names the application these menus
-                 * belong to, and weight is how a menu bar says so. */
-                Menu("EmbLink", .font = BodyBold, .color = g_ink) {
-                    /* A DEAD MENU ITEM IS A LIE, and this one had been sitting
-                     * here doing nothing. It says something true now: the name
-                     * the system calls itself and the machine it is running
-                     * on, delivered the way any program speaks from outside its
-                     * own window. */
-                    if (MenuItem("About EmbLink")) {
-                        char body[96];
-                        uint32_t sw = 0, sh = 0;
-                        embk_screen_size(&sw, &sh);
-                        snprintf(body, sizeof body, "%s \xc2\xb7 %ux%u \xc2\xb7 up %llu min",
-                                 ARCH_NAME, (unsigned)sw, (unsigned)sh,
-                                 (unsigned long long)(embk_uptime_ms() / 60000ull));
-                        embk_notify("EmbLink OS", body);
-                    }
-                    MenuSeparator();
-                    /* LOG OUT ends the session -- every process in it, this
-                     * bar included -- and init shows the login screen. The
-                     * name is the kernel's record of whose session this is,
-                     * not $USER. */
-                    static char logout_label[48];
-                    if (!logout_label[0]) {
-                        struct embk_session_info si;
-                        if (embk_session_info(&si) == 0 && si.user[0])
-                            snprintf(logout_label, sizeof logout_label, "Log Out %s", si.user);
-                        else
-                            snprintf(logout_label, sizeof logout_label, "Log Out");
-                    }
-                    /* LOCK SCREEN above Log Out, because it is the one you
-                     * want when you stand up and the one you would otherwise
-                     * reach for Log Out to do -- losing everything you had
-                     * open to answer the door. */
-                    if (MenuItem("Lock Screen")) request_lock();
-                    if (MenuItem(logout_label)) embk_session_end(0);
-                    if (MenuItem("Notifications")) open_notifications();
-                    MenuSeparator();
-                    /* RESTART AND SHUT DOWN. Until these existed the only way
-                     * to stop an EmbLink machine was to cut its power -- the
-                     * kernel could always do it (power_transition) and nothing
-                     * in userspace could ask. Neither returns.
-                     *
-                     * No confirmation dialog, deliberately: closing a window
-                     * now ASKS each application to go, and a shutdown does the
-                     * same thing to all of them at once, so the work that a
-                     * confirmation protects is already protected. */
-                    if (MenuItem("Restart"))   embk_power_restart();
-                    if (MenuItem("Shut Down")) embk_power_off();
-                }
-                /* THE FOCUSED APPLICATION, and a way to reach the others.
-                 * This is what a menu bar is for -- saying whose window you
-                 * are looking at -- and it is the first time this OS could
-                 * answer that question at all (embk_win_list). The name is
-                 * BOLD for the same reason the system menu is: weight is how a
-                 * bar says which of these belongs to what you are using.
-                 *
-                 * Empty when nothing is open, rather than a placeholder: the
-                 * desktop is not an application and saying so would be the
-                 * same lie the File/Edit/View menus told. */
-                if (g_focus_name[0]) {
-                    Menu(g_focus_name, .font = BodyBold, .color = g_ink) {
-                        for (int i = 0; i < g_win_n; i++) {
-                            static char label[WINS_MAX][40];
-                            snprintf(label[i], sizeof label[i], "%s%s",
-                                     g_wins[i].title,
-                                     (g_wins[i].flags & EMBK_WIN_MINIMIZED) ? "  (hidden)" : "");
-                            if (MenuItem(label[i])) embk_win_raise(g_wins[i].pid);
-                        }
-                    }
-                }
-
-                /* AND NOTHING ELSE. There were three more menus here --
-                 * File (New, Open), Edit (Undo, Redo), View (Zoom In, Zoom
-                 * Out) -- twelve words that did nothing at all. They were a
-                 * costume: a Mac menu bar carries the FOCUSED APP's menus, so
-                 * this one grew a set of app-shaped menus with no app behind
-                 * them. An OS that has not yet decided where an application's
-                 * menus live is better off saying nothing than miming it.
-                 *
-                 * What is left is the one menu that is really the system's:
-                 * about, log out, quit. */
-            }
-
-            Spacer();   /* the menus sit left, everything else trails right */
-
-            /* status glyphs, then the clock -- the trailing order a menu bar
-             * has. Wider spacing than a toolbar: these are separate readings,
-             * not a group of related controls. */
-            /* The readout, then the clock -- the trailing order a status
-             * strip has, with the number that changes on the inside so the
-             * clock keeps the corner it has always had. */
-            /* THE NETWORK, as a glyph that opens the details.
-             *
-             * A dot when there is a link and a dash when there is not, rather
-             * than a word: the bar is read at a glance and "Offline" spelled
-             * out is a sentence sitting permanently in the corner of a machine
-             * that is simply not plugged in. The menu behind it is where the
-             * address lives, because that is a thing you look UP, not a thing
-             * you monitor. */
-            {
-                int linked = g_net_ok && g_net.up;
-                Menu(linked ? "\xe2\x97\x8f" : "\xe2\x80\x93",
-                     .font = BodyBold, .color = g_ink) {
-                    if (!g_net_ok) {
-                        MenuItem("Network unavailable");
-                    } else if (!g_net.up) {
-                        MenuItem("Not connected");
-                    } else {
-                        char line[48];
-                        snprintf(line, sizeof line, "IP  %s", ip_text(g_net.ip));
-                        MenuItem(line);
-                        if (g_net.gateway) {
-                            snprintf(line, sizeof line, "Router  %s", ip_text(g_net.gateway));
-                            MenuItem(line);
-                        }
-                        if (g_net.dns) {
-                            snprintf(line, sizeof line, "DNS  %s", ip_text(g_net.dns));
-                            MenuItem(line);
-                        }
-                        MenuSeparator();
-                        MenuItem(g_net.dhcp ? "Configured by DHCP"
-                                            : "Configured statically");
-                    }
-                }
-            }
-            if (g_bar_cfg.bar_cpu) {
-                HStack(.width = 10) {}
-                meter(g_cpu_pct);
-                Text(cpu_text()).caption().color(g_ink);
-            }
-            HStack(.width = 10) {}                 /* two readings, not a group */
-            /* THE CLOCK IS A MENU. It was a label, and a label in the one
-             * corner everybody looks at is a wasted corner -- the month is the
-             * thing people actually want from a date. */
-            Menu(bar_clock(), .font = Caption, .color = g_ink, .width = 268) {
-                time_t now = time(NULL);
-                struct tm *tm = localtime(&now);
-                if (!tm) {
-                    MenuItem("The clock is unavailable");
-                } else {
-                    static const char *mon[12] = { "January","February","March",
-                        "April","May","June","July","August","September",
-                        "October","November","December" };
-                    char head[40];
-                    snprintf(head, sizeof head, "%s %d",
-                             mon[tm->tm_mon % 12], tm->tm_year + 1900);
-                    MenuItem(head);
-                    MenuSeparator();
-                    MenuItem(" Su  Mo  Tu  We  Th  Fr  Sa");
-                    char weeks[6][32];
-                    int n = month_grid(tm, weeks);
-                    for (int i = 0; i < n; i++) MenuItem(weeks[i]);
-                }
-            }
+static void system_menu(void) {
+    Menu("EmbLink",.font=BodyBold,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0) {
+        if(MenuItem("About EmbLink"))embk_notify("EmbLink OS","Contour desktop · a workspace of your own.");
+        MenuSeparator();
+        if(MenuItem("Applications"))request_apps();
+        if(MenuItem("Notifications"))open_notifications();
+        MenuSeparator();
+        if(MenuItem("Lock Screen"))request_lock();
+        if(MenuItem("Log Out"))embk_session_end(0);
+        MenuSeparator();
+        if(MenuItem("Restart"))embk_power_restart();
+        if(MenuItem("Shut Down"))embk_power_off();
+    }
+}
+static void workspace_menu(void) {
+    static char label[24];snprintf(label,sizeof label,"Space %u",g_space.workspace+1);
+    Menu(label,.font=Caption,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0,.width=224) {
+        for(unsigned i=0;i<g_space.workspace_count;i++) {
+            char text[32];snprintf(text,sizeof text,"%sWorkspace %u",i==g_space.workspace?"✓  ":"    ",i+1);
+            if(MenuItem(text)) {struct embk_desktop d={.version=1,.workspace=i};embk_desktop_control(EMBK_DESKTOP_SWITCH,&d);}
         }
-        Spacer();   /* transparent canvas below the bar -- dropdown room */
+        MenuSeparator();
+        for(unsigned i=0;i<g_space.workspace_count;i++)if(i!=g_space.workspace) {
+            char text[40];snprintf(text,sizeof text,"Move current window to %u",i+1);
+            if(MenuItem(text)){struct embk_desktop d={.version=1,.workspace=i};embk_desktop_control(EMBK_DESKTOP_MOVE_FRONT,&d);}
+        }
+    }
+}
+static void status_network(void) {
+    Menu("Network",.icon=IconNetwork,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0,.width=242) {
+        if(!g_net_ok)MenuItem("Network unavailable");
+        else if(!g_net.up)MenuItem("Not connected");
+        else {
+            char line[60];snprintf(line,sizeof line,"Address   %s",ip_text(g_net.ip));MenuItem(line);
+            snprintf(line,sizeof line,"Router   %s",ip_text(g_net.gateway));MenuItem(line);
+            snprintf(line,sizeof line,"DNS   %s",ip_text(g_net.dns));MenuItem(line);
+            MenuSeparator();MenuItem(g_net.dhcp?"Automatic address (DHCP)":"Manual address");
+        }
+    }
+}
+static void status_power(void) {
+    Menu("Power",.icon=IconBattery,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0,.width=224) {
+        char status[64];
+        if((g_power.flags&EMBK_POWER_BATTERY) && g_power.percent<=100)snprintf(status,sizeof status,"Battery  %u%%",g_power.percent);
+        else snprintf(status,sizeof status,"No battery reported");
+        MenuItem(status);MenuSeparator();
+        if(MenuItem("Lock Screen"))request_lock();
+    }
+}
+static void status_sound(void) {
+    Menu("Sound",.icon=IconVolume,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0) {
+        if(!(g_audio.flags&EMBK_AUDIO_AVAILABLE)){Text("No audio output available").caption().secondary().padding(10);}
+        else {
+        char label[40];snprintf(label,sizeof label,"Output volume   %u%%",g_audio.percent);MenuItem(label);
+        MenuSeparator();
+        if(MenuItem((g_audio.flags&EMBK_AUDIO_MUTED)?"Unmute output":"Mute output"))embk_audio_volume(g_audio.percent,!(g_audio.flags&EMBK_AUDIO_MUTED));
+        if(MenuItem("Volume up"))embk_audio_volume(g_audio.percent>90?100:g_audio.percent+10,!!(g_audio.flags&EMBK_AUDIO_MUTED));
+        if(MenuItem("Volume down"))embk_audio_volume(g_audio.percent<10?0:g_audio.percent-10,!!(g_audio.flags&EMBK_AUDIO_MUTED));
+        }
+    }
+}
+static void clock_menu(void) {
+    Menu(bar_clock(),.font=Caption,.width=268,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0) {
+        time_t now=time(NULL);struct tm *tm=localtime(&now);
+        if(tm) {
+            char heading[48];strftime(heading,sizeof heading,"%B %Y",tm);MenuItem(heading);MenuSeparator();
+            MenuItem(" Su  Mo  Tu  We  Th  Fr  Sa");
+            char weeks[6][32];int n=month_grid(tm,weeks);CodeSurface(){for(int i=0;i<n;i++)Text(weeks[i]).caption().px(12).py(3);}
+        } else MenuItem("Clock unavailable");
+    }
+}
+static void bar(void) {
+    bar_cfg_apply();cpu_sample();net_sample();wins_sample();
+    g_space.version=1;embk_desktop_control(EMBK_DESKTOP_GET,&g_space);
+    embk_power_get(&g_power);embk_audio_get(&g_audio);
+    em_shell_band(g_bar_cfg.bar_edge,g_bar_cfg.bar_size);
+
+    static uint64_t reveal_until;float px,py;ui_pointer_pos(&px,&py);
+    uint64_t now=em_now_ms();
+    float strip_y=g_bar_cfg.bar_edge?em_viewport_height()-g_bar_cfg.bar_size:0;
+    if(py>=strip_y && py<strip_y+g_bar_cfg.bar_size)reveal_until=now+900;
+    int hidden=g_bar_cfg.bar_autohide && !em_menu_any_open() && now>reveal_until;
+    if(!em_menu_any_open()) {
+        uint32_t sw,sh;embk_screen_size(&sw,&sh);
+        int canvas=(int)em_viewport_height();
+        em_window_move_to(0,g_bar_cfg.bar_edge?(int)sh-canvas+(hidden?g_bar_cfg.bar_size-2:0):(hidden?2-g_bar_cfg.bar_size:0));
+
+    }
+    VStack(.width=em_viewport_width(),.height=em_viewport_height(),.align=Fill,.spacing=EmZero) {
+        if(g_bar_cfg.bar_edge)Spacer();
+        HStack(.height=g_bar_cfg.bar_size,.align=Center,.spacing=EmZero,.px=8,
+               .background=T.surface,.border=1,.border_color=T.border) {
+            if(ImageButtonTinted("/system/images/ui-launcher.eic",26,T.accent))request_apps();
+            system_menu();
+            if(g_bar_cfg.bar_workspaces)workspace_menu();
+            if(g_focus_name[0] && em_viewport_width()>900) {
+                Menu(g_focus_name,.font=Caption,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0,.width=260) {
+                    for(int i=0;i<g_win_n;i++) {
+                        char text[64];snprintf(text,sizeof text,"%s%s",g_wins[i].title,(g_wins[i].flags&EMBK_WIN_MINIMIZED)?"  · hidden":"");
+                        if(MenuItem(text))embk_win_raise(g_wins[i].pid);
+                    }
+                }
+            }
+            Spacer();
+            if(g_bar_cfg.bar_order)clock_menu();
+            if(g_bar_cfg.bar_cpu && em_viewport_width()>1050)Text(cpu_text()).caption().secondary();
+            if(g_bar_cfg.bar_network)status_network();
+            if(g_bar_cfg.bar_sound)status_sound();
+            if(g_bar_cfg.bar_power)status_power();
+            if(!g_bar_cfg.bar_order)clock_menu();
+        }
+        if(!g_bar_cfg.bar_edge)Spacer();
     }
 }
 
@@ -622,7 +462,7 @@ static EmApp em_app_spec_ = {
     .theme    = Dark,
     .chrome   = Chromeless,
     .material = Translucent,      /* thin transparent bar; grows for dropdowns */
-    .refresh_ms = 1000,           /* the clock is live, and the ink re-samples */
+    .refresh_ms = 500,           /* the clock is live, and the ink re-samples */
     .view     = bar,
 };
 

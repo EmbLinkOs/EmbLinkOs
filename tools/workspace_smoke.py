@@ -101,12 +101,8 @@ print('RESULT '+json.dumps(data.hex()))'''))
     def snap(self,name):
         self.g.pump(1);p=self.out.parent/(name+'.ppm');self.g.qmp.screendump(str(p));return p
     def launch(self,name,title):
-        # System bar Apps opens the session's own launcher, then search narrows
-        # its grid to one app. This exercises the real .ns/.caps manifests.
-        self.click(16,12);self.g.pump(2)
-        # The shipped launcher order is deterministic on this fresh image.
-        position={'Editor':(832,135),'Note++':(995,135)}[name]
-        start=len(self.g.seen);self.click(*position);w=self.wait_window(title)
+        self.key('meta_l-spc');self.g.pump(2)
+        start=len(self.g.seen);self.type(name+'\n');w=self.wait_window(title)
         self.g.wait((title+': first frame presented').encode(),start=start)
         self.g.pump(1);return w
 

@@ -10,9 +10,8 @@
  * The format is deliberately the dullest thing that works -- "key value" lines
  * in /data/settings.conf. It is editable with the text editor we ship, it
  * diffs, and a corrupt or missing file simply yields defaults rather than an
- * unusable desktop. Unknown keys are preserved-by-ignoring: an older build
- * reading a newer file does not lose the keys it did not understand, it just
- * does not act on them.
+ * unusable desktop. Unknown keys are ignored while reading. Settings writes the complete
+ * schema it understands; it does not preserve future or third-party keys.
  */
 #ifndef _EMBLINK_OSCFG_H_
 #define _EMBLINK_OSCFG_H_
@@ -170,7 +169,46 @@ static const struct oscfg_timezone oscfg_timezones[OSCFG_TIMEZONES] = {
 };
 
 
+#define OSCFG_CONTOUR_FIELDS(X) \
+    X(surface_style, 1, 0, 3) \
+    X(custom_surface, 2107947, 0, 16777215) \
+    X(accent_custom, 0, 0, 1) \
+    X(custom_accent, 7452074, 0, 16777215) \
+    X(contrast, 0, 0, 2) \
+    X(density, 1, 0, 2) \
+    X(font, 0, 0, 2) \
+    X(text_scale, 100, 90, 130) \
+    X(transparency, 18, 0, 50) \
+    X(blur, 6, 0, 16) \
+    X(reduce_motion, 0, 0, 1) \
+    X(icon_theme, 0, 0, 1) \
+    X(desktop_icons, 1, 0, 1) \
+    X(desktop_icon_size, 48, 32, 64) \
+    X(bar_autohide, 0, 0, 1) \
+    X(shortcut_modifier, 0, 0, 1) \
+    X(bar_edge, 0, 0, 1) \
+    X(bar_size, 34, 28, 44) \
+    X(bar_order, 0, 0, 1) \
+    X(bar_network, 1, 0, 1) \
+    X(bar_power, 1, 0, 1) \
+    X(bar_sound, 1, 0, 1) \
+    X(bar_workspaces, 1, 0, 1) \
+    X(dock_edge, 0, 0, 2) \
+    X(dock_autohide, 0, 0, 1) \
+    X(dock_labels, 1, 0, 1) \
+    X(cursor_style, 0, 0, 2) \
+    X(cursor_size, 0, 0, 1) \
+    X(decoration, 0, 0, 2) \
+    X(window_radius, 8, 0, 12) \
+    X(shadows, 1, 0, 2) \
+    X(snap, 1, 0, 1) \
+    X(workspace_count, 4, 1, 6) \
+    X(workspace_wrap, 1, 0, 1)
+
 struct oscfg {
+    #define OSCFG_MEMBER(name, value, lo, hi) int name;
+    OSCFG_CONTOUR_FIELDS(OSCFG_MEMBER)
+    #undef OSCFG_MEMBER
     int volume,muted;
     int idle_dim_seconds,idle_lock_seconds,lid_lock,power_profile;
     int accent;        /* index into oscfg_accents                       */
@@ -213,12 +251,44 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
     return base + 32 + 14;
 }
 
+/* Work-area insets are shared by shell placement, app tiling and compositor.
+ * Auto-hide retains its strip: a desktop-owned dock cannot cover app input. */
+static inline void oscfg_insets(const struct oscfg *c, int *left, int *top, int *right, int *bottom) {
+    int band=oscfg_dock_band(c);
+    *left=c->dock_edge==1?band:0; *right=c->dock_edge==2?band:0;
+    *top=c->bar_edge==0?c->bar_size:0;
+    *bottom=c->bar_edge==1?c->bar_size:0;
+    if(c->dock_edge==0)*bottom+=band;
+}
+
 static inline void oscfg_defaults(struct oscfg *c) {
+    memset(c, 0, sizeof *c);
+    #define OSCFG_DEFAULT(name, value, lo, hi) c->name = value;
+    OSCFG_CONTOUR_FIELDS(OSCFG_DEFAULT)
+    #undef OSCFG_DEFAULT
     c->volume=100;c->muted=0;
     c->idle_dim_seconds=120;c->idle_lock_seconds=300;c->lid_lock=1;c->power_profile=0;
-    c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
-    c->ui_scale = 100; c->wallpaper = 0; c->tz = 0;
-    c->bar_24h = 1; c->bar_seconds = 0; c->bar_date = 1; c->bar_cpu = 1;
+    c->accent = 1; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
+    c->ui_scale = 100; c->wallpaper = 6; c->tz = 0;
+    c->bar_24h = 1; c->bar_seconds = 0; c->bar_date = 1; c->bar_cpu = 0;
+}
+
+/* Curated presets only reset appearance; audio, accounts, time and input
+ * choices survive. Defaults are also the reliable appearance reset. */
+#define OSCFG_PRESETS 4
+static const char *const oscfg_preset_names[] = { "Contour", "Paper", "Midnight", "Studio" };
+static inline void oscfg_preset(struct oscfg *c, int preset) {
+    int shortcut=c->shortcut_modifier;
+    struct oscfg d; oscfg_defaults(&d);
+    #define OSCFG_RESET(name, value, lo, hi) c->name=d.name;
+    OSCFG_CONTOUR_FIELDS(OSCFG_RESET)
+    #undef OSCFG_RESET
+    c->shortcut_modifier=shortcut;
+    c->accent=1;c->dark=1;c->ui_scale=100;c->wallpaper=6;c->dock_size=38;c->dock_dots=1;
+    c->bar_cpu=0;c->bar_date=1;
+    if(preset==1){c->dark=0;c->surface_style=1;c->accent=5;c->wallpaper=7;}
+    if(preset==2){c->surface_style=2;c->accent=4;c->wallpaper=4;c->density=0;}
+    if(preset==3){c->dark=0;c->surface_style=0;c->accent=0;c->wallpaper=7;c->density=0;c->transparency=0;c->reduce_motion=1;}
 }
 
 /* HOW THE SHELL'S NARROW COMPONENTS GET IT.
@@ -245,6 +315,9 @@ static inline void oscfg_defaults(struct oscfg *c) {
  * is a supported way to change these (Settings says so in About), so a typo
  * must yield a working desktop and not a 4000-pixel dock. */
 static inline void oscfg_clamp(struct oscfg *c) {
+    #define OSCFG_BOUND(name, value, lo, hi) if(c->name < lo)c->name=lo; if(c->name > hi)c->name=hi;
+    OSCFG_CONTOUR_FIELDS(OSCFG_BOUND)
+    #undef OSCFG_BOUND
     if(c->volume<0)c->volume=0;
     if(c->volume>100)c->volume=100;
     c->muted=!!c->muted;c->lid_lock=!!c->lid_lock;
@@ -301,7 +374,7 @@ static inline int  oscfg_write_to(const struct oscfg *c, const char *path);
 static inline void oscfg_ask_desktop(struct oscfg *c) {
     int ch = (int)embk_chan_connect(OSCFG_ENDPOINT);
     if (ch < 0) return;
-    char buf[640];
+    char buf[2048];
     unsigned len = 0, nh = 0;
     if (embk_chan_recv(ch, buf, sizeof buf - 1, &len, 0, &nh) == 0 && len) {
         if (len > sizeof buf - 1) len = sizeof buf - 1;
@@ -316,7 +389,7 @@ static inline void oscfg_ask_desktop(struct oscfg *c) {
 static inline int oscfg_read_from(struct oscfg *c, const char *path) {
     int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
     if (fd < 0) return 0;
-    char b[1024];
+    char b[2048];
     int64_t n = embk_read(fd, b, sizeof b - 1);
     embk_close(fd);
     if (n <= 0) return 0;
@@ -329,11 +402,14 @@ static inline int oscfg_read_from(struct oscfg *c, const char *path) {
  * copy for a process whose namespace cannot name it. Missing/unreadable =>
  * defaults, never a failure: losing your preferences must not mean losing your
  * desktop. */
-static inline void oscfg_load(struct oscfg *c) {
+static inline void oscfg_snapshot(struct oscfg *c) {
     oscfg_defaults(c);
     if (!oscfg_read_from(c, oscfg_path()))
         oscfg_ask_desktop(c);
     oscfg_clamp(c);
+}
+static inline void oscfg_load(struct oscfg *c) {
+    oscfg_snapshot(c);
     /* LOADING THE PREFERENCES MEANS WEARING THEM, for the one preference that
      * is invisible until something formats a date. An app that reads the
      * config to find the accent colour also gets the right clock, and no app
@@ -349,6 +425,9 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
         if (*p) *p++ = 0;
         if (line[0] == '#' || !line[0]) continue;
         if (sscanf(line, "%31s %d", key, &val) != 2) continue;
+        #define OSCFG_PARSE(name, value, lo, hi) if (!strcmp(key, #name)) { c->name=val; continue; }
+        OSCFG_CONTOUR_FIELDS(OSCFG_PARSE)
+        #undef OSCFG_PARSE
         if(!strcmp(key,"idle_dim_seconds"))c->idle_dim_seconds=val;
         else if(!strcmp(key,"idle_lock_seconds"))c->idle_lock_seconds=val;
         else if(!strcmp(key,"lid_lock"))c->lid_lock=val;
@@ -370,12 +449,12 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
     }
 }
 
-/* Written whole rather than patched in place: the file is four lines, and a
- * rewrite cannot leave a half-updated one behind. */
+/* Atomic replacement with file and parent-directory sync; a failed save is
+ * reported to Settings. The old or complete new snapshot remains readable. */
 /* The whole preference set as text. One serialiser, used by the file and by the
  * channel below: two encodings of the same thing is how they drift apart. */
 static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
-    return snprintf(out, (size_t)cap,
+    int n = snprintf(out, (size_t)cap,
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
                      "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n" "timezone %d\n"
@@ -383,10 +462,15 @@ static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
                      c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,
                      c->keymap, c->wallpaper, c->tz,
                      c->bar_24h, c->bar_seconds, c->bar_date, c->bar_cpu,c->volume,c->muted,c->idle_dim_seconds,c->idle_lock_seconds,c->lid_lock,c->power_profile);
+    if(n<0 || n>=cap)return -1;
+    #define OSCFG_PRINT(name, value, lo, hi) { int add=snprintf(out+n,(size_t)(cap-n),#name " %d\n",c->name); if(add<0 || add>=cap-n)return -1; n+=add; }
+    OSCFG_CONTOUR_FIELDS(OSCFG_PRINT)
+    #undef OSCFG_PRINT
+    return n;
 }
 
 static inline int oscfg_write_to(const struct oscfg *c, const char *path) {
-    char out[640],temporary[240];static unsigned sequence;
+    char out[2048],temporary[240];static unsigned sequence;
     int n=oscfg_format(c,out,sizeof out);
     if(n<0 || n>=(int)sizeof out)return -1;
     snprintf(temporary,sizeof temporary,"%s.pending-%u-%u",path,(unsigned)embk_getpid(),++sequence);
@@ -400,6 +484,14 @@ static inline int oscfg_write_to(const struct oscfg *c, const char *path) {
     if(!rc && embk_fsync(fd))rc=-1;
     if(embk_close(fd))rc=-1;
     if(!rc)rc=(int)embk_syscall2(EMBK_SYS_rename,(int64_t)(uintptr_t)temporary,(int64_t)(uintptr_t)path);
+    if(!rc) {
+        char parent[240];snprintf(parent,sizeof parent,"%s",path);
+        char *slash=strrchr(parent,'/');
+        if(!slash)snprintf(parent,sizeof parent,".");else if(slash==parent)slash[1]=0;else *slash=0;
+        fd=(int)embk_open(parent,EMBK_O_RDONLY,0);
+        if(fd<0)rc=-1;
+        else {if(embk_fsync(fd))rc=-1;if(embk_close(fd))rc=-1;}
+    }
     if(rc)embk_unlink(temporary);
     return rc? -1:0;
 }
@@ -411,8 +503,9 @@ static inline int oscfg_save(const struct oscfg *c) {
 /* Hand one connected peer the preferences and be done. Called by the desktop's
  * little server thread; see OSCFG_ENDPOINT above. */
 static inline int oscfg_serve_one(int ch, const struct oscfg *c) {
-    char out[640];
+    char out[2048];
     int n = oscfg_format(c, out, (int)sizeof out);
+    if(n<0)return -1;
     return embk_chan_send(ch, out, (unsigned)n, 0, 0, 0);
 }
 

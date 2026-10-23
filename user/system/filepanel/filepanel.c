@@ -155,7 +155,7 @@ static void panel(void) {
         HStack(.grow = 1, .align = Fill, .spacing = 0) {
             /* places */
             VStack(.width = 150, .align = Fill, .spacing = 2, .padding = 8,
-                   .background = t->surface_alt) {
+                   .background = t->sidebar) {
                 Text("Places").caption().secondary();
                 static const char *places[]={"Home","Documents","Downloads","Desktop"};
                 for(unsigned i=0;i<4;i++) {
@@ -182,7 +182,7 @@ static void panel(void) {
                             bool sel = (i == g_sel);
                             struct instance_handle row={0};
                             HStack(.spacing = 8, .align = Center, .px = 8, .py = 5,
-                                   .corner = t->radius_sm, .key = KEY[i],
+                                   .corner = t->radius_sm, .border=EmZero, .key = KEY[i],
                                    .background = sel ? t->accent_soft : (struct color){0,0,0,0}) {
                                 row=ui_open();
                                 Icon(g_entries[i].is_dir ? IconFolder : IconDoc)
@@ -191,7 +191,7 @@ static void panel(void) {
                             }
                             /* Container keys preserve identity; they do not
                              * register the leaf-only Clicked(id) result. */
-                            if (ui_consume_click(row)) {
+                            if(ui_control_interact(row)) {
                                 if (g_entries[i].is_dir) {
                                     char full[256];
                                     join(full, sizeof full, g_entries[i].name);

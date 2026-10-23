@@ -126,7 +126,7 @@ int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"--files-child")) return files_child();
     if(argc>1 && !strcmp(argv[1],"--policy")) return policy_fixture();
     if(argc>1 && !strcmp(argv[1],"--restricted")) return restricted(argc>2?atoi(argv[2]):0);
-    if(argc>1 && !strcmp(argv[1],"--menu-no-gpu")) {CHECK(embk_win_menu(0,1)==-1);CHECK(embk_win_close_ack(0)==-1);return 0;}
+    if(argc>1 && !strcmp(argv[1],"--menu-no-gpu")) {CHECK(embk_win_menu(0,1)==-1);CHECK(embk_win_close_ack(0)==-1);CHECK(embk_desktop_control(EMBK_DESKTOP_GET,(void *)(uintptr_t)-1)==-1);return 0;}
     struct embk_wifi_info wifi;struct embk_audio_info audio;struct embk_display_info display;
     CHECK(embk_wifi_get(&wifi)==0 && wifi.version==1 && wifi.saved_count<=8 && wifi.network_count<=24);
     CHECK(embk_syscall2(EMBK_SYS_wifi_info,(uintptr_t)&wifi,sizeof wifi-1)==-22);
@@ -140,6 +140,14 @@ int main(int argc,char **argv) {
     CHECK(embk_display_get(&display)==0 && display.version==1 && display.level_count<=32);
     CHECK(embk_display_brightness(101)==-22);
     CHECK(embk_display_get((void *)(uintptr_t)-1)==-14);
+    struct embk_desktop desktop={.version=EMBK_DESKTOP_VERSION};
+    CHECK(!embk_desktop_control(EMBK_DESKTOP_GET,&desktop));
+    CHECK(desktop.workspace_count>=1 && desktop.workspace_count<=6);
+    CHECK(embk_desktop_control(EMBK_DESKTOP_CONFIGURE,&desktop)==-1);
+    CHECK(embk_desktop_control(99,&desktop)==-22);
+    CHECK(embk_syscall3(EMBK_SYS_desktop_control,0,(int64_t)(uintptr_t)&desktop,sizeof desktop-1)==-22);
+    CHECK(embk_desktop_control(EMBK_DESKTOP_GET,(void *)(uintptr_t)-1)==-14);
+    desktop.version=0;CHECK(embk_desktop_control(EMBK_DESKTOP_GET,&desktop)==-22);
     CHECK(embk_win_menu(0,1)==-22 && embk_win_menu(0,2)==-22);
     void *menu_pixels=0;
     int menu=embk_win_create_shared_ex(200,80,10,32,"menu ownership",

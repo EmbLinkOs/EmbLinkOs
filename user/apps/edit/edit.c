@@ -119,7 +119,7 @@ static void app(void) {
         dropped[d.len]=0;snprintf(g_pending_path,sizeof g_pending_path,"%s",dropped);request(OPEN_PATH);
     }
     Window("Editor") {
-        WindowBar(base_name(g_path)){CloseGrip();}
+        AppBar(base_name(g_path)){}
         VStack(.spacing=10,.padding=16,.align=Fill,.grow=1) {
             HStack(.spacing=8,.align=Fill) {
                 Text(dirty()?"Unsaved changes":"All changes saved").caption().secondary();
@@ -129,7 +129,7 @@ static void app(void) {
                 if(Button("Save As").ghost().clicked())save_file(1);
                 if(Button("Save").primary().clicked())save_file(0);
             }
-            TextEditor(g_doc,sizeof g_doc,&g_cur,360);
+            TextEditor(g_doc,sizeof g_doc,&g_cur,em_viewport_height()>240?em_viewport_height()-168:72);
             Text(g_path[0]?g_path:"Choose a name and location when you save").caption().secondary();
             Text(g_status).caption().secondary();
         }
@@ -152,4 +152,5 @@ static void app(void) {
 }
 EM_APPLICATION {
     .title="Editor",.size={740,540},.theme=Dark,.chrome=Chromeless,.resize=Resizable,.view=app,
+    .min_size = { 400, 300 },
 };

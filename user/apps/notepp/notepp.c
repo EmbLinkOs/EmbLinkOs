@@ -51,35 +51,36 @@ static Color rgb(unsigned v) {
  * syntax palette has to keep seven things apart at body size on one
  * background, which is a different problem from making a button look pressed. */
 static Color role_color(int role) {
-    switch (role) {
-        case SYN_KEYWORD: return rgb(0xFFFF7AB2);
-        case SYN_TYPE:    return rgb(0xFF6BDFFF);
-        case SYN_STRING:  return rgb(0xFFFF8170);
-        case SYN_COMMENT: return rgb(0xFF7E8B99);
-        case SYN_NUMBER:  return rgb(0xFFD9C97C);
-        case SYN_PREPROC: return rgb(0xFFB281EB);
-        case SYN_PUNCT:   return rgb(0xFFA6B0BB);
-        default:          return rgb(0xFFE6E9ED);
+    bool dark=ui_theme()->bg.r<.5f;
+    switch(role) {
+    case SYN_KEYWORD:return rgb(dark?0xffe8a1c4:0xff83406f);
+    case SYN_TYPE:return rgb(dark?0xff8ac8db:0xff196379);
+    case SYN_STRING:return rgb(dark?0xffe6b394:0xff8c4a31);
+    case SYN_COMMENT:return ui_theme()->text_tertiary;
+    case SYN_NUMBER:return rgb(dark?0xffd9c484:0xff765f24);
+    case SYN_PREPROC:return rgb(dark?0xffc0a4dc:0xff72509d);
+    case SYN_PUNCT:return ui_theme()->text_secondary;
+    default:return ui_theme()->text;
     }
 }
-#define C_GUTTER      rgb(0xFF4E5967)
-#define C_GUTTER_CUR  rgb(0xFFB9C4D0)
-#define C_CURLINE     rgb(0x24303C4A)
-#define C_SEL         rgb(0x593B6FB5)
-#define C_CARET       rgb(0xFF7FB2FF)
-#define C_EDITOR_BG   rgb(0xFF16181D)
-#define C_MATCH       rgb(0x66FFC24B)   /* the bracket partner */
-#define C_FIND        rgb(0x4CE0A33A)   /* every other search hit */
-#define TAB_ON        rgb(0xFF3A3A3C)
-#define TAB_OFF       rgb(0x00000000)
-#define TAB_TEXT_ON   rgb(0xFFF2F2F7)
-#define TAB_TEXT_OFF  rgb(0xFF98989E)
+#define C_GUTTER (ui_theme()->text_tertiary)
+#define C_GUTTER_CUR (ui_theme()->text)
+#define C_CURLINE (ui_theme()->surface_alt)
+#define C_SEL (ui_theme()->selection)
+#define C_CARET (ui_theme()->accent)
+#define C_EDITOR_BG (ui_theme()->bg)
+#define C_MATCH (ui_theme()->accent_soft)
+#define C_FIND (ui_theme()->accent_soft)
+#define TAB_ON (ui_theme()->surface_alt)
+#define TAB_OFF rgb(0)
+#define TAB_TEXT_ON (ui_theme()->text)
+#define TAB_TEXT_OFF (ui_theme()->text_secondary)
 
 /* ---- state --------------------------------------------------------------- */
 
 /* The height of one line of code, everywhere: the row, the scroller, and the
  * page keys all have to agree or the caret leaves the screen. */
-#define NOTE_LINE_H 20.0f
+#define NOTE_LINE_H (ui_theme()->text_body+7.f)
 /* How much of one line the highlighter is given. Beyond this a line is not
  * coloured past the cap -- it is still all there, still editable, still saved. */
 #define NOTE_LINE_MAX 4096
@@ -748,9 +749,10 @@ static void document_view(float height) {
     /* How many lines fit. Recomputed every frame so a resize is not a special
      * case, and used by PgUp/PgDn as well as by the scroller. */
     /* Measured once, from the font actually in use, rather than assumed. */
-    if (g_char_w <= 0.0f) {
-        g_char_w   = em_text_width("M", 15.0f);
-        g_gutter_w = em_text_width("    0 ", 15.0f);
+    static float measured_size;
+    if(g_char_w<=0 || measured_size!=ui_theme()->text_body) {
+        measured_size=ui_theme()->text_body;
+        g_char_w=em_text_width("M",measured_size);g_gutter_w=em_text_width("    0 ",measured_size);
     }
 
     g_rows = (int)(height / NOTE_LINE_H);
@@ -1102,7 +1104,7 @@ static void app(void) {
         }
         Divider("editsep");
 
-        document_view(em_viewport_height() - chrome);
+        CodeSurface() {document_view(em_viewport_height()-chrome);}
 
         /* GO TO LINE, as its own question. It used to open the FIND bar and ask
          * for a number that nothing then read -- a prompt that lies about what
@@ -1192,6 +1194,7 @@ static void app(void) {
 
 EM_APPLICATION {
     .title  = "Note++",
+    .min_size = { 540, 340 },
     .size   = { 900, 620 },
     .theme  = Dark,
     .chrome = Chromeless,

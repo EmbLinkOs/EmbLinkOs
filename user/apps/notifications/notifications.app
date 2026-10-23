@@ -1,2 +1,2 @@
 name Notifications
-icon /system/images/setting.eic
+icon /system/images/notifications.eic

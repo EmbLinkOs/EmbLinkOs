@@ -92,6 +92,7 @@ struct paint {
 };
 
 struct scene_node {
+    bool hit_passthrough; /* decorative subtree, skipped by UI hit testing */
     struct node_handle self;                       /* for validation/debug; self.index
                                                     * == 0 marks a FREE slot */
     struct node_handle parent;

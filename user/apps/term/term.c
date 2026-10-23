@@ -701,9 +701,9 @@ static void term_view(void) {
      * line and any slack. A neutral near-black with a slight cool cast: it
      * stays out of the way of the text, which is the only thing here worth
      * looking at, and the prompt is the single spot of colour. */
-    const Color TERM_BG    = { .r=.086f, .g=.090f, .b=.106f, .a=1.f };  /* the ground */
-    const Color TERM_TEXT  = { .r=.855f, .g=.871f, .b=.898f, .a=1.f };  /* soft off-white */
-    const Color TERM_PROMPT= { .r=.435f, .g=.780f, .b=.612f, .a=1.f };  /* calm green */
+    const Color TERM_BG=ui_theme()->bg;
+    const Color TERM_TEXT=ui_theme()->text;
+    const Color TERM_PROMPT=ui_theme()->accent;
 
     Window("Terminal", .background = TERM_BG) {
         /* The shared frame (AppBar), so the Terminal, Files and Settings are
@@ -729,6 +729,7 @@ static void term_view(void) {
          * allowed to overflow, because an overflowing column gets shrunk and a
          * shrunk column of text collapses to nothing legible. This is the same
          * property a ScrollView has, and for the same reason. */
+        CodeSurface() {
         VStack(.spacing = 1, .px = 14, .pt = 10, .pb = 10, .align = Leading,
                .grow = 1, .clip = 1, .background = TERM_BG) {
             /* the wheel pages the scrollback -- up rolls back in time */
@@ -823,6 +824,7 @@ static void term_view(void) {
          * The dead space below the prompt is the Window's own ground, which is
          * the same colour, so it reads as one surface either way. */
         Spacer();
+        }
     }
 }
 
@@ -836,6 +838,7 @@ int main(void) {
 
     static EmApp app = {
         .title  = "Terminal",
+    .min_size = { 320, 240 },
         /* Smaller by default. 740x480 opened as a slab that dominated the
          * desktop; a terminal you have just opened should look like a tool you
          * reached for, not the thing you are now doing. It is resizable. */

@@ -157,6 +157,16 @@ static float seg_x_for(int want) {
     return -1;
 }
 
+static bool control_pressed,control_toggled;
+static void control_frame(const char *keys) {
+    for(const char *k=keys;k&&*k;k++)ui_input_char(*k);
+    ui_frame_begin();ui_begin_vstack(0xc01720);
+    ui_text_field_autofocus();ui_text_field(A,sizeof A,"name");
+    if(ui_button_secondary("Apply"))control_pressed=true;
+    if(ui_toggle(control_toggled))control_toggled=!control_toggled;
+    ui_text_field(B,sizeof B,"next");ui_end_stack();ui_frame_end();ui_run_layout(400,300);
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -696,6 +706,24 @@ int main(void) {
         seg_press(380, 12);
         CHECK(seg_pick == 2, "a press outside the control changes nothing");
     }
+
+    /* A queued Tab/Return/Space batch traverses fields AND controls once. */
+    A[0]=B[0]=0;control_pressed=control_toggled=false;
+    control_frame(0);control_frame(0);control_frame("x\t\n\t \ty");
+    CHECK(!strcmp(A,"x") && !strcmp(B,"y"),"Tab carries subsequent text through buttons into the next field");
+    CHECK(control_pressed && control_toggled,"Return activates a button and Space toggles without pointer input");
+
+    /* A segmented control replacing a fixed-width row must not inherit it. */
+    struct instance_handle old_row;
+    ui_frame_begin();ui_begin_vstack(0x51e63);ui_begin_hstack(0);old_row=ui_open();
+    ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=25},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=25});
+    ui_text("old");ui_end_stack();ui_end_stack();ui_frame_end();ui_run_layout(400,100);
+    static const char *wide_choices[]={"Compact","Balanced","Comfortable"};
+    for(int pass=0;pass<2;pass++) {
+        ui_frame_begin();ui_begin_vstack(0x51e63);ui_segmented(wide_choices,3,1);ui_end_stack();ui_frame_end();ui_run_layout(400,100);
+    }
+    float oldx,oldy,neww,newh;
+    CHECK(ui_rect_of(old_row,&oldx,&oldy,&neww,&newh) && neww>180,"a reused segmented root releases an old fixed width");
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

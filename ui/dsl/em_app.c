@@ -21,7 +21,7 @@
 #include <stdbool.h>
 
 #include "embk.h"
-#include "oscfg.h"   /* the user's preferences apply to every app */
+#include "appearance.h"   /* the user's preferences apply to every app */
 #include "ui.h"
 #include "kit.h"   /* ui_clipboard_provider: the kit needs one handed to it */
 #include "em.h"
@@ -244,6 +244,27 @@ static int emapp_clip_get(char *buf, unsigned cap) {
     return held > (int64_t)cap ? (int)cap : (int)held;
 }
 
+/* Background snapshots keep filesystem/channel waits off the render thread.
+ * Only the render thread touches theme state, fonts and retained geometry. */
+static embk_mutex g_appearance_lock=EMBK_MUTEX_INIT;
+static struct oscfg g_appearance_pending;
+static void appearance_worker(long arg) {
+    (void)arg;
+    for(;;) {
+        embk_sleep_ms(1000);
+        struct oscfg c;oscfg_snapshot(&c);
+        embk_mutex_lock(&g_appearance_lock);g_appearance_pending=c;embk_mutex_unlock(&g_appearance_lock);
+    }
+}
+
+static int g_appearance_worker_started;
+static void appearance_start(const struct oscfg *initial) {
+    embk_mutex_lock(&g_appearance_lock);g_appearance_pending=*initial;embk_mutex_unlock(&g_appearance_lock);
+    /* Long-lived services run several windows sequentially in one process. */
+    if(!g_appearance_worker_started && embk_thread_create(appearance_worker,0)>=0)g_appearance_worker_started=1;
+}
+static int g_shell_bottom,g_shell_height=34;
+void em_shell_band(int bottom,int height){g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;
@@ -266,28 +287,30 @@ int em_app_run(const EmApp *app) {
      * does not opt in to being themed, it simply is -- the alternative is
      * every app remembering to read a config file, which means most of them
      * won't and the desktop is inconsistent by default. */
-    int dock_band;
-    { struct oscfg cfg; oscfg_load(&cfg);
-      ui_theme_use_dark(cfg.dark != 0);
-      ui_theme_set_scale((float)cfg.ui_scale / 100.0f);
-      const struct oscfg_accent *a = &oscfg_accents[cfg.accent];
-      ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
-      /* how much of the bottom of the screen belongs to the dock */
-      dock_band = oscfg_dock_band(&cfg); }
+    struct oscfg appearance;oscfg_load(&appearance);
+    oscfg_apply_appearance(&appearance);
+
+    int inset_l,inset_t,inset_r,inset_b;
+    oscfg_insets(&appearance,&inset_l,&inset_t,&inset_r,&inset_b);
+
     ui_init(&sa, &la);
     em_set_clock(embk_uptime_ms);
 
     /* the window: requested content size, clamped + centred on the screen */
     uint32_t sw = 0, sh = 0;
     embk_screen_size(&sw, &sh);
+    int minw=app->min_size.w>0?app->min_size.w:200;
+    int minh=app->min_size.h>0?app->min_size.h:160;
+    if(sw && minw>(int)sw-inset_l-inset_r)minw=(int)sw-inset_l-inset_r;
+    if(sh && minh>(int)sh-inset_t-inset_b-34)minh=(int)sh-inset_t-inset_b-34;
     int winw = app->fullscreen && sw ? (int)sw : (app->size.w > 0 ? app->size.w : 640);
     int winh = app->fullscreen && sh ? (int)sh : (app->size.h > 0 ? app->size.h : 480);
     int glass = (app->material == Acrylic);      /* frosted window (implies chromeless) */
     int translucent = (app->material == Translucent);  /* per-pixel transparent, no blur */
     int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass || translucent;
-    int bar = chromeless ? 0 : 26;
+    int bar = chromeless ? 0 : 34;
     if (!app->fullscreen && sw) {
-        int maxw = translucent ? (int)sw : (int)sw - 8;
+        int maxw = translucent ? (int)sw : (int)sw - inset_l - inset_r - 8;
         if (winw > maxw) winw = maxw;
     }
     /* 64 was hard-coded here and it was WRONG at every dock size: the pill is
@@ -298,15 +321,15 @@ int em_app_run(const EmApp *app) {
      * clicks went to the app instead. From the outside: the dock needs several
      * clicks to launch anything, and once one app is open it stops working
      * altogether. Ask the preference instead of guessing. */
-    if (!app->fullscreen && sh && winh > (int)sh - 32 - dock_band - bar)
-        winh = (int)sh - 32 - dock_band - bar;
-    if (winw < 200) winw = 200;
+    if (!app->fullscreen && sh && winh > (int)sh - inset_t - inset_b - bar)
+        winh = (int)sh - inset_t - inset_b - bar;
+    if(winw<minw)winw=minw;
     /* chromeless strips (menu bars, docks) are legitimately short; normal
      * titled windows keep a usable floor. */
-    if (winh < (chromeless ? 24 : 160)) winh = chromeless ? 24 : 160;
-    int wx = app->fullscreen ? 0 : ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
-    int wy = app->fullscreen ? 0 : 32 + ((int)sh - 32 - dock_band - winh - bar) / 2;
-    if (wy < 32 && !app->fullscreen) wy = 32;
+    if(winh<(translucent?24:minh))winh=translucent?24:minh;
+    int wx = app->fullscreen ? 0 : inset_l+((int)sw-inset_l-inset_r-winw)/2;        if (wx < 0) wx = 0;
+    int wy = app->fullscreen ? 0 : inset_t+((int)sh-inset_t-inset_b-winh-bar)/2;
+    if (wy < inset_t && !app->fullscreen) wy = inset_t;
     /* Publish AFTER both are assigned. This line used to pass g_viewport_h to
      * em_set_viewport one statement BEFORE that variable was given a value, so
      * every application started life telling the toolkit its window was zero
@@ -340,6 +363,7 @@ int em_app_run(const EmApp *app) {
     em_window_set_resizable(app->resize == Resizable);
     em_window_set_glass(glass);          /* Window() adds a faint accent cast when glass */
     embk_key_grab(1);
+    if(strcmp(title,"TopBar"))appearance_start(&appearance);
 
     /* HAND THE WIDGET KIT A CLIPBOARD. It cannot call embk_clip_set itself --
      * it is built and unit-tested on the host, where there is no kernel to ask
@@ -385,7 +409,7 @@ int em_app_run(const EmApp *app) {
 
     int pace = app->pace_ms > 0 ? app->pace_ms : 10;
     int prev_epoch = em_ui_epoch(), first = 1;
-    int maximized = 0;
+    int drag_pending=0;
     /* Where the window is RIGHT NOW, and what it was before a placement moved
      * it. The runtime never knew its own position before: it told the
      * compositor where to put the window and then forgot, which is fine while
@@ -433,6 +457,15 @@ int em_app_run(const EmApp *app) {
          * the new one. */
         EmWinLayout want = EmWinNormal;
         int have_want = em_window_take_layout(&want);
+        if(drag_pending && !(in.buttons&EMBK_MOUSE_LEFT)) {
+            drag_pending=0;
+            if(appearance.snap && app->resize==Resizable && chromeless && !have_want) {
+                int32_t x,y;em_window_pos(&x,&y);wx_now=x;wy_now=y;
+                if(x<=inset_l+4) {want=EmWinLeft;have_want=1;}
+                else if(x+winw>=(int)sw-inset_r-4){want=EmWinRight;have_want=1;}
+                else if(y<=inset_t+4){want=EmWinFill;have_want=1;}
+            }
+        }
         if (!have_want && em_window_take_maximize()) { want = EmWinFill; have_want = 1; }
         /* PLEASE CLOSE -- the close light, or GUI+W. The runtime takes the app
          * down the ordinary way (the same path Escape and em_app_request_exit
@@ -446,6 +479,19 @@ int em_app_run(const EmApp *app) {
         if (in.win == EMBK_WIN_ACTION_CLOSE) {
             if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
             em_app_request_exit(0);
+        }
+        if(strcmp(title,"TopBar")) {
+            struct oscfg next;
+            embk_mutex_lock(&g_appearance_lock);next=g_appearance_pending;embk_mutex_unlock(&g_appearance_lock);
+            if(memcmp(&next,&appearance,sizeof next)) {
+                int l=inset_l,t=inset_t,r=inset_r,b=inset_b;
+                appearance=next;if(strcmp(title,"Settings"))oscfg_apply_appearance(&appearance);
+                oscfg_insets(&appearance,&inset_l,&inset_t,&inset_r,&inset_b);
+                if((l!=inset_l || t!=inset_t || r!=inset_r || b!=inset_b) && !app->fullscreen && !translucent) {
+                    want=layout_now;have_want=1;
+                }
+                em_structure_changed();em_request_frame();
+            }
         }
         /* A DROP LANDED. The payload is the application's to take
          * (embk_drop_take, in its view); all the runtime owes it is a frame in
@@ -465,21 +511,28 @@ int em_app_run(const EmApp *app) {
              * band. Every placement but Full is measured inside it, which is
              * what makes "Fill" different from "Full" and why both are offered
              * -- one leaves the shell reachable, the other does not. */
-            int ax = 0, ay = 32;
-            int aw = (int)sw, ah = (int)sh - 32 - dock_band;
+            int ax = inset_l, ay = inset_t;
+            int aw = (int)sw-inset_l-inset_r, ah = (int)sh-inset_t-inset_b;
             int nx = normal_x, ny = normal_y, nw = normal_w, nh = normal_h;
 
             switch (want) {
-            case EmWinNormal:                                            break;
-            case EmWinFill:   nx = ax; ny = ay; nw = aw; nh = ah - 26;    break;
+            case EmWinNormal:
+                if(nw>aw)nw=aw;if(nh>ah-bar)nh=ah-bar;
+                if(nx<ax)nx=ax;if(nx>ax+aw-nw)nx=ax+aw-nw;
+                if(ny<ay)ny=ay;if(ny>ay+ah-bar-nh)ny=ay+ah-bar-nh;
+                break;
+            case EmWinFill:   nx = ax; ny = ay; nw = aw; nh = ah - bar;    break;
             case EmWinFull:   nx = 0;  ny = 0;  nw = (int)sw; nh = (int)sh; break;
-            case EmWinLeft:   nx = ax; ny = ay; nw = aw / 2; nh = ah - 26; break;
-            case EmWinRight:  nx = ax + aw / 2; ny = ay; nw = aw - aw / 2; nh = ah - 26; break;
-            case EmWinTop:    nx = ax; ny = ay; nw = aw; nh = (ah - 26) / 2; break;
-            case EmWinBottom: nh = (ah - 26) / 2; nx = ax; ny = ay + nh;  nw = aw; break;
+            case EmWinLeft:   nx = ax; ny = ay; nw = aw / 2; nh = ah - bar; break;
+            case EmWinRight:  nx = ax + aw / 2; ny = ay; nw = aw - aw / 2; nh = ah - bar; break;
+            case EmWinTop:    nx = ax; ny = ay; nw = aw; nh = (ah - bar) / 2; break;
+            case EmWinBottom: nh = (ah - bar) / 2; nx = ax; ny = ay + nh;  nw = aw; break;
             }
-            if (nw < 200) nw = 200;
-            if (nh < 160) nh = 160;
+            if(want!=EmWinNormal && want!=EmWinFull && (nw<minw || nh<minh)) {
+                nx=ax;ny=ay;nw=aw;nh=ah-bar;want=EmWinFill;
+            }
+            if(nw<minw)nw=minw;
+            if(nh<minh)nh=minh;
 
             /* Remember where it was, but only when LEAVING the normal state --
              * otherwise going Left and then Right would record the left half
@@ -502,7 +555,7 @@ int em_app_run(const EmApp *app) {
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                 em_request_frame();
                 layout_now = want;
-                maximized = (want == EmWinFill || want == EmWinFull);
+
             }
         }
 
@@ -516,11 +569,13 @@ int em_app_run(const EmApp *app) {
              * borrows them until dismissal, including when resize fails. */
             if (want != menu_keyboard && embk_win_menu((uint32_t)win,want) >= 0)
                 menu_keyboard = want;
-            if (want != menu_expanded) {
+            int expanded=want?2:em_tooltip_visible()?1:0;
+            if(expanded!=menu_expanded || (!expanded && thin_h!=g_shell_height)) {
+                thin_h=g_shell_height;
                 int32_t wyc = 0; em_window_pos(0, &wyc);
                 /* The transparent dismiss surface reaches the dock and screen
                  * edges too; a 340px canvas silently missed clicks below it. */
-                int nh = want ? (int)sh - wyc : thin_h;
+                int nh=want?(int)sh:expanded?thin_h+48:thin_h;
                 if (nh < thin_h) nh = thin_h;
                 uint32_t *npx = 0;
                 if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
@@ -534,7 +589,8 @@ int em_app_run(const EmApp *app) {
                     rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
                     scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                     em_request_frame();
-                    menu_expanded = want;
+                    menu_expanded = expanded;
+                    em_window_move_to(0,g_shell_bottom && !want?(int)sh-nh:0);
                 }
             }
         }
@@ -611,7 +667,8 @@ int em_app_run(const EmApp *app) {
          * frames coming while a modal is up costs nothing -- modals are
          * transient -- and matches the always-build loop the modal was designed
          * against. */
-        int win_moved = em_window_moved();   /* read-and-clear (drag/snap last frame) */
+        int win_moved = em_window_moved();
+        if(win_moved && (in.buttons&EMBK_MOUSE_LEFT))drag_pending=1;   /* read-and-clear (drag/snap last frame) */
         /* refresh_ms was honoured for WIDGETS only, so an application whose
          * view shows something the world changes on its own -- a clock, or the
          * menu bar sampling the wallpaper under it -- only updated when the
@@ -680,7 +737,7 @@ int em_app_run(const EmApp *app) {
             force_full = true;
         }
 
-        ui_frame_begin(); em_new_frame(); app->view(); em_flush(); ui_frame_end();
+        ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         if (g_em_post_layout) g_em_post_layout();
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
@@ -762,8 +819,8 @@ int em_app_run(const EmApp *app) {
         int dw = 0, dh = 0;
         if (em_window_take_resize(&dw, &dh)) {
             int nw = winw + dw, nh = winh + dh;
-            if (nw < 200) nw = 200;
-            if (nh < 160) nh = 160;
+            if(nw<minw)nw=minw;
+            if(nh<minh)nh=minh;
             if (sw && nw > (int)sw) nw = (int)sw;
             if (sh && nh > (int)sh) nh = (int)sh;
             uint32_t *npx = 0;
@@ -783,7 +840,7 @@ int em_app_run(const EmApp *app) {
                 uint32_t *clr = back ? back : px;
                 for (int i = 0; i < winw * winh; i++) clr[i] = bg;
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
-                ui_frame_begin(); em_new_frame(); app->view(); em_flush(); ui_frame_end();
+                ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
                 ui_run_layout((float)winw, (float)winh);
                 if (g_em_post_layout) g_em_post_layout();
                 scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
@@ -815,6 +872,9 @@ int em_widget_run(const EmWidget *wg) {
     struct layout_arena la; layout_arena_init(&la);
     ui_theme_set_fonts(fr, fr);
     em_theme_use(wg->theme);
+    struct oscfg widget_appearance;oscfg_load(&widget_appearance);oscfg_apply_appearance(&widget_appearance);
+    appearance_start(&widget_appearance);
+
     ui_init(&sa, &la);
     em_set_clock(embk_uptime_ms);
 
@@ -865,6 +925,11 @@ int em_widget_run(const EmWidget *wg) {
         uint64_t now = embk_uptime_ms();
         int tick = wg->refresh_ms > 0 && (now - last_tick) >= (uint64_t)wg->refresh_ms;
 
+        struct oscfg next;
+        embk_mutex_lock(&g_appearance_lock);next=g_appearance_pending;embk_mutex_unlock(&g_appearance_lock);
+        if(memcmp(&next,&widget_appearance,sizeof next)) {
+            widget_appearance=next;oscfg_apply_appearance(&next);em_structure_changed();em_request_frame();
+        }
         int build = first || input_edge || tick || em_take_frame_request() ||
                     em_ui_epoch() != prev_epoch;
         if (!build) { cad_idle_tick(&cad); embk_sleep_ms(pace); continue; }
@@ -893,7 +958,7 @@ int em_widget_run(const EmWidget *wg) {
         }
 
         uint64_t frame_c0 = embk_thread_cpu_ns();
-        ui_frame_begin(); em_new_frame(); wg->view(); em_flush(); ui_frame_end();
+        ui_frame_begin(); em_new_frame(); wg->view(); em_flush();em_tooltip_host();ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
         if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
