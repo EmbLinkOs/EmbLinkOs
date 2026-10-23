@@ -716,9 +716,10 @@ void ui_set_text_gradient(const struct paint *p) {
 /* text + button + spacer                                                    */
 /* ------------------------------------------------------------------------- */
 
-static void set_text_on(struct instance_handle h, const char *str) {
+static void set_text_on(struct instance_handle h, const char *str,bool no_wrap) {
     struct instance *n = instance_resolve(h);
     if (!n) return;
+    scene_set_text_wrap(g_sa,n->scene_node,!no_wrap);
     /* BEFORE the no-op guard below: a run whose only change is being selected
      * has identical text, font and colour, so the guard would return before
      * ever applying it -- and the highlight would appear on the next unrelated
@@ -757,12 +758,17 @@ static void set_text_on(struct instance_handle h, const char *str) {
 void ui_text(const char *fmt, ...) {
     char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, 0, false, &created);
-    set_text_on(h, buf);
+    set_text_on(h, buf,false);
+}
+void ui_text_line(const char *fmt, ...) {
+    char buf[256];va_list ap;va_start(ap,fmt);vsnprintf(buf,sizeof buf,fmt,ap);va_end(ap);
+    bool created;struct instance_handle h=match_or_create(INSTANCE_TEXT,0,0,false,&created);
+    set_text_on(h,buf,true);
 }
 void ui_text_keyed(uint64_t key, const char *fmt, ...) {
     char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, key, key != 0, &created);
-    set_text_on(h, buf);
+    set_text_on(h, buf,false);
 }
 
 void ui_spacer(void) {

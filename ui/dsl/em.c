@@ -559,7 +559,7 @@ void em_nav(EmPage root) {
     if (em_now_ms() == 0 || TH->reduced_motion) {
         g_nav_t = 1.0f;
     } else if (g_nav_t < 1.0f) {
-        g_nav_t += (float)em_dt_ms() / NAV_DUR_MS;
+        g_nav_t += (float)em_dt_ms() / (TH->motion_ms>0?TH->motion_ms*1.5f:NAV_DUR_MS);
         if (g_nav_t > 1.0f) g_nav_t = 1.0f;
         em_request_frame();                /* transition in flight */
     }
@@ -720,12 +720,12 @@ static void em_text_impl(const char *s, EmProps p) {
         em_apply_box(p);
         ui_set_align(ALIGN_CENTER);
         ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(col);
-        ui_text("%s", s);
+        if(g_font_depth)ui_text_line("%s",s);else ui_text("%s",s);
         ui_box_end();
     } else {
         ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(col);
         if (p.background.a > 0) ui_set_text_bg(p.background);
-        ui_text("%s", s);
+        if(g_font_depth)ui_text_line("%s",s);else ui_text("%s",s);
     }
 }
 static void em_icon_impl(int cp, EmProps p) {
@@ -1778,10 +1778,10 @@ int  em_window_take_maximize(void) { int w = g_want_maximize; g_want_maximize = 
 /* ---- Spinner: phase-animated dots (indeterminate activity) ------------- */
 static void em_spinner_impl(void) {
     const struct ui_theme *t = TH;
-    em_request_frame();                    /* indeterminate: animates every frame */
+    if(!t->reduced_motion)em_request_frame();
     const int N = 8;
     float now = (float)em_now_ms();
-    float phase = now > 0 ? (now / 90.0f) : 0.0f;   /* advance ~11 steps/sec */
+    float phase = now>0 && !t->reduced_motion ? now/90.0f : 0.0f;   /* advance ~11 steps/sec */
     ui_begin_hstack(0);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp1 + 1);
@@ -2436,9 +2436,10 @@ void em_toast_host(void) {
     if (now && age > TOAST_MS) { g_toast.active = 0; g_em_epoch++; return; }
     /* fade+rise in over the first 180ms and out over the last 300ms */
     float op = 1.0f;
-    if (now) {
-        if (age < 180.0f) op = age / 180.0f;
-        else if (age > TOAST_MS - 300.0f) op = (TOAST_MS - age) / 300.0f;
+    if (now && !t->reduced_motion && t->motion_ms>0) {
+        float enter=t->motion_ms*1.5f,leave=t->motion_ms*2.5f;
+        if(age<enter)op=age/enter;
+        else if(age>TOAST_MS-leave)op=(TOAST_MS-age)/leave;
     }
     if (op < 0) op = 0;
     if (op > 1) op = 1;
@@ -3170,7 +3171,7 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     if (s_anim_key != key) { s_anim_key = key; s_anim_t0 = mnow; }
     float mt = 1.0f;
     if (mnow && s_anim_t0 && !t->reduced_motion) {
-        float e = (float)(mnow - s_anim_t0) / 150.0f;
+        float e = (float)(mnow-s_anim_t0)/(t->motion_ms>0?t->motion_ms:120.0f);
         mt = e < 0 ? 0 : e > 1.0f ? 1.0f : e;
         float inv = 1.0f - mt;
         mt = 1.0f - inv * inv * inv;

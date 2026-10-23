@@ -266,7 +266,7 @@ static void t5_pen_advance(struct font *f, uint32_t fh) {
     /* draw_text grew a paint and a box after this test was written: a
      * gradient-stroked glyph needs the box it is stroked over. NULL paint is
      * the plain-fill case this test has always been about. */
-    be->draw_text(&rt, 4, 40, "AAA", fh, 50.0f, white, 1.0f, NULL, 0.0f, 0.0f);
+    be->draw_text(&rt, 4, 40, "AAA", fh, 50.0f, white, 1.0f, NULL, 0.0f, 0.0f,false);
     be->end_frame(&rt);
 
     /* advance = 500 * 50/1000 = 25px; square 'A' ~ x in [bearing, bearing+15] */
@@ -285,6 +285,27 @@ static void t5_pen_advance(struct font *f, uint32_t fh) {
     free(rt.pixels);
 }
 
+static void t6_wrapped_pixels(struct font *f,uint32_t fh) {
+    int16_t ascent=f->ascent,descent=f->descent;
+    f->ascent=800;f->descent=200;
+    struct render_target rt={0};rt.width=128;rt.height=80;rt.stride=128*4;
+    rt.pixels=calloc(128*80,4);rt.format=EMBK_PIXFMT_BGRA8888_PRE;
+    struct render_backend *be=cpu_backend_get();be->begin_frame(&rt,NULL,0);
+    be->draw_text(&rt,0,0,"A A",fh,20,(struct color){1,1,1,1},1,NULL,11,60,true);
+    be->end_frame(&rt);
+    int ink=0;for(int y=20;y<60;y++)for(int x=0;x<128;x++)ink+=alpha_px(&rt,x,y)>0;
+    CHECK(ink>0,"wrapped text paints glyphs on the second measured line");
+    memset(rt.pixels,0,128*80*4);be->begin_frame(&rt,NULL,0);
+    be->draw_text(&rt,0,0,"A A",fh,20,(struct color){1,1,1,1},1,NULL,11,60,false);
+    be->end_frame(&rt);ink=0;
+    for(int y=20;y<60;y++)for(int x=0;x<128;x++)ink+=alpha_px(&rt,x,y)>0;
+    CHECK(ink==0,"preformatted input and code remain on one line");
+    CHECK(font_layout_text(f,"A  A",20,40,NULL,NULL)==1 && font_layout_text(f,"A  A",20,39,NULL,NULL)==2,
+          "measurement preserves repeated spaces at the wrapping boundary");
+    CHECK(font_layout_text(f,"A\nA",20,0,NULL,NULL)==2,"explicit line breaks share the same line walk");
+    free(rt.pixels);f->ascent=ascent;f->descent=descent;
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4b: font-rasterizer selftests ===\n");
     uint32_t fh = t1_load_and_square();
@@ -294,6 +315,7 @@ int main(void) {
         t3_composite(f);
         t4_atlas_cache(f);
         t5_pen_advance(f, fh);
+        t6_wrapped_pixels(f,fh);
     } else { printf("  FAIL: no font handle; skipping T2-T5\n"); g_fail++; }
     printf("=== font-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

@@ -51,7 +51,7 @@ struct render_backend {
 
     void (*draw_text)(struct render_target *rt, float x, float y, const char *utf8,
                       uint32_t font_handle, float size_px, struct color color, float opacity,
-                      const struct paint *paint, float box_w, float box_h);
+                      const struct paint *paint, float box_w, float box_h, bool wrap);
                       /* paint!=NONE -> glyphs stroked with a gradient over box_w*box_h */
 };
 

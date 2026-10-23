@@ -171,7 +171,7 @@ static void appearance_preview(void) {
         }
         Divider();
         HStack(.spacing=18,.padding=16,.align=Center) {
-            VStack(.spacing=4,.grow=1) {Text("A clear place to begin").title();Text("Readable text, quiet surfaces and a considered accent.").caption().secondary();}
+            VStack(.spacing=4,.grow=1,.align=Fill) {Text("A clear place to begin").title();Text("Readable text, quiet surfaces and a considered accent.").caption().secondary();}
             Badge("Selected");
         }
     }
@@ -705,7 +705,7 @@ static void app(void) {
             ContentPane(.padding=EmZero) {
                 ScrollView(&g_scroll,em_viewport_height()-48) {
                     VStack(.spacing=16,.padding=22,.align=Fill,.key=g_pane_name[g_pane]) {
-                        VStack(.spacing=4) {Text(g_pane_name[g_pane]).title();Text(g_pane_description[g_pane]).caption().secondary();}
+                        VStack(.spacing=4,.align=Fill) {Text(g_pane_name[g_pane]).title();Text(g_pane_description[g_pane]).caption().secondary();}
                         Divider();
                         switch(g_pane) {
                         case PANE_APPEARANCE:pane_appearance();break;

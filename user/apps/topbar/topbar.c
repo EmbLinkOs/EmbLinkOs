@@ -408,8 +408,9 @@ static void clock_menu(void) {
         time_t now=time(NULL);struct tm *tm=localtime(&now);
         if(tm) {
             char heading[48];strftime(heading,sizeof heading,"%B %Y",tm);MenuItem(heading);MenuSeparator();
-            MenuItem(" Su  Mo  Tu  We  Th  Fr  Sa");
-            char weeks[6][32];int n=month_grid(tm,weeks);CodeSurface(){for(int i=0;i<n;i++)Text(weeks[i]).caption().px(12).py(3);}
+            char weeks[6][32];int n=month_grid(tm,weeks);
+            CodeSurface(){Text(" Su  Mo  Tu  We  Th  Fr  Sa").caption().px(12).py(3);
+                for(int i=0;i<n;i++)Text(weeks[i]).caption().px(12).py(3);}
         } else MenuItem("Clock unavailable");
     }
 }

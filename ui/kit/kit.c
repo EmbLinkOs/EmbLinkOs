@@ -96,6 +96,9 @@ static void text_role(uint32_t font, float size, struct color color, const char 
     ui_set_text_color(color);
     ui_text("%s", s);
 }
+static void text_role_line(uint32_t font,float size,struct color color,const char *s) {
+    ui_set_font(font);ui_set_text_size(size);ui_set_text_color(color);ui_text_line("%s",s);
+}
 #define FMT(buf) do { va_list ap; va_start(ap, fmt); vsnprintf((buf), sizeof(buf), fmt, ap); va_end(ap); } while (0)
 
 void ui_heading(const char *fmt, ...) { char b[256]; FMT(b); const struct ui_theme *t=TH; text_role(t->font_bold, t->text_heading, t->text, b); }
@@ -1173,7 +1176,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     }
     ui_set_spacing(emph_fits ? 0 : 1);
     if (buf[0] == 0 && !focused) {
-        text_role(t->font_regular, t->text_body, CP(placeholder, t->text_tertiary), placeholder);
+        text_role_line(t->font_regular, t->text_body, CP(placeholder, t->text_tertiary), placeholder);
     } else if (emph_fits) {
         /* dim head, bright span, dim tail -- up to three runs, any of which
          * may be empty and is then simply not emitted */
@@ -1183,17 +1186,17 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         if (emph_s) {
             unsigned n = emph_s < sizeof part - 1 ? emph_s : (unsigned)sizeof part - 1;
             memcpy(part, buf, n); part[n] = 0;
-            text_role(t->font_regular, t->text_body, dim, part);
+            text_role_line(t->font_regular, t->text_body, dim, part);
         }
         {
             unsigned n = emph_n < sizeof part - 1 ? emph_n : (unsigned)sizeof part - 1;
             memcpy(part, buf + emph_s, n); part[n] = 0;
-            text_role(t->font_regular, t->text_body, lit, part);
+            text_role_line(t->font_regular, t->text_body, lit, part);
         }
         if (emph_s + emph_n < emph_fits) {
             const char *tail = buf + emph_s + emph_n;
             snprintf(part, sizeof part, "%s", tail);
-            text_role(t->font_regular, t->text_body, dim, part);
+            text_role_line(t->font_regular, t->text_body, dim, part);
         }
         ui_flex_spacer();
     } else {
@@ -1233,7 +1236,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             run[n_] = 0;                                                        \
             if (run[0]) {                                                       \
                 if (selected) ui_set_text_bg(CP(selection, t->selection));      \
-                text_role(t->font_regular, t->text_body, fg, run);              \
+                text_role_line(t->font_regular, t->text_body, fg, run);              \
             }                                                                   \
         } while (0)
 

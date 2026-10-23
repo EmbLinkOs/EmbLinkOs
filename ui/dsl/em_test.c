@@ -484,6 +484,13 @@ int main(void) {
     CHECK(chrome_closed,"a close press survives the icon's simultaneous hover tint change");
     em_feed_pointer(20,18,0,0,0,1);chrome_frame();
 
+    struct ui_appearance calm={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
+    ui_theme_configure(&calm);em_set_clock(fake_clock);g_ms+=10000;em_toast("Ready",Success);
+    ui_frame_begin();em_new_frame();VStack(.key="calm-toast") {em_toast_host();}
+    em_flush();ui_frame_end();ui_run_layout(400,100);
+    struct scene_node *toast=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+    CHECK(toast && toast->opacity==1,"reduced motion presents a toast without a fade or slide");
+
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

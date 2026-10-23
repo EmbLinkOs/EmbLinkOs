@@ -201,38 +201,8 @@ int layout_debug_wrap_lines(struct layout_arena *la, struct scene_arena *sa,
     if (!s || s->kind != SCENE_NODE_TEXT || !s->data.text.utf8) return 0;
     struct font *f = font_for_handle(s->data.text.font_handle);
     if (!f) return 0;
-    float size = s->data.text.size_px;
-    const char *str = s->data.text.utf8;
-    float space_w = text_char_advance(f, ' ', size);
-
-    int lines = 1; float cur = 0;
-    const unsigned char *p = (const unsigned char *)str;
-    while (*p) {
-        if (*p == ' ') { p++; continue; }               /* word boundary */
-        const unsigned char *w0 = p;
-        while (*p && *p != ' ') p++;                     /* word = [w0, p) */
-        float word_w = 0;
-        for (const char *q = (const char *)w0; q < (const char *)p; ) {
-            uint32_t cp; q += font_utf8_decode(q, &cp);
-            word_w += text_char_advance(f, cp, size);
-        }
-
-        if (word_w <= width) {                           /* whole word fits on a line */
-            if (cur == 0) cur = word_w;
-            else if (cur + space_w + word_w <= width) cur += space_w + word_w;
-            else { lines++; cur = word_w; }
-        } else {                                         /* character-wrap fallback */
-            if (cur > 0) { lines++; cur = 0; }
-            for (const char *q = (const char *)w0; q < (const char *)p; ) {
-                uint32_t cp; q += font_utf8_decode(q, &cp);
-                float cw = text_char_advance(f, cp, size);
-                if (cur == 0) cur = cw;
-                else if (cur + cw <= width) cur += cw;
-                else { lines++; cur = cw; }
-            }
-        }
-    }
-    return lines;
+    return font_layout_text(f,s->data.text.utf8,s->data.text.size_px,
+                            s->data.text.no_wrap?0:width,NULL,NULL);
 }
 
 float layout_measure_height_at_width(struct layout_arena *la, struct scene_arena *sa,
@@ -243,6 +213,8 @@ float layout_measure_height_at_width(struct layout_arena *la, struct scene_arena
     if (!s || s->kind != SCENE_NODE_TEXT) return 0;
     struct font *f = font_for_handle(s->data.text.font_handle);
     if (!f) return 0;
+    if(s->data.text.no_wrap)
+        return font_layout_text(f,s->data.text.utf8,s->data.text.size_px,0,NULL,NULL)*font_line_height(f,s->data.text.size_px);
     /* memoized: wrapping is a pure function of (content, font, size, width),
      * and this is called from SEVEN sites per arrange -- for a document,
      * hundreds of times per frame at an unchanged width. The line-width memo
@@ -330,7 +302,7 @@ static void measure_intrinsic(struct layout_arena *la, struct scene_arena *sa, s
         struct scene_node *s = paired(sa, n);
         if (s && s->kind == SCENE_NODE_TEXT) {
             struct font *f = font_for_handle(s->data.text.font_handle);
-            n->intrinsic_h = f ? font_line_height(f, s->data.text.size_px) : 0;
+            n->intrinsic_h = f ? font_line_height(f,s->data.text.size_px)*font_layout_text(f,s->data.text.utf8,s->data.text.size_px,0,NULL,NULL) : 0;
         } else if (s && s->kind == SCENE_NODE_IMAGE) {
             n->intrinsic_h = (float)s->data.image.h;
         } else {

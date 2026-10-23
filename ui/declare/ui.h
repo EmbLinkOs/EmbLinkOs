@@ -79,6 +79,8 @@ void ui_set_text_bg(struct color c);
 
 /* --- leaves --- */
 void ui_text(const char *fmt, ...);
+/* Preformatted/single-line content: no automatic word wrapping. */
+void ui_text_line(const char *fmt, ...);
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px);
 void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                     float width_px, float height_px);
