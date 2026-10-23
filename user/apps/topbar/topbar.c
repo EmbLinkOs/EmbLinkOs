@@ -218,16 +218,37 @@ static void meter(int pct) {
  *
  * A status bar must never wait for anybody. So the waiting happens here, off
  * the render path, and the loop just reads whatever the last answer was.
- * `volatile` because two threads touch it: the only requirement is that the
- * reader eventually sees new values, and the worst a torn read can do is draw
- * one frame with a mixed pair of booleans. */
-static volatile struct oscfg g_bar_cfg = { .bar_24h = 1, .bar_date = 1, .bar_cpu = 1 };
+ * The worker publishes a complete snapshot under a mutex. Only the render
+ * thread reads g_bar_cfg and changes the theme, so a settings update cannot
+ * race a frame or leave the dropdown on a different palette from the desktop. */
+static struct oscfg g_bar_cfg, g_bar_pending;
+static embk_mutex g_bar_cfg_lock = EMBK_MUTEX_INIT;
+static void bar_cfg_apply(void) {
+    struct oscfg next;
+    embk_mutex_lock(&g_bar_cfg_lock);
+    next = g_bar_pending;
+    embk_mutex_unlock(&g_bar_cfg_lock);
+    static int applied;
+    int changed = !applied || next.dark != g_bar_cfg.dark ||
+                  next.accent != g_bar_cfg.accent || next.ui_scale != g_bar_cfg.ui_scale;
+    g_bar_cfg = next;
+    if (changed) {
+        applied = 1;
+        ui_theme_use_dark(next.dark != 0);
+        ui_theme_set_scale((float)next.ui_scale / 100.0f);
+        const struct oscfg_accent *a = &oscfg_accents[next.accent];
+        ui_theme_set_accent((Color){a->r,a->g,a->b,1.0f});
+        em_structure_changed();
+    }
+}
 static void bar_cfg_thread(long arg) {
     (void)arg;
     for (;;) {
         struct oscfg c;
         oscfg_load(&c);
-        g_bar_cfg = c;
+        embk_mutex_lock(&g_bar_cfg_lock);
+        g_bar_pending = c;
+        embk_mutex_unlock(&g_bar_cfg_lock);
         embk_sleep_ms(1000);
     }
 }
@@ -394,6 +415,7 @@ static void wins_sample(void) {
 }
 
 static void bar(void) {
+    bar_cfg_apply();
     const struct ui_theme *t = ui_theme();
 
     /* park at the top-center the first time we're drawn */
@@ -610,6 +632,8 @@ int main(void) {
     if (sw) em_app_spec_.size.w = (int)sw;    /* a menu bar spans the display */
     (void)sh;
     /* Off the render path, deliberately -- see bar_cfg_thread. */
+    oscfg_defaults(&g_bar_cfg);
+    g_bar_pending = g_bar_cfg;
     embk_thread_create(bar_cfg_thread, 0);
     return em_app_run(&em_app_spec_);
 }

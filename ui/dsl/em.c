@@ -3061,7 +3061,12 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     ui_set_offset(ax - ovx, ay - ovy - 8.0f * (1.0f - mt));
     ui_set_corner_radius(t->radius_md);
     ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
-    em_glass_apply(12.0f);                 /* blur behind + tint + edge highlight */
+    em_glass_apply(12.0f);
+    /* Menus must stay readable over bright pictures and desktop icons too.
+     * A dense theme tint gives the rows one surface without separate pills. */
+    Color menu_tint=t->surface_alt;menu_tint.a=0.96f;
+    ui_set_paint(solid(menu_tint));
+    ui_set_border(1.0f,t->border_strong);
     ui_set_clip_children(true);
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
@@ -3117,8 +3122,15 @@ void em_menu_(const char *label, EmProps p) {
     ui_end_stack();
     if (ui_consume_click(btn)) {
         if (is_open) g_menu_open = 0;
-        else { g_menu_open = (const void *)label; float px, py; ui_pointer_pos(&px, &py);
-               g_menu_ax = px; g_menu_ay = py + 8.0f; }
+        else {
+            g_menu_open = (const void *)label;
+            float x,y,w,h;
+            if (ui_rect_of(btn,&x,&y,&w,&h)) {
+                g_menu_ax=x; g_menu_ay=y+h+2.0f;
+            } else {
+                ui_pointer_pos(&x,&y);g_menu_ax=x;g_menu_ay=y+8.0f;
+            }
+        }
         g_em_epoch++;
         is_open = (g_menu_open == (const void *)label);
     }
@@ -3153,6 +3165,10 @@ void em_menu_end_(void) {
  * thin translucent menu-bar window tall enough to show the dropdown, then
  * shrink it back on close -- so the bar stays a thin strip when idle. */
 int em_menu_any_open(void) { return g_menu_open != 0; }
+int em_menu_dismiss(void) {
+    if (!g_menu_open) return 0;
+    g_menu_open=0;g_em_epoch++;return 1;
+}
 
 bool em_menu_item(const char *label, const char *shortcut) {
     em_flush();
@@ -3160,7 +3176,10 @@ bool em_menu_item(const char *label, const char *shortcut) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
-    ui_set_paint(solid(pressed ? shade(t->accent_soft, 0.94f) : hov ? t->accent_soft : t->surface));
+    /* One panel material, with a highlight only on the current row. Reset the
+     * border explicitly: reconciled instances may have been glass containers. */
+    ui_set_paint(solid(pressed ? shade(t->accent_soft, 0.94f) : hov ? t->accent_soft : (Color){0,0,0,0}));
+    ui_set_border(0,t->border);
     ui_set_corner_radius(t->radius_sm);
     ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp3);
     ui_set_align(ALIGN_CENTER);

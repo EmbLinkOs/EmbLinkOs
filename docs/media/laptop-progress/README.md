@@ -1,7 +1,7 @@
 # Laptop progress captures
 
-Forty actual EmbLinkOS captures document two milestones: the original laptop
-work and its integration with master through `a281865`. PNG exports preserve
+Forty-six actual EmbLinkOS captures document the original laptop work, its
+integration with master through `a281865`, and system-menu polish after PR #40. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -9,10 +9,52 @@ Use [gallery.json](gallery.json) for ordering, captions, dimensions, source and
 PNG hashes, fixture flags, featured images and historical/current metadata.
 Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show the
 merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
-The current desktop guest includes a **synthetic ACPI fixture** throughout;
+The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Current merged desktop
+## Latest: system-menu polish
+
+Captures 41–46 compare the previous menu with the current native light/dark
+palette, Escape dismissal, live preferences and action dispatch. Capture 41 is
+the baseline; 42–46 use a fresh QEMU live image without an ACPI fixture.
+
+### Before: mixed menu styling
+
+The integrated desktop before this change: bright rows on the dark desktop. This baseline capture includes the synthetic ACPI fixture.
+
+![Before: mixed menu styling in EmbLinkOS](41-menu-before.png)
+
+### System menu in dark appearance
+
+The bar applies the live dark palette; idle rows share one dense surface with a consistent outline.
+
+![System menu in dark appearance in EmbLinkOS](42-menu-dark.png)
+
+### System menu in light appearance
+
+Changing Appearance through Settings updates the running menu bar without restarting it.
+
+![System menu in light appearance in EmbLinkOS](43-menu-light.png)
+
+### Escape dismisses the dropdown
+
+The menu closes, releases keyboard ownership and returns the bar to 26 pixels. The test reopens it and then uses the dock.
+
+![Escape dismisses the dropdown in EmbLinkOS](44-menu-escape.png)
+
+### Live appearance controls
+
+Actual pointer input switches to Light before the test verifies the running system menu palette.
+
+![Live appearance controls in EmbLinkOS](45-menu-appearance.png)
+
+### Menu action reaches notification service
+
+About EmbLink still posts a native notification after repeated open, Escape, outside-click and appearance changes.
+
+![Menu action reaches notification service in EmbLinkOS](46-menu-action.png)
+
+## Merged desktop milestone
 
 ![Desktop after reboot and login](38-merged-persistence.png)
 

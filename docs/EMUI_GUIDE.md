@@ -282,7 +282,16 @@ MenuBar() {
 `MenuItem(label)` and `MenuItemK(label, shortcut)` each **return `bool`** — true
 on the frame they're chosen (act on it directly in an `if`). `MenuSeparator()`
 draws a divider. Clicking a bar `Menu` toggles its panel open at the label; an
-item click or an outside click closes it.
+item click or an outside click closes it. The panel anchors to the label's
+rectangle, so clicking either edge opens it in the same place. Idle rows share
+the panel material; only hovered/pressed rows receive an accent highlight.
+The panel follows the active light/dark palette with a dense tint for legibility.
+
+In `EM_APPLICATION`, Escape dismisses an open menu-bar dropdown before any
+application exit handling. A translucent system bar temporarily borrows keyboard
+focus while its dropdown is open, and releases it on dismissal. Its transparent
+outside-click surface covers the display only while open; the bar returns to
+its original thin size afterward.
 
 **Context menu** — anchor a popover where the pointer was right-pressed:
 

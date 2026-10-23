@@ -9,7 +9,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 #define CHECK(x) do {if(!(x)) {printf("devicecheck: line %d failed: %s\n",__LINE__,#x);return __LINE__%200+1;}} while(0)
-static int restricted(void) {
+static int restricted(int parent_menu) {
+    if(parent_menu>0)CHECK(embk_win_menu((uint32_t)parent_menu,1)==-22);
     struct embk_wifi_info wifi;
     CHECK(embk_wifi_get(&wifi)==0);
     CHECK(embk_wifi_change((const void *)(uintptr_t)-1)==-1);
@@ -103,7 +104,8 @@ int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"--files")) return preferences("--files-child");
     if(argc>1 && !strcmp(argv[1],"--files-child")) return files_child();
     if(argc>1 && !strcmp(argv[1],"--policy")) return policy_fixture();
-    if(argc>1 && !strcmp(argv[1],"--restricted")) return restricted();
+    if(argc>1 && !strcmp(argv[1],"--restricted")) return restricted(argc>2?atoi(argv[2]):0);
+    if(argc>1 && !strcmp(argv[1],"--menu-no-gpu")) {CHECK(embk_win_menu(0,1)==-1);return 0;}
     struct embk_wifi_info wifi;struct embk_audio_info audio;struct embk_display_info display;
     CHECK(embk_wifi_get(&wifi)==0 && wifi.version==1 && wifi.saved_count<=8 && wifi.network_count<=24);
     CHECK(embk_syscall2(EMBK_SYS_wifi_info,(uintptr_t)&wifi,sizeof wifi-1)==-22);
@@ -117,9 +119,24 @@ int main(int argc,char **argv) {
     CHECK(embk_display_get(&display)==0 && display.version==1 && display.level_count<=32);
     CHECK(embk_display_brightness(101)==-22);
     CHECK(embk_display_get((void *)(uintptr_t)-1)==-14);
-    char *child[]={"/data/apps/devicecheck/devicecheck.elf","--restricted",0};
+    CHECK(embk_win_menu(0,1)==-22 && embk_win_menu(0,2)==-22);
+    void *menu_pixels=0;
+    int menu=embk_win_create_shared_ex(200,80,10,32,"menu ownership",
+                                      EMBK_WINF_TRANSLUCENT,&menu_pixels);
+    CHECK(menu>0 && menu_pixels);
+    CHECK(embk_win_resize(menu,200,26,&menu_pixels)>=0 && menu_pixels);
+    CHECK(embk_win_resize(menu,200,80,&menu_pixels)>=0 && menu_pixels);
+    CHECK(!embk_win_menu((uint32_t)menu,1));
+    CHECK(embk_syscall2(EMBK_SYS_win_menu,((uint64_t)1<<32)|(uint32_t)menu,1)==-22);
+    char menu_id[16];snprintf(menu_id,sizeof menu_id,"%u",(unsigned)menu);
+    char *child[]={"/data/apps/devicecheck/devicecheck.elf","--restricted",menu_id,0};
     struct embk_spawn_file_action action;embk_action_set_caps(&action,EMBK_CAP_BIT(EMBK_CAP_NETWORK)|EMBK_CAP_BIT(EMBK_CAP_GPU));
     int handle=embk_spawn(child[0],child,&action,1);CHECK(handle>=0);CHECK(embk_wait(handle)==0);
+    CHECK(!embk_win_menu((uint32_t)menu,0));CHECK(!embk_win_destroy(menu));
+    CHECK(embk_win_menu((uint32_t)menu,1)==-22);
+    child[1]="--menu-no-gpu";child[2]=NULL;
+    embk_action_set_caps(&action,EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+    handle=embk_spawn(child[0],child,&action,1);CHECK(handle>=0);CHECK(embk_wait(handle)==0);
     if(argc>1 && !strcmp(argv[1],"--fixture")) {
         CHECK((display.flags&(EMBK_DISPLAY_BACKLIGHT|EMBK_DISPLAY_KNOWN))==(EMBK_DISPLAY_BACKLIGHT|EMBK_DISPLAY_KNOWN));
         CHECK(display.level_count==6 && display.percent==60);

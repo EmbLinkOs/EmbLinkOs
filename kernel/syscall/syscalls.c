@@ -1460,6 +1460,13 @@ static int64_t sys_win_restore(const struct sysargs *a) {
     return (int64_t)compositor_restore_pid((int)pid);
 }
 
+static int64_t sys_win_menu(const struct sysargs *a) {
+    int cg=cap_gate(EMBK_CAP_GPU);if(cg)return cg;
+    if(a->arg[0]>UINT32_MAX || a->arg[1]>1)return -EMBK_EINVAL;
+    return compositor_win_menu(current_process ? (int)current_process->pid : 0,
+                               (uint32_t)a->arg[0],(int)a->arg[1]);
+}
+
 static int64_t sys_win_blur_rect(const struct sysargs *a) {
     return compositor_win_blur_rect(current_process ? (int)current_process->pid : 0,
                                     (uint32_t)a->arg[0], (int)a->arg[1], (int)a->arg[2],
@@ -2835,6 +2842,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_fd_poll]        = sys_fd_poll,
     [SYS_clip_set]       = sys_clip_set,
     [SYS_clip_get]       = sys_clip_get,
+    [SYS_win_menu] = sys_win_menu,
     [SYS_win_blur_rect]  = sys_win_blur_rect,
     [SYS_win_restore]    = sys_win_restore,
     [SYS_win_minimize]   = sys_win_minimize,

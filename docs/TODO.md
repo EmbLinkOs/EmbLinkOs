@@ -1,3 +1,11 @@
+## Desktop menu follow-up (2026-10-23)
+
+- [x] Live system-menu palette, stable label anchors, one panel surface,
+  Escape dismissal, full-display outside clicks and restored thin bar/input.
+- [ ] Arrow-key menu navigation, type-to-select, keyboard menu activation,
+  accessible menu roles and context-menu Escape behavior.
+- [ ] Consistent focus indication, dialogs and unsaved-document handling across apps.
+
 ## Laptop integration follow-up (2026-10-23)
 
 - [x] Preserve master ABI/ARM architecture and integrate laptop services into the current desktop.

@@ -1187,6 +1187,12 @@ static inline int embk_proc_alive(int handle) {
     return (int)embk_syscall1(EMBK_SYS_proc_alive, handle);
 }
 
+/* Temporarily give a caller-owned translucent menu window keyboard focus.
+ * Release on dismissal; window destruction/reaping also releases it. */
+static inline int embk_win_menu(uint32_t win,int active) {
+    return (int)embk_syscall2(EMBK_SYS_win_menu,win,active);
+}
+
 /* Screen (framebuffer) size, so a windowed app can size itself to fit -- e.g.
  * clamp a tall window so it isn't rejected on a short display. */
 static inline int embk_screen_size(uint32_t *w, uint32_t *h) {

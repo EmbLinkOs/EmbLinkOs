@@ -8,6 +8,15 @@ first (the intended design and the decisions behind it), then this file
 history are ground truth; this file is reconstructed for the design record —
 if it disagrees with the code, the code wins.*
 
+## Desktop menu polish, 2026-10-23
+
+After PR #40, system dropdowns follow live appearance preferences, share a
+legible panel surface and open beneath their labels. Escape dismisses an open
+menu; outside clicks cover the display while open, then dock/app input returns.
+The compositor now supports temporary window-owned menu keyboard focus and
+resizing a translucent bar back to its thin height. See
+[DESKTOP_MENUS.md](DESKTOP_MENUS.md) for scope and acceptance.
+
 ## Laptop integration, 2026-10-23
 
 The `laptop-daily-use` branch incorporates master through `a281865` (210 incoming

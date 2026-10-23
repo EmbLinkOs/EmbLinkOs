@@ -281,7 +281,10 @@ int em_app_run(const EmApp *app) {
     int translucent = (app->material == Translucent);  /* per-pixel transparent, no blur */
     int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass || translucent;
     int bar = chromeless ? 0 : 26;
-    if (!app->fullscreen && sw && winw > (int)sw - 8)        winw = (int)sw - 8;
+    if (!app->fullscreen && sw) {
+        int maxw = translucent ? (int)sw : (int)sw - 8;
+        if (winw > maxw) winw = maxw;
+    }
     /* 64 was hard-coded here and it was WRONG at every dock size: the pill is
      * dock_size+32 tall before the gap, so 84px at the default and 106 at the
      * largest. Every app window therefore covered the top of the dock -- and
@@ -387,6 +390,7 @@ int em_app_run(const EmApp *app) {
     EmWinLayout layout_now = EmWinNormal;
     int wx_now = wx, wy_now = wy;
     int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
+    int menu_keyboard = -1;
     int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
     uint64_t last_app_tick = 0;
@@ -500,10 +504,15 @@ int em_app_run(const EmApp *app) {
          * bar still reads as a thin strip; only the dropdown paints into it. */
         if (translucent) {
             int want = em_menu_any_open();
+            /* Chrome normally leaves keys with the app. An open dropdown
+             * borrows them until dismissal, including when resize fails. */
+            if (want != menu_keyboard && embk_win_menu((uint32_t)win,want) >= 0)
+                menu_keyboard = want;
             if (want != menu_expanded) {
                 int32_t wyc = 0; em_window_pos(0, &wyc);
-                int nh = want ? (int)sh - wyc - 8 : thin_h;
-                if (want && nh > 340) nh = 340;
+                /* The transparent dismiss surface reaches the dock and screen
+                 * edges too; a 340px canvas silently missed clicks below it. */
+                int nh = want ? (int)sh - wyc : thin_h;
                 if (nh < thin_h) nh = thin_h;
                 uint32_t *npx = 0;
                 if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
@@ -529,6 +538,9 @@ int em_app_run(const EmApp *app) {
         }
         int had_key = 0;
         for (int c; (c = embk_key_poll()) != 0; ) {
+            /* Escape first dismisses a menu; it must not quit the application
+             * (especially the system bar) that owns an open dropdown. */
+            if (c == 27 && em_menu_dismiss()) { had_key = 1; continue; }
             /* THE HOOK GETS FIRST REFUSAL ON PASTE TOO. The replay below turns
              * newlines and tabs into spaces, which is right for a terminal --
              * a paste must never execute anything -- and wrong for an editor,

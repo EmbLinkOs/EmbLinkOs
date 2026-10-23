@@ -23,6 +23,7 @@ struct comp_window {
     uint32_t  cw, ch;       /* content dimensions in px                       */
     int       z;            /* z-order: larger is nearer the front            */
     int       visible;
+    int       menu_keyboard; /* temporary keyboard owner while a bar menu is open */
     int       desktop;      /* 1 = chromeless full-screen back layer (the home) */
     int       chromeless;   /* 1 = floating window with NO kernel chrome: the app
                              * draws its own bar/close (EmUI V4 Window/WindowBar)
@@ -353,12 +354,16 @@ uint32_t compositor_focused_pid(void) {
     if(session_input_owner())return session_input_owner();
     uint32_t pid = 0;
     spin_lock(&g_comp_lock);
-    struct comp_window *best = 0, *desk = 0;
+    struct comp_window *best = 0, *desk = 0, *menu = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
         if (!w->used || !w->visible || !session_ui_allowed(w->pid)) continue;
         if (w->desktop) { desk = w; continue; }     /* the fallback owner */
-        /* CHROME NEVER TAKES THE KEYBOARD. A menu bar or an ambient widget has
+        if (w->translucent && w->menu_keyboard) {
+            if (!menu || w->z > menu->z) menu = w;
+            continue;
+        }
+        /* IDLE CHROME NEVER TAKES THE KEYBOARD. A menu bar or an ambient widget has
          * nothing to type into, so letting one hold focus could only ever steal
          * input from the app you were actually typing in -- clicking a menu
          * would silently kill your terminal's keyboard. */
@@ -367,7 +372,8 @@ uint32_t compositor_focused_pid(void) {
     }
     /* No app window up -> the desktop owns it, so there is ALWAYS exactly one
      * owner and never a free-for-all (that race is the bug this all fixes). */
-    if (!best) best = desk;
+    if (menu) best = menu;
+    else if (!best) best = desk;
     if (best) pid = (uint32_t)best->pid;
     spin_unlock(&g_comp_lock);
     return pid;
@@ -1166,6 +1172,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->cw = cw; w->ch = ch;
     w->z = g_next_z++;
     w->visible = 1;
+    w->menu_keyboard = 0;
     w->desktop = 0;
     w->chromeless = 0;
     w->widget = 0;
@@ -1259,6 +1266,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     struct comp_window *w = &g_wins[slot];
     w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid;
     w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
+    w->menu_keyboard = 0;
     w->desktop = desktop;
     w->chromeless = chromeless;
     w->widget = widget;
@@ -1316,7 +1324,15 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
                               uint32_t nw, uint32_t nh, uint64_t *out_client_va) {
     const fb_info_t *fi = fb_get_info();
     if (!fi || !client) return -EMBK_EINVAL;
-    if (nw < 120 || nh < 90 || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
+    /* Translucent system bars are legitimately shorter than app content.
+     * Refusing their original 26px height left an invisible expanded canvas
+     * intercepting clicks after its menu was dismissed. */
+    spin_lock(&g_comp_lock);
+    struct comp_window *owner=win_find((int)client->pid,id);
+    if (!owner || !owner->shared) {spin_unlock(&g_comp_lock);return -EMBK_ENOENT;}
+    uint32_t min_h=owner->translucent ? 24u : 90u;
+    spin_unlock(&g_comp_lock);
+    if (nw < 120 || nh < min_h || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
 
     /* new backing first (outside the lock: pmm/vmm work) */
     uint64_t bytes = (uint64_t)nw * nh * 4;
@@ -1896,6 +1912,18 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
             out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
     spin_unlock(&g_comp_lock);
     return (int)n;
+}
+
+/* Only the owner can lend an existing translucent window the keyboard.
+ * Session lock ownership is checked before this flag in focused_pid(). The
+ * state lives with the window, so destroy/reap cannot leave a global grab. */
+int compositor_win_menu(int pid,uint32_t id,int active) {
+    if (active != 0 && active != 1) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    struct comp_window *w=win_find(pid,id);
+    if (!w || !w->translucent) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    w->menu_keyboard=active;
+    spin_unlock(&g_comp_lock);return 0;
 }
 
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be

@@ -573,6 +573,7 @@ void em_menubar_end_(void);
 #define Menu(label, ...)  EM_SCOPE_(em_menu_((label), (EmProps){__VA_ARGS__}), em_menu_end_())
 void em_menu_(const char *label, EmProps p);
 void em_menu_end_(void);
+int  em_menu_dismiss(void);    /* dismiss a bar dropdown; returns 1 only if one was open */
 int  em_menu_any_open(void);   /* is any MenuBar dropdown open? (app runtime grows the window) */
 
 /* MenuItem: one row; returns true the frame it's clicked (which also closes the

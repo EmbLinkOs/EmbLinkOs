@@ -221,3 +221,9 @@ is unlinked reference code. GPT partition identity chooses the actual boot root;
 Recovery mounts it read-only and installs only through an explicit disk plan.
 ARM shared code still cross-links; laptop screen/policy services report ENOTSUP
 there. See DAILY_USE.md and LAPTOP_VALIDATION.md for behavior and evidence.
+
+System-menu focus is window-owned state (`win_menu`, syscall 144). It overrides
+normal app focus only while a translucent menu is open, and cannot override the
+session lock owner. The bar applies asynchronous preference snapshots on its
+render thread. See EMUI_INTERNALS.md and DESKTOP_MENUS.md for the lifecycle and
+native interaction tests.

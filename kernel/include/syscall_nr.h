@@ -338,6 +338,7 @@
 #define SYS_notice_get 141
 #define SYS_policy_get 142
 #define SYS_policy_set 143
+#define SYS_win_menu 144
 
 
 
