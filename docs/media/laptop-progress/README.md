@@ -1,7 +1,7 @@
 # Laptop progress captures
 
-Forty-six actual EmbLinkOS captures document the original laptop work, its
-integration with master through `a281865`, and system-menu polish after PR #40. PNG exports preserve
+Sixty-one actual EmbLinkOS captures document the original laptop work, its
+integration with master through `a281865`, system-menu polish after PR #40, and recoverable document workspaces. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -12,7 +12,101 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: system-menu polish
+## Latest: document workspaces
+
+Captures 47–61 follow real file creation, saving, unsaved-close protection, forced-stop recovery and reopening after independent boots. They use authenticated QEMU accounts and disposable NVMe storage, with no synthetic ACPI fixture.
+
+### A shared Save dialog
+
+Both editors use the session file service. The picker shows the actual authenticated home and user places.
+
+![A shared Save dialog](47-shared-save.png)
+
+### A durable saved document
+
+Editor reports the completed save in Documents after synced temporary-file replacement.
+
+![A durable saved document](48-document-saved.png)
+
+### Confirming file replacement
+
+Save As asks before replacing the existing Milestone.txt; cancelling keeps the original path and contents.
+
+![Confirming file replacement](49-replace-confirmation.png)
+
+### Editor protects unsaved changes
+
+GUI+W opens Save, Discard and Cancel. The window remains alive beyond the former compositor close deadline.
+
+![Editor protects unsaved changes](50-editor-unsaved-close.png)
+
+### Quitting a multi-document workspace
+
+Note++ checks every dirty tab. The acceptance test also cancels a partially answered quit and verifies dirty state is retained.
+
+![Quitting a multi-document workspace](51-workspace-unsaved-close.png)
+
+### Two dirty tabs before a forced stop
+
+Both modified tabs remain open after cancelling quit. The VM is then terminated without logout or shutdown.
+
+![Two dirty tabs before a forced stop](52-workspace-before-crash.png)
+
+### Editor recovers after a cold boot
+
+The original saved document and its unsaved addition return from a separately checkpointed draft on NVMe.
+
+![Editor recovers after a cold boot](53-editor-recovered.png)
+
+### Both Note++ drafts recovered
+
+A new boot restores both unsaved tabs, including the second draft that directory mutation could previously skip.
+
+![Both Note++ drafts recovered](54-workspace-recovered.png)
+
+### Saving the recovered workspace
+
+A recovered document is saved through the common picker. Its path and cursor are recorded for session reopening.
+
+![Saving the recovered workspace](55-workspace-saved.png)
+
+### Saved work reopens after another reboot
+
+A third independent boot authenticates the user and reopens the saved Note++ document with its exact contents.
+
+![Saved work reopens after another reboot](56-workspace-after-reboot.png)
+
+### Browsing persisted documents
+
+The shared Open panel lists both saved documents in the authenticated Documents folder. File rows now receive selection clicks.
+
+![Browsing persisted documents](57-shared-open.png)
+
+### The original document reopens from the picker
+
+Editor loads Milestone.txt through the shared Open panel after the final cold boot; exact bytes are checked.
+
+![The original document reopens from the picker](58-document-after-reboot.png)
+
+### Creating a document in Files
+
+The authenticated Files window offers New Document in the current folder.
+
+![Creating a document in Files](59-files-new-document.png)
+
+### Files hands the document to Editor
+
+Files creates FromFiles.txt, supplies HOME and EDIT_FILE to Editor, and the edited document is saved in the same home.
+
+![Files hands the document to Editor](60-files-created-and-saved.png)
+
+### Duplicate document names are refused
+
+Creating FromFiles.txt again reports that the name already exists and does not open a replacement editor.
+
+![Duplicate document names are refused](61-files-name-conflict.png)
+
+## System-menu milestone
 
 Captures 41–46 compare the previous menu with the current native light/dark
 palette, Escape dismissal, live preferences and action dispatch. Capture 41 is
