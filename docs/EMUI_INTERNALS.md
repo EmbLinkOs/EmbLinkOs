@@ -510,3 +510,13 @@ retain their 90-pixel minimum. Previously the shared resize minimum rejected
 `tools/menu_smoke.py` tests actual Escape, outside clicks, stable anchoring,
 live appearance changes and subsequent dock use; devicecheck covers ownership,
 capability/bounds and the thin resize round trip.
+
+## Deferred close requests
+
+EmApp routes Escape, window close state and explicit exit requests through one
+optional close callback before teardown. A veto consumes the request and asks
+for another frame. A caller-owned `win_close_ack` cancels the compositor close
+grace timer; the runtime sends it immediately on receiving a close request when
+a hook is installed, including input polls while idle. Apps without a hook keep
+the existing timeout. The state belongs to the window and does not confer
+process-control authority over other apps. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).

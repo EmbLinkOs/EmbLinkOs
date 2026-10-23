@@ -31,6 +31,10 @@
 
 static int g_app_exit_requested;
 static int g_app_exit_code;
+static int (*g_em_close_hook)(void);
+static int g_key_modifiers;
+int em_key_modifiers(void) { return g_key_modifiers; }
+void em_set_close_hook(int (*fn)(void)) { g_em_close_hook=fn; }
 static float g_viewport_w;   /* mirrored into em.c via em_set_viewport */
 static int   g_blur_rect[4] = {0,0,0,0};   /* window-local frost rect (w<=0 = none) */
 static int   g_blur_dirty = 0;
@@ -48,6 +52,7 @@ static float g_viewport_h;
 void em_app_request_exit(int code) {
     g_app_exit_code = code;
     g_app_exit_requested = 1;
+    em_request_frame();
 }
 
 
@@ -435,10 +440,13 @@ int em_app_run(const EmApp *app) {
          * its owner. Before this the compositor killed the process outright and
          * an unsaved document went with it.
          *
-         * An app that wants to ask "save first?" sets a key hook and handles
-         * this itself; doing nothing still closes, which is the right default
-         * for the many apps with nothing to lose. */
-        if (in.win == EMBK_WIN_ACTION_CLOSE) em_app_request_exit(0);
+         * An app that wants to ask "save first?" installs a close hook.
+         * Acknowledge immediately so drawing its prompt cannot race the
+         * compositor's grace timeout. Apps without a hook retain that backstop. */
+        if (in.win == EMBK_WIN_ACTION_CLOSE) {
+            if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
+            em_app_request_exit(0);
+        }
         /* A DROP LANDED. The payload is the application's to take
          * (embk_drop_take, in its view); all the runtime owes it is a frame in
          * which to notice -- an idle app builds none, and the drop would sit
@@ -537,7 +545,8 @@ int em_app_run(const EmApp *app) {
             g_blur_dirty = 0;
         }
         int had_key = 0;
-        for (int c; (c = embk_key_poll()) != 0; ) {
+        for (int input; (input = embk_key_poll_input()) > 0; ) {
+            int c=input&255;g_key_modifiers=(input>>8)&255;
             /* Escape first dismisses a menu; it must not quit the application
              * (especially the system bar) that owns an open dropdown. */
             if (c == 27 && em_menu_dismiss()) { had_key = 1; continue; }
@@ -583,11 +592,7 @@ int em_app_run(const EmApp *app) {
                 continue;
             }
             if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
-            if (c == 27) {
-                embk_win_destroy(win); embk_key_grab(0); free(back);
-                char b[64]; snprintf(b, sizeof b, "%s: exit\n", title); embk_puts(1, b);
-                return 0;
-            }
+            if (c == 27) { em_app_request_exit(0); had_key = 1; continue; }
             ui_input_char(c);
             had_key = 1;
         }
@@ -636,6 +641,11 @@ int em_app_run(const EmApp *app) {
                 embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
                 struct embk_win_input pin;
                 embk_win_input(&pin);
+                if (pin.win == EMBK_WIN_ACTION_CLOSE) {
+                    if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
+                    em_app_request_exit(0); break;
+                }
+                if (pin.win == EMBK_WIN_ACTION_DROP) em_request_frame();
                 ui_pointer_at_time(pin.when);
                 em_feed_pointer((float)pin.x, (float)pin.y,
                                 pin.buttons & EMBK_MOUSE_LEFT,
@@ -681,7 +691,17 @@ int em_app_run(const EmApp *app) {
         if (em_window_minimized()) embk_win_minimize(win);
         if (em_window_maximized()) em_window_post_maximize();   /* acted on next pass */
 
-        if (g_app_exit_requested || em_window_closed() || em_window_take_close()) {
+        int closing = g_app_exit_requested || em_window_closed();
+        /* Always consume the one-shot close, including when another source
+         * already requested exit; a deferred request must not replay. */
+        if (em_window_take_close()) closing = 1;
+        if (closing && g_em_close_hook && !g_em_close_hook()) {
+            embk_win_close_ack((uint32_t)win);
+            g_app_exit_requested = 0;
+            em_request_frame();
+            closing = 0;
+        }
+        if (closing) {
             /* Give the reservation back before leaving. The thread dying would
              * do it too, but em_app_run RETURNS -- an app that goes on to do
              * something else must not still be holding a claim on a cadence it

@@ -339,6 +339,8 @@
 #define SYS_policy_get 142
 #define SYS_policy_set 143
 #define SYS_win_menu 144
+#define SYS_win_close_ack 145
+#define SYS_key_poll_input 146
 
 
 

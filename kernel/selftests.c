@@ -9080,6 +9080,10 @@ int selftests_handle_command(const char *cmd)
 
     /* Laptop control-plane acceptance runs in ring 3 and waits for the full
      * child result, including its confined preferences/file-operation probes. */
+    if(!strcmp(cmd,"test input snapshot")) {
+        kprintf("[cmd] test input snapshot: queued Ctrl+S and Up retain distinct modifiers: %s\n",
+                keyboard_input_snapshot_selftest()?"OK":"FAIL");return 1;
+    }
     if(!strcmp(cmd,"test document sync")) {document_sync_test();return 1;}
     const char *device_mode=NULL;
     if(!strcmp(cmd,"test devices fixture"))device_mode="--fixture";

@@ -16,7 +16,7 @@ results=[]
 try:
     guest.wait(b'TopBar: first frame presented')
     guest.qmp.screendump(str(out/'desktop.ppm'))
-    for command in ['test devices','test devices preferences','test devices files','test document sync','test pagecache',
+    for command in ['test devices','test devices preferences','test devices files','test document sync','test input snapshot','test pagecache',
                     'test ipc cancel','test channel','test compositor','test session',
                     'test kill io','test posix']:
         start=len(guest.seen);guest.serial.sendall((command+'\n').encode())

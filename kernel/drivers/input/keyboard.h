@@ -219,6 +219,9 @@ char keyboard_getchar(void);
 
 // Non-blocking read: returns 1 if the next ASCII character is available, otherwise returns 0
 int keyboard_has_char(void);
+/* One ordered character plus its modifier snapshot. Zero means empty. */
+uint32_t keyboard_poll_input(void);
+int keyboard_input_snapshot_selftest(void);
 
 /* Ctrl-C routing — docs/INTERRUPTION.md.
  *

@@ -199,6 +199,8 @@
 #define EMBK_SYS_policy_get 142
 #define EMBK_SYS_policy_set 143
 #define EMBK_SYS_win_menu 144
+#define EMBK_SYS_win_close_ack 145
+#define EMBK_SYS_key_poll_input 146
 
 
 

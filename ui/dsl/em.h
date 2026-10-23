@@ -730,6 +730,13 @@ float em_viewport_height(void);
  *     when something arrived. Keep it cheap; it runs at loop pace.
  * Both are target-runtime features (em_app.c); NULL = off (the default). */
 void em_set_key_hook(int (*fn)(int ch));
+/* Modifier snapshot of the character currently delivered to a key hook. */
+int em_key_modifiers(void);
+/* All ordinary exits (Escape, window controls, GUI+W, request_exit) call this.
+ * Return 1 to close, 0 to defer and show a dialog. A deferral acknowledges the
+ * compositor request, so waiting for the user has no forced-kill deadline.
+ * After Save/Discard, call request_exit again; the hook must then allow it. */
+void em_set_close_hook(int (*fn)(void));
 void em_set_idle_hook(void (*fn)(void));
 /* Runs after LAYOUT and before the frame is rendered -- the only moment at
  * which every node's resolved position is known and the pixels have not been

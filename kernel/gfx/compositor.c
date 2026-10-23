@@ -372,8 +372,10 @@ uint32_t compositor_focused_pid(void) {
     }
     /* No app window up -> the desktop owns it, so there is ALWAYS exactly one
      * owner and never a free-for-all (that race is the bug this all fixes). */
-    if (menu) best = menu;
-    else if (!best) best = desk;
+    if(menu && (!best || menu->z>best->z))best=menu;
+    /* A raised launcher is a real modal surface, including for keyboard
+     * input. It must outrank the application it visibly covers. */
+    if(desk && (!best || desk->z>best->z))best=desk;
     if (best) pid = (uint32_t)best->pid;
     spin_unlock(&g_comp_lock);
     return pid;
@@ -1917,6 +1919,14 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
 /* Only the owner can lend an existing translucent window the keyboard.
  * Session lock ownership is checked before this flag in focused_pid(). The
  * state lives with the window, so destroy/reap cannot leave a global grab. */
+int compositor_win_close_ack(int pid,uint32_t id) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w=win_find(pid,id);
+    if (!w) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    w->asked_close_ms=0;
+    spin_unlock(&g_comp_lock);return 0;
+}
+
 int compositor_win_menu(int pid,uint32_t id,int active) {
     if (active != 0 && active != 1) return -EMBK_EINVAL;
     spin_lock(&g_comp_lock);

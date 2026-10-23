@@ -491,6 +491,7 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
 #endif
 #ifndef EMBK_E2BIG
 #define EMBK_E2BIG    7
+#define EMBK_ENAMETOOLONG 36
 #endif
 
 /* --- sessions: whose a process is -------------------------------------------
@@ -978,6 +979,12 @@ static inline int embk_key_event_poll(struct embk_key_event *ev) {
 }
 /* What is held RIGHT NOW (EMBK_KM_*), which events alone cannot tell you if
  * you missed the press. */
+/* Same character queue as key_poll, with modifiers captured when that byte
+ * was produced. Zero means empty; bits 0..7 are the byte, 8..15 EMBK_KM_*.
+ * This distinguishes queued Ctrl+S from Up after Ctrl has been released. */
+static inline int embk_key_poll_input(void) {
+    return (int)embk_syscall0(EMBK_SYS_key_poll_input);
+}
 static inline int embk_key_mods(void) {
     return (int)embk_syscall0(EMBK_SYS_key_mods);
 }
@@ -1187,6 +1194,11 @@ static inline int embk_proc_alive(int handle) {
     return (int)embk_syscall1(EMBK_SYS_proc_alive, handle);
 }
 
+/* Accept a close request without exiting (e.g. an unsaved-changes dialog).
+ * Cancels the compositor grace timer for this caller-owned window only. */
+static inline int embk_win_close_ack(uint32_t win) {
+    return (int)embk_syscall1(EMBK_SYS_win_close_ack,win);
+}
 /* Temporarily give a caller-owned translucent menu window keyboard focus.
  * Release on dismissal; window destruction/reaping also releases it. */
 static inline int embk_win_menu(uint32_t win,int active) {

@@ -188,6 +188,7 @@ void compositor_anim_tick(void);
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
 int compositor_win_menu(int pid,uint32_t id,int active);
+int compositor_win_close_ack(int pid,uint32_t id);
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 /* `when` is the millisecond the reported button state was MADE, which for a
  * replayed press is when the finger went down and not when this poll happened.

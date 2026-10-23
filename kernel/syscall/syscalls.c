@@ -1460,6 +1460,13 @@ static int64_t sys_win_restore(const struct sysargs *a) {
     return (int64_t)compositor_restore_pid((int)pid);
 }
 
+static int64_t sys_win_close_ack(const struct sysargs *a) {
+    int cg=cap_gate(EMBK_CAP_GPU);if(cg)return cg;
+    if(a->arg[0]>UINT32_MAX)return -EMBK_EINVAL;
+    return compositor_win_close_ack(current_process ? (int)current_process->pid : 0,
+                                    (uint32_t)a->arg[0]);
+}
+
 static int64_t sys_win_menu(const struct sysargs *a) {
     int cg=cap_gate(EMBK_CAP_GPU);if(cg)return cg;
     if(a->arg[0]>UINT32_MAX || a->arg[1]>1)return -EMBK_EINVAL;
@@ -1481,6 +1488,12 @@ static int64_t sys_clip_get(const struct sysargs *a) {
     return clipboard_get_user((void *)a->arg[0], (size_t)a->arg[1]);
 }
 
+static int64_t sys_key_poll_input(const struct sysargs *a) {
+    (void)a;
+    uint32_t focus=compositor_focused_pid();
+    if(focus && current_process && current_process->pid!=focus)return 0;
+    return keyboard_poll_input();
+}
 static int64_t sys_key_poll(const struct sysargs *a) {
     (void)a;
     /* Keys belong to the FRONT window's process. The character queue is a
@@ -2843,6 +2856,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_clip_set]       = sys_clip_set,
     [SYS_clip_get]       = sys_clip_get,
     [SYS_win_menu] = sys_win_menu,
+    [SYS_win_close_ack] = sys_win_close_ack,
+    [SYS_key_poll_input] = sys_key_poll_input,
     [SYS_win_blur_rect]  = sys_win_blur_rect,
     [SYS_win_restore]    = sys_win_restore,
     [SYS_win_minimize]   = sys_win_minimize,
