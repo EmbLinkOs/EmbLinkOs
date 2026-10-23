@@ -411,6 +411,8 @@ static bool     g_focus_first;            /* wrapped: the first field of this fr
 static bool     g_seen_field;             /* a field has been emitted this frame */
 static char     g_carry[32];              /* keys typed after the Tab, for the next field */
 static int      g_carry_n;
+static float g_field_next_width,g_field_next_height;
+void ui_text_field_next_size(float width,float height) {g_field_next_width=width;g_field_next_height=height;}
 static bool     g_autofocus_next;         /* see ui_text_field_autofocus */
 
 void ui_text_field_autofocus(void) { g_autofocus_next = true; }
@@ -846,6 +848,8 @@ bool ui_control_interact(struct instance_handle self) {
 
 static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool masked) {
     const struct ui_theme *t = TH;
+    float width=g_field_next_width,height=g_field_next_height;
+    g_field_next_width=g_field_next_height=0;
     bool     emph  = g_emph_on;
     unsigned emph_s = g_emph_start, emph_n = g_emph_len;
     g_emph_on = false;                    /* consumed, whether or not it is used */
@@ -1155,7 +1159,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     ui_set_border(focused ? 1.5f : 1.0f,
                   focused ? CP(focus, t->accent) : CP(border, t->border_strong));
     ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
-    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_size(width>0?sz_fixed(width):sz_grow(),height>0?sz_fixed(height):sz_intrinsic());
     ui_set_align(ALIGN_CENTER);
 
     ui_begin_hstack(0);

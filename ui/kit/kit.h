@@ -103,6 +103,9 @@ struct color ui_ctl_color_(int which, struct color dflt);
  * whether a click landed in the field its commands would reach. */
 int ui_focused_field_rect(float *x, float *y, float *w, float *h);
 
+/* Layout for the next field; zero keeps the growing/intrinsic default. */
+void ui_text_field_next_size(float width,float height);
+
 bool ui_text_field(char *buf, unsigned long cap, const char *placeholder);
 bool ui_password_field(char *buf, unsigned long cap, const char *placeholder);
 

@@ -467,7 +467,7 @@ int em_app_run(const EmApp *app) {
                 else if(y<=inset_t+4){want=EmWinFill;have_want=1;}
             }
         }
-        if (!have_want && em_window_take_maximize()) { want = EmWinFill; have_want = 1; }
+        if (!have_want && em_window_take_maximize()) { want = layout_now==EmWinFill?EmWinNormal:EmWinFill; have_want = 1; }
         /* PLEASE CLOSE -- the close light, or GUI+W. The runtime takes the app
          * down the ordinary way (the same path Escape and em_app_request_exit
          * use), so main() returns, files close and the window is destroyed by

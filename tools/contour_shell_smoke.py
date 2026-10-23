@@ -32,7 +32,7 @@ def main():
         eventually(lambda:cfg('settings',w['pid'],'custom_surface')==0xE4E8DF,'custom surface did not save')
         ui.reveal(w,'Custom accent')
         current=d.read('settings',w['pid'],'g_accent_hex',8).split(b'\0',1)[0].decode()
-        ui.click_text(w,current);d.key('meta_l-a');d.type('D66F52');ui.select(w,'Custom accent','Use colour')
+        ui.reveal(w,current);ui.click_text(w,current);d.key('meta_l-a');d.type('D66F52');ui.select(w,'Custom accent','Use colour')
         eventually(lambda:cfg('home',home,'accent_custom')==1 and cfg('home',home,'custom_accent')==0xD66F52,'custom accent did not reach shell')
         d.g.pump(3);d.snap('custom-palette')
         d.click(1127,17);d.g.pump(2)

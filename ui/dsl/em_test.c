@@ -445,6 +445,13 @@ int main(void) {
               "without it the change is read a flush too early and thrown away");
     }
 
+    char sized_field[16]="value";
+    ui_frame_begin();VStack(.key="sized-field") {TextField(sized_field,sizeof sized_field,"Value").width(112);}
+    em_flush();ui_frame_end();ui_run_layout(400,100);
+    float fx,fy,fw,field_h;
+    CHECK(ui_rect_of(ui_first_child(ui_first_child(ui_root())),&fx,&fy,&fw,&field_h) && fw==112,
+          "a text field honors its authored width");
+
     char query[32]="";bool submitted=false;
     /* A search field forwards its own submit edge, exactly once. */
     for(int pass=0;pass<3;pass++) {

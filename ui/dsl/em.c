@@ -1012,13 +1012,15 @@ static void em_text_menu(void) {
 }
 
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
-    (void)p; if (out_hov) *out_hov = false;
+    if (out_hov) *out_hov = false;
+    ui_text_field_next_size(p.width,p.height);
     bool f = ui_text_field(buf, cap, ph);
     if (f) em_text_menu();
     return f;
 }
 static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
-    (void)p; if (out_hov) *out_hov = false;
+    if (out_hov) *out_hov = false;
+    ui_text_field_next_size(p.width,p.height);
     return ui_password_field(buf, cap, ph);
 }
 static void em_segmented_impl(const char *const *labels, int count, int *bind, EmProps p) {
@@ -1631,14 +1633,14 @@ static void em_zoom_board(void) {
         em_window_post_layout(pick);
         g_zoom_open = 0;
     } else if (outside) {
-        /* A CLICK ON THE LIGHT ITSELF still means "fill". The board's scrim
+        /* A click on the light still toggles fill/restore. The board's scrim
          * covers the whole window, the light included, so the light's own
          * handler never sees that press -- and since the board opens on hover,
          * that is the state every click on the light is made in. */
         float px, py; ui_pointer_pos(&px, &py);
         int on_light = px >= g_zoom_light[0] && px <= g_zoom_light[2] &&
                        py >= g_zoom_light[1] && py <= g_zoom_light[3];
-        if (on_light) em_window_post_layout(EmWinFill);
+        if (on_light) em_window_post_maximize();
         g_zoom_open = 0;
     }
 }

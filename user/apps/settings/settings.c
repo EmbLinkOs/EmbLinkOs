@@ -125,7 +125,7 @@ static void setting_label(const char *title, const char *why) {
 
 /* Bind controls and flush before reading staged DSL values. */
 static void choice(const char *title,const char *detail,const char *const *labels,int n,int *value) {
-    HStack(.spacing=16,.align=Center,.py=4,.grow=1) {
+    HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key=title) {
         setting_label(title,detail);
         int pick=*value;Segmented(labels,n,&pick);Sync();
         if(pick!=*value) {
@@ -136,7 +136,7 @@ static void choice(const char *title,const char *detail,const char *const *label
     }
 }
 static void switch_row(const char *title,const char *detail,int *value) {
-    HStack(.spacing=16,.align=Center,.py=4,.grow=1) {
+    HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key=title) {
         setting_label(title,detail);bool on=!!*value;Toggle("",&on);Sync();
         if(on!=!!*value){*value=on;commit();}
     }
@@ -147,7 +147,7 @@ static int rgb_parse(const char *s,int *value) {
     *value=(int)strtoul(s,0,16);return 1;
 }
 static void colour_editor(const char *label,char *buffer,int *value,int *enabled) {
-    HStack(.spacing=12,.align=Center) {
+    HStack(.spacing=12,.align=Center,.key=label) {
         setting_label(label,"Six hexadecimal digits, without #.");
         TextField(buffer,8,"RRGGBB").width(112);
         if(Button("Use colour").secondary().clicked()) {
@@ -196,7 +196,7 @@ static void pane_appearance(void) {
         choice("Appearance","A light or dark foundation.",modes,2,&g_cfg.dark);
         choice("Surfaces","Coordinate every window and temporary panel.",surfaces,4,&g_cfg.surface_style);
         if(g_cfg.surface_style==3)colour_editor("Surface colour",g_surface_hex,&g_cfg.custom_surface,0);
-        HStack(.spacing=8,.align=Center) {
+        HStack(.spacing=8,.align=Center,.key="accent-swatches") {
             setting_label("Accent","Coordinated for readable selection, focus and actions.");
             for(int i=0;i<OSCFG_ACCENTS;i++) {
                 const struct oscfg_accent *a=&oscfg_accents[i];Color c={a->r,a->g,a->b,1};
