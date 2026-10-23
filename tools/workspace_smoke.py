@@ -139,13 +139,13 @@ def main():
         w=d.launch('Editor','Editor')
         d.click(w['x']+100,w['y']+150);d.type(original)
         expect_text('edit',w,original)
+        d.key('up');d.g.pump(1)
+        assert all(v['title']!='Save' for v in d.state()['windows']), 'Up was mistaken for Ctrl+S'
         d.key('ctrl-s');d.wait_window('Save');d.snap('shared-save')
         save_as('Milestone.txt')
         assert text('edit',w,'g_path')=='/home/tester/Documents/Milestone.txt'
         assert text('edit',w,'g_status').startswith('Saved ')
         d.snap('document-saved')
-        d.key('up');d.g.pump(1)
-        assert all(v['title']!='Save' for v in d.state()['windows']), 'Up was mistaken for Ctrl+S'
         d.click(w['x']+590,w['y']+65);panel=d.wait_window('Save')
         d.click(panel['x']+717,panel['y']+379);d.g.pump(1)
         assert integer('filepanel',panel,'g_replace')==1,'existing Save As skipped replacement confirmation'
