@@ -96,6 +96,8 @@ static int64_t sys_write(const struct sysargs *a) {
     const char *buf = (const char *)a->arg[1];
     size_t len = (size_t)a->arg[2];
 
+    struct fd_entry held;int borrowed=fd_borrow(fd,&held);if(borrowed)return borrowed;
+    if((fd_entry_flags(&held)&O_ACCMODE)==O_RDONLY){fd_return(&held);return -EMBK_EBADF;}
     /* Heap bounce buffer, one allocation per call -- same reasoning as sys_read:
      * the chunk size is the throughput lever, and the kernel stack could never
      * afford a big one. Falls back to a small stack chunk if kmalloc fails. */
@@ -121,7 +123,7 @@ static int64_t sys_write(const struct sysargs *a) {
 
         size_t advanced;
         size_t written = 0;
-        int rc = vfs_fd_write(fd, chunk, n, &written);
+        int rc = fd_write_entry(&held, chunk, n, &written);
         if (rc != EMBK_OK) {
             ret = done > 0 ? (int64_t)done : rc;
             goto out;
@@ -139,7 +141,7 @@ out:
     if (chunk != fallback) {
         kfree(chunk);
     }
-    return ret;
+    fd_return(&held);return ret;
 }
 
 /* read(fd, buf, len) -> bytes read, via the fd/VFS layer. No fd 0 (stdin)
@@ -152,10 +154,8 @@ static int64_t sys_read(const struct sysargs *a) {
     char *buf = (char *)a->arg[1];
     size_t len = (size_t)a->arg[2];
 
-    if ( fd == 1 || fd == 2) {
-        return -EMBK_EINVAL;   // no stdio-fd read support yet
-    }
-
+    struct fd_entry held;int borrowed=fd_borrow(fd,&held);if(borrowed)return borrowed;
+    if((fd_entry_flags(&held)&O_ACCMODE)==O_WRONLY){fd_return(&held);return -EMBK_EBADF;}
     /* Bounce buffer on the HEAP, one allocation for the whole call.
      *
      * It used to be `char chunk[SYSCALL_IO_CHUNK]` on the kernel stack, which
@@ -197,7 +197,7 @@ static int64_t sys_read(const struct sysargs *a) {
         }
 
         size_t got = 0;
-        int rc = vfs_fd_read(fd, chunk, n, &got);
+        int rc = fd_read_entry(&held, chunk, n, &got);
         if (rc != EMBK_OK) {
             ret = done > 0 ? (int64_t)done : rc;
             goto out;
@@ -212,7 +212,7 @@ static int64_t sys_read(const struct sysargs *a) {
              * and if the fd CAN'T rewind (a pipe: ESPIPE), say so instead of
              * ignoring the failure and silently eating the bytes. */
             uint64_t np = 0;
-            int srr = vfs_fd_seek(fd, -(int64_t)got, 1 /* SEEK_CUR */, &np);
+            int srr = (held.ops->seek?held.ops->seek(&held,-(int64_t)got,1,&np):-EMBK_ESPIPE);
             kprintf("sys_read: copy_to_user FAULT pid=%u dst=0x%llx off_done=%llu (%s %llu)\n",
                     current_thread ? (unsigned)current_process->pid : 0u,
                     (unsigned long long)(uintptr_t)(buf + done),
@@ -234,7 +234,7 @@ out:
     if (chunk != fallback) {
         kfree(chunk);
     }
-    return ret;
+    fd_return(&held);return ret;
 }
 
 /* open(path, flags, mode) -> fd, or -errno. `path` is copied in through a
@@ -365,11 +365,10 @@ static int64_t sys_fd_avail(const struct sysargs *a) {
     return vfs_fd_avail(fd);
 }
 
-/* fcntl(fd, cmd, arg) -- the sliver of POSIX fcntl the kernel actually owns:
- * the O_NONBLOCK fd flag. cmd 1 = get (returns 1 if non-blocking, else 0);
- * cmd 2 = set non-blocking to `arg`. F_DUPFD is served by SYS_dup, which the
- * libc's fcntl() routes to. cmd 3 returns access/nonblock wire flags;
- * cmd 4/5 read/write the per-descriptor close-on-exec bit. */
+/* Stable fcntl wire operations: 1/2 retain nonblocking-only get/set;
+ * 3 queries access plus shared status; 4/5 get/set descriptor CLOEXEC;
+ * 6 replaces the mutable nonblocking/append bits (wire bits 2/3).
+ * F_DUPFD continues to use SYS_dup. */
 static int64_t sys_fcntl(const struct sysargs *a) {
     int fd  = (int)a->arg[0];
     int cmd = (int)a->arg[1];

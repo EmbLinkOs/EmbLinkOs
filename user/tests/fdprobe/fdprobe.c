@@ -19,6 +19,14 @@
 #define RECORDS 32
 static unsigned checks,failures;
 static char root[256],path[256];
+static volatile unsigned read_started,read_finished;
+static int read_result;
+static int getall(int,void *,size_t);
+static void delayed_reader(long fd) {
+    char reply[8];__atomic_store_n(&read_started,1,__ATOMIC_RELEASE);
+    read_result=getall((int)fd,reply,sizeof reply)==0 && !memcmp(reply,"delayed\n",8);
+    __atomic_store_n(&read_finished,1,__ATOMIC_RELEASE);embk_thread_exit(0);
+}
 #define CHECK(c) do { checks++;if(!(c)){printf("FAIL line %d: %s (errno %d)\n",__LINE__,#c,errno);failures++;} } while(0)
 static int putall(int fd,const void *data,size_t n) {
     const char *p=data;while(n){int k=write(fd,p,n);if(k<=0)return -1;p+=k;n-=(size_t)k;}return 0;
@@ -43,6 +51,7 @@ static void gated_pipe(int fds[2]) {
 }
 static int helper(int argc,char **argv) {
     if(!strcmp(argv[1],"--noop"))return 42;
+    if(!strcmp(argv[1],"--stdio-read")){char byte;return read(1,&byte,1)==1 && byte=='!'?42:94;}
     if(!strcmp(argv[1],"--flags"))return argc==3 && fcntl(atoi(argv[2]),F_SETFL,O_NONBLOCK|O_APPEND)==0?42:80;
     if(!strcmp(argv[1],"--hold")){if(putall(1,"ready",5))return 81;for(;;)embk_sleep_ms(100);}
     if(!strcmp(argv[1],"--writer")) {
@@ -114,7 +123,10 @@ static void append(void) {
     CHECK(lseek(b,0,SEEK_SET)==0 && write(b,"",0)==0 && lseek(b,0,SEEK_CUR)==0);
     CHECK(fcntl(b,F_SETFL,0)==0 && write(b,"!",1)==1);
     CHECK(fcntl(b,F_SETFL,O_APPEND)==0 && lseek(b,0,SEEK_SET)==0 && write(b,"Z",1)==1);
-    CHECK(lseek(a,0,SEEK_SET)==0 && read(a,data,sizeof data)==7 && !memcmp(data,"!eedXYZ",7));close(a);close(b);
+    CHECK(lseek(a,0,SEEK_SET)==0 && read(a,data,sizeof data)==7 && !memcmp(data,"!eedXYZ",7));
+    CHECK(lseek(a,0,SEEK_SET)==0);char *args[]={"fdprobe","--stdio-read",NULL};collect(child(args,-1,a),42);
+    CHECK(lseek(a,0,SEEK_CUR)==1);close(a);close(b);
+    a=open(path,O_RDONLY);CHECK(a>=0 && ftruncate(a,0)==-1 && errno==EBADF);close(a);
 }
 static void parallel_writers(int independent) {
     int fd=open(path,O_CREAT|O_TRUNC|O_RDWR,0644);CHECK(fd>=0);int gate[2];gated_pipe(gate);
@@ -187,6 +199,17 @@ static void network(void) {
     CHECK(handle>=0 && embk_kill(handle)==0);
     int status=0;CHECK(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
     CHECK(putall(s,"after-kill\n",11)==0 && getall(s,reply,11)==0 && !memcmp(reply,"after-kill\n",11));close(s);
+    for(int round=0;round<8;round++) {
+        s=socket(AF_INET,SOCK_STREAM,0);CHECK(s>=0 && connect(s,(void *)&a,sizeof a)==0);
+        CHECK(putall(s,"delayed\n",8)==0);read_started=read_finished=0;read_result=0;
+        int tid=(int)embk_thread_create(delayed_reader,s);CHECK(tid>=0);
+        uint64_t deadline=embk_uptime_ms()+5000;
+        while(!__atomic_load_n(&read_started,__ATOMIC_ACQUIRE) && embk_uptime_ms()<deadline)embk_sleep_ms(1);
+        CHECK(read_started!=0);embk_sleep_ms(30);close(s);
+        int reused=socket(AF_INET,SOCK_DGRAM,0);CHECK(reused==s);
+        while(!__atomic_load_n(&read_finished,__ATOMIC_ACQUIRE) && embk_uptime_ms()<deadline)embk_sleep_ms(5);
+        CHECK(read_finished && read_result);if(read_finished)CHECK(embk_thread_join(tid)==0);close(reused);
+    }
     int u=socket(AF_INET,SOCK_DGRAM,0);alias=dup(u);CHECK(u>=0 && alias>=0);close(u);a=address(39382);a.sin_addr.s_addr=htonl(0x0a000202);
     CHECK(sendto(alias,"datagram",8,0,(void *)&a,sizeof a)==8);
     CHECK(recvfrom(alias,reply,sizeof reply,0,NULL,NULL)==8 && !memcmp(reply,"datagram",8));

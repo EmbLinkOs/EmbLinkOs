@@ -137,12 +137,12 @@ struct fd_ops {
  * fresh open -- it is an accidental third thing that corrupts silently, which
  * is precisely why vnode_fd_inherit() used to refuse rather than approximate.
  *
- * `refs` counts descriptors, across every process. The vnode's own reference
- * is released once, when the last of them goes. */
+ * `refs` counts descriptors and in-flight I/O loans across every process.
+ * The vnode's own reference is released once, when the last of them goes. */
 struct open_file {
     struct vnode vn;
     uint64_t pos;
-    int refs;                   /**< descriptors pointing here; atomic */
+    int refs;                   /**< descriptors and I/O loans; atomic */
 
     /* The file's PAGES. Not "a cache this fd keeps" -- the one object every
      * descriptor onto this file shares, so a write through one is visible to a
@@ -177,6 +177,12 @@ int vfs_open(const char *path, int flags, uint32_t mode);
 int vfs_close(int fd);
 int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read);
 int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
+/* Keep one resolved backing across a whole syscall, including bounce chunks.
+ * Return on every exit. A PTY loan pins storage without extending endpoint life. */
+int fd_borrow(int fd,struct fd_entry *copy);
+void fd_return(struct fd_entry *copy);
+int fd_read_entry(struct fd_entry *,void *,size_t,size_t *);
+int fd_write_entry(struct fd_entry *,const void *,size_t,size_t *);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */

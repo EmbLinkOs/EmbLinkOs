@@ -868,9 +868,8 @@ int dup(int fd) {
  * after applying ordered actions. Native explicit-transfer launches retain
  * their existing policy.
  *
- * F_GETFL translates the actual access mode and nonblocking state from the
- * kernel. F_SETFL changes nonblocking state; other mutable file flags remain
- * outside this adapter's current contract.
+ * F_GETFL translates access mode and shared append/nonblocking state.
+ * F_SETFL changes those supported status bits without changing access mode.
  * F_DUPFD is real, and routes to the same kernel operation dup() uses -- with
  * the "lowest free descriptor AT OR ABOVE this number" behaviour that is the
  * only thing distinguishing it from dup().

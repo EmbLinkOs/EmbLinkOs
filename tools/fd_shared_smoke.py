@@ -25,7 +25,9 @@ def main():
                         try:data=c.recv(4096)
                         except socket.timeout:continue
                         if not data:break
-                        received.extend(data);c.sendall(data)
+                        received.extend(data)
+                        if data==b'delayed\n':time.sleep(.3)
+                        c.sendall(data)
         except Exception as e:errors.append(str(e))
     def datagram():
         try:
@@ -69,7 +71,8 @@ def main():
         assert matches and all(a==b for a,b in matches),text
         d.snap('shared-socket-traffic')
         type_text('echo 82649\n');eventually(lambda:'82649' in screen.text(w).splitlines() and prompt(),'prompt after socket checks')
-        assert bytes(received)==b'child-net\nparent-net\nafter-kill\n'*2,(received,errors)
+        expected=b'child-net\nparent-net\nafter-kill\n'+b'delayed\n'*8
+        assert bytes(received)==expected*2,(received,errors)
         assert datagrams==['datagram','','datagram',''] and not errors,(datagrams,errors)
         assert b'PANIC' not in d.g.seen
         (out/'fixtures.json').write_text(json.dumps({'tcp_bytes':len(received),'tcp':received.decode(),'udp':datagrams,'errors':errors},indent=2)+'\n')
