@@ -22,6 +22,7 @@
 
 #ifndef __EMBK_H__
 #define __EMBK_H__
+#include "embk_terminal.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -71,6 +72,7 @@
  * action-passing app rebuilt when they do). */
 #define EMBK_SPAWN_ACTION_OPEN        1
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
+#define EMBK_SPAWN_ACTION_INHERIT_FD 9    /* src_obj_handle names a parent fd */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
 #define EMBK_SPAWN_SESSION_LIVE 1u
@@ -168,6 +170,15 @@ static inline int embk_fd_install_obj(int handle, int target_fd) {
  * the next read() returns immediately. */
 static inline int64_t embk_fd_avail(int fd) {
     return embk_syscall1(EMBK_SYS_fd_avail, fd);
+}
+static inline int embk_terminal_control(int fd,unsigned op,void *data,unsigned bytes) {
+    return (int)embk_syscall4(EMBK_SYS_terminal,fd,op,(int64_t)(uintptr_t)data,bytes);
+}
+static inline int embk_openpty(int pair[2]) {
+    return embk_terminal_control(-1,EMBK_TERMINAL_OPEN,pair,2*sizeof(int));
+}
+static inline int embk_terminal_foreground(int fd,int handle) {
+    return embk_terminal_control(fd,EMBK_TERMINAL_FOREGROUND,&handle,sizeof handle);
 }
 /* Remove a file (the shell's rm). 0 or -EMBK_*. */
 static inline int embk_unlink(const char *path) {

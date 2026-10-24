@@ -4,9 +4,10 @@
  * pointing at a file that does not exist for this target -- broken the same
  * way its utime.h is (see user/lib/sys/utime.h). Same cure: override it.
  *
- * EmbLink's console has no termios line discipline; tcgetattr()/tcsetattr()
- * are defined in syscalls.c as honest ENOTTY-style refusals so callers (git's
- * terminal prompting) take their "not a terminal" fallback paths. */
+ * Private PTY sessions implement canonical/raw input and echo. The legacy
+ * machine console still refuses termios. Unsupported flags and timed reads
+ * fail explicitly; see docs/TERMINAL.md for the supported subset. */
+
 #ifndef _EMBK_TERMIOS_H
 #define _EMBK_TERMIOS_H
 
@@ -28,6 +29,16 @@ struct termios {
 #define ISIG   0x0001
 #define ICANON 0x0002
 #define ECHO   0x0008
+#define ECHOE  0x0010
+#define ECHOK  0x0020
+#define ICRNL  0x0100
+#define OPOST  0x0001
+#define ONLCR  0x0004
+#define CS8    0x0030
+#define VINTR  0
+#define VERASE 2
+#define VKILL  3
+#define VEOF   4
 #define VMIN   6
 #define VTIME  5
 
@@ -41,6 +52,7 @@ extern "C" {
 
 int tcgetattr(int fd, struct termios *t);
 int tcsetattr(int fd, int actions, const struct termios *t);
+void cfmakeraw(struct termios *t);
 
 #ifdef __cplusplus
 }

@@ -165,7 +165,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
              kernel/process/debug.c \
-			 kernel/tty/tty.c \
+			 kernel/tty/tty.c kernel/tty/pty.c \
              kernel/acpi/acpi.c \
              kernel/acpi/aml.c \
              kernel/acpi/acpi_dev.c \
@@ -639,7 +639,7 @@ endef
 
 # The programs built this way. Adding a name here makes it a PIE; it must have
 # exactly one source file and no non-PIC dependency.
-NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher
+NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher ttyprobe
 
 .PHONY: pie-check
 pie-check:
@@ -1614,7 +1614,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/ttyprobe/ttyprobe.c user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
 EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
 EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
@@ -1980,7 +1980,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf $(if $(PIE_OK),build/pieprobe.elf,) \
+EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf $(if $(PIE_OK),build/pieprobe.elf,) \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
@@ -2602,9 +2602,14 @@ compile-commands:
 
 .PHONY: compile-commands
 
+.PHONY: terminal-test
+terminal-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/tty/pty_host.c -o $(BUILD)/pty_host_test
+	$(BUILD)/pty_host_test
 # The structured shell's pure pipeline (lexer -> parser -> evaluator ->
 # builtins + the wire round-trip), host-run. The two OS-backed pieces (ls,
 # external spawn) link as stubs; they get exercised live by `test shell`.
+
 shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \

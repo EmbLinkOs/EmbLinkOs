@@ -411,6 +411,9 @@ struct thread {
                              * only given an environment when its parent passes
                              * one (see spawn.h). Guarded by has_argv, which is
                              * set on the same path. */
+    /* A blocking PTY syscall pins storage independently of descriptors.
+     * Reaping a hard-killed thread must release the pin its stack cannot. */
+    struct pty *io_pty;
 };
 
 /* The resource owner: address space, pid, parent/child tracking, fd/handle
@@ -876,6 +879,8 @@ void wait_queue_wake_all(struct wait_queue *wq);
  * @return EMBK_OK, or -EMBK_EINVAL if no such process.
  */
 int process_cancel(uint32_t pid);
+/* Same cancellation under an already-held scheduler lock (PTY hangup/reap). */
+int process_cancel_locked(uint32_t pid);
 
 /* Raise a counted interrupt on `pid` if it has opted in (intr_catch), waking
  * its blocked threads exactly as a cancellation does so a sleeper notices.

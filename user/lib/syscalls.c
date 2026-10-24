@@ -1513,18 +1513,40 @@ struct passwd *getpwuid(uid_t uid)        { (void)uid;  errno = ENOENT; return N
 struct passwd *getpwnam(const char *name) { (void)name; errno = ENOENT; return NULL; }
 
 char *getpass(const char *prompt) { (void)prompt; errno = ENOTTY; return NULL; }
-int tcgetattr(int fd, struct termios *t) { (void)fd; (void)t; errno = ENOTTY; return -1; }
+int tcgetattr(int fd, struct termios *t) {
+    if (!t) { errno=EFAULT; return -1; }
+    struct embk_terminal_attr a;
+    int rc=embk_terminal_control(fd,EMBK_TERMINAL_GET_ATTR,&a,sizeof a);
+    if (rc<0) return embk_fail(rc);
+    memset(t,0,sizeof *t);
+    t->c_iflag=a.iflag; t->c_oflag=a.oflag; t->c_cflag=a.cflag; t->c_lflag=a.lflag;
+    memcpy(t->c_cc,a.cc,sizeof a.cc); return 0;
+}
 int tcsetattr(int fd, int actions, const struct termios *t) {
-    (void)fd; (void)actions; (void)t; errno = ENOTTY; return -1;
+    if (!t) { errno=EFAULT; return -1; }
+    if (actions!=TCSANOW && actions!=TCSAFLUSH) { errno=actions==TCSADRAIN?ENOTSUP:EINVAL; return -1; }
+    for (unsigned i=EMBK_TCC_COUNT;i<NCCS;i++) if (t->c_cc[i]) { errno=ENOTSUP; return -1; }
+    struct embk_terminal_attr a; memset(&a,0,sizeof a);
+    a.iflag=t->c_iflag; a.oflag=t->c_oflag; a.cflag=t->c_cflag; a.lflag=t->c_lflag;
+    memcpy(a.cc,t->c_cc,sizeof a.cc);
+    int rc=embk_terminal_control(fd,actions==TCSAFLUSH?EMBK_TERMINAL_SET_ATTR_FLUSH:EMBK_TERMINAL_SET_ATTR,&a,sizeof a);
+    return rc<0?embk_fail(rc):0;
+}
+void cfmakeraw(struct termios *t) {
+    t->c_iflag=0; t->c_oflag=0; t->c_lflag=0; t->c_cflag=CS8;
+    t->c_cc[VMIN]=1; t->c_cc[VTIME]=0;
 }
 
 int ioctl(int fd, unsigned long request, ...) {
-    /* TIOCGWINSZ is the caller that matters; the console has no winsize
-     * protocol, and a fabricated 80x24 would be a guess dressed as a
-     * measurement. Callers fall back to their defaults. */
-    (void)fd; (void)request;
-    errno = ENOSYS;
-    return -1;
+    if (request!=TIOCGWINSZ && request!=TIOCSWINSZ) { errno=ENOTSUP; return -1; }
+    va_list ap; va_start(ap,request); struct winsize *w=va_arg(ap,struct winsize *); va_end(ap);
+    if (!w) { errno=EFAULT; return -1; }
+    struct embk_terminal_size s;
+    if (request==TIOCSWINSZ) { s.rows=w->ws_row; s.cols=w->ws_col; s.xpixel=w->ws_xpixel; s.ypixel=w->ws_ypixel; }
+    int rc=embk_terminal_control(fd,request==TIOCGWINSZ?EMBK_TERMINAL_GET_SIZE:EMBK_TERMINAL_SET_SIZE,&s,sizeof s);
+    if (rc<0) return embk_fail(rc);
+    if (request==TIOCGWINSZ) { w->ws_row=s.rows; w->ws_col=s.cols; w->ws_xpixel=s.xpixel; w->ws_ypixel=s.ypixel; }
+    return 0;
 }
 
 /* mmap -- ANONYMOUS PRIVATE ONLY, over the kernel's EMBK_SYS_mmap.

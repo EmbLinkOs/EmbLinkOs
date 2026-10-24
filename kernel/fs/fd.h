@@ -61,10 +61,12 @@ enum fd_backing {
     FD_BACKING_NULLDEV,       /**< /dev/null: EOF source / discard sink (stateless) */
     FD_BACKING_SOCKET,        /**< a TCP connection (kernel/net/tcp) -- M4 network fd */
     FD_BACKING_UDP,           /**< a UDP datagram socket (kernel/net/udp) -- M5 */
+    FD_BACKING_PTY,           /**< isolated master/slave terminal session */
 };
 
 struct pipe;   /* opaque -- defined in kernel/ipc/pipe.c; the fd layer only
                 * stores the pointer + side and dispatches through pipe_fd_ops. */
+struct pty;
 
 /* Per-backing dispatch, sme pattern as struct vfs_ops and struct gpu_driver.
  * Adding a fourth backing later touches this table, not four switch statements. 
@@ -165,6 +167,7 @@ struct fd_entry {
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
         struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
         struct { int us; } udp;                          /**< FD_BACKING_UDP (UDP socket index) */
+        struct { struct pty *p; int side; } pty;
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
 };
@@ -224,6 +227,9 @@ int vfs_fd_dup(int oldfd, int newfd, int min_fd);
  * reference (ref bumped under the lock); the parent's obj-handle stays alive
  * and must be released separately for EOF. side: 0=read, 1=write. */
 int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side);
+int fd_alloc_pty(int pair[2]);
+int fd_terminal_control(int fd, unsigned op, void *data);
+int fd_inherit_into(struct process *target, int target_fd, int source_fd);
 
 /* Network sockets (M4). fd_alloc_socket() claims a free fd backed by an
  * unconnected TCP socket (conn = -1) in `p`; fd_socket_connect() runs the

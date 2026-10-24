@@ -10,6 +10,7 @@
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
 #include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
 #include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
+#include "tty/pty.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/vma.h"
@@ -501,6 +502,7 @@ static void thread_reap_slot(struct thread *t) {
         return;
     }
 
+    if (t->io_pty) { pty_unpin_locked(t->io_pty); t->io_pty=NULL; }
     vmm_free_kernel_stack(t->kstack_top, KSTACK_SIZE);
     /* A thread that died still holding a declaration gives it back here -- by
      * RECOUNTING, never by decrementing.
@@ -1262,20 +1264,17 @@ static void wake_expired_locked(void) {
  * ignore the flag forever. Escalation to the uncatchable process_kill() is the
  * PARENT's policy, not the kernel's.
  * -------------------------------------------------------------------- */
-int process_cancel(uint32_t pid) {
-    spin_lock(&g_sched_lock);
+int process_cancel_locked(uint32_t pid) {
 
     struct process *proc = process_find(pid);
     if (!proc) {
         /* EINVAL, matching process_handle_resolve()'s answer for a handle that
          * names nothing -- the kernel has no ESRCH. */
-        spin_unlock(&g_sched_lock);
         return -EMBK_EINVAL;
     }
     if (proc->live_thread_count == 0) {
         /* Already gone. Cancelling a corpse is not an error: the requested end
          * state ("it is not running") already holds. */
-        spin_unlock(&g_sched_lock);
         return EMBK_OK;
     }
 
@@ -1294,8 +1293,11 @@ int process_cancel(uint32_t pid) {
         }
     }
 
-    spin_unlock(&g_sched_lock);
     return EMBK_OK;
+}
+
+int process_cancel(uint32_t pid) {
+    sched_lock(); int rc=process_cancel_locked(pid); sched_unlock(); return rc;
 }
 
 /* See the comment on intr_catch in process.h for why this exists alongside
@@ -2321,9 +2323,18 @@ int process_create_env(const char *path, char *const argv[], int argc,
                                EMBK_CAP_INHERIT);
 }
 
-/* Create a new process from an ELF executable, WITH an explicit capability
- * request. process_create_env() below is the requested_caps == EMBK_CAP_INHERIT
- * wrapper. */
+/* A rejected spawn may already own inherited terminal/pipe references.
+ * Release them before its unpublished process slot is reused. */
+static void spawn_discard_fds(struct process *proc) {
+    for (int i=0;i<FD_MAX_OPEN;i++) {
+        struct fd_entry *e=&proc->fds[i];
+        if (e->used && e->ops && e->ops->close) e->ops->close(e);
+        memset(e,0,sizeof *e);
+    }
+}
+
+/* Create a process with an explicit capability request. process_create_env()
+ * above supplies EMBK_CAP_INHERIT for callers using the native default. */
 int process_create_caps(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count,
@@ -2557,6 +2568,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             int fd = fd_open_into(proc, act->target_fd, act->path, act->flags, act->mode);
             if (fd < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return fd;  // fd_open_into failed
             }
@@ -2568,12 +2580,14 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * child. Needs a real spawning process holding the surface. */
             if (!current_thread) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EINVAL;
             }
             int dh = surface_transfer_to(current_process, act->target_fd, proc);
             if (dh < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return dh;  // transfer failed (bad handle / OOM)
             }
@@ -2582,14 +2596,24 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * the channel stays open, only the holder changes (Layer A). */
             if (!current_thread) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EINVAL;
             }
             int dh = channel_transfer_end_to(current_process, act->target_fd, proc);
             if (dh < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return dh;
+            }
+        } else if (act->kind == SPAWN_ACTION_INHERIT_FD) {
+            int rc=fd_inherit_into(proc,act->target_fd,act->src_obj_handle);
+            if (rc<0) {
+                vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
+                proc->pid = 0;
+                return rc;
             }
         } else if (act->kind == SPAWN_ACTION_INSTALL_OBJ) {
             /* Install a byte-stream obj-handle the PARENT holds as a plain fd
@@ -2602,17 +2626,20 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * worse than spawn failing outright (same policy as ACTION_OPEN). */
             if (!current_thread) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EINVAL;
             }
             if (act->src_obj_handle < 0 || act->src_obj_handle >= OBJ_HANDLE_MAX) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EBADF;
             }
             struct obj_handle *oh = &current_process->obj_handles[act->src_obj_handle];
             if (!oh->used) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EBADF;
             }
@@ -2634,6 +2661,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             }
             if (irc < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return irc;
             }
@@ -2653,12 +2681,14 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             if (!current_process ||
                 !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_DEBUG))) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EPERM;
             }
             want_debug = 1;
         } else {
             vmm_destroy_address_space(pml4);
+            spawn_discard_fds(proc);
             proc->pid = 0;
             return -EMBK_EINVAL;  // unknown spawn action kind
         }
@@ -2677,6 +2707,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                         PROT_READ | PROT_WRITE) != 0) {
         vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_ENOMEM;
     }
@@ -2688,6 +2719,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     if (!stack_phys) {
         vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_ENOMEM;  // Failed to allocate user stack
     }
@@ -2713,6 +2745,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             > PAGE_SIZE) {
         vma_destroy_all(proc);          /* the stack's frame is its object's, not ours to free */
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_E2BIG;
     }
@@ -2775,6 +2808,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         pmm_free_page(stack_phys);
         vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_EIO;  // Failed to allocate kernel stack
     }
@@ -2805,6 +2839,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * child the debugger asked to hold. */
             vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+            spawn_discard_fds(proc);
             proc->pid = 0;
             return -EMBK_ENOMEM;
         }

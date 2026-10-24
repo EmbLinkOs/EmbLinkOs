@@ -50,6 +50,7 @@
 #include "process/futex.h"
 #include "process/debug.h"   /* sys_debug_* handlers for the table below */
 #include "tty/tty.h"
+#include "tty/pty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
 #include "ipc/clipboard.h"
@@ -1461,6 +1462,28 @@ static int64_t sys_win_restore(const struct sysargs *a) {
 }
 
 #include "../../user/lib/embk_desktop.h"
+/* terminal(fd, op, buffer, bytes): all device authority comes from the fd.
+ * OPEN allocates a private pair and rolls back both descriptors on copyout. */
+static int64_t sys_terminal(const struct sysargs *a) {
+    int fd=(int)a->arg[0]; unsigned op=(unsigned)a->arg[1];
+    void *user=(void *)(uintptr_t)a->arg[2]; size_t bytes=(size_t)a->arg[3];
+    union { struct embk_terminal_attr attr; struct embk_terminal_size size; int pair[2]; int handle; } data;
+    size_t expected;
+    if (op==EMBK_TERMINAL_OPEN) expected=sizeof data.pair;
+    else if (op>=EMBK_TERMINAL_GET_ATTR && op<=EMBK_TERMINAL_SET_ATTR_FLUSH) expected=sizeof data.attr;
+    else if (op==EMBK_TERMINAL_GET_SIZE || op==EMBK_TERMINAL_SET_SIZE) expected=sizeof data.size;
+    else if (op==EMBK_TERMINAL_FOREGROUND) expected=sizeof data.handle;
+    else return -EMBK_EINVAL;
+    if (bytes!=expected) return -EMBK_EINVAL;
+    bool get=op==EMBK_TERMINAL_OPEN || op==EMBK_TERMINAL_GET_ATTR || op==EMBK_TERMINAL_GET_SIZE;
+    if (!get && copy_from_user(&data,user,expected)!=0) return -EMBK_EFAULT;
+    int rc=op==EMBK_TERMINAL_OPEN?fd_alloc_pty(data.pair):fd_terminal_control(fd,op,&data);
+    if (!rc && get && copy_to_user(user,&data,expected)!=0) {
+        if (op==EMBK_TERMINAL_OPEN) { vfs_close(data.pair[0]); vfs_close(data.pair[1]); }
+        return -EMBK_EFAULT;
+    }
+    return rc;
+}
 static int64_t sys_desktop_control(const struct sysargs *a) {
     int cg=cap_gate(EMBK_CAP_GPU);if(cg)return cg;
     if(a->arg[0]>EMBK_DESKTOP_MOVE_FRONT || a->arg[2]!=sizeof(struct embk_desktop))return -EMBK_EINVAL;
@@ -2869,6 +2892,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_close_ack] = sys_win_close_ack,
     [SYS_key_poll_input] = sys_key_poll_input,
     [SYS_desktop_control] = sys_desktop_control,
+    [SYS_terminal] = sys_terminal,
     [SYS_win_blur_rect]  = sys_win_blur_rect,
     [SYS_win_restore]    = sys_win_restore,
     [SYS_win_minimize]   = sys_win_minimize,
