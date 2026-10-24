@@ -479,6 +479,30 @@ static void t9_cross_gap(void) {
     layout_arena_destroy(&LA); scene_arena_destroy(&SA);
 }
 
+/* A centred dialog is a column inside a row. Its paragraph wraps as text,
+ * without an explicit wrapping Flow container. The row must budget that height. */
+static void t5_dialog_height(uint32_t fh) {
+    scene_arena_init(&SA);layout_arena_init(&LA);
+    struct layout_handle row=mk(LAYOUT_HANDLE_NULL,NODE_HANDLE_NULL,SCENE_NODE_GROUP,0);
+    L(row)->is_container=true;L(row)->axis=AXIS_ROW;L(row)->align=ALIGN_CENTER;
+    struct layout_handle dialog=mk(row,NODE_HANDLE_NULL,SCENE_NODE_RECT,0);
+    L(dialog)->is_container=true;L(dialog)->axis=AXIS_COLUMN;
+    L(dialog)->width=(struct layout_size){.mode=SIZE_FIXED,.fixed_value=100};
+    L(dialog)->padding_left=L(dialog)->padding_right=L(dialog)->padding_top=L(dialog)->padding_bottom=10;
+    L(dialog)->spacing=8;L(dialog)->align=ALIGN_STRETCH;
+    struct node_handle sn;
+    struct layout_handle text=mk(dialog,NODE_HANDLE_NULL,SCENE_NODE_TEXT,&sn);
+    scene_set_text(&SA,sn,"hello world hello world",fh,20,(struct color){1,1,1,1});
+    struct layout_handle actions=mk(dialog,NODE_HANDLE_NULL,SCENE_NODE_RECT,0);
+    L(actions)->height=(struct layout_size){.mode=SIZE_FIXED,.fixed_value=20};
+    layout_run(&LA,&SA,row,200,200);
+    float expected=layout_measure_height_at_width(&LA,&SA,text,80)+20+8+20;
+    CHECK(L(dialog)->resolved_h>=expected-.05f,"a centred dialog budgets all naturally wrapped paragraph lines");
+    CHECK(L(actions)->resolved_y>=L(text)->resolved_y+L(text)->resolved_h+7.95f,
+          "dialog actions follow the complete paragraph without clipping it");
+    layout_arena_destroy(&LA);scene_arena_destroy(&SA);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 5: layout-engine selftests ===\n");
     uint32_t fh = font_load(g_ttf, build_font());
@@ -491,6 +515,7 @@ int main(void) {
     t3d_wrap_no_shrink(fh);
     t4_stretch();
     t5_wrap(fh);
+    t5_dialog_height(fh);
     t6_writeback(fh);
     t7_space_around_evenly();
     t8_align_self();

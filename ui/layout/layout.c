@@ -385,14 +385,19 @@ static int shrinkable_default(int mode) {
  * is known, so they are right for everything EXCEPT a subtree that wraps --
  * which is why the expensive width-dependent measurement is gated on this
  * rather than run everywhere. */
-static int subtree_wraps(struct layout_arena *la, struct layout_handle h) {
+static int subtree_wraps(struct layout_arena *la, struct scene_arena *sa, struct layout_handle h) {
     struct layout_node *n = layout_resolve(la, h);
-    if (!n || !n->is_container) return 0;
+    if (!n) return 0;
+    if(is_text(sa,n)) {
+        struct scene_node *text=scene_resolve(sa,n->scene_node);
+        return text && !text->data.text.no_wrap;
+    }
+    if(!n->is_container)return 0;
     if (n->wrap && n->axis == AXIS_ROW) return 1;
     for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
         struct layout_node *cn = layout_resolve(la, c);
         if (!cn) break;
-        if (subtree_wraps(la, c)) return 1;
+        if (subtree_wraps(la, sa, c)) return 1;
         c = cn->next_sibling;
     }
     return 0;
@@ -1276,7 +1281,7 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
              * bottom of the box entirely. The wrap arm stretches to `lc`. */
         } else if (ktext && is_row) {
             crossv[i] = layout_measure_height_at_width(la, sa, kids[i], finalm[i]); /* height at final width */
-        } else if (is_row && k->is_container && subtree_wraps(la, kids[i])) {
+        } else if (is_row && k->is_container && subtree_wraps(la, sa, kids[i])) {
             /* ROW: a container child that WRAPS somewhere inside it cannot be
              * measured by intrinsic_h -- intrinsics are computed before any
              * width is known, so a wrapping row inside counts as one line. Ask

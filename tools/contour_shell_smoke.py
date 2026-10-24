@@ -29,7 +29,10 @@ def main():
         with Image.open(capture) as im:
             bright=sum(min(im.getpixel((x,y)))>170 for y in range(54,94) for x in range(35,75))
         assert bright>20,'monochrome desktop glyph lost contrast against the dark wallpaper'
-        d.key('meta_l-spc');d.g.pump(2);d.snap('monochrome-library');d.key('meta_l-spc');d.g.pump(1)
+        d.key('meta_l-spc');d.g.pump(2)
+        desktop=next(a for a in d.state()['windows'] if a['pid']==home)
+        assert abs(ui.text(desktop,'Calculator')['rect'][1]-ui.text(desktop,'Settings')['rect'][1])<2, 'a missing icon collapsed its library cell'
+        d.snap('monochrome-library');d.key('meta_l-spc');d.g.pump(1)
         ui.click_text(w,'Appearance');ui.select(w,'Surfaces','Custom')
         current=d.read('settings',w['pid'],'g_surface_hex',8).split(b'\0',1)[0].decode()
         ui.click_text(w,current);d.key('meta_l-a');d.type('E4E8DF');ui.select(w,'Surface colour','Use colour')
