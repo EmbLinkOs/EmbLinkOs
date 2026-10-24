@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-103 actual EmbLinkOS captures document the original laptop work, its
+110 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
-recoverable document workspaces, the Contour desktop redesign, and keyboard
-interaction. PNG exports preserve
+recoverable document workspaces, the Contour desktop redesign, keyboard
+interaction, private terminal sessions and VT screen emulation. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -13,6 +13,52 @@ Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show t
 merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
+
+## Latest: full-screen terminal
+
+Seven real QMP captures show the native screen witness, cross-application clipboard and restored shell. They use a disposable UEFI/NVMe session without a synthetic ACPI fixture. The witness exercises the emulator; it does not establish Vim, zsh or xterm compatibility.
+
+### A screen with independent regions
+
+The native raw-mode terminal witness keeps its heading and footer fixed while twelve log entries scroll inside its margins. Application-cursor Down selects the second row; colours and Unicode cells are rendered by the actual emulator.
+
+![A screen with independent regions](104-terminal-screen-region.png)
+
+### Cursor position, round trip
+
+The native application positions its cursor, requests a report and verifies the terminal reply through its own standard input. This is a screen-emulation witness, not an upstream application compatibility claim.
+
+![Cursor position, round trip](105-terminal-cursor-reply.png)
+
+### One screen, a larger workspace
+
+The real window control expands Terminal. The application queries updated PTY dimensions and redraws its screen at the new size; restoring the window is verified in the same run.
+
+![One screen, a larger workspace](106-terminal-live-resize.png)
+
+### Multiline paste reaches the program
+
+Text copied from Editor reaches the running raw-mode application inside bracketed-paste delimiters. The program verifies 22 bytes and one newline without treating that newline as an ordinary command.
+
+![Multiline paste reaches the program](107-terminal-bracketed-paste.png)
+
+### Screen text back in Editor
+
+Copy screen exports plain UTF-8 text without terminal escape sequences. Editor receives the complete multiline grid through a single paste command, replaces its selection and clears the retained highlight.
+
+![Screen text back in Editor](108-terminal-screen-editor.png)
+
+### Return to the native shell
+
+Leaving the alternate screen restores the previous native command and its result. The witness confirms its exit; alternate-screen content does not enter the primary output.
+
+![Return to the native shell](109-terminal-primary-restored.png)
+
+### A large clipboard in the code editor
+
+The guest doubles text using Editor selection/copy/paste commands, then copies more than 8 KiB into Note++. Its separate application paste hook receives the full multiline text without indexing beyond its clipboard buffer.
+
+![A large clipboard in the code editor](110-terminal-long-editor-paste.png)
 
 ## Latest: interactive terminal sessions
 

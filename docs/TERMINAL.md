@@ -2,8 +2,8 @@
 
 EmbLinkOS now has private pseudo-terminal pairs. Terminal launches the native
 shell on a terminal slave; programs inherit that slave through standard input,
-output and error. The emulator owns the master. This is the first development
-shell milestone, not a claim that zsh or arbitrary Unix applications run here.
+output and error. The emulator owns the master. The emulator now supplies a real VT screen model.
+This does not claim that zsh or arbitrary Unix applications run here.
 
 ## Implemented contract
 
@@ -68,8 +68,69 @@ The emulator master is nonblocking, with a bounded pending-input queue so a
 slow program cannot block the UI thread. Output draining has a per-iteration
 budget so continuous output also yields to rendering. Overflow is reported;
 input is not silently discarded. Closing the emulator closes the master before collecting
-its shell. Appearance, monospace rendering and transcript reflow remain shared
-with the Contour desktop.
+its shell. Appearance and display scaling follow the Contour desktop.
+
+## Screen model and interactions
+
+`user/terminal/vt.c` is a UI-independent streaming parser and cell model. The
+renderer paints fixed-width glyphs into retained bitmaps and redraws when screen,
+input, size or appearance changes. Logical row rotation keeps ordinary scrolling
+from copying an entire screen. Output work is bounded per event-loop iteration.
+
+Implemented screen operations include:
+
+- Cursor positioning, save/restore, pending autowrap, tabs, erasure, character
+  insertion/deletion, line insertion/deletion and scroll regions with origin mode.
+- Separate primary and alternate screens (`47`, `1047`, `1049`), cursor visibility
+  and static outline/bar/underline styles. Alternate output never enters history.
+- Normal/bright ANSI, 256-colour and RGB SGR, bold, dim, underline, inverse,
+  conceal and strike. Concealed cells are also masked when copying text.
+- Streaming UTF-8 with replacement for malformed sequences, basic wide cells,
+  up to two combining marks per cell and DEC line-drawing characters.
+- Up to 220 columns, 60 rows and 300 primary history rows. Streaming primary
+  text reflows on resize; coordinate-addressed screens retain coordinates and
+  clip/pad so applications can redraw after querying their new dimensions.
+- Device status/cursor-position replies, primary device attributes, application
+  cursor keys and bracketed paste. Unknown bounded OSC/DCS/APC/PM payloads are
+  consumed without appearing as output. OSC clipboard writes are ignored.
+
+**Copy screen** exports the visible grid as UTF-8 text, without terminal escape
+sequences. It includes the local prompt when visible. **Paste** removes unsafe
+control bytes. At the native prompt, line breaks and tabs become spaces and an
+oversized paste is refused without inserting a prefix or executing a command.
+An application that explicitly enables bracketed paste receives its delimiters
+and multiline content. Cmd+C/V and Ctrl+Shift+C/V operate on the screen clipboard;
+ordinary Ctrl-letter input continues to the running program. Shift+PageUp/Down
+and the wheel view primary history; the alternate screen has no history view.
+**Clear** and the shell's `clear` builtin clear the screen and history.
+
+Native shell integration uses opt-in `EMBLINK_PROMPT=1` with OSC 133 prompt and
+command markers, rather than overloading ordinary control bytes. The native
+prompt keeps its existing 255-byte command limit and local history/completion.
+The pending program-input queue holds 65,568 bytes, independently of the smaller
+kernel device queues, and reports pressure in the app bar.
+
+Shared text controls now receive a single paste command after the app hook gets
+first refusal. Editors read multiline clipboard text directly; fields flatten
+line breaks/tabs. This avoids overflowing the 32-key queue. Paste replaces a
+selection as one undoable edit; text that cannot fit leaves the original intact.
+Retained text runs explicitly clear their highlights after selection collapse.
+Note++'s custom hook also bounds the full clipboard length before indexing its
+buffer and accepts multiline text up to the 64 KiB clipboard limit.
+
+### Compatibility limits
+
+Keep `TERM=emlink`: this is a tested subset, not xterm/terminfo compatibility.
+Mouse reporting, range selection, full grapheme/emoji shaping and bidirectional
+layout are not implemented. Italic attributes are parsed but use the regular
+face. Cursor styles stay static without animation. Basic combining/wide-cell
+support does not promise every glyph is present in the installed fonts.
+
+The current keyboard byte ABI overlaps some navigation and Ctrl-letter codes.
+Captured modifiers distinguish unmodified arrows from Ctrl-letter input, but
+Ctrl+arrow identity remains ambiguous. Shift/Alt arrow encoding is supported;
+complete modified navigation requires physical key identity through the input
+stack. Resize dimensions are queryable; there is no `SIGWINCH` yet.
 
 ## Installed development headers
 
@@ -82,13 +143,14 @@ SDK paths even when upstream headers with the same names are present.
 ## Verification
 
 ```
-make terminal-test
-make shell-test
+make terminal-test terminal-screen-test
+make shell-test declare-test em-test kit-test
 # Boot the image, then use the serial debug console:
 test terminal
 test tty
 # Graphical acceptance with QEMU, GDB and the existing cloud build environment:
 python3 tools/terminal_smoke.py
+python3 tools/terminal_screen_smoke.py
 ```
 
 `terminal-test` compiles the production device state machine with a minimal
@@ -116,25 +178,37 @@ Enter, restores cooked input and finishes on Ctrl+D. It verifies prompt
 history/editing, foreground Ctrl+C, shell-loop interruption and independent
 Terminal windows, and records real screenshots.
 
+The screen-model host suite covers cursor/edit operations, colours, margins,
+primary/alternate isolation, streaming Unicode, wide-cell resize, replies, key
+modes, split-input equivalence and randomized parser/resize invariants. Run it
+with AddressSanitizer/UBSan by compiling `vt.c` and `tests/tty/vt_test.c` with
+`-Iuser/terminal -fsanitize=address,undefined -fno-omit-frame-pointer`.
+
+The graphical screen acceptance launches native `ttyprobe --screen` in raw mode.
+It checks application-cursor selection, confined log scrolling, Unicode/colour
+cells and actual selection pixels, cursor-position reply round trips, live
+resizing, multiline bracketed paste from Editor, plain screen text copied back
+to Editor, alternate-screen restoration and safe prompt paste refusal. It then
+doubles clipboard text through Editor commands and pastes more than 8 KiB into
+Note++ to exercise its separate application hook. Read-only
+GDB inspection observes state; all graphical actions use real QMP input.
+
 ## Remaining milestones
 
-1. **VT screen emulation:** cursor addressing, erasure, scroll regions, alternate
-   screens, cursor visibility, Unicode cell widths, selection and paste. Output
-   currently supports transcript text and SGR colours only. Keep `TERM=emlink`;
-   advertising `xterm-256color` before implementing it would mislead applications.
-2. **Unix shell compatibility:** supply the missing process/libc semantics for
+1. **Unix shell compatibility:** supply the missing process/libc semantics for
    a small POSIX shell, prove scripts and pipelines, then port an interactive
    shell such as zsh. Preserve the native structured shell alongside it.
-3. **Job control:** process groups, controlling-terminal rules, Ctrl+Z/`fg`/`bg`
+2. **Job control:** process groups, controlling-terminal rules, Ctrl+Z/`fg`/`bg`
    across full pipelines, terminal-access checks and resize notifications. The
    current per-device target is a native handle delegation, not POSIX job control
    or a general signal implementation. `SIGWINCH`, PTY pathname allocation and
    `posix_openpt`/`grantpt`/`unlockpt` are not implemented by this milestone.
-4. **Programming workflows:** broader command-line utilities/build tools, Python
+3. **Programming workflows:** broader command-line utilities/build tools, Python
    subprocess integration, complete Git transport workflows and packaged SDKs.
-5. **Engineering workflows:** SSH, USB serial devices, debug probes and firmware
+4. **Engineering workflows:** SSH, USB serial devices, debug probes and firmware
    flashing. Driver and physical-device validation remain separate requirements.
 
 The existing CPython/Git/compiler ports do not imply their entire upstream
-feature sets work. The next priority is screen emulation and compatibility
-measured against real applications, followed by a mature shell port.
+feature sets work. The next priority is Unix process/libc compatibility measured
+against a small POSIX shell, followed by job control and a mature interactive
+shell port.

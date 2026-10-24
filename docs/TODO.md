@@ -3,7 +3,11 @@
 - [x] Private descriptor-backed PTYs, canonical/raw modes, echo and nonblocking queues.
 - [x] Explicit child descriptor transfer, resize queries, EOF records and reference-safe hangup.
 - [x] Terminal direct input, native prompt preservation and per-session Ctrl+C delegation.
-- [ ] VT screen emulation, alternate screen, Unicode cell widths, selection and paste.
+- [x] VT screen model, alternate screen, basic Unicode widths, colours and live resize.
+- [x] Screen copy, safe native-prompt paste and application bracketed paste.
+- [x] Shared controls receive paste commands without key-queue truncation.
+- [ ] Terminal range selection, complete grapheme rendering and modified-key identity.
+- [ ] Terminfo/application compatibility and mouse reporting.
 - [ ] POSIX shell port and the required process/libc compatibility.
 - [ ] Full process-group job control and resize notifications.
 - [ ] Broader developer utilities, Python subprocess and packaged SDK workflows.

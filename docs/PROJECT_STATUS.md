@@ -1,5 +1,32 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Full-screen terminal milestone (2026-10-24)
+
+Terminal now has a bounded VT parser and cell model, primary/alternate screens,
+cursor and line editing, scroll regions, Unicode widths, SGR colour and live
+resizing. A retained fixed-cell renderer follows desktop appearance and scaling.
+Screen copy, safe prompt paste and application-controlled bracketed paste work
+across applications. The native prompt retains history and completion.
+
+A real ring-3 screen witness passes cursor-key selection, confined scrolling,
+cursor-position reply round trips, live dimensions, cross-app multiline paste,
+plain screen copy and primary-output restoration. Host VT parser/resize tests
+pass AddressSanitizer/UBSan. The private-terminal regression still passes all
+108 guest checks, with zero leaked devices, plus cooked/raw input, interruption,
+independent windows, EOF and close cleanup.
+
+Clipboard commands now reach focused fields/editors without overflowing the
+key queue. Long multiline replacement and undo stay within document bounds;
+retained selection highlights clear after collapse. Note++ validates the full
+clipboard length. Shared control and rendering suites pass sanitizer checks.
+
+This remains `TERM=emlink`, with a native structured shell. Unix process/libc
+compatibility, a POSIX shell port, job control, complete modified navigation,
+range selection and broader VT compatibility remain open. The
+[terminal contract](TERMINAL.md) separates implemented operations from limits.
+The [progress gallery](media/laptop-progress/README.md) includes actual guest
+screenshots; no physical-laptop or upstream shell compatibility is implied.
+
 ## Interactive terminal sessions (2026-10-24)
 
 Terminal now launches the native shell on a private pseudo-terminal. Programs
@@ -15,7 +42,7 @@ acceptance verifies real cooked/raw input, Ctrl-letter/navigation distinction,
 interruptions, separate sessions and active-close cleanup. The ABI has 148
 unique calls; existing syscall and capability IDs retain their values.
 
-Full VT screen emulation, POSIX job control and a Unix shell port remain next.
+Broader VT compatibility, POSIX job control and a Unix shell port remain next.
 Contract and limitations: [TERMINAL.md](TERMINAL.md). Four new original-pixel
 captures extend the [progress gallery](media/laptop-progress/README.md).
 
