@@ -1690,7 +1690,7 @@ int process_child_control(int selector,unsigned op,unsigned flags,void *user) {
         if(current_process->cancelled){spin_unlock(&g_sched_lock);return -EMBK_ECANCELED;}
         wait_queue_block(&current_process->child_wait,current_thread);
         schedule_locked();
-        if(entry_flags & (1ULL<<9))arch_irq_enable();
+        arch_irq_restore(entry_flags);
     }
 }
 
@@ -1817,9 +1817,7 @@ retry:
         /* Resumed (see the entry_flags comment at the top): re-establish
          * the interrupt state our caller actually had, since neither the
          * context switch nor spin_unlock could know it. */
-        if (entry_flags & (1ULL << 9)) {
-            arch_irq_enable();
-        }
+        arch_irq_restore(entry_flags);
     }
 }
 
@@ -3922,9 +3920,7 @@ retry:
         }
         wait_queue_block(&proc->join_wait, current_thread);
         schedule_locked();
-        if (entry_flags & (1ULL << 9)) {
-            arch_irq_enable();
-        }
+        arch_irq_restore(entry_flags);
     }
 }
 
