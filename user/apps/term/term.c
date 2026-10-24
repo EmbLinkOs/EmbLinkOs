@@ -1,32 +1,13 @@
-/* user/apps/term/term.c -- the EmbLink Terminal: the structured shell, on screen.
+/* EmbLink Terminal: a private PTY session with a native prompt editor.
  *
- * NOT a teletype. The window is a read-only TRANSCRIPT VIEWER with a single
- * INPUT LINE beneath it: you read above, you type below, and the cursor only
- * ever lives on that one line. Running `ls` prints its output into the viewer
- * rather than into the thing you are typing in.
- *
- * That inverts who owns the line. A classic terminal forwards every keystroke
- * and lets the shell echo -- which only works when input and output share one
- * stream. Here nothing is sent until Enter, so the TERMINAL owns the line
- * buffer, and therefore owns the whole editing surface a Linux user's hands
- * expect: cursor movement (Left/Right/Home/End), kills (Ctrl+U/K/W), history
- * (Up/Down), Ctrl+C to abandon a line, Ctrl+L to clear, Tab completion for
- * paths and commands, and wheel/PgUp scrollback.
- *
- * The transcript is COLOURED: a per-character attribute plane beside the
- * character plane, filled by parsing ANSI SGR (ESC[..m) out of the byte
- * stream. The shell emits SGR only when TERM=emlink says someone can parse it
- * -- the same contract Linux uses -- so pipes and the serial console stay
- * clean bytes.
- *
- * It spawns /shell.elf as a child with both stdio ends piped (Piece-0
- * plumbing: INSTALL_OBJ into the child, fd_install_obj for its own ends).
- * Output is polled with embk_fd_avail() from the runtime's idle hook (a render
- * loop must never block in read()).
- *
- * Closing the window closes the shell FOR FREE: the terminal's exit drops
- * its pipe fds (exit-time reap loop), the shell's read(0) returns EOF, and
- * its REPL exits -- nobody sends signals, the plumbing itself hangs up. */
+ * At the shell prompt we retain local history, completion and cursor editing.
+ * Once a command starts, input goes directly to the PTY master. Programs choose
+ * canonical/echo or raw mode through termios; their escape-key input uses ANSI
+ * sequences. Output currently supports transcript reflow and SGR colours, not
+ * a complete VT screen. TERM=emlink deliberately advertises only that subset.
+ * The master is nonblocking and input is queued so a slow child cannot freeze
+ * the window. Closing the master hangs up the slave, including blocked reads.
+ */
 
 #include <stdio.h>
 #include <stdint.h>
@@ -48,8 +29,9 @@
 static int g_cols = 96;    /* live: chars per line before a hard wrap */
 static int g_rows = 22;    /* live: visible transcript lines */
 #define SB_ROWS 300        /* scrollback depth (a ring of whole lines) */
-#define FD_SHELL_IN  10    /* our WRITE end of the shell's stdin  */
-#define FD_SHELL_OUT 11    /* our READ end of the shell's stdout  */
+static int g_master=-1;
+#define FD_SHELL_IN g_master
+#define FD_SHELL_OUT g_master
 
 /* --- scrollback: characters + a parallel ATTRIBUTE plane ------------------
  * g_head is the ring slot of the CURRENT (partial) line; g_count how many
@@ -71,6 +53,13 @@ static uint8_t g_cont[SB_ROWS];
 static int  g_view = 0;
 static int  g_shell = -1;      /* spawn handle */
 static bool g_dead = false;
+static bool g_at_prompt=false;
+static unsigned char g_pending[4096];
+static size_t g_pending_n=0;
+static bool term_send(const void *data,size_t n) {
+    if (n>sizeof g_pending-g_pending_n) return false;
+    memcpy(g_pending+g_pending_n,data,n); g_pending_n+=n; return true;
+}
 static uint8_t g_attr = 0;     /* current SGR state, applied to incoming chars */
 
 /* --- the command line ------------------------------------------------------
@@ -284,8 +273,8 @@ static void sgr_apply(void) {
 static void term_putc(char c) {
     /* the shell's cwd marker: swallowed whole, never shown */
     if (g_cwd_cap) {
-        if (c == '\n') { g_cwd[g_cwd_n] = 0; g_cwd_cap = 0; }
-        else if (g_cwd_n < (int)sizeof g_cwd - 1) g_cwd[g_cwd_n++] = c;
+        if (c == '\n') { g_cwd[g_cwd_n] = 0; g_cwd_cap = 0; g_at_prompt=true; }
+        else if (c != '\r' && g_cwd_n < (int)sizeof g_cwd - 1) g_cwd[g_cwd_n++] = c;
         return;
     }
     if (c == CWD_MARK) { g_cwd_cap = 1; g_cwd_n = 0; return; }
@@ -500,18 +489,33 @@ static void complete(void) {
 
 /* --- runtime hooks -------------------------------------------------------- */
 
-/* idle: drain the shell's output pipe without blocking; wake the renderer
+/* idle: drain the terminal master without blocking; wake the renderer
  * only when something actually arrived. Also notice the shell dying. */
 static void term_idle(void) {
     bool got = false;
-    for (;;) {
+    if (g_pending_n && !g_dead) {
+        int64_t written=embk_write(g_master,g_pending,g_pending_n);
+        if (written>0) {
+            g_pending_n-=(size_t)written;
+            memmove(g_pending,g_pending+written,g_pending_n);
+        }
+    }
+    static int last_cols=0,last_rows=0;
+    if (g_cols!=last_cols || g_rows!=last_rows) {
+        struct embk_terminal_size size={(uint16_t)g_rows,(uint16_t)g_cols,0,0};
+        if (embk_terminal_control(g_master,EMBK_TERMINAL_SET_SIZE,&size,sizeof size)==0) { last_cols=g_cols; last_rows=g_rows; }
+    }
+    size_t budget=16384;
+    while (budget) {
         int64_t n = embk_fd_avail(FD_SHELL_OUT);
         if (n <= 0) break;
         char buf[256];
-        int r = (int)embk_read(FD_SHELL_OUT, buf, n < (int64_t)sizeof buf ? (size_t)n : sizeof buf);
+        size_t want=n<(int64_t)sizeof buf?(size_t)n:sizeof buf;
+        if (want>budget) want=budget;
+        int r = (int)embk_read(FD_SHELL_OUT, buf, want);
         if (r <= 0) break;
         for (int i = 0; i < r; i++) term_putc(buf[i]);
-        got = true;
+        got = true; budget-=(size_t)r;
     }
     if (!g_dead && g_shell >= 0 && !embk_proc_alive(g_shell)) {
         g_dead = true;
@@ -525,6 +529,29 @@ static void term_idle(void) {
  * page the scrollback; editing keys work AT the caret; ESC clears the line
  * first and only closes the window when there is nothing to clear. */
 static int term_key(int c) {
+    if (!g_at_prompt && !g_dead) {
+        const char *seq=NULL;
+        unsigned mods=(unsigned)em_key_modifiers();
+        if (!(mods&EMBK_KM_CTRL)) switch (c) {
+        case EMBK_KEY_UP: seq="\033[A"; break;
+        case EMBK_KEY_DOWN: seq="\033[B"; break;
+        case EMBK_KEY_RIGHT: seq="\033[C"; break;
+        case EMBK_KEY_LEFT: seq="\033[D"; break;
+        case EMBK_KEY_HOME: seq="\033[H"; break;
+        case EMBK_KEY_END: seq="\033[F"; break;
+        case EMBK_KEY_DEL: seq="\033[3~"; break;
+        case EMBK_KEY_PGUP: seq="\033[5~"; break;
+        case EMBK_KEY_PGDN: seq="\033[6~"; break;
+        }
+        unsigned char byte=(unsigned char)c;
+        if (!(mods&EMBK_KM_CTRL)) {
+            if (c=='\b') byte=127;
+            if (c=='\n') byte='\r';
+        }
+        bool queued=seq?term_send(seq,strlen(seq)):term_send(&byte,1);
+        if (!queued) term_say("\n[input queue full; wait for the program to read]\n");
+        em_request_frame(); return 1;
+    }
     if (c == 27) {
         if (g_dead || g_in_n == 0) return 0;     /* nothing to clear -> close */
         g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
@@ -554,6 +581,9 @@ static int term_key(int c) {
         term_say(g_in); term_say("^C\n");
         g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
         break;
+    case 0x04:
+        if (!g_in_n && term_send("\004",1)) g_at_prompt=false;
+        break;
     case 0x0C:                                   /* Ctrl+L: clear the screen */
         term_putc('\f');
         break;
@@ -572,9 +602,10 @@ static int term_key(int c) {
         g_hist_at = -1;
         term_say(prompt_text());
         term_putc(' ');
-        char nl = '\n';
-        if (g_in_n) write(FD_SHELL_IN, g_in, (size_t)g_in_n);
-        write(FD_SHELL_IN, &nl, 1);
+        char command[IN_MAX+1];
+        memcpy(command,g_in,(size_t)g_in_n); command[g_in_n]='\n';
+        if (!term_send(command,(size_t)g_in_n+1)) return 1;
+        g_at_prompt=false;
         g_in[0] = 0; g_in_n = 0; g_cur = 0;
         break;
     }
@@ -589,26 +620,21 @@ static int term_key(int c) {
     return 1;                                    /* never reaches the toolkit */
 }
 
-/* --- spawn the shell with both stdio ends piped --------------------------- */
+/* --- spawn the shell on an isolated terminal slave ----------------------- */
 static bool term_spawn_shell(void) {
-    int pin[2], pout[2];                         /* {read_h, write_h} */
-    if (embk_pipe(pin) != 0) return false;       /* shell stdin */
-    if (embk_pipe(pout) != 0) {
-        embk_close_handle(pin[0]); embk_close_handle(pin[1]);
-        return false;
+    int pair[2];
+    if (embk_openpty(pair)<0) return false;
+    g_master=pair[0];
+    struct embk_terminal_attr attr;
+    if (embk_terminal_control(pair[1],EMBK_TERMINAL_GET_ATTR,&attr,sizeof attr)<0) goto failed;
+    attr.lflag&=~(EMBK_TLF_ECHO|EMBK_TLF_ISIG);
+    if (embk_terminal_control(pair[1],EMBK_TERMINAL_SET_ATTR,&attr,sizeof attr)<0) goto failed;
+    if (embk_fcntl_set_nonblock(g_master,1)<0) goto failed;
+    struct embk_spawn_file_action acts[3]; memset(acts,0,sizeof acts);
+    for (int i=0;i<3;i++) {
+        acts[i].kind=EMBK_SPAWN_ACTION_INHERIT_FD;
+        acts[i].target_fd=i; acts[i].src_obj_handle=pair[1];
     }
-
-    struct embk_spawn_file_action acts[3];
-    memset(acts, 0, sizeof acts);
-    acts[0].kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;   /* stdin  <- pin read end */
-    acts[0].target_fd = 0;
-    acts[0].src_obj_handle = pin[0];
-    acts[1].kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;   /* stdout -> pout write end */
-    acts[1].target_fd = 1;
-    acts[1].src_obj_handle = pout[1];
-    acts[2].kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;   /* stderr -> same pipe */
-    acts[2].target_fd = 2;
-    acts[2].src_obj_handle = pout[1];
 
     char *argv[] = { "/system/bin/shell.elf", NULL };
     /* Start the shell in the user's HOME (docs/USERSPACE.md §5): cwd is never
@@ -626,22 +652,11 @@ static bool term_spawn_shell(void) {
     char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", NULL };
     int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, senv, acts, 3);
 
-    /* our copies of the CHILD's ends must go, whatever happened -- EOF
-     * accounting depends on it */
-    embk_close_handle(pin[0]);
-    embk_close_handle(pout[1]);
-    if (h < 0) {
-        embk_close_handle(pin[1]); embk_close_handle(pout[0]);
-        return false;
-    }
-    g_shell = (int)h;
-
-    /* our ends become plain fds; the handles are then redundant */
-    embk_fd_install_obj(pin[1],  FD_SHELL_IN);
-    embk_fd_install_obj(pout[0], FD_SHELL_OUT);
-    embk_close_handle(pin[1]);
-    embk_close_handle(pout[0]);
-    return true;
+    close(pair[1]);
+    if (h<0) { close(g_master); g_master=-1; return false; }
+    g_shell=(int)h; return true;
+failed:
+    close(pair[0]); close(pair[1]); g_master=-1; return false;
 }
 
 /* --- the view -------------------------------------------------------------- */
@@ -787,7 +802,7 @@ static void term_view(void) {
                     float bx = 0, by = 0, bw = 0, bh = 0;
                     int got = ui_open_rect(&bx, &by, &bw, &bh);
                     if (got && bw > 1 && bh > 1) {
-                        int plen = (int)strlen(prompt_text());
+                        int plen = (int)strlen(g_at_prompt?prompt_text():"Direct input");
                         if (plen > 0) {
                             float cw = bw / (float)plen, lh = bh + 1.0f;
                             int cols = (int)((em_viewport_width() - 32.0f) / cw);
@@ -797,12 +812,12 @@ static void term_view(void) {
                             g_rows = rows < 3  ? 3  : rows > SB_VROWS ? SB_VROWS : rows;
                         }
                     }
-                    Text(prompt_text()).caption().bold().color(TERM_PROMPT);
+                    Text(g_at_prompt?prompt_text():"Direct input").caption().bold().color(TERM_PROMPT);
                 }
                 Text(" ").caption().color(TERM_TEXT);
                 if (g_dead) {
                     Text("[process exited]").caption().secondary();
-                } else {
+                } else if (g_at_prompt) {
                     static char pre[IN_MAX], post[IN_MAX];
                     snprintf(pre,  sizeof pre,  "%.*s", g_cur, g_in);
                     snprintf(post, sizeof post, "%s",   g_in + g_cur);
@@ -851,20 +866,8 @@ int main(void) {
     };
     int rc = em_app_run(&app);
 
-    /* Close the shell's STDIN before waiting for it.
-     *
-     * The old comment here claimed our pipe fds "die with us" and the shell
-     * would EOF -- but they die when the PROCESS exits, and the process cannot
-     * exit while it is parked in this wait. So the terminal waited for a shell
-     * that was itself waiting for an EOF only the terminal's exit could send:
-     * a deadlock, and the terminal stayed alive forever with its dock dot lit.
-     *
-     * It was invisible for as long as the close button called exit(0) directly,
-     * which tore the process down without ever reaching this line. Moving the
-     * button into the shared AppBar routed close through the runtime's clean
-     * return -- and the clean path walked straight into the deadlock that was
-     * always here. Closing the write end explicitly is what the comment always
-     * assumed was happening. */
+    /* Close the emulator endpoint before collecting the shell. A blocked
+     * slave read sees EOF; no global console mode is involved. */
     if (g_shell >= 0) {
         close(FD_SHELL_IN);          /* an fd, so close() -- NOT a handle close */
         embk_wait(g_shell);          /* ...so this returns */
