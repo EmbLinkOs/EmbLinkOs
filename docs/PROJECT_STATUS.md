@@ -1,5 +1,16 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Keyboard interaction milestone (2026-10-24)
+
+Shared fields and controls support Tab/Shift+Tab with queued modifier snapshots,
+focus revelation inside scroll views, nested dialog containment/restoration and
+keyboard menu navigation. Application hooks cannot consume ordinary keys behind
+a modal decision. Context-menu editing returns to the original field/selection.
+The Settings reset cancels with Escape without exiting the app. Native keyboard
+acceptance passes for Settings, system menus and a dirty Editor document; shared
+host suites cover nested scopes, hidden menus, mixed queues and slider input.
+Details and limits: [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md).
+
 ## Contour desktop milestone (2026-10-24)
 
 Contour replaces fragmented shell/app styling with shared semantic surfaces,

@@ -5,7 +5,8 @@
 - [x] Shared work areas, live cursor/chrome/effects and isolated configurable workspaces.
 - [x] Searchable Settings, coordinated presets, live preferences and confirmed reset.
 - [x] Align native application chrome, document/code surfaces and authentication surfaces.
-- [ ] Reverse Tab, directional menu navigation and assistive-technology semantics.
+- [x] Reverse Tab, directional menu navigation, modal focus containment and scroll revelation.
+- [ ] Assistive-technology semantics, labels, announcements and platform integration.
 - [ ] Arbitrary font/icon-pack installation, shortcut recording and free panel-item ordering.
 - [ ] Per-monitor scaling, display profiles and compositor-backed overlay auto-hide.
 - [ ] Validate physical laptop rendering, pointer/input, power and graphics performance.

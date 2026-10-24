@@ -1,8 +1,9 @@
 # Laptop progress captures
 
-95 actual EmbLinkOS captures document the original laptop work, its
+99 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
-recoverable document workspaces, and the Contour desktop redesign. PNG exports preserve
+recoverable document workspaces, the Contour desktop redesign, and keyboard
+interaction. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -13,7 +14,35 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: Contour desktop
+## Latest: keyboard interaction
+
+Four real guest captures accompany keyboard acceptance. They use a disposable UEFI/NVMe live session, with no synthetic ACPI fixture.
+
+### Keyboard focus stays in dialogs
+
+Reset appearance opens with Cancel focused. The guest verifies forward traversal, keyboard cancellation and restoration to the initiating control.
+
+![Keyboard focus stays in dialogs](96-keyboard-dialog.png)
+
+### Reverse traversal, the same boundary
+
+Shift+Tab wraps to Reset inside the confirmation; Tab returns to Cancel without reaching controls behind the dialog.
+
+![Reverse traversal, the same boundary](97-reverse-dialog.png)
+
+### Menus work from the keyboard
+
+Right reaches the adjacent workspace menu, Down selects its second item, Home returns to its first, and Escape releases menu ownership.
+
+![Menus work from the keyboard](98-keyboard-menu.png)
+
+### A safe choice for unsaved work
+
+The dirty Editor guard focuses Cancel, contains keyboard traversal and blocks background Save. Cancelling preserves the exact text and restores typing focus.
+
+![A safe choice for unsaved work](99-document-dialog.png)
+
+## Contour desktop
 
 These are actual UEFI/NVMe guest captures of the redesign, including customization, applications and authenticated document workflows. They contain no synthetic ACPI fixture.
 

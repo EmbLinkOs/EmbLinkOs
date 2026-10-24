@@ -22,8 +22,13 @@ content while retaining the selected family in surrounding chrome.
 
 Text/password fields honor authored `.width` and `.height`; zero retains their
 growing/intrinsic defaults. Set `EmApp.min_size` for usable compact layouts.
-Use `.tooltip("…")` for icon-only actions; decorative overlays must pass pointer input through. Controls supply
-forward Tab focus and Return/Space activation. Keep page/container identities
+Use `.tooltip("…")` for icon-only actions; decorative overlays must pass pointer
+input through. Controls supply
+Tab/Shift+Tab focus, scroll revelation and Return/Space activation. Standard
+overlays contain focus and restore the initiating control. Handle
+`OverlayDismissed()` to cancel an overlay with Escape or an outside click. See
+[KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md) for menu and modifier semantics. Keep
+page/container identities
 stable with `.key` when a conditional page changes widget structure, and reset
 fixed dimensions when reusing a node for intrinsic layout. See
 [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md) for supported preferences and limits.
