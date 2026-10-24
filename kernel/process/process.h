@@ -97,12 +97,13 @@ enum process_state {
  * spawn-and-forget parent (one that never wait()s its dead children) leaks a
  * slot per dead child; process_handle_reap_dead() reclaims those on pressure so
  * a full table self-heals instead of sys_spawn having to kill its new child --
- * this cap is therefore the limit on simultaneously-LIVE children, not a leak
- * ceiling. 32 gives a launcher comfortable headroom (256 B/process). */
+ * explicitly retained child statuses are excluded from reclamation and keep
+ * their slots until collected. The bound includes live and retained children. */
 #define PROC_HANDLE_MAX 32
 struct proc_handle {
     uint32_t pid;
     bool used;
+    bool retained; /* explicit spawn request: never discard an uncollected status */
 };
 
 /* Intrusive wait queue: blocked THREADS are linked through their own
@@ -650,6 +651,7 @@ struct process {
      * one process's own children. */
     struct wait_queue join_wait;
 
+    bool force_terminated;     /* distinguish a hard kill from exit(-1) */
     int exit_code;             /**< Exit code once every thread has exited (meaningful only then) */
 
     /* EmbDBG v2 lifetime history: lapic ticks when this process was created
@@ -1592,5 +1594,13 @@ static inline struct process *current_process_atomic(void) {
  * thread's owner", never what any caller wanted. */
 #define current_thread  (current_thread_atomic())
 #define current_process (current_process_atomic())
+
+
+/* Explicit child-status control. Copies the result before reaping, so a bad
+ * userspace destination cannot consume a status. See embk_child.h for the ABI. */
+int process_child_control(int selector,unsigned op,unsigned flags,void *user);
+int process_handle_alloc_retained(struct process *owner,uint32_t pid,bool retained);
+void process_abort_spawn(uint32_t pid);
+void process_handle_free_pid(struct process *owner,int handle,uint32_t pid);
 
 #endif /* __PROCESS_H__ */

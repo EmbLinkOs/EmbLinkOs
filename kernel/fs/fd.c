@@ -1328,11 +1328,11 @@ static const struct fd_ops nulldev_fd_ops = {
 static int pipe_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
     if (e->u.pipe.side != 0) return -EMBK_EBADF;    /* direction enforced at the
                                                       * op, per the one-kind design */
-    return pipe_read(e->u.pipe.p, buf, len, out);
+    return pipe_read_flags(e->u.pipe.p,buf,len,out,(e->flags&O_NONBLOCK)!=0);
 }
 static int pipe_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
     if (e->u.pipe.side != 1) return -EMBK_EBADF;
-    return pipe_write(e->u.pipe.p, buf, len, out);
+    return pipe_write_flags(e->u.pipe.p,buf,len,out,(e->flags&O_NONBLOCK)!=0,true);
 }
 static int pipe_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *out) {
     (void)e;(void)d;(void)w;(void)out; return -EMBK_ESPIPE;
@@ -1379,14 +1379,19 @@ static const struct fd_ops pipe_fd_ops = {
  * would be properly unref'd rather than leaked). Runs UNLOCKED (spawn's
  * file-actions loop, ordinary syscall context), hence ops->close, and the
  * self-contained sched_lock around the ref bump. */
-int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side)
+static int install_pipe(struct process *target, int target_fd, struct pipe *p, int side)
 {
     if (!target || !p || (side != 0 && side != 1))
         return -EMBK_EINVAL;
-    if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
+    if (target_fd < -1 || target_fd >= FD_BASE + FD_MAX_OPEN)
         return -EMBK_EBADF;
 
     fdlock(target);             /* same rule as fd_open_into: target's table, atomic redirect */
+    if (target_fd==-1) {
+        for(target_fd=FD_BASE;target_fd<FD_BASE+FD_MAX_OPEN;target_fd++)
+            if(!target->fds[target_fd-FD_BASE].used)break;
+        if(target_fd==FD_BASE+FD_MAX_OPEN){fdunlock(target);return -EMBK_EMFILE;}
+    }
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
     if (e->used && e->ops && e->ops->close)
         e->ops->close(e);
@@ -1406,9 +1411,17 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
                                  * Fresh g_sched_lock, not nested under fd_lock. */
     sched_unlock();
     fdunlock(target);
-    return EMBK_OK;
+    return target_fd;
 }
 
+
+int fd_install_pipe(struct process *target,int fd,struct pipe *p,int side) {
+    if(fd<FD_BASE)return -EMBK_EBADF;
+    int rc=install_pipe(target,fd,p,side);return rc<0?rc:EMBK_OK;
+}
+int fd_install_pipe_any(struct process *target,struct pipe *p,int side) {
+    return install_pipe(target,-1,p,side);
+}
 
 /* ---- FD_BACKING_SOCKET: a TCP connection as a read/write fd (M4) --------- */
 static int sock_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {

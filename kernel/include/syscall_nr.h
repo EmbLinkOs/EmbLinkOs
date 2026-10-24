@@ -343,6 +343,8 @@
 #define SYS_key_poll_input 146
 #define SYS_desktop_control 147
 #define SYS_terminal 148
+#define SYS_child 149
+#define SYS_pipe_fds 150
 
 
 

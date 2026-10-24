@@ -639,7 +639,7 @@ endef
 
 # The programs built this way. Adding a name here makes it a PIE; it must have
 # exactly one source file and no non-PIC dependency.
-NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher ttyprobe
+NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher ttyprobe processprobe
 
 .PHONY: pie-check
 pie-check:
@@ -809,7 +809,7 @@ NEWLIB_DYN_WL      = -Wl,--export-dynamic -Wl,--no-dynamic-linker -Wl,--hash-sty
 build/crt0.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
-build/syscalls.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
+build/syscalls.o: user/lib/syscalls.c user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
 # --- ON-OS DYNAMIC-LINK ABI (so tcc can build EmUI apps against libembk.so) ---
@@ -837,7 +837,7 @@ $(foreach p,$(NEWLIB_SIMPLE_PROGS),$(eval $(call NEWLIB_SIMPLE_PROG,$(p))))
 build/crt0_pic.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 
-build/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
+build/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 
 build/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(BUILD)
@@ -1614,7 +1614,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/tests/ttyprobe/ttyprobe.c user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/processprobe/processprobe.c user/tests/ttyprobe/ttyprobe.c user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
 EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
 EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
@@ -1988,7 +1988,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf $(if $(PIE_OK),build/pieprobe.elf,) \
+EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf $(if $(PIE_OK),build/pieprobe.elf,) \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
@@ -3538,3 +3538,10 @@ contour-test:
 	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 $(UI_INC) -Iuser/lib \
 	    ui/theme/theme.c tests/desktop/appearance_test.c -lm -o $(BUILD)/contour_test
 	$(BUILD)/contour_test
+
+.PHONY: process-compat-test
+process-compat-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/process/pipe_host.c -o $(BUILD)/pipe_host_test
+	$(BUILD)/pipe_host_test
+	python3 tools/check_native_abi.py
+	python3 tests/tty/sdk_staging.py

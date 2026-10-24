@@ -15,18 +15,10 @@
  * flushes stdio then calls _exit()). A mismatch here shows up as an
  * "undefined reference to `read'" style LINK error, not a silent bug.
  *
- * Error convention: the kernel returns a small negative -EMBK_* code on
- * failure (values chosen to match POSIX errno, see kernel/include/errno.h),
- * so a failing stub sets `errno = -ret` and returns -1 with no translation
- * table. embk_is_err() (embk_syscall.h) draws the line at the Linux-style
- * [-4095,-1] error window, so real large results (an sbrk address, a byte
- * count) are never mistaken for error codes.
- *
- * Genuinely-absent operations (fork/execve/wait/link/unlink) fail with
- * ENOSYS rather than pretending: EmbLink's process model is spawn()-based
- * (no fork/exec), and the VFS public surface exposes no unlink/link yet.
- * Programs wanting EmbLink's native primitives (spawn, threads, handles)
- * call them directly, not through this POSIX-shaped layer. */
+ * Error convention: negative native errors are translated to newlib errno.
+ * Real pipe descriptors and handle-authorized child waits are supplied here;
+ * fork and in-place exec remain unsupported. Native spawn callers explicitly
+ * select descriptors, environment and exit-status retention. */
 
 /* newlib's <sys/features.h> only defines _POSIX_TIMERS for targets it knows
  * (RTEMS/Cygwin), never for bare x86_64-elf, so <time.h> hides clock_gettime()
@@ -864,12 +856,9 @@ int dup(int fd) {
  * convenient stub. (Should exec ever exist -- it will not, by design -- this
  * must become real state.)
  *
- * F_GETFL reports the TRUE state: O_RDWR, blocking (no O_NONBLOCK) -- every fd
- * here is blocking, so this is a fact, not a stub. F_SETFL accepts a request to
- * (re)assert blocking mode (a no-op: already so) but REFUSES O_NONBLOCK, because
- * a false "non-blocking is set" is the real trap -- the caller would then hang
- * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
- * which reads/sets the flags) work while never lying about non-blocking.
+ * F_GETFL translates the actual access mode and nonblocking state from the
+ * kernel. F_SETFL changes nonblocking state; other mutable file flags remain
+ * outside this adapter's current contract.
  * F_DUPFD is real, and routes to the same kernel operation dup() uses -- with
  * the "lowest free descriptor AT OR ABOVE this number" behaviour that is the
  * only thing distinguishing it from dup().
@@ -907,11 +896,9 @@ int fcntl(int fd, int cmd, ...) {
          * there is nothing to store and nothing that could later disagree. */
         return 0;
     case F_GETFL: {
-        /* Access mode is always read/write here; report O_NONBLOCK truthfully
-         * from the kernel fd flag (sockets can now be non-blocking). sys_fcntl
-         * cmd 1 = get non-blocking. */
-        int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
-        return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+        int64_t fl=embk_syscall3(EMBK_SYS_fcntl,fd,3,0);
+        if(fl<0)return embk_fail(fl);
+        return ((int)fl&3)|((fl&4)?O_NONBLOCK:0);
     }
     case F_DUPFD: {
         va_list ap; va_start(ap, cmd);
@@ -1274,11 +1261,7 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     return -1;
 }
 
-pid_t wait(int *status) {
-    (void)status;
-    errno = ENOSYS;   /* the kernel's wait is handle-based, not wait-any-child */
-    return -1;
-}
+pid_t wait(int *status) { return waitpid((pid_t)-1,status,0); }
 
 int link(const char *oldpath, const char *newpath) {
     /* REAL since SYS_link (112). This stub said "no link op yet" for as long
@@ -1455,20 +1438,17 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
 }
 
 int pipe(int fds[2]) {
-    /* EmbLink HAS pipes (the shell's pipelines run on them) -- what is missing
-     * is only this POSIX veneer, which needs a lowest-free-fd install the SDK
-     * does not expose yet. ENOSYS is literally true ("not implemented"), and
-     * every git caller sits behind a fork/exec that refuses first. */
-    (void)fds;
-    errno = ENOSYS;
-    return -1;
+    if(!fds){errno=EFAULT;return -1;}
+    int rc=embk_pipe_fds(fds);return rc<0?embk_fail(rc):0;
 }
 
-/* Process control that presumes fork/exec/sessions -- the model this OS
- * deliberately does not have (spawn + explicit handles instead). */
-pid_t waitpid(pid_t pid, int *status, int options) {
-    (void)pid; (void)status; (void)options;
-    errno = ENOSYS; return (pid_t)-1;
+pid_t waitpid(pid_t pid,int *status,int options) {
+    if(options & ~WNOHANG){errno=EINVAL;return (pid_t)-1;}
+    if(pid==0 || pid < (pid_t)-1){errno=ENOSYS;return (pid_t)-1;}
+    int64_t rc=embk_syscall5(EMBK_SYS_child,pid,EMBK_CHILD_WAIT_STATUS,
+        (int64_t)(intptr_t)status,status?sizeof *status:0,(options&WNOHANG)?EMBK_CHILD_NOHANG:0);
+    if(rc<0){errno=rc==-125?EINTR:embk_errno_from_kernel(rc);return (pid_t)-1;}
+    return (pid_t)rc;
 }
 /* dup2 -- redirection. `cmd > file` is this call and nothing else: open the
  * file, dup2 it onto fd 1, and every write the program makes to stdout lands

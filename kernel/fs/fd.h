@@ -227,6 +227,7 @@ int vfs_fd_dup(int oldfd, int newfd, int min_fd);
  * reference (ref bumped under the lock); the parent's obj-handle stays alive
  * and must be released separately for EOF. side: 0=read, 1=write. */
 int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side);
+int fd_install_pipe_any(struct process *target,struct pipe *p,int side);
 int fd_alloc_pty(int pair[2]);
 int fd_terminal_control(int fd, unsigned op, void *data);
 int fd_inherit_into(struct process *target, int target_fd, int source_fd);

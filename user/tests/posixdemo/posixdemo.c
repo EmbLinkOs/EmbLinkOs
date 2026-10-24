@@ -662,14 +662,8 @@ static void test_fcntl(void) {
     ck("F_SETFD(0) accepted too (no exec => unobservable either way)",
        fcntl(fd, F_SETFD, 0) == 0);
 
-    /* F_GETFL REPORTS THE TRUTH rather than refusing. It used to return
-     * ENOSYS, on the reasoning that a false success would make a caller
-     * believe it had non-blocking I/O and then hang in a blocking read -- but
-     * that confuses "cannot SET O_NONBLOCK" with "cannot say what the flags
-     * are". Every fd here is O_RDWR and blocking, which is a complete and
-     * accurate answer; F_SETFL is still the one that refuses. */
-    ck("F_GETFL reports the true state (O_RDWR, blocking)",
-       fcntl(fd, F_GETFL) == O_RDWR);
+    ck("F_GETFL reports the actual read-only access mode",
+       fcntl(fd, F_GETFL) == O_RDONLY);
 
     close(fd);
 

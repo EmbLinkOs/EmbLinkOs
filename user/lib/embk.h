@@ -23,6 +23,7 @@
 #ifndef __EMBK_H__
 #define __EMBK_H__
 #include "embk_terminal.h"
+#include "embk_child.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -72,6 +73,7 @@
  * action-passing app rebuilt when they do). */
 #define EMBK_SPAWN_ACTION_OPEN        1
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
+#define EMBK_SPAWN_ACTION_KEEP_STATUS 10
 #define EMBK_SPAWN_ACTION_INHERIT_FD 9    /* src_obj_handle names a parent fd */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
@@ -151,6 +153,16 @@ static inline int64_t embk_close(int fd) {
  * directly; install one as a child's fd 0/1, or into your own fd table). */
 static inline int embk_pipe(int out_handles[2]) {
     return (int)embk_syscall1(EMBK_SYS_pipe, (int64_t)(intptr_t)out_handles);
+}
+/* Descriptor form: lowest available slots, rollback on any allocation/copyout
+ * failure. The object-handle form above keeps its original contract. */
+static inline int embk_pipe_fds(int out_fds[2]) {
+    return (int)embk_syscall1(EMBK_SYS_pipe_fds,(int64_t)(intptr_t)out_fds);
+}
+/* INFO is non-consuming; waits return 1 for a copied result, 0 for NOHANG
+ * with nothing ready, or a negative error. Signed exit codes are data. */
+static inline int embk_child_control(int selector,unsigned op,unsigned flags,struct embk_child_result *out) {
+    return (int)embk_syscall5(EMBK_SYS_child,selector,op,(int64_t)(intptr_t)out,sizeof *out,flags);
 }
 /* Release an obj-handle (pipe end, channel end, surface) via the kernel's
  * generic kind dispatch. For pipes this is what delivers EOF: after

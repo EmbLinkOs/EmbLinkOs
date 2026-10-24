@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='terminal-sdk-') as directory:
     previous=fs.NEWLIB_INC;fs.NEWLIB_INC=directory
     try:objects=fs.discover_userland_objects()
     finally:fs.NEWLIB_INC=previous
-    for relative in ['termios.h','sys/ioctl.h','embk_terminal.h','embk.h','embk_syscall.h']:
+    for relative in ['termios.h','sys/ioctl.h','embk_terminal.h','embk_child.h','embk.h','embk_syscall.h']:
         path=b'system/abi/include/'+relative.encode()
         matches=[obj for obj in objects if obj[0]==path]
         assert len(matches)==1,(relative,len(matches))

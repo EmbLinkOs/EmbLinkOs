@@ -1307,6 +1307,7 @@ def discover_userland_objects(build_dir="build"):
                         ("user/lib/document.h",            b"system/abi/include/document.h"),
                         ("user/lib/embk_desktop.h",        b"system/abi/include/embk_desktop.h"),
                         ("user/lib/embk_terminal.h",       b"system/abi/include/embk_terminal.h"),
+                        ("user/lib/embk_child.h",          b"system/abi/include/embk_child.h"),
                         ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
                         ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
                         ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),
