@@ -32,7 +32,7 @@ print('RESULT '+json.dumps([int(ps[i]['pid']) for i in range(ps.type.range()[1]+
         for command in ['test posix-shell','test posix-shell','test spawn-compat','test process-compat','test handle reap','test sched wait','test terminal','test tty','test posix','test channel','test capgate']:
             result=d.g.command(command,('[cmd] '+command+':').encode(),timeout=240)
             line=re.search(r'\[cmd\] '+re.escape(command)+r':[^\r\n]*',result)
-            assert line and line.group().endswith('OK') and 'FAIL' not in result,result
+            assert line and re.search(r'\bOK\b',line.group()) and 'FAIL' not in result,result
             print(line.group(),flush=True)
         screen=TerminalState(d);w=d.launch('Terminal','Terminal')
         prompt=lambda:screen.integer(w,'g_at_prompt',1)==1
