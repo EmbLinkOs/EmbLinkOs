@@ -176,6 +176,7 @@ static int      g_cursor_x, g_cursor_y, g_cursor_valid;
 static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
 static int      g_cursor_under_valid;
 static uint32_t g_prev_buttons;
+static int g_buttons_suppressed; /* ownership/space changes wait for physical release */
 static int      g_dragging;        /* a title-bar drag is in progress          */
 static uint32_t g_drag_id;         /* which window is being dragged             */
 static int      g_drag_dx, g_drag_dy;  /* pointer offset within the window frame */
@@ -2079,6 +2080,8 @@ void compositor_pointer_tick(void) {
     mouse_get_state(&x, &y, &b);
 
     spin_lock(&g_comp_lock);
+    int suppressed=g_buttons_suppressed;
+    if(suppressed){if(!b)g_buttons_suppressed=0;b=0;}
     int left = (b & MOUSE_BTN_LEFT) != 0, prev = (g_prev_buttons & MOUSE_BTN_LEFT) != 0;
     /* HOW MANY presses actually happened, which the level cannot say: a whole
      * down-up-down-up between two ticks leaves `left` equal to `prev` and the
@@ -2089,6 +2092,7 @@ void compositor_pointer_tick(void) {
     uint32_t presses = 0, ptime = 0;
     while (presses < COMP_CLICK_Q && mouse_take_press(&ptime))
         press_ev[presses++].t = ptime;
+    if(suppressed)presses=0;
     /* Belt: if the level moved but the driver reported nothing (a device that
      * only ever sets absolute state), still treat it as one press, timed now. */
     if (presses == 0 && left && !prev) press_ev[presses++].t = (uint32_t)timer_uptime_ms();
@@ -2305,7 +2309,7 @@ void compositor_pointer_tick(void) {
     }
     /* drain the scroll wheel every tick; route it to the hovered window's app */
     int32_t wheel = mouse_take_wheel();
-    if (wheel && g_ptr_pid) g_ptr_wheel += wheel;
+    if (wheel && g_ptr_pid && !suppressed) g_ptr_wheel += wheel;
 
     g_prev_buttons = b;
     #undef DIRTY
@@ -2397,6 +2401,8 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
 void compositor_session_changed(void) {
     spin_lock(&g_comp_lock);
     g_drag_id=0;g_dragging=0;g_cap_win=0;g_cap_pid=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
+    g_buttons_suppressed=1;g_ptr_wheel=0;
+    for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
     uint32_t owner=session_input_owner();
     g_anim.kind=ANIM_NONE;
     if(owner)for(unsigned i=0;i<COMP_MAX_WINDOWS;i++)
@@ -2413,6 +2419,7 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
     if(operation>EMBK_DESKTOP_MOVE_FRONT)return -EMBK_EINVAL;
     if(operation && (!session_ui_allowed(pid) || session_input_owner()))return -EMBK_EPERM;
     spin_lock(&g_comp_lock);
+    int reset_capture=0;
     if(operation==EMBK_DESKTOP_CONFIGURE) {
         uint32_t owns=0;
         for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && g_wins[i].pid==pid)owns=g_wins[i].id;
@@ -2426,8 +2433,11 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
             spin_unlock(&g_comp_lock);return -EMBK_EINVAL;
         }
         if(g_anim.kind!=ANIM_NONE)anim_finish();
-        unsigned active=g_desktop_owner==(int)owns?g_desktop.workspace:0;g_desktop_owner=(int)owns;
+        unsigned before=g_desktop.workspace;
+        int new_owner=g_desktop_owner!=(int)owns;
+        unsigned active=new_owner?0:before;g_desktop_owner=(int)owns;
         g_desktop=*state;g_desktop.workspace=active<state->workspace_count?active:state->workspace_count-1;
+        reset_capture=new_owner || g_desktop.workspace!=before;
         for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].workspace>=state->workspace_count)g_wins[i].workspace=state->workspace_count-1;
         keyboard_set_shortcut_modifier(state->shortcut_modifier);
         cursor_layers_ready=0;
@@ -2437,13 +2447,19 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
         if(g_anim.kind!=ANIM_NONE)anim_finish();
         if(operation==EMBK_DESKTOP_MOVE_FRONT) {
             struct comp_window *front=front_app_window();
-            if(front && !front->desktop && !front->translucent && !front->widget)front->workspace=state->workspace;
-        } else g_desktop.workspace=state->workspace;
+            if(front && !front->desktop && !front->translucent && !front->widget) {
+                reset_capture=front->workspace!=state->workspace;front->workspace=state->workspace;
+            }
+        } else {reset_capture=g_desktop.workspace!=state->workspace;g_desktop.workspace=state->workspace;}
     }
     if(operation) {
-        g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
-        g_drag_on=0;g_drag_pid=0;
-        for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+        /* Palette/geometry publication must retain a held gesture. Clearing its
+         * button level generated a synthetic second press on the next tick. */
+        if(reset_capture) {
+            g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
+            g_drag_on=0;g_drag_pid=0;g_ptr_wheel=0;g_buttons_suppressed=1;
+            for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+        }
         enforce_focus();const fb_info_t *fi=fb_get_info();
         if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
     }

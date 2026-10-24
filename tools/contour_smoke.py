@@ -18,7 +18,7 @@ def main():
     def desktop():
         return d.debug('''import gdb,json
 s=gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_desktop")
-print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count','top','bottom','left','right','background','cursor_style','cursor_size','flags']}))''')
+print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count','top','bottom','left','right','background','cursor_style','cursor_size','flags']} | {'pointer_buttons':int(gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_ptr_buttons")),'suppressed':int(gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_buttons_suppressed"))}))''')
     def eventually(check,message):
         end=time.monotonic()+30
         while not check():
@@ -55,6 +55,14 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count',
         d.type('hidden');assert text('edit',edit,'g_doc')=='A workspace of our own.','hidden workspace received keyboard input'
         d.key('meta_l-2');eventually(lambda:desktop()['workspace']==1,'reach moved Editor')
         d.snap('workspace-moved')
+        ui=NativeUI(d);ui.move(edit['x']+120,edit['y']+155)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});d.g.pump(.5)
+        d.key('meta_l-1');eventually(lambda:desktop()['workspace']==0,'held-button workspace switch')
+        d.g.pump(1);assert desktop()['pointer_buttons']==0 and desktop()['suppressed']==1,'held mouse leaked to another workspace'
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'})
+        eventually(lambda:desktop()['suppressed']==0,'mouse release did not end suppression')
+        d.key('meta_l-2');d.g.pump(1)
+        assert text('edit',edit,'g_doc')=='A workspace of our own.'
         settings=d.launch('Settings','Settings');d.snap('appearance-dark')
         # Paper preset: the real settings file, desktop palette and open apps update.
         d.click(settings['x']+365,settings['y']+163)

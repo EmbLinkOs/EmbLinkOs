@@ -43,7 +43,17 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['top','bottom','left','right',
         eventually(lambda:state()['left']>0 and dock_ready('left'),'left dock geometry');d.g.pump(2);d.snap('left-dock')
         ui.select(w,'Placement','Right');eventually(lambda:state()['right']>0 and dock_ready('right'),'right dock geometry');d.g.pump(2);d.snap('right-dock')
         ui.select(w,'Placement','Bottom');eventually(lambda:state()['right']==0 and state()['bottom']>0,'bottom dock insets')
-        ui.toggle(w,'Auto-hide');eventually(lambda:cfg(w,'dock_autohide')==1,'dock auto-hide preference')
+        # Keep the physical press across desktop publication. One gesture must
+        # produce one persisted change, even when the shell polls mid-press.
+        r=ui.text(w,'Auto-hide')['parents'][1]
+        ui.move(int(w['x']+r[0]+r[2]-22),int(w['y']+r[1]+r[3]/2))
+        needle=b'rename settings.conf.pending-'+str(w['pid']).encode()+b'-'
+        saves=d.g.seen.count(needle)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});d.g.pump(4)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'});d.g.pump(1)
+        eventually(lambda:cfg(w,'dock_autohide')==1,'dock auto-hide preference')
+        assert d.g.seen.count(needle)-saves==1,'one held toggle produced multiple saves'
+        print('Held toggle: one persisted change across live publication',flush=True)
         d.g.pump(2);d.snap('dock-hidden');ui.move(640,790);d.g.pump(2);d.snap('dock-revealed')
         ui.toggle(w,'Auto-hide');d.g.pump(2)
         ui.select(w,'Screen edge','Bottom');eventually(lambda:state()['top']==0,'bottom command strip')
