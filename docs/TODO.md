@@ -11,7 +11,8 @@
 - [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
 - [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
 - [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.
-- [ ] posix_spawn/posix_spawnp action translation, descriptor inheritance policy and explicit starting-directory context.
+- [x] Bounded posix_spawn/posix_spawnp with ordered actions, CLOEXEC and independent starting-directory context.
+- [ ] Shared socket descriptor lifetime, shared status flags and full append semantics.
 - [ ] POSIX shell port and the remaining process/libc compatibility.
 - [ ] Full process-group job control and resize notifications.
 - [ ] Broader developer utilities, Python subprocess and packaged SDK workflows.

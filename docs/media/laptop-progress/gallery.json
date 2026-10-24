@@ -2157,6 +2157,26 @@
       "featured": true,
       "milestone": "Descriptor pipes and retained child-status waits",
       "historical": false
+    },
+    {
+      "id": "112-posix-spawn-pipeline",
+      "phase": "POSIX spawn adapter",
+      "title": "Ordered spawn actions and a POSIX pipeline",
+      "caption": "The native spawn witness passes 357 checks in the logged-in Terminal session. Ordered descriptor actions, close-on-exec, independent directory context before constructors, exact environments, PATH search and all 32 retained child results are checked. Two children transform 66,049 bytes; a following shell command succeeds. This is a bounded spawn adapter on native handles, not a ported Unix shell.",
+      "alt": "POSIX spawn and two-child pipeline checks in EmbLinkOS Terminal",
+      "file": "112-posix-spawn-pipeline.png",
+      "capture_date": "2026-10-24",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe; live desktop session",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "bfcc7e6f94ebb51df345d9ac4eb25dcc9fd6ea0f763bd5074f7cf227da4205fe",
+      "source_capture": "posix-spawn-and-pipeline.ppm",
+      "source_sha256": "c4351559907c345eeaa2334654ac05b75d70b2938339eb4f5fdfa9de0f91945a",
+      "source_commit": "052be4cbffab8c6b6b0567610d6b584255441442",
+      "featured": true,
+      "milestone": "Ordered POSIX spawn with descriptor inheritance and directory context",
+      "historical": false
     }
   ]
 }

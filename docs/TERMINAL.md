@@ -195,9 +195,11 @@ GDB inspection observes state; all graphical actions use real QMP input.
 
 ## Remaining milestones
 
-The [pipe and child-status foundation](PROCESS_COMPATIBILITY.md) now supplies
-real descriptor pipes, actual-PID waits, retained exit status and a native
-multi-child pipeline witness. It does not yet provide a `posix_spawn` adapter.
+The [process compatibility layer](PROCESS_COMPATIBILITY.md) now supplies real
+descriptor pipes, actual-PID waits, retained exit status and bounded
+`posix_spawn`/`posix_spawnp` with ordered actions, close-on-exec and independent
+starting-directory context. A real multi-child POSIX pipeline witness passes
+inside Terminal; a POSIX shell port and job control remain open.
 
 1. **Unix shell compatibility:** supply the remaining process/libc semantics for
    a small POSIX shell, prove scripts and pipelines, then port an interactive

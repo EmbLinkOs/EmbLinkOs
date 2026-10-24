@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-111 actual EmbLinkOS captures document the original laptop work, its
+112 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation and process compatibility. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility and ordered POSIX spawn. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -13,6 +13,20 @@ Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show t
 merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
+
+## Latest: POSIX spawn
+
+The spawn adapter passes 357 checks in the normal logged-in Terminal namespace,
+including ordered file actions, close-on-exec, PATH lookup, exact child
+environments and directory setup before constructors run. Two children
+transform 66,049 bytes through pipes, and a following shell command succeeds.
+The same checks pass twice through the serial wrapper. This is a bounded
+adapter on native child handles; a POSIX shell port remains open.
+
+This original-pixel QMP capture uses a disposable UEFI/NVMe live session without
+a synthetic ACPI fixture. Captures 01–111 and their metadata are unchanged.
+
+![Ordered spawn actions and a POSIX pipeline](112-posix-spawn-pipeline.png)
 
 ## Latest: process compatibility
 

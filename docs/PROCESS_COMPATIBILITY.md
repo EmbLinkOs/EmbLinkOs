@@ -1,8 +1,9 @@
 # Pipes and child status for shell ports
 
 EmbLinkOS uses explicit spawn actions and parent-owned child handles. The newlib
-adapter now supplies real `pipe()`, `waitpid()` and `wait()` on that model. This
-is a process compatibility foundation, not a ported POSIX shell or fork/exec.
+adapter supplies real `pipe()`, `waitpid()`, `wait()`, `posix_spawn()` and
+`posix_spawnp()` on that model. This is a bounded process compatibility layer,
+not a ported POSIX shell or fork/exec.
 
 ## Descriptor pipes
 
@@ -69,14 +70,106 @@ The handle and its retention policy are published together under the scheduler
 lock. Pressure reclamation skips retained statuses. The bound remains 32 handles
 per process, counting both live children and retained completions.
 
-When all slots are occupied, spawn returns `EMFILE`. The unpublished child is
-detached and terminated through the orphan cleanup path, rather than leaving an
-unreachable zombie in the parent. Existing native launchers keep their previous
-reclamation policy unless they explicitly request retention.
+Spawn reserves a handle before creating a child or applying file actions. A
+reservation has PID zero, is retained against pressure reclamation, and cannot
+be resolved as a child. Construction failure frees the reservation. When all
+slots are occupied, spawn returns `EMFILE` before running another program. The
+completed child is linked into the parent's live-child list under the scheduler
+lock only after construction succeeds; failed constructions leave no stale
+list entry. Existing native launchers keep their previous reclamation policy
+unless they explicitly request retention.
 
 A terminal child normally also needs three `INHERIT_FD` actions for its standard
 input/output/error. Retention does not implicitly copy descriptors, environment,
 namespace grants or any other authority.
+
+## Spawn adapter
+
+`posix_spawn(&pid, path, actions, attributes, argv, envp)` creates a fresh native
+process and returns zero or a **newlib error number directly**. It preserves
+`errno` and leaves `pid` unchanged on failure. It never replaces the caller or
+pretends to fork. The explicit `envp` is passed unchanged, including an empty
+or null environment. The child status is retained until an owned `waitpid` or
+`wait` collects it. The 32-handle limit counts live and completed children.
+
+Native syscall **152, `spawn_pid`**, uses the existing six-argument spawn layout
+but returns the actual PID with retained handle publication. This avoids a libc
+follow-up lookup racing another thread's wait. The original spawn syscall still
+returns a handle. Neither operation changes the contract of an unused register.
+
+The adapter explicitly requests a snapshot of the caller's open descriptors.
+Regular files share their open description/cursor; pipes and PTYs take proper
+endpoint references. Closed standard slots remain closed. Actions are then
+applied **in insertion order on the child table**:
+
+- `addopen` opens a copied path onto the chosen descriptor, including `/dev/null`.
+- `adddup2` duplicates a descriptor from the child's current table, so chains and
+  temporary-descriptor swaps work. It clears the target's close-on-exec flag,
+  including `adddup2(fd, fd)`; ordinary `dup2(fd, fd)` preserves that flag.
+- `addclose` closes the named child descriptor. A closed or invalid descriptor
+  fails with `EBADF` before the child runs.
+- `addchdir_np` changes the directory used by subsequent relative open/chdir
+  actions and the executable path. Paths use the libc's existing lexical
+  normalization. Neither the parent's descriptors nor its directory is changed.
+
+`F_GETFD`, `F_SETFD` and `O_CLOEXEC` now store real per-descriptor state. Ordinary
+`dup`/`F_DUPFD` clear it. After actions, the compatibility policy closes entries
+still marked close-on-exec. A marked file/pipe/PTY can therefore serve as an
+explicit dup source before it is closed. Legacy native explicit transfers keep
+their existing inheritance policy.
+
+The starting directory travels in a dedicated process field, read through
+**syscall 151, `spawn_cwd`**, before constructors run. A null/empty environment or
+a conflicting `PWD` does not change it. Legacy native launches without explicit
+context retain their existing best-effort `PWD` startup behavior.
+
+`posix_spawnp` searches the **caller's** `PATH`; the child's `envp` does not select
+its executable. Empty and relative entries use the child's final starting
+directory. An unset PATH uses `/system/bin:/bin`. Names containing `/` bypass
+search. Missing/non-directory candidates continue searching; a remembered
+`EACCES` takes precedence over exhaustion. Unrecognized executable formats fail
+without a shell fallback.
+
+Native actions 11–14 add descriptor snapshot, child-table dup2, close and cwd.
+The native list now holds at most 64 actions and is copied into kernel heap
+memory rather than expanding the syscall stack. The adapter reserves three
+entries for its explicit policy/context, leaving **61 ordered user actions**.
+Paths are at most 255 bytes; the existing 127-argument, 31-environment-entry,
+1024-environment-byte and combined 4 KiB startup-page limits still apply.
+Oversized requests fail without truncation. Adding an action copies its path,
+and failure leaves the action list unchanged.
+
+Attributes have initialization, destruction and stored get/set values. Only
+zero attribute flags can be applied: identity, process-group, scheduler and signal
+flags return `ENOTSUP` without mutation; unknown bits return `EINVAL`.
+`addfchdir_np` returns `ENOTSUP` because the VFS cannot reconstruct an fd's path.
+
+**Socket limitation:** TCP/UDP descriptors do not yet have a shared lifetime.
+An inheritable socket makes this adapter return `ENOSYS`, avoiding a copied
+child descriptor closing the parent's connection. Marking it `FD_CLOEXEC`
+excludes it. Socket transfer/dup actions are not supported by this policy.
+
+## Spawn validation
+
+```
+# Serial debug console:
+test spawn-compat
+# Full booted desktop acceptance:
+python3 tools/spawn_compat_smoke.py
+```
+
+`spawnprobe` runs real ring-3 children through the installed libc. It checks
+inherited files/pipes and descriptor flags, ordered open/dup/close chains, cursor
+swaps, preserved parent state, closed stdio, action limits, directory setup
+before constructors, exact environments, PATH search, failure cleanup and all
+32 retained statuses. A full handle table must not execute a marker child.
+Two spawned children transform 66,049 bytes through bounded descriptor pipes.
+The current run passes **357/357 spawn checks** in each of two serial runs and
+again inside Terminal. Fixtures live in the invoking user's home (or `/data`
+for the kernel-context wrapper), so the GUI run uses the normal session namespace. The harness repeats
+the serial run and executes the same program in Terminal, then checks another
+shell command. It also reruns the process, PTY, legacy-handle, scheduler,
+console/POSIX and channel regressions and checks pipe allocation baselines.
 
 ## Validation
 
@@ -102,8 +195,9 @@ waiters. All 32 retained statuses survive pressure before reverse-order
 collection. Two native children transform 66,049 bytes through bounded pipes.
 The same program runs in Terminal, and a following command must still work.
 The serial wrapper checks that live pipe allocation returns to its baseline.
-The current guest run passes 203/203 checks twice via that wrapper and once
-inside Terminal. Legacy handle reclamation, scheduler waits, 108 PTY checks,
+Pipe/wait acceptance passed 203/203 checks twice via that wrapper and once
+inside Terminal. The later spawn harness repeats all 203 checks alongside its
+own child tests. Legacy handle reclamation, scheduler waits, 108 PTY checks,
 console/POSIX/channel tests and the wider integration batch also pass. The x86
 images build and boot; the AArch64 kernel compiles and links without a new ARM
 runtime claim. Blocking wait paths restore interrupts through the architecture
@@ -124,10 +218,9 @@ ASAN_OPTIONS=detect_leaks=1 /tmp/pipe-host
 
 ## Remaining compatibility work
 
-`fork`, in-place `exec`, a complete `posix_spawn`/`posix_spawnp` adapter and a Unix
-shell port remain open. The next adapter must translate ordered file actions,
-select inherited descriptors and carry the starting directory independently of
-the child's environment. The native default environment remains explicit.
+`fork`, in-place `exec`, a POSIX shell port and broader process compatibility
+remain open. The spawn adapter above is a bounded implementation with explicit
+limits, not a claim of complete POSIX process semantics.
 
 Process groups, controlling-terminal rules, stopped/continued statuses and
 resize signals remain separate work. Group selectors (`pid == 0` or `< -1`)
@@ -135,8 +228,8 @@ return `ENOSYS`; options other than `WNOHANG` return `EINVAL` without consuming
 a result. General signal delivery remains unsupported.
 
 Descriptor status flags are still per entry: changing `O_NONBLOCK` after `dup`
-does not update its other copies. Mutable flags beyond nonblocking and a full
-close-on-exec inheritance policy still need work before broader POSIX claims.
-The native open operation still reserves standard descriptor slots; the new
-pipe allocation explicitly supports those slots when free. These limits do not
-change the tested native spawn and structured-shell contracts.
+does not update its other copies. Mutable status flags beyond nonblocking and
+per-write append semantics need work before broader POSIX claims. Socket
+inheritance, shared open-description flags and job control remain separate
+milestones. Native open and descriptor pipe allocation both use the lowest free
+slot, including closed standard descriptors.

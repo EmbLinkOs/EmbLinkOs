@@ -1,5 +1,38 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Ordered POSIX spawn (2026-10-24)
+
+The newlib adapter now implements bounded `posix_spawn` and `posix_spawnp` on
+native child handles. Ordered open/dup2/close/chdir actions run on the child
+table, while the parent keeps its descriptors and working directory. File and
+pipe inheritance, real close-on-exec flags, PATH lookup and exact environments
+work together. A separate starting-directory context is installed before
+constructors, independently of PWD. The PID-returning native entry publishes
+retained ownership without a second libc lookup. A full handle table fails
+before constructing or running another child.
+
+The adapter supports 61 user actions, 64 descriptors and the existing bounded
+argv/environment startup page. TCP/UDP inheritance returns ENOSYS until sockets
+have a shared lifetime; marking them close-on-exec excludes them. Process-group,
+scheduler, identity and signal attribute flags return ENOTSUP. `fork`, in-place
+`exec`, job control and a POSIX shell port remain open. The native shell is
+preserved. See [PROCESS_COMPATIBILITY.md](PROCESS_COMPATIBILITY.md) for contracts,
+limits, new syscalls 151/152 and validation commands.
+
+Native acceptance passes **357/357 spawn checks** twice through the serial
+wrapper and again inside Terminal under the normal session namespace. The
+66,049-byte two-child pipeline completes and another shell command succeeds.
+Malformed input, copyout retry, failed-action cleanup, all 32 retained statuses,
+constructor cwd and unchanged environment/parent state are covered. Existing
+203 process checks, 108 PTY checks, handle reclamation, scheduler, console/POSIX
+and channel regressions pass. The host pipe/PTY/SDK/VT/shell suites pass;
+production pipe sanitizer coverage remains green. The wider device, preferences,
+files, document, page-cache, IPC, compositor, session and kill-I/O integration
+batch passes. x86 images build and boot; the AArch64 kernel compiles and links
+without a new ARM runtime or physical-hardware claim. The
+[progress gallery](media/laptop-progress/README.md) has 112 actual captures,
+with all prior images and metadata preserved.
+
 ## Process compatibility foundation (2026-10-24)
 
 Newlib now has real descriptor `pipe()`, actual-PID `waitpid()` and `wait()`
@@ -16,9 +49,9 @@ native syscall IDs match the SDK, and capability IDs are unchanged. The
 [process compatibility contract](PROCESS_COMPATIBILITY.md) records behavior,
 validation commands and the remaining descriptor/signal limitations.
 
-This is preparation for a Unix shell port. `posix_spawn` action translation,
-starting-directory handoff, descriptor inheritance policy, process-group job
-control and a POSIX shell itself remain open. The native structured shell and
+This foundation prepared a Unix shell port. The later spawn milestone above
+adds action translation, directory handoff and a descriptor policy; process-group
+job control and a POSIX shell itself remain open. The native structured shell and
 `TERM=emlink` remain available. Native acceptance passes 203 checks twice through
 the serial wrapper and again inside Terminal, followed by another shell command.
 Pipes return to their allocation baseline. Legacy handle reclamation, scheduler
