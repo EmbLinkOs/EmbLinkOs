@@ -9,6 +9,7 @@ import re,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from lock_test import keyname
+from native_terminal import TerminalState
 
 def main():
     out=Path(tempfile.mkdtemp(prefix='terminal-native-',dir='/workspace/.setup')); print(out,flush=True)
@@ -21,7 +22,7 @@ def main():
             d.g.pump(.4)
     def integer(w,name,n=4):return int.from_bytes(d.read('term',w['pid'],name,n),'little',signed=n>1)
     def prompt(w):return integer(w,'g_at_prompt',1)==1
-    def transcript(w):return d.read('term',w['pid'],'g_sb',300*221).replace(b'\0',b'\n').decode('utf-8','replace')
+    def transcript(w):return screen.text(w)
     def text(w,needle):return needle in transcript(w)
     def type_text(value):
         extra={'/':'slash','"':'shift-apostrophe','{':'shift-bracket_left','}':'shift-bracket_right'}
@@ -37,6 +38,7 @@ def main():
             assert re.search(r'\[cmd\] '+re.escape(cmd)+r':[^\r\n]*OK',result),result
             print(result[result.rfind('[cmd]'):].strip(),flush=True)
         d.g.qmp.cmd('human-monitor-command',**{'command-line':f'gdbserver unix:{d.sock},server=on,wait=off'})
+        screen=TerminalState(d)
         w=d.launch('Terminal','Terminal');eventually(lambda:prompt(w),'initial PTY prompt')
         assert b'\r' not in d.read('term',w['pid'],'g_cwd',160).split(b'\0',1)[0]
         type_text('echo 123');d.key('backspace');type_text('4\n')

@@ -23,7 +23,7 @@ static int child(const char *mode) {
     if (tcgetattr(0,&t)) return 22;
     if (!strcmp(mode,"--keys")) {
         cfmakeraw(&t); if (tcsetattr(0,TCSANOW,&t)) return 30;
-        puts("Raw key check: Ctrl+B, Ctrl+S, Ctrl+H, Return, Left."); fflush(stdout);
+        printf("Raw key check: Ctrl+B, Ctrl+S, Ctrl+H, Return, Left.\r\n"); fflush(stdout);
         unsigned char bytes[7],expected[]={2,19,8,13,27,'[','D'};
         size_t off=0;
         while (off<sizeof bytes) {
@@ -31,7 +31,7 @@ static int child(const char *mode) {
             off+=(size_t)n;
         }
         if (memcmp(bytes,expected,sizeof bytes)) return 32;
-        puts("Raw key sequence verified."); return 0;
+        printf("Raw key sequence verified.\r\n"); return 0;
     }
     if (!strcmp(mode,"--echo")) {
         cfmakeraw(&t); if (tcsetattr(0,TCSANOW,&t)) return 23;
@@ -165,7 +165,7 @@ static int interactive(void) {
     char line[128]; ssize_t n=read(0,line,sizeof line-1); if (n<=0) return 1;
     line[n]=0; printf("Received: %s",line);
     rawmode=saved; cfmakeraw(&rawmode); if (tcsetattr(0,TCSANOW,&rawmode)) return 2;
-    puts("Raw input: press one key without Enter."); fflush(stdout);
+    printf("Raw input: press one key without Enter.\r\n"); fflush(stdout);
     unsigned char c; n=read(0,&c,1);
     if (tcsetattr(0,TCSANOW,&saved)) return 3;
     if (n!=1) return 4;
@@ -174,7 +174,64 @@ static int interactive(void) {
     n=read(0,line,sizeof line); if (n<0) return 5;
     puts("Terminal probe complete."); return 0;
 }
+
+/* Real ring-3 full-screen acceptance witness, using only terminal stdio. */
+static int screen_witness(void) {
+    struct termios saved,t;struct winsize size={0},previous={0};
+    if(tcgetattr(0,&saved) || ioctl(0,TIOCGWINSZ,&size))return 40;
+    t=saved;cfmakeraw(&t);if(tcsetattr(0,TCSANOW,&t))return 41;
+    printf("\033[?1049h\033[?25l\033[?1h\033[?2004h");fflush(stdout);
+    unsigned selected=0,logs=0,pasted=0,paste_lines=0;bool paste=false,redraw=true;
+    char sequence[80];unsigned sequence_n=0,state=0;char status[160]="Ready for raw keys; no Enter required.";
+    for(;;) {
+        if(embk_cancelled())break;
+        if(ioctl(0,TIOCGWINSZ,&size)==0 && memcmp(&size,&previous,sizeof size)){previous=size;redraw=true;}
+        if(redraw) {
+            printf("\033[r\033[0m\033[2J\033[H");
+            if(size.ws_col<35 || size.ws_row<13)printf("Resize to at least 35 x 13. q: return");
+            else {
+                printf("\033[1;38;2;115;210;188mEmbLink terminal screen check\033[0m");
+                printf("\033[2;1HLive PTY dimensions: %u columns, %u rows",size.ws_col,size.ws_row);
+                printf("\033[3;1HArrows: select | Enter: log | r: reply | q: return");
+                const char *names[]={"Primary viewport","Scrolling region","Unicode cells"};
+                for(unsigned i=0;i<3;i++)printf("\033[%u;1H%s %c %-25s\033[0m",5+i,i==selected?"\033[48;2;56;95;89;38;2;238;247;242m":"",i==selected?'>':' ',names[i]);
+                printf("\033[8;1HUTF-8: caf\xc3\xa9   e\xcc\x81   \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90");
+                printf("\033[9;1H\033[38;5;109mScroll-region log\033[0m");
+                printf("\033[10;%ur\033[%u;1H",size.ws_row-2,size.ws_row-2);
+                printf("Log %03u: only this region scrolls",logs);
+                printf("\033[%u;1H\033[2K%s",size.ws_row,status);
+            }
+            fflush(stdout);redraw=false;
+        }
+        if(!(embk_fd_poll(0,EMBK_POLLIN)&EMBK_POLLIN)){embk_sleep_ms(10);continue;}
+        unsigned char c;if(read(0,&c,1)!=1)break;
+        if(state==1){if(c=='[' || c=='O'){state=2;sequence_n=0;}else state=0;continue;}
+        if(state==2) {
+            if(sequence_n+1<sizeof sequence)sequence[sequence_n++]=(char)c;
+            if(c>=0x40 && c<=0x7e) {
+                sequence[sequence_n]=0;state=0;
+                if(!strcmp(sequence,"A")){selected=(selected+2)%3;redraw=true;}
+                else if(!strcmp(sequence,"B")){selected=(selected+1)%3;redraw=true;}
+                else if(!strcmp(sequence,"4;10R")){snprintf(status,sizeof status,"Cursor reply verified: row 4, column 10");redraw=true;}
+                else if(!strcmp(sequence,"200~")){paste=true;pasted=paste_lines=0;}
+                else if(!strcmp(sequence,"201~")){paste=false;snprintf(status,sizeof status,"Bracketed paste verified: %u bytes, %u newline(s)",pasted,paste_lines);redraw=true;}
+            }
+            continue;
+        }
+        if(c==27){state=1;continue;}
+        if(paste){pasted++;if(c=='\n')paste_lines++;continue;}
+        if(c=='q' || c==3)break;
+        if(c=='r'){printf("\033[4;10H\033[6n");fflush(stdout);continue;}
+        if(c=='\r' && size.ws_row>=13 && size.ws_col>=35) {
+            logs++;printf("\033[%u;1H\r\n\033[2KLog %03u: only this region scrolls",size.ws_row-2,logs);fflush(stdout);
+        }
+    }
+    printf("\033[r\033[?2004l\033[?1l\033[?25h\033[0m\033[?1049l");fflush(stdout);
+    if(tcsetattr(0,TCSANOW,&saved))return 42;
+    puts("Alternate screen restored.");return 0;
+}
 int main(int argc,char **argv) {
+    if (argc>1 && !strcmp(argv[1],"--screen")) return screen_witness();
     if (argc>1 && !strcmp(argv[1],"--selftest")) return selftest();
     if (argc>1) return child(argv[1]);
     return interactive();

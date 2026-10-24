@@ -1640,6 +1640,14 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
+# Terminal's screen parser/model is pure userspace and separately host-tested.
+build/vt.o: user/terminal/vt.c user/terminal/vt.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
+build/term.o: user/terminal/vt.h
+build/term.elf: build/term.o build/vt.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o build/vt.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
 # Photos -- the picture viewer. Like vellum it needs more than one object, so
 # it gets an explicit rule and is filtered out of the generic EmUI link above.
 # It shares the browser's decoders rather than carrying its own: png.c and
@@ -2601,6 +2609,11 @@ compile-commands:
 	python3 tools/gen_compile_commands.py
 
 .PHONY: compile-commands
+
+.PHONY: terminal-screen-test
+terminal-screen-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_test.c -o $(BUILD)/vt_test
+	$(BUILD)/vt_test
 
 .PHONY: terminal-test
 terminal-test: | $(BUILD)

@@ -425,11 +425,20 @@ int main(int argc, char **argv) {
         } else {
             char cwd[192];
             if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
-            puts1("\x10"); puts1(cwd); puts1("\n");
+            const char *integration=getenv("EMBLINK_PROMPT");
+            if (integration && !strcmp(integration,"1")) {
+                /* OSC shell integration, distinct from ordinary C0 bytes and
+                 * terminated without adding a row to the terminal screen. */
+                for (char *p=cwd;*p;p++) if ((unsigned char)*p<32 || (unsigned char)*p==127) *p='?';
+                puts1("\033[?1049l\033[?1l\033[?2004l\033[?25h\033[0m");
+                puts1("\033]133;A;cwd="); puts1(cwd); puts1("\007");
+            } else puts1("embk> ");
         }
         int n = read_line(line, sizeof line);
         if (n < 0) break;                      /* console EOF/error: leave */
         if (strcmp(line, "exit") == 0) break;
+        const char *integration=getenv("EMBLINK_PROMPT");
+        if (integration && !strcmp(integration,"1")) puts1("\033]133;C\007");
         (void)run_line(line, &top);
     }
     if (g_console_session) embk_tty_mode(EMBK_TTY_COOKED);

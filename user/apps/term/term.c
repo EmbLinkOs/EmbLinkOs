@@ -3,8 +3,8 @@
  * At the shell prompt we retain local history, completion and cursor editing.
  * Once a command starts, input goes directly to the PTY master. Programs choose
  * canonical/echo or raw mode through termios; their escape-key input uses ANSI
- * sequences. Output currently supports transcript reflow and SGR colours, not
- * a complete VT screen. TERM=emlink deliberately advertises only that subset.
+ * sequences. Output uses a bounded VT screen with primary/alternate grids and
+ * streaming Unicode and cursor editing. TERM=emlink advertises this subset.
  * The master is nonblocking and input is queued so a slow child cannot freeze
  * the window. Closing the master hangs up the slave, including blocked reads.
  */
@@ -15,52 +15,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
+#include "../../terminal/vt.h"
+#include "font.h"
+#include "backend.h"
 
 #include "embk.h"
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
 
-/* CAPACITY (buffer dimensions) vs the LIVE GRID (what fits right now). The
- * window is resizable, so the grid is measured from the viewport every frame
- * and the buffers are simply big enough for the largest sane window. */
-#define SB_COLS  220       /* widest line the scrollback can hold */
-#define SB_VROWS 60        /* most transcript rows we can ever render */
-static int g_cols = 96;    /* live: chars per line before a hard wrap */
-static int g_rows = 22;    /* live: visible transcript lines */
-#define SB_ROWS 300        /* scrollback depth (a ring of whole lines) */
-static int g_master=-1;
+/* The cell model owns the screen; rendering never changes parsed content. */
+static struct vt g_vt;
+static int g_cols=80,g_rows=20,g_view=0,g_master=-1,g_shell=-1;
 #define FD_SHELL_IN g_master
 #define FD_SHELL_OUT g_master
-
-/* --- scrollback: characters + a parallel ATTRIBUTE plane ------------------
- * g_head is the ring slot of the CURRENT (partial) line; g_count how many
- * slots hold real lines; g_view how far the user has paged back (0 = live).
- * Each cell's attribute: low 4 bits = colour (0 default, 1..8 = ANSI 30..37),
- * bit 4 = bright, bit 5 = bold. */
-#define AT_COLOR(a)  ((a) & 0x0F)
-#define AT_BRIGHT    0x10
-#define AT_BOLD      0x20
-static char    g_sb [SB_ROWS][SB_COLS + 1];
-static uint8_t g_sba[SB_ROWS][SB_COLS];
-static int  g_head = 0, g_count = 1, g_col = 0;
-/* Rows produced by a HARD WRAP are marked as continuations of the row above.
- * Without that mark a wrapped line and a real newline are indistinguishable in
- * the ring, and re-wrapping the scrollback at a new width is impossible --
- * which is why narrowing the window used to CLIP old output instead of
- * reflowing it. One bit per row buys the whole feature. */
-static uint8_t g_cont[SB_ROWS];
-static int  g_view = 0;
-static int  g_shell = -1;      /* spawn handle */
-static bool g_dead = false;
-static bool g_at_prompt=false;
-static unsigned char g_pending[4096];
-static size_t g_pending_n=0;
+static bool g_dead=false,g_at_prompt=false;
+static char g_notice[96];
+static unsigned char g_pending[65568];
+static size_t g_pending_n;
 static bool term_send(const void *data,size_t n) {
-    if (n>sizeof g_pending-g_pending_n) return false;
-    memcpy(g_pending+g_pending_n,data,n); g_pending_n+=n; return true;
+    if (n>sizeof g_pending-g_pending_n) {snprintf(g_notice,sizeof g_notice,"Input queue is full; wait for the program to read.");return false;}
+    memcpy(g_pending+g_pending_n,data,n);g_pending_n+=n;return true;
 }
-static uint8_t g_attr = 0;     /* current SGR state, applied to incoming chars */
+static void term_reply(void *unused,const char *data,size_t n) {(void)unused;(void)term_send(data,n);}
 
 /* --- the command line ------------------------------------------------------
  * The terminal owns the line: nothing reaches the shell until Enter. g_cur is
@@ -97,14 +75,9 @@ static void hist_step(int dir) {
     g_cur = g_in_n;
 }
 
-/* --- the prompt ------------------------------------------------------------
- * The shell hands us its working directory as a marker line (0x10 <path> \n)
- * instead of printing a prompt, so the transcript holds only real output and we
- * can draw a proper user@host:cwd$ on the input line -- with the path live, so
- * it follows `cd` the way a shell prompt should. */
-#define CWD_MARK 0x10
-static char g_cwd[192] = "/";
-static int  g_cwd_cap = 0, g_cwd_n = 0;
+/* OSC 133 shell integration publishes a completed native prompt. Other
+ * programs own their terminal screen and receive input directly. */
+static char g_cwd[192]="/";
 
 #define HOSTNAME "emblink"
 
@@ -141,196 +114,16 @@ static const char *prompt_text(void) {
     return p;
 }
 
-/* Clear the transcript. Not "scroll it away" -- the scrollback is genuinely
- * emptied, which is what someone reaching for Clear wants: the previous
- * session's output gone, not hidden one wheel-turn above. The current line is
- * kept because it is the line you are standing on. */
 static void term_clear(void) {
-    for (int i = 0; i < SB_ROWS; i++) { g_sb[i][0] = 0; g_sba[i][0] = 0; g_cont[i] = 0; }
-    g_head = 0; g_count = 1; g_col = 0; g_view = 0;
+    vt_feed(&g_vt,"\033[2J\033[H\033[3J",11);g_view=0;
 }
-
-/* ring slot of logical line `i` (0 = oldest live line, g_count-1 = current) */
-static int sb_slot(int i) {
-    return (g_head - (g_count - 1) + i + 2 * SB_ROWS) % SB_ROWS;
-}
-
-static void term_newline_ex(int continuation) {
-    g_head = (g_head + 1) % SB_ROWS;
-    g_cont[g_head] = (uint8_t)continuation;
-    if (g_count < SB_ROWS) g_count++;
-    memset(g_sb[g_head], 0, sizeof g_sb[0]);
-    memset(g_sba[g_head], 0, sizeof g_sba[0]);
-    g_col = 0;
-    /* keep a paged-back view anchored on the same CONTENT while new lines
-     * arrive underneath -- until the ring saturates and eats it */
-    if (g_view > 0 && g_view < g_count - g_rows) g_view++;
-    if (g_view > g_count - g_rows) g_view = g_count > g_rows ? g_count - g_rows : 0;
-}
-static void term_newline(void) { term_newline_ex(0); }
-
-/* Re-wrap the whole scrollback for a new width.
- *
- * Output is wrapped as it ARRIVES, so every line already in the ring was cut
- * to the width the window had at the time. Narrowing the window therefore used
- * to leave old lines too long -- clipped at the new edge -- and widening left
- * them short with a ragged right margin. Both are the same bug: the buffer
- * remembered a decision that belonged to the view.
- *
- * So: rebuild. Continuation runs are joined back into the logical lines the
- * shell actually printed, then re-emitted wrapped at the new width, attributes
- * carried along with their characters. */
-#define LOGICAL_MAX (SB_COLS * 4)
-
-static void term_reflow(int newcols) {
-    if (newcols < 20) newcols = 20;
-    if (newcols > SB_COLS) newcols = SB_COLS;
-
-    /* static, not stack: this is ~130KB of scratch and the app runs on a
-     * modest thread stack */
-    static char    tsb [SB_ROWS][SB_COLS + 1];
-    static uint8_t tsba[SB_ROWS][SB_COLS];
-    static uint8_t tcont[SB_ROWS];
-    int thead = 0, tcount = 1, tcol = 0;
-    memset(tsb[0], 0, sizeof tsb[0]);
-    memset(tsba[0], 0, sizeof tsba[0]);
-    tcont[0] = 0;
-
-    char    lbuf[LOGICAL_MAX];
-    uint8_t labuf[LOGICAL_MAX];
-    int     ln = 0;
-    int     started = 0;
-
-    for (int i = 0; i <= g_count; i++) {
-        int flush = (i == g_count);            /* one past the end: emit the tail */
-        int slot = flush ? 0 : sb_slot(i);
-        /* a row that is NOT a continuation begins a new logical line */
-        if (!flush && g_cont[slot] && started) {
-            for (int c = 0; c < SB_COLS && g_sb[slot][c] && ln < LOGICAL_MAX; c++) {
-                lbuf[ln] = g_sb[slot][c]; labuf[ln] = g_sba[slot][c]; ln++;
-            }
-            continue;
-        }
-        if (started) {
-            /* emit the completed logical line, wrapped at newcols */
-            for (int c = 0; c < ln; c++) {
-                if (tcol >= newcols) {
-                    thead = (thead + 1) % SB_ROWS;
-                    if (tcount < SB_ROWS) tcount++;
-                    memset(tsb[thead], 0, sizeof tsb[0]);
-                    memset(tsba[thead], 0, sizeof tsba[0]);
-                    tcont[thead] = 1; tcol = 0;
-                }
-                tsba[thead][tcol] = labuf[c];
-                tsb[thead][tcol++] = lbuf[c];
-                tsb[thead][tcol] = 0;
-            }
-            if (!flush) {
-                thead = (thead + 1) % SB_ROWS;
-                if (tcount < SB_ROWS) tcount++;
-                memset(tsb[thead], 0, sizeof tsb[0]);
-                memset(tsba[thead], 0, sizeof tsba[0]);
-                tcont[thead] = 0; tcol = 0;
-            }
-        }
-        if (flush) break;
-        ln = 0; started = 1;
-        for (int c = 0; c < SB_COLS && g_sb[slot][c] && ln < LOGICAL_MAX; c++) {
-            lbuf[ln] = g_sb[slot][c]; labuf[ln] = g_sba[slot][c]; ln++;
-        }
-    }
-
-    memcpy(g_sb,  tsb,  sizeof g_sb);
-    memcpy(g_sba, tsba, sizeof g_sba);
-    memcpy(g_cont, tcont, sizeof g_cont);
-    g_head = thead; g_count = tcount; g_col = tcol;
-    g_view = 0;                 /* the old anchor described the old wrapping */
-}
-
-/* --- ANSI SGR (ESC [ ... m) ------------------------------------------------
- * Only SGR is honoured -- colour and weight are what a transcript needs. Any
- * other CSI sequence is parsed to its final byte and dropped whole, so cursor
- * games from ported software degrade to plain text instead of garbage. */
-static int  g_esc = 0;            /* 0 plain, 1 saw ESC, 2 inside CSI */
-static int  g_csi[8], g_csi_n;    /* collected numeric params */
-static int  g_csi_cur;            /* param being accumulated (-1 = none yet) */
-
-static void sgr_apply(void) {
-    if (g_csi_cur >= 0 && g_csi_n < 8) g_csi[g_csi_n++] = g_csi_cur;
-    if (g_csi_n == 0) { g_attr = 0; return; }         /* bare ESC[m = reset */
-    for (int i = 0; i < g_csi_n; i++) {
-        int p = g_csi[i];
-        if      (p == 0)              g_attr = 0;
-        else if (p == 1)              g_attr |= AT_BOLD;
-        else if (p == 22)             g_attr &= (uint8_t)~AT_BOLD;
-        else if (p >= 30 && p <= 37)  g_attr = (uint8_t)((g_attr & ~0x1F) | (p - 30 + 1));
-        else if (p >= 90 && p <= 97)  g_attr = (uint8_t)((g_attr & ~0x1F) | (p - 90 + 1) | AT_BRIGHT);
-        else if (p == 39)             g_attr &= (uint8_t)~0x1F;
-        /* backgrounds / everything else: ignored on purpose */
-    }
-}
-
 static void term_putc(char c) {
-    /* the shell's cwd marker: swallowed whole, never shown */
-    if (g_cwd_cap) {
-        if (c == '\n') { g_cwd[g_cwd_n] = 0; g_cwd_cap = 0; g_at_prompt=true; }
-        else if (c != '\r' && g_cwd_n < (int)sizeof g_cwd - 1) g_cwd[g_cwd_n++] = c;
-        return;
-    }
-    if (c == CWD_MARK) { g_cwd_cap = 1; g_cwd_n = 0; return; }
-
-    /* escape-sequence states eat their bytes before anything else sees them */
-    if (g_esc == 1) {
-        if (c == '[') { g_esc = 2; g_csi_n = 0; g_csi_cur = -1; }
-        else g_esc = 0;                                  /* lone ESC: dropped */
-        return;
-    }
-    if (g_esc == 2) {
-        if (c >= '0' && c <= '9') {
-            g_csi_cur = (g_csi_cur < 0 ? 0 : g_csi_cur) * 10 + (c - '0');
-        } else if (c == ';') {
-            if (g_csi_n < 8) g_csi[g_csi_n++] = g_csi_cur < 0 ? 0 : g_csi_cur;
-            g_csi_cur = -1;
-        } else if (c >= 0x40 && c <= 0x7E) {             /* final byte */
-            if (c == 'm') sgr_apply();
-            g_esc = 0;
-        }
-        return;
-    }
-    if (c == 0x1B) { g_esc = 1; return; }
-
-    if (c == '\n') { term_newline(); return; }
-    if (c == '\r') { g_col = 0; return; }
-    if (c == '\t') {                       /* expand to 8-column stops */
-        int stop = (g_col / 8 + 1) * 8;
-        while (g_col < stop && g_col < g_cols) {
-            g_sba[g_head][g_col] = 0;
-            g_sb[g_head][g_col++] = ' ';
-        }
-        g_sb[g_head][g_col] = '\0';
-        return;
-    }
-    if (c == '\f') {                       /* form feed: the shell's `clear` */
-        memset(g_sb, 0, sizeof g_sb);
-        memset(g_sba, 0, sizeof g_sba);
-        g_head = 0;
-        g_count = 1;
-        g_col = 0;
-        g_view = 0;
-        return;
-    }
-    if (c == '\b') {
-        if (g_col > 0) { g_col--; g_sb[g_head][g_col] = '\0'; }
-        return;
-    }
-    if ((unsigned char)c < 0x20) return;   /* other control bytes: drop */
-    if (g_col >= g_cols) term_newline_ex(1);   /* hard wrap -> a continuation */
-    g_sba[g_head][g_col] = g_attr;
-    g_sb[g_head][g_col++] = c;
-    g_sb[g_head][g_col] = '\0';
+    vt_feed(&g_vt,&c,1);
 }
-
-static void term_say(const char *s) { while (*s) term_putc(*s++); }
+static void term_newline(void) {vt_feed(&g_vt,"\r\n",2);}
+static void term_say(const char *s) {
+    while (*s) {if (*s=='\n')term_newline();else term_putc(*s);s++;}
+}
 
 /* --- line-editor edits ----------------------------------------------------- */
 
@@ -343,14 +136,14 @@ static void in_insert(char c) {
 
 static void in_backspace(void) {
     if (g_cur == 0) return;
-    memmove(g_in + g_cur - 1, g_in + g_cur, (size_t)(g_in_n - g_cur) + 1);
-    g_cur--; g_in_n--;
+    int start=g_cur-1;while(start>0 && ((unsigned char)g_in[start]&0xc0)==0x80)start--;
+    memmove(g_in+start,g_in+g_cur,(size_t)(g_in_n-g_cur)+1);g_in_n-=g_cur-start;g_cur=start;
 }
 
 static void in_delete(void) {                    /* forward delete, at the caret */
     if (g_cur >= g_in_n) return;
-    memmove(g_in + g_cur, g_in + g_cur + 1, (size_t)(g_in_n - g_cur));
-    g_in_n--;
+    int end=g_cur+1;while(end<g_in_n && ((unsigned char)g_in[end]&0xc0)==0x80)end++;
+    memmove(g_in+g_cur,g_in+end,(size_t)(g_in_n-end)+1);g_in_n-=end-g_cur;
 }
 
 static void in_kill_to_start(void) {             /* Ctrl+U */
@@ -477,14 +270,14 @@ static void complete(void) {
     if (n == 1) { in_insert(cs[0].is_dir ? '/' : ' '); return; }
 
     /* stuck with several: show them, the way a second Tab does in bash */
-    term_say(prompt_text()); term_putc(' '); term_say(g_in); term_putc('\n');
+    term_say(prompt_text()); term_putc(' '); term_say(g_in); term_newline();
     for (int i = 0; i < n; i++) {
         if (cs[i].is_dir) { term_say("\x1b[1;34m"); term_say(cs[i].name);
                             term_say("\x1b[0m/"); }
         else term_say(cs[i].name);
         term_say("  ");
     }
-    term_putc('\n');
+    term_newline();
 }
 
 /* --- runtime hooks -------------------------------------------------------- */
@@ -514,8 +307,15 @@ static void term_idle(void) {
         if (want>budget) want=budget;
         int r = (int)embk_read(FD_SHELL_OUT, buf, want);
         if (r <= 0) break;
-        for (int i = 0; i < r; i++) term_putc(buf[i]);
+        uint64_t scrolled=g_vt.scrolls;
+        vt_feed(&g_vt,buf,(size_t)r);
+        if(g_view>0)g_view+=(int)(g_vt.scrolls-scrolled);
         got = true; budget-=(size_t)r;
+    }
+    static unsigned prompt_serial;
+    if(prompt_serial!=g_vt.prompt_serial) {
+        prompt_serial=g_vt.prompt_serial;g_at_prompt=g_vt.shell_ready;
+        snprintf(g_cwd,sizeof g_cwd,"%.*s",(int)sizeof g_cwd-1,g_vt.directory);got=true;
     }
     if (!g_dead && g_shell >= 0 && !embk_proc_alive(g_shell)) {
         g_dead = true;
@@ -525,45 +325,86 @@ static void term_idle(void) {
     if (got) em_request_frame();
 }
 
+static void term_copy(void) {
+    static char copy[65536];size_t n=0;
+    struct vt *snapshot=NULL;const struct vt *source=&g_vt;
+    if(g_at_prompt && !g_view) {
+        snapshot=malloc(sizeof *snapshot);
+        if(!snapshot){snprintf(g_notice,sizeof g_notice,"Screen text could not be copied.");em_request_frame();return;}
+        *snapshot=g_vt;snapshot->reply=NULL;source=snapshot;
+        vt_feed(snapshot,prompt_text(),strlen(prompt_text()));vt_feed(snapshot," ",1);vt_feed(snapshot,g_in,(size_t)g_in_n);
+    }
+    for(int y=0;y<g_rows;y++) {
+        char row[VT_COLS*12+1];size_t k=vt_line_text(source,y,(unsigned)g_view,row,sizeof row);
+        if(n+k+1>sizeof copy){free(snapshot);snprintf(g_notice,sizeof g_notice,"Screen text exceeds the clipboard limit.");em_request_frame();return;}
+        memcpy(copy+n,row,k);n+=k;if(y+1<g_rows)copy[n++]='\n';
+    }
+    free(snapshot);
+    if(embk_clip_set(copy,n)<0)snprintf(g_notice,sizeof g_notice,"Screen text could not be copied.");
+    else snprintf(g_notice,sizeof g_notice,"Screen copied");
+    em_request_frame();
+}
+static void term_paste(void) {
+    if(g_dead)return;
+    static char clipboard[65536],paste[65568];
+    int64_t held=embk_clip_get(clipboard,sizeof clipboard);
+    if(held<=0)return;
+    if(held>(int64_t)sizeof clipboard){snprintf(g_notice,sizeof g_notice,"Clipboard text is too large to paste.");em_request_frame();return;}
+    bool bracketed=!g_at_prompt && g_vt.bracketed_paste;
+    size_t n=0;if(bracketed){memcpy(paste,"\033[200~",6);n=6;}
+    for(int64_t i=0;i<held;i++) {
+        unsigned char c=(unsigned char)clipboard[i];
+        if(c=='\r') {if(i+1<held && clipboard[i+1]=='\n')continue;c='\n';}
+        if(!bracketed && (c=='\n' || c=='\t'))c=' ';
+        if(c==127 || (c<32 && c!='\n' && c!='\t'))continue;
+        paste[n++]=(char)c;
+    }
+    if(bracketed){memcpy(paste+n,"\033[201~",6);n+=6;}
+    if(g_at_prompt) {
+        if(n>IN_MAX-1-(size_t)g_in_n)snprintf(g_notice,sizeof g_notice,"Pasted text exceeds the command line limit.");
+        else {memmove(g_in+g_cur+n,g_in+g_cur,(size_t)(g_in_n-g_cur)+1);memcpy(g_in+g_cur,paste,n);g_cur+=(int)n;g_in_n+=(int)n;}
+    } else (void)term_send(paste,n);
+    em_request_frame();
+}
+
 /* keys: the full line-editor surface. PgUp/PgDn (and the wheel, in the view)
  * page the scrollback; editing keys work AT the caret; ESC clears the line
  * first and only closes the window when there is nothing to clear. */
 static int term_key(int c) {
+    unsigned mods=(unsigned)em_key_modifiers();g_notice[0]=0;
+    if(c==EMBK_KEY_COPY || (c==3 && (mods&(EMBK_KM_CTRL|EMBK_KM_SHIFT))==(EMBK_KM_CTRL|EMBK_KM_SHIFT))) {term_copy();return 1;}
+    if(c==EMBK_KEY_PASTE || (c==22 && (g_at_prompt || (mods&EMBK_KM_SHIFT)))) {term_paste();return 1;}
+    if((c==EMBK_KEY_PGUP || c==EMBK_KEY_PGDN) && (g_at_prompt || (mods&EMBK_KM_SHIFT))) {
+        if(!g_vt.alt) {
+            g_view+=(c==EMBK_KEY_PGUP?1:-1)*(g_rows/2);
+            if(g_view<0)g_view=0;
+            if(g_view>(int)g_vt.history_count)g_view=(int)g_vt.history_count;
+        }
+        em_request_frame();return 1;
+    }
     if (!g_at_prompt && !g_dead) {
-        const char *seq=NULL;
-        unsigned mods=(unsigned)em_key_modifiers();
-        if (!(mods&EMBK_KM_CTRL)) switch (c) {
-        case EMBK_KEY_UP: seq="\033[A"; break;
-        case EMBK_KEY_DOWN: seq="\033[B"; break;
-        case EMBK_KEY_RIGHT: seq="\033[C"; break;
-        case EMBK_KEY_LEFT: seq="\033[D"; break;
-        case EMBK_KEY_HOME: seq="\033[H"; break;
-        case EMBK_KEY_END: seq="\033[F"; break;
-        case EMBK_KEY_DEL: seq="\033[3~"; break;
-        case EMBK_KEY_PGUP: seq="\033[5~"; break;
-        case EMBK_KEY_PGDN: seq="\033[6~"; break;
+        unsigned key=(unsigned)c;
+        /* Driver navigation bytes overlap C0 control letters. The captured
+         * modifier snapshot, not the current held keys, distinguishes them. */
+        if (!(mods&EMBK_KM_CTRL)) switch(c) {
+        case EMBK_KEY_UP:key=VT_KEY_UP;break;case EMBK_KEY_DOWN:key=VT_KEY_DOWN;break;
+        case EMBK_KEY_LEFT:case EMBK_KEY_SEL_LEFT:key=VT_KEY_LEFT;break;
+        case EMBK_KEY_RIGHT:case EMBK_KEY_SEL_RIGHT:key=VT_KEY_RIGHT;break;
+        case EMBK_KEY_HOME:case EMBK_KEY_SEL_HOME:key=VT_KEY_HOME;break;
+        case EMBK_KEY_END:case EMBK_KEY_SEL_END:key=VT_KEY_END;break;
+        case EMBK_KEY_DEL:key=VT_KEY_DELETE;break;
+        case EMBK_KEY_PGUP:key=VT_KEY_PAGEUP;break;case EMBK_KEY_PGDN:key=VT_KEY_PAGEDOWN;break;
+        case '\t':key=VT_KEY_TAB;break;case '\n':key='\r';break;case '\b':key=127;break;
         }
-        unsigned char byte=(unsigned char)c;
-        if (!(mods&EMBK_KM_CTRL)) {
-            if (c=='\b') byte=127;
-            if (c=='\n') byte='\r';
-        }
-        bool queued=seq?term_send(seq,strlen(seq)):term_send(&byte,1);
-        if (!queued) term_say("\n[input queue full; wait for the program to read]\n");
-        em_request_frame(); return 1;
+        unsigned vtmods=((mods&EMBK_KM_SHIFT)?1:0)|((mods&EMBK_KM_ALT)?2:0)|((mods&EMBK_KM_CTRL)?4:0);
+        char sequence[16];size_t n=vt_key_sequence(&g_vt,key,vtmods,sequence);
+        if(n)(void)term_send(sequence,n);
+        if(g_view)g_view=0;
+        em_request_frame();return 1;
     }
     if (c == 27) {
         if (g_dead || g_in_n == 0) return 0;     /* nothing to clear -> close */
         g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
-        em_request_frame();
-        return 1;
-    }
-    if (c == EMBK_KEY_PGUP || c == EMBK_KEY_PGDN) {
-        int max_back = g_count > g_rows ? g_count - g_rows : 0;
-        if (c == EMBK_KEY_PGUP) g_view += g_rows / 2;
-        else                    g_view -= g_rows / 2;
-        if (g_view > max_back) g_view = max_back;
-        if (g_view < 0) g_view = 0;
         em_request_frame();
         return 1;
     }
@@ -572,8 +413,8 @@ static int term_key(int c) {
     switch (c) {
     case EMBK_KEY_UP:    hist_step(-1); break;
     case EMBK_KEY_DOWN:  hist_step(+1); break;
-    case EMBK_KEY_LEFT:  if (g_cur > 0) g_cur--; break;
-    case EMBK_KEY_RIGHT: if (g_cur < g_in_n) g_cur++; break;
+    case EMBK_KEY_LEFT: if(g_cur>0){g_cur--;while(g_cur>0 && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur--;}break;
+    case EMBK_KEY_RIGHT: if(g_cur<g_in_n){g_cur++;while(g_cur<g_in_n && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur++;}break;
     case EMBK_KEY_HOME:  case 0x01: g_cur = 0;      break;   /* Home / Ctrl+A */
     case EMBK_KEY_END:              g_cur = g_in_n; break;   /* End  / Ctrl+E */
     case 0x03:                                   /* Ctrl+C: abandon the line */
@@ -585,7 +426,7 @@ static int term_key(int c) {
         if (!g_in_n && term_send("\004",1)) g_at_prompt=false;
         break;
     case 0x0C:                                   /* Ctrl+L: clear the screen */
-        term_putc('\f');
+        term_clear();
         break;
     case 0x15: in_kill_to_start(); break;        /* Ctrl+U */
     case 0x0B: in_kill_to_end();   break;        /* Ctrl+K */
@@ -610,7 +451,7 @@ static int term_key(int c) {
         break;
     }
     default:
-        if (c >= 0x20 && c <= 0x7E) {
+        if (c >= 0x20 && c <= 0xF4) {
             if (g_view != 0) g_view = 0;         /* typing = snap back to live */
             in_insert((char)c);
         }
@@ -649,7 +490,7 @@ static bool term_spawn_shell(void) {
     char user_env[64];
     snprintf(user_env, sizeof user_env, "USER=%s",
              getenv("USER") ? getenv("USER") : "user");
-    char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", NULL };
+    char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", "EMBLINK_PROMPT=1", NULL };
     int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, senv, acts, 3);
 
     close(pair[1]);
@@ -661,189 +502,142 @@ failed:
 
 /* --- the view -------------------------------------------------------------- */
 
-/* the ANSI palette, tuned for the dark ground (normal / bright) */
-static Color ansi_color(uint8_t attr, Color dflt) {
-    static const Color norm[8] = {
-        { .r=.35f, .g=.37f, .b=.40f, .a=1 },   /* black (visible grey) */
-        { .r=.87f, .g=.42f, .b=.42f, .a=1 },   /* red */
-        { .r=.45f, .g=.78f, .b=.51f, .a=1 },   /* green */
-        { .r=.86f, .g=.75f, .b=.44f, .a=1 },   /* yellow */
-        { .r=.47f, .g=.65f, .b=.92f, .a=1 },   /* blue */
-        { .r=.78f, .g=.56f, .b=.86f, .a=1 },   /* magenta */
-        { .r=.44f, .g=.79f, .b=.80f, .a=1 },   /* cyan */
-        { .r=.88f, .g=.89f, .b=.91f, .a=1 },   /* white */
-    };
-    static const Color bright[8] = {
-        { .r=.48f, .g=.50f, .b=.54f, .a=1 },
-        { .r=.96f, .g=.54f, .b=.54f, .a=1 },
-        { .r=.56f, .g=.90f, .b=.62f, .a=1 },
-        { .r=.95f, .g=.86f, .b=.55f, .a=1 },
-        { .r=.58f, .g=.75f, .b=.98f, .a=1 },
-        { .r=.88f, .g=.67f, .b=.95f, .a=1 },
-        { .r=.55f, .g=.90f, .b=.91f, .a=1 },
-        { .r=.97f, .g=.97f, .b=.99f, .a=1 },
-    };
-    int ci = AT_COLOR(attr);
-    if (ci == 0) return dflt;
-    return (attr & AT_BRIGHT) ? bright[ci - 1] : norm[ci - 1];
+/* --- a single retained bitmap, painted only when the model/input changes --- */
+static uint32_t *g_pixels[2];
+static int g_pixel_width,g_pixel_height,g_pixel_index,g_cell_width,g_cell_height;
+static uint64_t g_painted_signature;
+static bool g_bitmap_valid;
+
+static uint32_t rgb(Color c) {
+    return ((uint32_t)(c.r*255+.5f)<<16)|((uint32_t)(c.g*255+.5f)<<8)|(uint32_t)(c.b*255+.5f);
 }
-
-/* Per-run scratch: substrings handed to Text() must outlive the frame build,
- * so every run gets its own slot rather than sharing one static buffer. */
-#define MAX_RUNS 10
-static char s_run[SB_VROWS][MAX_RUNS][SB_COLS + 1];
-
-/* one transcript row, split into runs of equal attribute */
-static void row_runs(int row_i, const char *s, const uint8_t *a, Color dflt) {
-    HStack(.spacing = 0, .align = Center) {
-        int i = 0, run = 0;
-        while (s[i] && run < MAX_RUNS) {
-            uint8_t at = a[i];
-            int j = i;
-            while (s[j] && a[j] == at) j++;
-            int len = j - i; if (len > SB_COLS) len = SB_COLS;
-            memcpy(s_run[row_i][run], s + i, (size_t)len);
-            s_run[row_i][run][len] = 0;
-            EmV t = Text(s_run[row_i][run]).caption().color(ansi_color(at, dflt));
-            if (at & AT_BOLD) t.bold();
-            i = j; run++;
-        }
+static Color colour(uint32_t c) {return (Color){((c>>16)&255)/255.f,((c>>8)&255)/255.f,(c&255)/255.f,1};}
+static void fill(uint32_t *pixels,int x,int y,int w,int h,uint32_t color) {
+    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>g_pixel_width?g_pixel_width:x+w,y1=y+h>g_pixel_height?g_pixel_height:y+h;
+    for(int row=y0;row<y1;row++)for(int col=x0;col<x1;col++)pixels[(size_t)row*g_pixel_width+col]=0xff000000u|color;
+}
+static void paint_cell(struct render_target *rt,int x,int y,const struct vt_cell *c,uint32_t foreground,uint32_t background,uint32_t font,uint32_t bold,float size) {
+    if (!c->width) return;
+    uint32_t fg=c->fg==VT_DEFAULT?foreground:c->fg,bg=c->bg==VT_DEFAULT?background:c->bg;
+    if(c->flags&VT_INVERSE){uint32_t tmp=fg;fg=bg;bg=tmp;}
+    if(c->flags&VT_DIM)fg=((fg&0xfefefeu)>>1);
+    int px=x*g_cell_width,py=y*g_cell_height,w=c->width*g_cell_width;
+    fill(rt->pixels,px,py,w,g_cell_height,bg);
+    if(!(c->flags&VT_HIDDEN)) {
+        char text[16];unsigned n=0;
+        n+=vt_encode(c->rune,text+n);
+        for(unsigned i=0;i<2;i++)if(c->combining[i])n+=vt_encode(c->combining[i],text+n);
+        text[n]=0;
+        cpu_backend_get()->draw_text(rt,(float)px,(float)py+1,text,(c->flags&VT_BOLD)?bold:font,size,colour(fg),1,NULL,(float)w,(float)g_cell_height,false);
+        if(c->flags&VT_UNDERLINE)fill(rt->pixels,px,py+g_cell_height-2,w,1,fg);
+        if(c->flags&VT_STRIKE)fill(rt->pixels,px,py+g_cell_height/2,w,1,fg);
     }
 }
-
+static unsigned next_rune(const char *s,uint32_t *rune) {
+    int n=font_utf8_decode(s,rune);return n>0?(unsigned)n:1;
+}
+static void overlay_text(struct render_target *rt,const char *text,int *x,int *y,uint32_t fg,uint32_t bg,uint32_t font,uint32_t bold,float size) {
+    for(const char *p=text;*p;) {
+        uint32_t rune;unsigned n=next_rune(p,&rune);p+=n;int w=vt_width(rune);if(w<0)continue;
+        if(w==0)continue;
+        if(*x+w>g_cols){*x=0;(*y)++;}
+        if(*y>=g_rows)break;
+        struct vt_cell c={.rune=rune,.fg=fg,.bg=bg,.width=(uint8_t)w};
+        paint_cell(rt,*x,*y,&c,fg,bg,font,bold,size);*x+=w;
+    }
+}
+static void paint_cursor(struct render_target *rt,int x,int y,uint32_t color) {
+    if(x>=g_cols){x=0;y++;}if(y>=g_rows)return;
+    int style=g_at_prompt?5:g_vt.cursor_style;
+    if(style==3 || style==4)fill(rt->pixels,x*g_cell_width,(y+1)*g_cell_height-2,g_cell_width,2,color);
+    else if(style==5 || style==6)fill(rt->pixels,x*g_cell_width,y*g_cell_height,2,g_cell_height,color);
+    else {
+        /* An outline keeps the underlying character readable without blink. */
+        fill(rt->pixels,x*g_cell_width,y*g_cell_height,g_cell_width,1,color);
+        fill(rt->pixels,x*g_cell_width,(y+1)*g_cell_height-1,g_cell_width,1,color);
+        fill(rt->pixels,x*g_cell_width,y*g_cell_height,1,g_cell_height,color);
+        fill(rt->pixels,(x+1)*g_cell_width-1,y*g_cell_height,1,g_cell_height,color);
+    }
+}
+static uint64_t signature(const char *s,uint64_t h) {for(;*s;s++)h=(h^(unsigned char)*s)*1099511628211ull;return h;}
+static bool screen_bitmap(void) {
+    const struct ui_theme *t=ui_theme();
+    uint32_t font=em_font("/system/fonts/mono.ttf"),bold=em_font("/system/fonts/mono-bold.ttf");
+    if(!font)font=t->font_regular;
+    if(!bold)bold=font;
+    float size=t->text_caption;struct font *f=font_for_handle(font);if(!f)return false;
+    struct glyph_cache_entry *m=glyph_cache_lookup_or_rasterize(font_global_atlas(),f,'M',size);
+    int cw=m?(int)ceilf(m->advance_px):8;
+    int ch=(int)ceilf((f->ascent+f->descent+f->line_gap)*size/f->units_per_em)+2;
+    if(cw<1)cw=1;
+    if(ch<1)ch=1;
+    int cols=(int)((em_viewport_width()-28)/cw),rows=(int)((em_viewport_height()-t->toolbar_height-20)/ch);
+    if(cols<2)cols=2;
+    if(cols>VT_COLS)cols=VT_COLS;
+    if(rows<2)rows=2;
+    if(rows>VT_ROWS)rows=VT_ROWS;
+    int w=cols*cw,h=rows*ch;
+    if(w!=g_pixel_width || h!=g_pixel_height) {
+        uint32_t *a=malloc((size_t)w*h*4),*b=malloc((size_t)w*h*4);
+        if(!a || !b){free(a);free(b);return false;}
+        if(!vt_resize(&g_vt,cols,rows)){free(a);free(b);return false;}
+        free(g_pixels[0]);free(g_pixels[1]);g_pixels[0]=a;g_pixels[1]=b;g_pixel_width=w;g_pixel_height=h;g_bitmap_valid=false;
+    }
+    g_cols=cols;g_rows=rows;g_cell_width=cw;g_cell_height=ch;
+    if(g_view>(int)g_vt.history_count)g_view=(int)g_vt.history_count;
+    if(g_vt.alt)g_view=0;
+    if(g_at_prompt && !g_view) {
+        unsigned cells=(unsigned)(strlen(prompt_text())+1+strlen(g_in));
+        unsigned offset=g_vt.primary.cursor.wrap?(unsigned)g_cols:(unsigned)g_vt.primary.cursor.x;
+        vt_prompt_room(&g_vt,(offset+cells)/(unsigned)g_cols);
+    }
+    uint32_t bg=rgb(t->bg),fg=rgb(t->text),accent=rgb(t->accent);
+    uint64_t hash=signature(g_in,g_vt.revision*1099511628211ull);
+    hash=signature(prompt_text(),hash);hash^=(uint64_t)g_cur<<32;hash^=(uint64_t)(g_at_prompt+2*g_dead+4*g_view)<<24;
+    hash^=(uint64_t)bg<<16;hash^=(uint64_t)fg;hash^=(uint64_t)accent<<32;
+    hash^=(uint64_t)w<<40;hash^=(uint64_t)h<<48;hash^=(uint64_t)font<<8;hash^=(uint64_t)(size*4);
+    if(!g_bitmap_valid || hash!=g_painted_signature) {
+        g_pixel_index^=1;struct render_target rt={g_pixels[g_pixel_index],(uint32_t)w,(uint32_t)h,(uint32_t)w*4,EMBK_PIXFMT_BGRA8888_PRE,0};
+        struct clip_saved clip;cpu_clip_save_and_clear(&clip);
+        fill(rt.pixels,0,0,w,h,bg);
+        for(int y=0;y<rows;y++)for(int x=0;x<cols;x++)paint_cell(&rt,x,y,vt_view_cell(&g_vt,y,x,(unsigned)g_view),fg,bg,font,bold,size);
+        struct vt_cursor *cursor=&vt_active(&g_vt)->cursor;
+        int x=cursor->x,y=cursor->y;
+        if(g_at_prompt && cursor->wrap){x=0;y++;}
+        if(g_at_prompt && !g_view) {
+            overlay_text(&rt,prompt_text(),&x,&y,accent,bg,bold,bold,size);overlay_text(&rt," ",&x,&y,fg,bg,font,bold,size);
+            int caret_x=x,caret_y=y;
+            for(int i=0;i<g_cur;) {
+                uint32_t rune;unsigned n=next_rune(g_in+i,&rune);i+=(int)n;int width=vt_width(rune);if(width<0)width=1;
+                if(caret_x+width>cols){caret_x=0;caret_y++;}caret_x+=width;
+            }
+            overlay_text(&rt,g_in,&x,&y,fg,bg,font,bold,size);x=caret_x;y=caret_y;
+        }
+        if(!g_view && !g_dead && (g_at_prompt || g_vt.cursor_visible))paint_cursor(&rt,x,y,accent);
+        cpu_clip_restore(&clip);g_painted_signature=hash;g_bitmap_valid=true;
+    }
+    return true;
+}
 static void term_view(void) {
-    /* ONE ground colour for the whole window -- chrome, transcript, command
-     * line and any slack. A neutral near-black with a slight cool cast: it
-     * stays out of the way of the text, which is the only thing here worth
-     * looking at, and the prompt is the single spot of colour. */
-    const Color TERM_BG=ui_theme()->bg;
-    const Color TERM_TEXT=ui_theme()->text;
-    const Color TERM_PROMPT=ui_theme()->accent;
-
-    Window("Terminal", .background = TERM_BG) {
-        /* The shared frame (AppBar), so the Terminal, Files and Settings are
-         * one product. The lights, the drag zone and the centred title all come
-         * from there; what the Terminal adds is the one control that belongs to
-         * a terminal specifically. */
-        AppBar(title_text(), .background = TERM_BG) {
-            if (Button("Clear").ghost().color(TERM_TEXT).clicked()) term_clear();
+    const Color bg=ui_theme()->bg;
+    Window("Terminal",.background=bg) {
+        AppBar(g_notice[0]?g_notice:title_text(),.background=bg) {
+            if(Button("Copy screen").ghost().clicked())term_copy();
+            if(Button("Paste").ghost().clicked())term_paste();
+            if(Button("Clear").ghost().clicked())term_clear();
         }
-        /* THE SURFACE. One column: output, then the prompt you are typing at,
-         * then whatever space is left over.
-         *
-         * The previous version put the command line in its own lifted strip
-         * pinned to the bottom edge. That is a chat window, not a terminal --
-         * and it is wrong in a way you feel rather than see: your typing was
-         * nowhere near the output it belongs to, and a blank gap sat between
-         * the two whenever the transcript was short. A terminal's prompt is
-         * the NEXT LINE of the transcript. It sits directly under the last
-         * thing printed, in the same face on the same ground, and the whole
-         * column grows downward together. */
-        /* .clip: the transcript is a WINDOW onto the scrollback, so if the
-         * row estimate is off by one the extra row must be trimmed -- not
-         * allowed to overflow, because an overflowing column gets shrunk and a
-         * shrunk column of text collapses to nothing legible. This is the same
-         * property a ScrollView has, and for the same reason. */
-        CodeSurface() {
-        VStack(.spacing = 1, .px = 14, .pt = 10, .pb = 10, .align = Leading,
-               .grow = 1, .clip = 1, .background = TERM_BG) {
-            /* the wheel pages the scrollback -- up rolls back in time */
-            float wd = ui_take_wheel();
-            if (wd != 0.0f) {
-                int max_back = g_count > g_rows ? g_count - g_rows : 0;
-                g_view += (int)(wd * 3.0f);
-                if (g_view > max_back) g_view = max_back;
-                if (g_view < 0) g_view = 0;
-                em_request_frame();
-            }
-
-            /* Only the rows that EXIST are drawn. The old view always emitted
-             * g_rows rows, padding with blanks -- which is what forced the
-             * prompt to the bottom of the window and left the gap. */
-            /* One row for the prompt, and one of slack: the row height is
-             * derived from a measured box and rounding down by a pixel is
-             * enough to ask for a row that does not fit. Slack costs one line
-             * of scrollback; overflowing costs the whole view. */
-            int room  = g_rows > 2 ? g_rows - 2 : 1;
-            int avail = g_count - g_view;
-            if (avail < 0) avail = 0;
-            int show  = avail < room ? avail : room;
-            int start = avail - show;
-            if (start < 0) start = 0;
-
-            if (g_view > 0) {
-                static char mark[64];
-                snprintf(mark, sizeof mark,
-                         "-- %d line(s) back -- wheel down to return --", g_view);
-                Text(mark).caption().secondary();
-            }
-            for (int r = 0; r < show; r++) {
-                /* NO `continue`/`break` inside a container's brace scope: the
-                 * EmUI containers are for-loop MACROS, so a bare continue
-                 * targets the MACRO's hidden loop and silently skips the rest
-                 * of the body. */
-                int logical = start + r;
-                int slot = sb_slot(logical);
-                if (logical >= 0 && logical < g_count && g_sb[slot][0])
-                    row_runs(r, g_sb[slot], g_sba[slot], TERM_TEXT);
-                else
-                    Text(" ").caption().color(TERM_TEXT);   /* empty collapses (V7) */
-            }
-
-            /* THE PROMPT LINE -- the last line of the transcript, not a
-             * separate control. Same row height, same ground, no divider. */
-            HStack(.spacing = 0, .align = Center) {
-                /* Grid calibration, free of charge: the prompt is drawn in the
-                 * same mono face as the transcript and we KNOW its length, so
-                 * its measured box gives the character advance and the line
-                 * height -- no font API, no hidden probe node. Reads LAST
-                 * frame's geometry (one frame of lag is invisible). */
-                HStack(.align = Center) {
-                    float bx = 0, by = 0, bw = 0, bh = 0;
-                    int got = ui_open_rect(&bx, &by, &bw, &bh);
-                    if (got && bw > 1 && bh > 1) {
-                        int plen = (int)strlen(g_at_prompt?prompt_text():"Direct input");
-                        if (plen > 0) {
-                            float cw = bw / (float)plen, lh = bh + 1.0f;
-                            int cols = (int)((em_viewport_width() - 32.0f) / cw);
-                            int rows = (int)((em_viewport_height() - 46.0f - 22.0f) / lh);
-                            int want = cols < 20 ? 20 : cols > SB_COLS ? SB_COLS : cols;
-                            if (want != g_cols) { g_cols = want; term_reflow(want); }
-                            g_rows = rows < 3  ? 3  : rows > SB_VROWS ? SB_VROWS : rows;
-                        }
-                    }
-                    Text(g_at_prompt?prompt_text():"Direct input").caption().bold().color(TERM_PROMPT);
-                }
-                Text(" ").caption().color(TERM_TEXT);
-                if (g_dead) {
-                    Text("[process exited]").caption().secondary();
-                } else if (g_at_prompt) {
-                    static char pre[IN_MAX], post[IN_MAX];
-                    snprintf(pre,  sizeof pre,  "%.*s", g_cur, g_in);
-                    snprintf(post, sizeof post, "%s",   g_in + g_cur);
-                    if (pre[0])  Text(pre).caption().color(TERM_TEXT);
-                    /* a block caret, the way a terminal draws one */
-                    Text("\xE2\x96\x8B").caption().color(TERM_PROMPT);
-                    if (post[0]) Text(post).caption().color(TERM_TEXT);
-                }
-            }
-
+        VStack(.spacing=0,.px=14,.pt=10,.pb=10,.align=Leading,.clip=1,.background=bg) {
+            float wheel=ui_take_wheel();
+            if(wheel && !g_vt.alt) {g_view+=(int)(wheel*3);if(g_view<0)g_view=0;if(g_view>(int)g_vt.history_count)g_view=(int)g_vt.history_count;}
+            if(screen_bitmap()) {em_flush();ui_image_sized(0x5445524d,g_pixels[g_pixel_index],(uint32_t)g_pixel_width,(uint32_t)g_pixel_height,(float)g_pixel_width,(float)g_pixel_height);}
+            else Text("Terminal display could not be resized.").secondary();
         }
-        /* The filler is a SIBLING of the transcript, not a child of it.
-         * EmProps' .grow only makes a box grow along the CROSS axis (width in
-         * a column), so the transcript column is intrinsic-height whatever we
-         * ask -- with the spacer inside, the column ended exactly under the
-         * prompt and the window's resize grip, which anchors after it, was
-         * stranded halfway up the window. Out here the spacer eats the
-         * remaining height and the grip lands in the corner where it belongs.
-         * The dead space below the prompt is the Window's own ground, which is
-         * the same colour, so it reads as one surface either way. */
         Spacer();
-        }
     }
 }
 
 int main(void) {
+    vt_init(&g_vt,g_cols,g_rows,term_reply,NULL);
     if (!term_spawn_shell()) {
         term_say("can't start /shell.elf\n");
         g_dead = true;
@@ -872,5 +666,6 @@ int main(void) {
         close(FD_SHELL_IN);          /* an fd, so close() -- NOT a handle close */
         embk_wait(g_shell);          /* ...so this returns */
     }
+    free(g_pixels[0]);free(g_pixels[1]);
     return rc;
 }
