@@ -543,7 +543,13 @@ void em_overlay_end_(void)  {
 }
 int  em_overlay_dismissed(void) { return g_ov_dismissed; }
 int  em_overlay_active(void)    { return g_ov_now || g_ov_prev; }
-void em_dialog_(EmProps p)  { em_flush(); ui_dialog_begin(0); em_apply_box(p); }
+void em_dialog_(EmProps p)  {
+    em_flush();ui_dialog_begin(0);
+    /* em_apply_box deliberately clears omitted fills on retained containers.
+     * Supply the semantic default through props, as Card and Sidebar do. */
+    if(p.background.a<=0)p.background=TH->surface;
+    em_apply_box(p);
+}
 void em_dialog_end_(void)   { em_flush(); ui_dialog_end(); }
 /* True while a page transition is fading in. The host loop should force a full
  * surface repaint on these frames: a page swap removes nodes, and the dirty-rect
@@ -2834,7 +2840,7 @@ const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
 
 /* ---- .eic multi-resolution icons (docs/ICONS.md) ------------------------ */
 
-#define EM_ICON_MAX 24
+#define EM_ICON_MAX 128
 
 static uint32_t eic_rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
 static uint32_t eic_rd32(const uint8_t *p) {

@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
 
 static int g_fail;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  FAIL: %s\n", (msg)); g_fail++; } \
@@ -483,6 +484,28 @@ int main(void) {
     em_feed_pointer(20,18,1,0,0,1);chrome_frame();
     CHECK(chrome_closed,"a close press survives the icon's simultaneous hover tint change");
     em_feed_pointer(20,18,0,0,0,1);chrome_frame();
+
+    /* Switching icon families keeps colour tiles and original line assets in
+     * the same process cache. Exercise every shipped icon, not one fallback. */
+    DIR *images=opendir("system/images");unsigned icons=0,loaded=0;
+    CHECK(images!=NULL,"shipped icon directory is available");
+    if(images) {
+        struct dirent *entry;
+        while((entry=readdir(images))) {
+            size_t n=strlen(entry->d_name);if(n<4 || strcmp(entry->d_name+n-4,".eic"))continue;
+            char path[512];snprintf(path,sizeof path,"/system/images/%s",entry->d_name);
+            icons++;if(em_image_at(path,54,&iw,&ih))loaded++;
+        }
+        closedir(images);
+    }
+    CHECK(icons>24 && loaded==icons,"colour and monochrome families coexist without dropping an icon");
+
+    ui_frame_begin();em_new_frame();Overlay() {Dialog(.width=300) {Text("A readable decision");}}
+    em_flush();ui_frame_end();ui_run_layout(400,300);
+    struct instance_handle overlay=ui_first_child(ui_root());
+    struct scene_node *dialog=scene_resolve(&SA,ui_scene_of(ui_first_child(overlay)));
+    CHECK(dialog && dialog->data.rect.fill.kind==PAINT_SOLID && dialog->data.rect.fill.solid.a==1,
+          "a default Dialog retains an opaque readable surface");
 
     struct ui_appearance calm={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
     ui_theme_configure(&calm);em_set_clock(fake_clock);g_ms+=10000;em_toast("Ready",Success);

@@ -321,6 +321,7 @@ static void lock_set(int on) {
     if(gate<0){embk_puts(1,"home: lock ownership request failed\n");return;}
     g_locked = on;
     if (on) {
+        ui_request_focus(INSTANCE_HANDLE_NULL); /* password owns the new modal */
         g_apps_open = 0;                      /* one modal surface at a time */
         g_lock_gen++;
         g_lock_msg[0] = 0;
@@ -382,7 +383,7 @@ static void poll_lock_request(void) {
 
 static void apps_set_open(int open) {
     if (open == g_apps_open) return;
-    if (open) { scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
+    if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
     g_apps_open = open;
     /* Render the new state BEFORE moving the layer when closing, and move it
      * before rendering when opening -- either way the compositor's recompose
@@ -400,6 +401,7 @@ static void apps_set_open(int open) {
      * front (hiding the menu bar, which is how it looked like a crash) over a
      * desktop that had simply not drawn its launcher. */
     em_structure_changed();
+    g_invalidate = 2; /* Home owns its loop; it must consume structural invalidation. */
     g_full_present = 3;
     g_dock_dirty = 1;
     /* Say so on the serial console. The launcher is reachable only from the
@@ -1844,14 +1846,8 @@ int main(int argc, char **argv, char **envp) {
         ui_frame_begin(); em_new_frame(); home_ui(); em_flush();em_tooltip_host();ui_frame_end();
         ui_run_layout((float)sw, (float)sh);
 
-        /* NOT invalidating the render cache here, though it is what the second
-         * open needs. scene_render_invalidate() does make it start painting
-         * again -- and it paints at the WRONG GEOMETRY, the search field
-         * landing in the top-left corner instead of centred, which over the
-         * menu bar looks worse than not painting at all. The staleness and the
-         * bad layout are two faults and only one of them is understood. */
-
-        /* No forced full repaints. This loop used to nuke the renderer's rect
+        /* Structural transitions invalidate a bounded number of frames above.
+         * Ordinary dock changes and drags keep partial repaints. This loop used to nuke the renderer's rect
          * cache (two whole frames' worth) on every dock change and all through
          * a drag, because the dirty tracker lost the pixels of MOVED and
          * DESTROYED nodes -- the closed launcher stayed painted, dragged icons
