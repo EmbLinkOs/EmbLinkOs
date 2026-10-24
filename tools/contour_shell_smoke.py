@@ -24,7 +24,11 @@ def main():
         w=d.launch('Settings','Settings');ui=NativeUI(d);ui.click_text(w,'Paper');d.g.pump(3)
         ui.click_text(w,'Desktop & Dock');ui.reveal(w,'Application icons');ui.select(w,'Application icons','Monochrome')
         eventually(lambda:cfg('home',home,'icon_theme')==1,'monochrome preference did not reach shell');d.g.pump(3)
-        d.snap('monochrome-settings')
+        capture=d.snap('monochrome-settings')
+        from PIL import Image
+        with Image.open(capture) as im:
+            bright=sum(min(im.getpixel((x,y)))>170 for y in range(54,94) for x in range(35,75))
+        assert bright>20,'monochrome desktop glyph lost contrast against the dark wallpaper'
         d.key('meta_l-spc');d.g.pump(2);d.snap('monochrome-library');d.key('meta_l-spc');d.g.pump(1)
         ui.click_text(w,'Appearance');ui.select(w,'Surfaces','Custom')
         current=d.read('settings',w['pid'],'g_surface_hex',8).split(b'\0',1)[0].decode()

@@ -445,6 +445,8 @@ static struct app_item grid_to_item(int i) {
  * Renders the icon
  * (with hover styling) and tracks a press as either a click or a drag; the drop
  * is resolved after the frame in dock_resolve_drop(). */
+static Color    g_desk_ink = { .r = .93f, .g = .94f, .b = .96f, .a = 1.f };
+
 /* Colour tiles have opaque backgrounds, so alpha-tinting the whole tile
  * erases its glyph. Monochrome uses the matching original line silhouette. */
 static const char *monochrome_icon(const char *path) {
@@ -483,7 +485,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
     ui_set_align(ALIGN_CENTER);
     /* ALWAYS set opacity, so an instance never stays dimmed after its drag ends */
     ui_set_opacity((g_drag == kind && g_drag_i == idx && g_drag_moved) ? 0.3f : 1.0f);
-    if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(it.icon),size,ui_theme()->text);
+    if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(it.icon),size,kind==1?g_desk_ink:ui_theme()->text);
     else ImageButton(it.icon, size);         /* styling only; click/drag handled below */
     if (ui_is_active()) {
         g_any_active = 1;
@@ -592,8 +594,10 @@ static void cfg_poll(void) {
 
     static int appearance_applied;
     if(!appearance_applied || memcmp(&g_cfg,&was,sizeof g_cfg)) {
-        appearance_applied=1;oscfg_apply_appearance(&g_cfg);
-        oscfg_publish_desktop(&g_cfg);force_repaint();
+        oscfg_apply_appearance(&g_cfg);
+        /* A lock can temporarily gate publication. Retry the same snapshot
+         * after ownership returns instead of leaving chrome/insets stale. */
+        appearance_applied=oscfg_publish_desktop(&g_cfg)>=0;force_repaint();
     }
 
     embk_mutex_lock(&g_cfg_mutex);g_cfg_published=g_cfg;embk_mutex_unlock(&g_cfg_mutex);
@@ -699,7 +703,6 @@ static void prefs_listener(long arg) {
  *
  * The two thresholds are hysteresis. One would make a label flicker between
  * inks on a wallpaper that happens to sit near it. */
-static Color    g_desk_ink = { .r = .93f, .g = .94f, .b = .96f, .a = 1.f };
 static int      g_desk_ink_dark = 0;
 static uint64_t g_desk_ink_next = 0;
 static void desk_ink_poll(void) {
@@ -852,17 +855,17 @@ static void dock_pill(void) {
 /* The ghost: the dragged icon following the cursor (an out-of-flow overlay). */
 static void drag_ghost(void) {
     if (!(g_drag && g_drag_moved)) return;
-    ui_begin_vstack(0x6057);
-    ui_set_overlay(true);            /* fill parent, out of flow */
-    ui_set_layer(2);                 /* ABOVE dialog scrims: the ghost must ride
-                                      * over the launcher while dragging out of it */
-    ui_begin_vstack(1);
-    ui_set_offset(g_drag_x - 22.0f, g_drag_y - 22.0f);
-    ui_set_opacity(0.85f);
-    if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(g_drag_item.icon),44,ui_theme()->text);
-    else ImageButton(g_drag_item.icon,44);
-    ui_end_stack();
-    ui_end_stack();
+    const struct ui_theme *t=ui_theme();
+    ui_begin_vstack(0x6057);ui_set_overlay(true);ui_set_layer(2);ui_set_hit_passthrough(true);
+    ui_begin_vstack(1);ui_set_offset(g_drag_x-22,g_drag_y-22);ui_set_opacity(.85f);
+    ui_set_padding(t->icon_theme?4:0,t->icon_theme?4:0,t->icon_theme?4:0,t->icon_theme?4:0);
+    ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=t->icon_theme?t->surface:(Color){0,0,0,0}});
+    ui_set_corner_radius(t->radius_sm);ui_set_border(t->icon_theme?1:0,t->border);
+    if(t->icon_theme) {
+        uint32_t w=0,h=0;const uint32_t *px=em_image_at(monochrome_icon(g_drag_item.icon),36,&w,&h);
+        if(px)ui_image_sized_tinted(1,px,w,h,36,36,t->text);
+    } else Image(g_drag_item.icon,.height=44);
+    ui_end_stack();ui_end_stack();
 }
 
 /* The application library uses a bounded search/grid surface. Its dimensions

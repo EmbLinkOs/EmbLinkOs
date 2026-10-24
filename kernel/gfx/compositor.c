@@ -177,6 +177,7 @@ static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
 static int      g_cursor_under_valid;
 static uint32_t g_prev_buttons;
 static int g_buttons_suppressed; /* ownership/space changes wait for physical release */
+static void reset_pointer_capture_locked(void);
 static int      g_dragging;        /* a title-bar drag is in progress          */
 static uint32_t g_drag_id;         /* which window is being dragged             */
 static int      g_drag_dx, g_drag_dy;  /* pointer offset within the window frame */
@@ -1870,9 +1871,13 @@ int compositor_quit_front(void) {
 
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
+    if(session_input_owner() || !session_ui_allowed(pid)){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].pid==pid &&
        !g_wins[i].desktop && !g_wins[i].widget && !g_wins[i].translucent) {
-        g_desktop.workspace=g_wins[i].workspace;break;
+        if(g_desktop.workspace!=g_wins[i].workspace) {
+            g_desktop.workspace=g_wins[i].workspace;reset_pointer_capture_locked();
+        }
+        break;
     }
 
     int changed = 0;
@@ -2049,6 +2054,13 @@ void compositor_anim_tick(void) {
  * resolved separately, here, at the release edge. */
 static int      g_drag_on;
 static uint32_t g_drag_pid;
+/* Caller holds g_comp_lock. New ownership must not inherit old press history. */
+static void reset_pointer_capture_locked(void) {
+    mouse_discard_presses();(void)mouse_take_wheel();
+    g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
+    g_drag_on=0;g_drag_pid=0;g_ptr_wheel=0;g_buttons_suppressed=1;
+    for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+}
 void compositor_drag_set(int on, uint32_t pid) {
     spin_lock(&g_comp_lock);
     g_drag_on = on ? 1 : 0;
@@ -2080,6 +2092,9 @@ void compositor_pointer_tick(void) {
     mouse_get_state(&x, &y, &b);
 
     spin_lock(&g_comp_lock);
+    struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
+    if(g_cap_pid && (!captured || !captured->visible || !on_workspace(captured) || !session_ui_allowed(captured->pid)))
+        reset_pointer_capture_locked();
     int suppressed=g_buttons_suppressed;
     if(suppressed){if(!b)g_buttons_suppressed=0;b=0;}
     int left = (b & MOUSE_BTN_LEFT) != 0, prev = (g_prev_buttons & MOUSE_BTN_LEFT) != 0;
@@ -2400,9 +2415,7 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
 
 void compositor_session_changed(void) {
     spin_lock(&g_comp_lock);
-    g_drag_id=0;g_dragging=0;g_cap_win=0;g_cap_pid=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
-    g_buttons_suppressed=1;g_ptr_wheel=0;
-    for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+    g_drag_id=0;reset_pointer_capture_locked();
     uint32_t owner=session_input_owner();
     g_anim.kind=ANIM_NONE;
     if(owner)for(unsigned i=0;i<COMP_MAX_WINDOWS;i++)
@@ -2417,8 +2430,12 @@ void compositor_session_changed(void) {
 int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *state) {
     if(!state || state->version!=EMBK_DESKTOP_VERSION)return -EMBK_EINVAL;
     if(operation>EMBK_DESKTOP_MOVE_FRONT)return -EMBK_EINVAL;
-    if(operation && (!session_ui_allowed(pid) || session_input_owner()))return -EMBK_EPERM;
     spin_lock(&g_comp_lock);
+    /* Session transitions also take this lock before completing. A request
+     * queued before a lock must recheck ownership when it actually runs. */
+    if(operation && (!session_ui_allowed(pid) || session_input_owner())) {
+        spin_unlock(&g_comp_lock);return -EMBK_EPERM;
+    }
     int reset_capture=0;
     if(operation==EMBK_DESKTOP_CONFIGURE) {
         uint32_t owns=0;
@@ -2455,11 +2472,7 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
     if(operation) {
         /* Palette/geometry publication must retain a held gesture. Clearing its
          * button level generated a synthetic second press on the next tick. */
-        if(reset_capture) {
-            g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
-            g_drag_on=0;g_drag_pid=0;g_ptr_wheel=0;g_buttons_suppressed=1;
-            for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
-        }
+        if(reset_capture)reset_pointer_capture_locked();
         enforce_focus();const fb_info_t *fi=fb_get_info();
         if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
     }
@@ -2467,8 +2480,8 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
 }
 
 int compositor_request_launcher(void) {
-    if(session_input_owner())return -EMBK_EPERM;
     spin_lock(&g_comp_lock);
+    if(session_input_owner()){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && session_ui_allowed(g_wins[i].pid)) {
         g_wins[i].pending_action=7;spin_unlock(&g_comp_lock);return 0;
     }

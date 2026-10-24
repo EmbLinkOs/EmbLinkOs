@@ -103,6 +103,10 @@ int mouse_take_press(uint32_t *when_ms) {
     spin_unlock(&pointer_state_lock);return result;
 }
 
+void mouse_discard_presses(void) {
+    spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;spin_unlock(&pointer_state_lock);
+}
+
 static int32_t  g_w = 1024, g_h = 768;
 
 static uint8_t  g_pkt[4];

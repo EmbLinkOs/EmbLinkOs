@@ -47,6 +47,11 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count',
         d.snap('workspace-empty')
         calc=d.launch('Calculator','Calculator');d.type('2');d.key('shift-equal');d.type('3\n')
         d.g.wait(b'calc: = 5');d.snap('calculator')
+        terminal=d.launch('Terminal','Terminal')
+        d.key('meta_l-1');eventually(lambda:desktop()['workspace']==0,'leave dock app workspace')
+        d.click(612,748)
+        eventually(lambda:desktop()['workspace']==1,'dock did not reach running app workspace')
+        close(d.window('Terminal'))
         d.key('meta_l-1');eventually(lambda:desktop()['workspace']==0,'return to workspace 1')
         assert text('edit',edit,'g_doc')=='A workspace of our own.'
         d.snap('workspace-return')
