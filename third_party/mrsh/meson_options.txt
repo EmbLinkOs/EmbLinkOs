@@ -1,0 +1,35 @@
+option(
+	'readline',
+	type: 'feature',
+	value: 'auto',
+	description: 'Enable improved interactive interface via readline',
+)
+
+option(
+	'readline-provider',
+	type: 'combo',
+	choices: ['readline', 'editline'],
+	value: 'readline',
+	description: 'Provider of the readline library',
+)
+
+option(
+	'examples',
+	type: 'boolean',
+	value: true,
+	description: 'Build example programs',
+)
+
+option(
+	'reference-shell',
+	type: 'string',
+	value: 'sh',
+	description: 'Reference shell used in tests',
+)
+
+option(
+	'test-undefined-behavior',
+	type: 'boolean',
+	value: true,
+	description: 'Run tests that assert undefined behavior fails',
+)
