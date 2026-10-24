@@ -1,3 +1,16 @@
+## Development shell (2026-10-24)
+
+- [x] Private descriptor-backed PTYs, canonical/raw modes, echo and nonblocking queues.
+- [x] Explicit child descriptor transfer, resize queries, EOF records and reference-safe hangup.
+- [x] Terminal direct input, native prompt preservation and per-session Ctrl+C delegation.
+- [ ] VT screen emulation, alternate screen, Unicode cell widths, selection and paste.
+- [ ] POSIX shell port and the required process/libc compatibility.
+- [ ] Full process-group job control and resize notifications.
+- [ ] Broader developer utilities, Python subprocess and packaged SDK workflows.
+- [ ] SSH, USB serial/debug probes and physical board workflows.
+
+Contract, tests and explicit limitations: [TERMINAL.md](TERMINAL.md).
+
 ## Contour follow-up (2026-10-24)
 
 - [x] Shared semantic palette, real regular/bold font families, density and text metrics.

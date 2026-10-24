@@ -1,5 +1,24 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Interactive terminal sessions (2026-10-24)
+
+Terminal now launches the native shell on a private pseudo-terminal. Programs
+can choose canonical/raw input, receive keys without Enter, query measured
+window dimensions and use a per-device foreground Ctrl+C route. The native
+prompt retains its local history/completion/editor. Independent terminal
+sessions no longer depend on the global console discipline.
+
+Descriptor transfer, EOF records, nonblocking queue pressure, hangup and
+hard-killed I/O cleanup pass 108 real guest checks. Host state-machine and shell
+suites pass, including PTY AddressSanitizer/UBSan coverage. Native graphical
+acceptance verifies real cooked/raw input, Ctrl-letter/navigation distinction,
+interruptions, separate sessions and active-close cleanup. The ABI has 148
+unique calls; existing syscall and capability IDs retain their values.
+
+Full VT screen emulation, POSIX job control and a Unix shell port remain next.
+Contract and limitations: [TERMINAL.md](TERMINAL.md). Four new original-pixel
+captures extend the [progress gallery](media/laptop-progress/README.md).
+
 ## Keyboard interaction milestone (2026-10-24)
 
 Shared fields and controls support Tab/Shift+Tab with queued modifier snapshots,

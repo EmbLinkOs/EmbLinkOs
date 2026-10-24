@@ -1,5 +1,14 @@
 # EmbLinkOS — Architecture
 
+## Private terminal sessions (2026-10-24)
+
+Syscall 148 adds descriptor-scoped master/slave terminal pairs, isolated line
+modes, dimensions, readiness and hangup. Explicit spawn descriptor transfer
+(action 9) gives children real terminal stdio. The native shell delegates
+foreground interruption within its PTY rather than changing the global console
+route. Native spawn remains the process primitive; full POSIX job control and
+Unix shell compatibility are still pending. See [TERMINAL.md](TERMINAL.md).
+
 ## Contour desktop contract (2026-10-24)
 
 Shared semantic tokens, original SVG/EIC icons and `oscfg` snapshots now drive
@@ -9,7 +18,7 @@ shortcut and workspace contract. Only the desktop-layer owner can configure it;
 workspace actions respect session locks. Hidden workspaces are excluded from
 rendering and input. The compositor retains its CPU-rendered fallback.
 
-The native ABI has 147 unique calls. Configuration, accessibility boundaries,
+The native ABI has 148 unique calls. Configuration, accessibility boundaries,
 coverage and acceptance are recorded in [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
 
 ## Document workspace platform (2026-10-23)

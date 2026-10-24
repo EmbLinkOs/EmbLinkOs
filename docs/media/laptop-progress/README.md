@@ -1,6 +1,6 @@
 # Laptop progress captures
 
-99 actual EmbLinkOS captures document the original laptop work, its
+103 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, and keyboard
 interaction. PNG exports preserve
@@ -13,6 +13,34 @@ Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show t
 merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
+
+## Latest: interactive terminal sessions
+
+Four real QMP captures accompany the terminal-device milestone. They come from a disposable UEFI/NVMe live session with no synthetic ACPI fixture. They show the native shell and terminal witness, not a ported Unix shell or a full VT screen emulator.
+
+### The native prompt, preserved
+
+Terminal runs its native shell on a private pseudo-terminal while retaining local caret editing and command history. The guest verifies edited commands and their separate result lines.
+
+![The native prompt, preserved](100-terminal-prompt.png)
+
+### A program takes keyboard input
+
+The child reports measured terminal dimensions, receives an edited canonical line and switches to raw input. It is waiting for one key without Enter.
+
+![A program takes keyboard input](101-terminal-raw-input.png)
+
+### One key, delivered immediately
+
+The native program receives z as byte 0x7a without Enter, then restores canonical input. Ctrl+D returns control to the shell; the same guest also verifies Ctrl-letter bytes and ANSI arrow input.
+
+![One key, delivered immediately](102-terminal-direct-input.png)
+
+### Interrupt a command and keep working
+
+Ctrl+C stops a foreground child and interrupts a native shell loop. Subsequent commands produce their expected results in the same Terminal session.
+
+![Interrupt a command and keep working](103-terminal-interrupt.png)
 
 ## Latest: keyboard interaction
 
