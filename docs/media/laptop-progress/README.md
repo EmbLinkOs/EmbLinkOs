@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-112 actual EmbLinkOS captures document the original laptop work, its
+114 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility and ordered POSIX spawn. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn and spawn-based sh. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,14 +14,29 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: POSIX spawn
+## Latest: spawn-based sh
+
+The image now includes an initial mrsh-based shell alongside the native prompt.
+The shared 83-case script corpus passes 338 checks in Terminal and twice through
+the serial wrapper. Interactive input runs loops, arithmetic, command substitution
+and a verified 66,049-byte three-stage pipeline. This is a bounded development
+shell; see [the contract](../../POSIX_SHELL.md) for supported options and gaps.
+
+These original-pixel QMP captures use a disposable UEFI/NVMe live session without
+a synthetic ACPI fixture. Captures 01–112 and their metadata are unchanged.
+
+![Shell scripts in the native Terminal](113-posix-shell-script-checks.png)
+
+![Interactive sh, expansion and a three-stage pipeline](114-posix-shell-interactive.png)
+
+## Earlier: POSIX spawn
 
 The spawn adapter passes 357 checks in the normal logged-in Terminal namespace,
 including ordered file actions, close-on-exec, PATH lookup, exact child
 environments and directory setup before constructors run. Two children
 transform 66,049 bytes through pipes, and a following shell command succeeds.
 The same checks pass twice through the serial wrapper. This is a bounded
-adapter on native child handles; a POSIX shell port remains open.
+adapter on native child handles; the later sh milestone above builds on it.
 
 This original-pixel QMP capture uses a disposable UEFI/NVMe live session without
 a synthetic ACPI fixture. Captures 01–111 and their metadata are unchanged.

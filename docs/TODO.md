@@ -13,7 +13,8 @@
 - [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.
 - [x] Bounded posix_spawn/posix_spawnp with ordered actions, CLOEXEC and independent starting-directory context.
 - [ ] Shared socket descriptor lifetime, shared status flags and full append semantics.
-- [ ] POSIX shell port and the remaining process/libc compatibility.
+- [x] Initial mrsh-based sh port with explicit workers, pipelines, substitution and scripts.
+- [ ] Broader shell conformance, utility coverage and remaining process/libc compatibility.
 - [ ] Full process-group job control and resize notifications.
 - [ ] Broader developer utilities, Python subprocess and packaged SDK workflows.
 - [ ] SSH, USB serial/debug probes and physical board workflows.

@@ -1,5 +1,37 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Spawn-based sh (2026-10-24)
+
+The image now includes an initial mrsh-based `sh` port. Quoting, parameters,
+arithmetic, loops, functions, conditionals, case, aliases, sourced files,
+subshells, command substitution, pipelines, redirection, here-documents,
+background commands and wait run through explicit spawn workers. The native
+structured shell remains the default; `sh` enters the new shell and `exit`
+returns. Shared host/native scripts cover 83 selected cases, with 79 also
+compared against `/bin/sh`. Host ASan/UBSan and leak checks cover the shell,
+worker startup and bounded typed AST transport.
+
+Native acceptance passes **338/338 checks** twice through the serial wrapper
+and again in Terminal. Desktop input verifies loops, arithmetic, substitution,
+a 66,049-byte three-stage pipeline, single command echo and foreground Ctrl+C
+with a surviving background job, followed by wait and return to the native
+shell. The 357 spawn, 203 process and 108 PTY checks, capability gates and wider
+desktop integration batch pass. x86 images build/boot and the AArch64 kernel
+compiles/links; no ARM shell runtime or physical-hardware acceptance is added.
+The [progress gallery](media/laptop-progress/README.md) contains 114 actual
+captures, preserving all prior 112 images and metadata.
+
+This is a development foundation with explicit limits, not complete POSIX or
+zsh compatibility. General signals, process groups, in-place exec, automatic
+shebang loading, broad Unix utilities and comprehensive shell conformance
+remain open. Worker contexts use immediately unlinked temporary files and need
+a writable home/temp directory. See [POSIX_SHELL.md](POSIX_SHELL.md) for the
+supported flags, native bounds, remaining language gaps and test commands.
+
+Spawn OPEN actions now enforce the caller's filesystem capability, closing a
+gap relative to direct open. Explicit transfer of an already-owned descriptor
+retains the existing capability model.
+
 ## Ordered POSIX spawn (2026-10-24)
 
 The newlib adapter now implements bounded `posix_spawn` and `posix_spawnp` on
@@ -15,7 +47,8 @@ The adapter supports 61 user actions, 64 descriptors and the existing bounded
 argv/environment startup page. TCP/UDP inheritance returns ENOSYS until sockets
 have a shared lifetime; marking them close-on-exec excludes them. Process-group,
 scheduler, identity and signal attribute flags return ENOTSUP. `fork`, in-place
-`exec`, job control and a POSIX shell port remain open. The native shell is
+`exec` and job control remain open. The later sh milestone above uses the
+adapter without fork. The native shell is
 preserved. See [PROCESS_COMPATIBILITY.md](PROCESS_COMPATIBILITY.md) for contracts,
 limits, new syscalls 151/152 and validation commands.
 

@@ -218,8 +218,9 @@ ASAN_OPTIONS=detect_leaks=1 /tmp/pipe-host
 
 ## Remaining compatibility work
 
-`fork`, in-place `exec`, a POSIX shell port and broader process compatibility
-remain open. The spawn adapter above is a bounded implementation with explicit
+An initial [spawn-based sh port](POSIX_SHELL.md) now uses this adapter for
+external programs and isolated shell workers. `fork`, in-place `exec` and
+broader process compatibility remain open. The spawn adapter above is a bounded implementation with explicit
 limits, not a claim of complete POSIX process semantics.
 
 Process groups, controlling-terminal rules, stopped/continued statuses and

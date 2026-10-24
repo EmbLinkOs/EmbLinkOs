@@ -3,7 +3,10 @@
 EmbLinkOS now has private pseudo-terminal pairs. Terminal launches the native
 shell on a terminal slave; programs inherit that slave through standard input,
 output and error. The emulator owns the master. The emulator now supplies a real VT screen model.
-This does not claim that zsh or arbitrary Unix applications run here.
+An initial spawn-based `sh` port is available through `sh`, `sh file.sh` and
+`sh -c 'command'`; see [POSIX_SHELL.md](POSIX_SHELL.md) for its language,
+utilities, limits and verification. This does not claim that zsh or arbitrary
+Unix applications run here.
 
 ## Implemented contract
 

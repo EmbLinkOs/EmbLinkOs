@@ -514,6 +514,15 @@ for the concrete Makefile + `mkfs_embkfs.py` steps — mechanically it's "copy
 an existing app's three registration points and rename," not something that
 needs new loader code.
 
+## Spawn-based sh
+
+The default image build includes the pinned mrsh-based port and its native
+probe; no network download or configure step is needed. Use `sh`, `sh file.sh`
+or `sh -c 'command'` from Terminal. Host checks are
+`make posixsh-test posixsh-sanitize-test`; native acceptance is
+`python3 tools/posixsh_smoke.py` after building fresh images.
+See [POSIX_SHELL.md](POSIX_SHELL.md) for supported behavior and limitations.
+
 ## Optional ports: C++, CPython, git, TCC
 
 The core OS builds with just the cross toolchain above. Four bigger programs are
