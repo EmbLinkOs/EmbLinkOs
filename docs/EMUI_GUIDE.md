@@ -10,6 +10,24 @@ compositor, retained updates under the hood) instead of *how to use it*, see
 [EMUI_INTERNALS.md](EMUI_INTERNALS.md). If you haven't built the toolchain
 yet, do that first: [BUILD_SETUP.md](BUILD_SETUP.md).
 
+## Contour appearance
+
+The runtime applies the user's shared appearance snapshot and refreshes open
+windows when it changes. Use `ui_theme` semantic roles and dimensions instead
+of literal colours or a private theme loader. Natural text wraps at its arranged
+width; code content and single-line fields retain preformatted behavior.
+`user/lib/appearance.h` is the single adapter for toolkit fonts, palette, density and compositor preferences.
+`CodeSurface() { ... }` scopes monospace regular/bold faces to code or terminal
+content while retaining the selected family in surrounding chrome.
+
+Text/password fields honor authored `.width` and `.height`; zero retains their
+growing/intrinsic defaults. Set `EmApp.min_size` for usable compact layouts.
+Use `.tooltip("…")` for icon-only actions; decorative overlays must pass pointer input through. Controls supply
+forward Tab focus and Return/Space activation. Keep page/container identities
+stable with `.key` when a conditional page changes widget structure, and reset
+fixed dimensions when reusing a node for intrinsic layout. See
+[CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md) for supported preferences and limits.
+
 ## Mental model
 
 EmUI apps are **immediate-mode declarative**: you write a `view()` function
@@ -210,7 +228,8 @@ IconButton(IconGear).id("settings");
 if (Clicked("settings")) open_settings();   // checked elsewhere in the tree
 ```
 
-Icons are Unicode codepoints from a DejaVu-Sans-safe set —
+Icons retain stable integer aliases and resolve to the original Contour EIC
+line assets; font glyphs provide a fallback when an asset cannot load. Use
 `IconCheck`, `IconClose`, `IconStar`, `IconGear`, `IconSearch`, `IconBolt`,
 `IconChevronR/L/U/D`, `IconGrid`, `IconFiles`, `IconFolder`, `IconTrash`,
 `IconCloud`, and more — see the bottom of `ui/dsl/em.h` for the full list.

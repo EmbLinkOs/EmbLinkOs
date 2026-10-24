@@ -1,5 +1,17 @@
 # EmbLinkOS — Architecture
 
+## Contour desktop contract (2026-10-24)
+
+Shared semantic tokens, original SVG/EIC icons and `oscfg` snapshots now drive
+the shell, native applications and widget runtime. Syscall 147,
+`desktop_control`, publishes a versioned work-area, palette, effects, cursor,
+shortcut and workspace contract. Only the desktop-layer owner can configure it;
+workspace actions respect session locks. Hidden workspaces are excluded from
+rendering and input. The compositor retains its CPU-rendered fallback.
+
+The native ABI has 147 unique calls. Configuration, accessibility boundaries,
+coverage and acceptance are recorded in [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+
 ## Document workspace platform (2026-10-23)
 
 Document saving, shared file dialogs, acknowledged close requests and per-process recovery drafts now share a platform contract. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) for ordering, failure semantics, authority and remaining races.

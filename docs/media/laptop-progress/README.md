@@ -1,7 +1,8 @@
 # Laptop progress captures
 
-Sixty-one actual EmbLinkOS captures document the original laptop work, its
-integration with master through `a281865`, system-menu polish after PR #40, and recoverable document workspaces. PNG exports preserve
+95 actual EmbLinkOS captures document the original laptop work, its
+integration with master through `a281865`, system-menu polish after PR #40,
+recoverable document workspaces, and the Contour desktop redesign. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -12,7 +13,215 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: document workspaces
+## Latest: Contour desktop
+
+These are actual UEFI/NVMe guest captures of the redesign, including customization, applications and authenticated document workflows. They contain no synthetic ACPI fixture.
+
+### A calmer desktop
+
+Contour introduces mineral surfaces, compact original icons and a readable command strip.
+
+![A calmer desktop](62-contour-desktop.png)
+
+### The application library
+
+A bounded, searchable library launches installed native applications through keyboard or pointer input.
+
+![The application library](63-contour-library.png)
+
+### One shared appearance
+
+Settings coordinates semantic colours, typography, control density and live application appearance.
+
+![One shared appearance](64-contour-appearance.png)
+
+### Paper after a cold boot
+
+The saved Paper preset returns after an independent UEFI boot and account authentication.
+
+![Paper after a cold boot](65-contour-paper.png)
+
+### Workspaces preserve running work
+
+Editor moves to another workspace while preserving its text; hidden windows are separately checked for input isolation.
+
+![Workspaces preserve running work](66-contour-spaces.png)
+
+### Window and workspace preferences
+
+Shared decorations, shadows, corner geometry and workspace behavior are configurable in Settings.
+
+![Window and workspace preferences](67-contour-windows.png)
+
+### Readable and reduced effects
+
+Text size, contrast, cursor appearance and reduced-motion preferences share the same configuration system.
+
+![Readable and reduced effects](68-contour-accessibility.png)
+
+### Terminal with native chrome
+
+Terminal keeps a monospace transcript while its surrounding controls follow the selected interface family.
+
+![Terminal with native chrome](69-contour-terminal.png)
+
+### Files follows the desktop
+
+Files uses semantic selection, a shared sidebar surface and compact native window controls.
+
+![Files follows the desktop](70-contour-files.png)
+
+### Editor in Contour
+
+Editor inherits shared typography and chrome while retaining safe saving and recovery.
+
+![Editor in Contour](71-contour-editor.png)
+
+### Photos in Contour
+
+The photo application uses the shared palette, window controls and preferred corner geometry.
+
+![Photos in Contour](72-contour-photos.png)
+
+### An honest empty music library
+
+Music explains its empty state and retains the common desktop hierarchy.
+
+![An honest empty music library](73-contour-music.png)
+
+### Measured system activity
+
+Activity Monitor presents actual process measurements within the shared native interface.
+
+![Measured system activity](74-contour-monitor.png)
+
+### Notification history
+
+The history window has an original icon and a readable empty state.
+
+![Notification history](75-contour-notifications.png)
+
+### A dock on the left
+
+A reserved side band keeps application windows clear of the configurable dock.
+
+![A dock on the left](76-contour-left-dock.png)
+
+### A dock on the right
+
+The same dock supports the opposite screen edge with shared placement rules.
+
+![A dock on the right](77-contour-right-dock.png)
+
+### The command strip moves
+
+The command strip can occupy either horizontal screen edge.
+
+![The command strip moves](78-contour-bottom-strip.png)
+
+### Menus open toward the workspace
+
+At the bottom edge, the system menu opens upward and retains its dismissal surface.
+
+![Menus open toward the workspace](79-contour-bottom-menu.png)
+
+### A different typographic character
+
+A real serif regular/bold family updates Settings and the command strip.
+
+![A different typographic character](80-contour-serif.png)
+
+### Scale and density are independent
+
+The acceptance run selects 115 percent interface scale and compact spacing through the actual controls.
+
+![Scale and density are independent](81-contour-density.png)
+
+### Reset remains a deliberate choice
+
+Reset appearance asks for confirmation; acceptance checks cancellation and reset separately, including a scaled serif explanation.
+
+![Reset remains a deliberate choice](82-contour-reset.png)
+
+### A coherent sign-in surface
+
+The account sign-in screen uses the shared default visual language and retains the authentication service.
+
+![A coherent sign-in surface](83-contour-login.png)
+
+### The lock follows the session
+
+The themed lock acquires screen ownership; workspace shortcuts are checked while the session is locked.
+
+![The lock follows the session](84-contour-lock.png)
+
+### The shared Save panel
+
+The session file service uses Contour chrome, user places and the same shared controls as its callers.
+
+![The shared Save panel](85-contour-picker.png)
+
+### A real multi-document workspace
+
+Note++ keeps a monospace document canvas and shared native chrome; both dirty tabs survive a forced stop.
+
+![A real multi-document workspace](86-contour-note-workspace.png)
+
+### Recovery retains the new interface
+
+An independent boot restores both Note++ drafts, with exact document contents checked by the acceptance run.
+
+![Recovery retains the new interface](87-contour-recovered.png)
+
+### Original monochrome silhouettes
+
+The shell uses matching line silhouettes, preserving distinct application glyphs in a single ink.
+
+![Original monochrome silhouettes](88-contour-monochrome.png)
+
+### One icon family throughout the library
+
+The application library follows the same monochrome icon preference as the dock and desktop.
+
+![One icon family throughout the library](89-contour-monochrome-library.png)
+
+### A coordinated custom palette
+
+A custom light surface and rust accent are entered through Settings, persisted and applied live.
+
+![A coordinated custom palette](90-contour-custom-palette.png)
+
+### Power status follows the provider
+
+The emulated guest reports no battery; the bar avoids suggesting a permanently full battery.
+
+![Power status follows the provider](91-contour-power-status.png)
+
+### A compact, readable window
+
+Wrapped descriptions and previews remain readable at the actual 640 by 420 minimum window size.
+
+![A compact, readable window](92-contour-compact-window.png)
+
+### Fill the available workspace
+
+Window fill respects the shared command-strip and dock insets.
+
+![Fill the available workspace](93-contour-fill.png)
+
+### Restore the previous geometry
+
+The window control restores the position and dimensions recorded before filling.
+
+![Restore the previous geometry](94-contour-restored.png)
+
+### Tile with a deliberate layout board
+
+The native hover board places Settings in the right half while preserving its usable minimum size.
+
+![Tile with a deliberate layout board](95-contour-tiled.png)
+
+## Document workspaces
 
 Captures 47–61 follow real file creation, saving, unsaved-close protection, forced-stop recovery and reopening after independent boots. They use authenticated QEMU accounts and disposable NVMe storage, with no synthetic ACPI fixture.
 

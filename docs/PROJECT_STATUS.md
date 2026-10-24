@@ -1,5 +1,23 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Contour desktop milestone (2026-10-24)
+
+Contour replaces fragmented shell/app styling with shared semantic surfaces,
+real regular/bold type families, original icons and compact native controls.
+The new command strip, searchable library, side docks, live Settings and
+isolated workspaces share a versioned compositor contract (native syscall 147).
+Application chrome, document/code surfaces and authentication screens follow the
+same system. Defaults, curated presets and validated custom colours persist.
+
+The x86 images, shared UI/appearance/document host suites, sanitizer checks,
+native desktop/customization runs, three-boot document workflow and native
+integration batch pass. Layout regressions cover complete wrapped dialog
+explanations, and icon-cache coverage loads both complete shipped families. Current scope, evidence and remaining accessibility,
+customization and hardware work: [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+The [progress gallery](media/laptop-progress/README.md) retains earlier milestones
+and adds original-pixel redesign captures. Browser engine development remains
+with the user; this milestone applies shared native chrome.
+
 ## Document workspace milestone (2026-10-23)
 
 Editor and Note++ now share guarded close, Open/Save, conflict detection, synced replacement and recoverable drafts. Files creates documents and passes the authenticated home to Editor. The native ABI now has 146 unique calls; queued keyboard modifier snapshots distinguish document shortcuts from navigation. Details and test commands: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).

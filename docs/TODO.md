@@ -1,3 +1,17 @@
+## Contour follow-up (2026-10-24)
+
+- [x] Shared semantic palette, real regular/bold font families, density and text metrics.
+- [x] Original icon family, command strip, bounded application library and side/bottom docks.
+- [x] Shared work areas, live cursor/chrome/effects and isolated configurable workspaces.
+- [x] Searchable Settings, coordinated presets, live preferences and confirmed reset.
+- [x] Align native application chrome, document/code surfaces and authentication surfaces.
+- [ ] Reverse Tab, directional menu navigation and assistive-technology semantics.
+- [ ] Arbitrary font/icon-pack installation, shortcut recording and free panel-item ordering.
+- [ ] Per-monitor scaling, display profiles and compositor-backed overlay auto-hide.
+- [ ] Validate physical laptop rendering, pointer/input, power and graphics performance.
+
+Scope and current evidence: [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+
 ## Desktop menu follow-up (2026-10-23)
 
 ## Document workspace follow-up (2026-10-23)
