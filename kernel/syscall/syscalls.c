@@ -2123,8 +2123,8 @@ static int64_t sys_net_accept(const struct sysargs *a) {
 static int64_t sys_net_sendto(const struct sysargs *a) {
     int cg = cap_gate(EMBK_CAP_NETWORK);
     if (cg) return cg;
+    if (a->arg[4] > 1472) return -EMBK_EMSGSIZE;
     uint32_t len = (uint32_t)a->arg[4];
-    if (len > 1472) len = 1472;
     uint8_t kbuf[1472];
     if (len && copy_from_user(kbuf, (const void *)a->arg[3], len) != EMBK_OK) return -EMBK_EFAULT;
     return fd_udp_sendto(current_process, (int)a->arg[0], (uint32_t)a->arg[1], (uint16_t)a->arg[2], kbuf, len);

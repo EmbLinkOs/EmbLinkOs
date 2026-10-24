@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -103,7 +104,7 @@ static void status_flags(void) {
     char *args[]={"fdprobe","--flags",number,NULL};collect(child(args,-1,-1),42);
     CHECK(fcntl(a,F_GETFL)==(O_RDWR|O_NONBLOCK|O_APPEND) && fcntl(b,F_GETFL)==O_RDWR);
     close(a);close(b);
-    puts("Status: shared across dup/spawn; CLOEXEC, separate opens and pipe/PTY ends stay independent.");
+    if(!failures)puts("Status: shared across dup/spawn; CLOEXEC, separate opens and pipe/PTY ends stay independent.");
 }
 static void append(void) {
     int a=open(path,O_CREAT|O_TRUNC|O_RDWR,0644);CHECK(a>=0 && write(a,"seed",4)==4);
@@ -146,7 +147,7 @@ static void parallel_readers(void) {
     unsigned index,seen[256]={0},total=0;int valid=1;
     while(read(out[0],&index,sizeof index)==sizeof index){if(index>=256 || seen[index]++)valid=0;total++;}
     CHECK(valid && total==256);for(int i=0;i<WRITERS;i++)collect(pids[i],42);close(out[0]);close(fd);
-    puts("Files: append selects EOF per write; concurrent readers, shared cursors and independent append writers verified.");
+    if(!failures)puts("Files: append selects EOF per write; concurrent readers, shared cursors and independent append writers verified.");
 }
 static struct sockaddr_in address(unsigned port) {
     struct sockaddr_in a;memset(&a,0,sizeof a);a.sin_family=AF_INET;a.sin_port=htons(port);return a;
@@ -171,7 +172,7 @@ static void socket_ownership(void) {
     CHECK(!(embk_fd_poll(alias,EMBK_POLLIN)&EMBK_POLLNVAL));close(s);
     collect(child(args,-1,-1),42);CHECK(!(embk_fd_poll(alias,EMBK_POLLIN)&EMBK_POLLNVAL));close(alias);
     for(int round=0;round<40;round++){u=socket(AF_INET,SOCK_DGRAM,0);copy=dup(u);CHECK(u>=0 && copy>=0);close(u);close(copy);}
-    puts("Sockets: TCP/UDP identity survives duplicate close and child exit; last close releases ownership.");
+    if(!failures)puts("Sockets: TCP/UDP identity survives duplicate close and child exit; last close releases ownership.");
 }
 static void network(void) {
     struct sockaddr_in a=address(39381);a.sin_addr.s_addr=htonl(0x0a000202);
@@ -183,12 +184,16 @@ static void network(void) {
     int ready[2];gated_pipe(ready);char *hold[]={"fdprobe","--hold",NULL};pid_t pid=child(hold,-1,ready[1]);close(ready[1]);
     CHECK(getall(ready[0],reply,5)==0 && !memcmp(reply,"ready",5));close(ready[0]);
     int handle=-1;for(int h=0;h<32;h++){struct embk_child_result info;if(embk_child_control(h,EMBK_CHILD_INFO,0,&info)==1 && info.pid==(unsigned)pid)handle=h;}
-    CHECK(handle>=0 && embk_kill(handle)==0);collect(pid,255);
+    CHECK(handle>=0 && embk_kill(handle)==0);
+    int status=0;CHECK(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
     CHECK(putall(s,"after-kill\n",11)==0 && getall(s,reply,11)==0 && !memcmp(reply,"after-kill\n",11));close(s);
     int u=socket(AF_INET,SOCK_DGRAM,0);alias=dup(u);CHECK(u>=0 && alias>=0);close(u);a=address(39382);a.sin_addr.s_addr=htonl(0x0a000202);
     CHECK(sendto(alias,"datagram",8,0,(void *)&a,sizeof a)==8);
-    CHECK(recvfrom(alias,reply,sizeof reply,0,NULL,NULL)==8 && !memcmp(reply,"datagram",8));close(alias);
-    puts("Network: connected TCP transfer, child exit/kill and UDP duplicate traffic verified with local echo fixtures.");
+    CHECK(recvfrom(alias,reply,sizeof reply,0,NULL,NULL)==8 && !memcmp(reply,"datagram",8));
+    char oversized[1473]={0};CHECK(sendto(alias,oversized,sizeof oversized,0,(void *)&a,sizeof a)==-1 && errno==EMSGSIZE);
+    CHECK(embk_net_sendto(alias,0x0a000202,39382,oversized,1UL<<32)==-90);
+    CHECK(sendto(alias,"",0,0,(void *)&a,sizeof a)==0 && recvfrom(alias,reply,sizeof reply,0,NULL,NULL)==0);close(alias);
+    if(!failures)puts("Network: connected TCP transfer, child exit/kill and UDP duplicate traffic verified with local echo fixtures.");
 }
 int main(int argc,char **argv) {
     if(argc>1 && strcmp(argv[1],"--network"))return helper(argc,argv);

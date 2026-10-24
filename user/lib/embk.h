@@ -392,7 +392,18 @@ static inline unsigned long embk_getcaps(void) {
 #define EMBK_POLLHUP  0x0010
 #define EMBK_POLLNVAL 0x0020
 
-/* O_NONBLOCK fd flag: sys_fcntl cmd 1 = get (1/0), 2 = set from arg. */
+/* Shared status flags, independent of the per-descriptor CLOEXEC bit.
+ * Stable wire bits, not native/newlib O_* values. Cmd 1/2 retain the original
+ * nonblocking-only contract; cmd 3/6 query/update the supported status set. */
+#define EMBK_FD_ACCESS_MASK 3
+#define EMBK_FD_NONBLOCK 4
+#define EMBK_FD_APPEND 8
+static inline int embk_fcntl_get_status(int fd) {
+    return (int)embk_syscall3(EMBK_SYS_fcntl,fd,3,0);
+}
+static inline int embk_fcntl_set_status(int fd,int flags) {
+    return (int)embk_syscall3(EMBK_SYS_fcntl,fd,6,flags);
+}
 static inline int embk_fcntl_get_nonblock(int fd) {
     return (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
 }

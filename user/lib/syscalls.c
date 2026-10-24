@@ -1667,7 +1667,7 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     if (!dest) return write(fd, buf, len);                     /* connected socket */
     const struct sockaddr_in *in = (const struct sockaddr_in *)dest;
     int r = embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
-    return r < 0 ? embk_fail(r) : (ssize_t)r;
+    return r < 0 ? embk_fail(r) : (ssize_t)len;
 }
 
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,

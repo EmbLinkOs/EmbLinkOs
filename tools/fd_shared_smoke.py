@@ -70,7 +70,7 @@ def main():
         d.snap('shared-socket-traffic')
         type_text('echo 82649\n');eventually(lambda:'82649' in screen.text(w).splitlines() and prompt(),'prompt after socket checks')
         assert bytes(received)==b'child-net\nparent-net\nafter-kill\n'*2,(received,errors)
-        assert datagrams==['datagram','datagram'] and not errors,(datagrams,errors)
+        assert datagrams==['datagram','','datagram',''] and not errors,(datagrams,errors)
         assert b'PANIC' not in d.g.seen
         (out/'fixtures.json').write_text(json.dumps({'tcp_bytes':len(received),'tcp':received.decode(),'udp':datagrams,'errors':errors},indent=2)+'\n')
         print('PASS: shared flags/cursors, concurrent append/read, TCP/UDP dup/spawn/exit/kill, native regressions and desktop prompt',flush=True)
