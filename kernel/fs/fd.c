@@ -64,6 +64,42 @@ static struct fd_entry *fd_table(void)
 static inline void fdlock(struct process *p)   { if (p) mutex_lock(&p->fd_lock); }
 static inline void fdunlock(struct process *p) { if (p) mutex_unlock(&p->fd_lock); }
 
+/* One status/socket identity per open description, not per descriptor number.
+ * Descriptor references include copies in unpublished spawn tables. Backing
+ * endpoints retain their existing lifetime rules; sockets close only when this
+ * last shared reference goes. CLOEXEC deliberately stays in fd_entry. */
+struct fd_shared {
+    int refs;
+    int flags;
+    int conn;                   /* TCP TCB or UDP socket index */
+    uint16_t bind_port;
+    struct mutex io_lock;       /* serializes the regular-file cursor */
+};
+static unsigned shared_live;
+static struct fd_shared *shared_new(int flags) {
+    struct fd_shared *s=kmalloc(sizeof *s);
+    if (!s) return NULL;
+    memset(s,0,sizeof *s);
+    s->refs=1;s->flags=flags&(O_ACCMODE|O_APPEND|O_NONBLOCK);s->conn=-1;
+    mutex_init(&s->io_lock);
+    __atomic_fetch_add(&shared_live,1,__ATOMIC_RELAXED);
+    return s;
+}
+unsigned fd_shared_live_count(void) { return __atomic_load_n(&shared_live,__ATOMIC_RELAXED); }
+int fd_entry_flags(const struct fd_entry *e) {
+    return e->shared?__atomic_load_n(&e->shared->flags,__ATOMIC_ACQUIRE):0;
+}
+static int shared_copy(struct fd_entry *dst,const struct fd_entry *src) {
+    if (!src->shared) return -EMBK_ENOMEM;
+    __atomic_fetch_add(&src->shared->refs,1,__ATOMIC_RELAXED);
+    *dst=*src;return 0;
+}
+static bool shared_drop(struct fd_entry *e) {
+    struct fd_shared *s=e->shared;
+    if (!s || __atomic_sub_fetch(&s->refs,1,__ATOMIC_ACQ_REL)) return false;
+    __atomic_fetch_sub(&shared_live,1,__ATOMIC_RELAXED);kfree(s);return true;
+}
+
 /* --- open file descriptions (see struct open_file in fd.h) -----------------
  *
  * The refcount is atomic rather than fd-table-locked because the descriptors
@@ -107,7 +143,7 @@ void vfs_fd_init(void)
         fds[i].cloexec = false;
         fds[i].backing = FD_BACKING_NONE;
         fds[i].ops = NULL;
-        fds[i].flags = 0;
+        fds[i].shared = NULL;
         fds[i].u.file.of = NULL;
     }
 }
@@ -513,8 +549,9 @@ static int fd_seek_compute(uint64_t base, int64_t delta, uint64_t *out)
  * no parent / no inheritable entry. Called from process_create() BEFORE file
  * actions, so a spawn redirect can override an inherited slot. */
 void fds_init_stdio(struct process *proc) {
-    struct fd_entry *parent_fds = current_thread ? current_process->fds : NULL;
-
+    struct process *parent=current_thread?current_process:NULL;
+    struct fd_entry *parent_fds = parent?parent->fds:NULL;
+    fdlock(parent);
     for (int i = 0; i < FD_STDIO_MAX; i++) {
         struct fd_entry *dst = &proc->fds[i];
         if (parent_fds && parent_fds[i].used && parent_fds[i].ops
@@ -536,9 +573,11 @@ void fds_init_stdio(struct process *proc) {
         dst->used = true;
         dst->backing = FD_BACKING_CONSOLE;
         dst->ops = &console_fd_ops;
-        dst->flags = (i == 0) ? O_RDONLY : O_WRONLY;  /* stdin vs stdout/stderr */
+        dst->shared = shared_new((i == 0) ? O_RDONLY : O_WRONLY);
+        if (!dst->shared) { memset(dst,0,sizeof *dst);continue; }  /* stdin vs stdout/stderr */
         memset(&dst->u, 0, sizeof(dst->u));
     }
+    fdunlock(parent);
 }
 
 int vfs_open(const char *path, int flags, uint32_t mode)
@@ -569,7 +608,8 @@ int vfs_open(const char *path, int flags, uint32_t mode)
                 e->used = true;
                 e->backing = FD_BACKING_NULLDEV;
                 e->ops = &nulldev_fd_ops;
-                e->flags = flags & ~O_CLOEXEC;
+                e->shared = shared_new(flags);
+                if (!e->shared) { memset(e,0,sizeof *e);rfd=-EMBK_ENOMEM;break; }
     e->cloexec = (flags & O_CLOEXEC) != 0;
                 rfd = i + FD_BASE;
                 break;
@@ -677,16 +717,17 @@ int vfs_open(const char *path, int flags, uint32_t mode)
     fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
     fds[fd - FD_BASE].ops = &vnode_fd_ops;
     fds[fd - FD_BASE].u.file.of = of;
-    fds[fd - FD_BASE].flags = flags & ~O_CLOEXEC;
+    fds[fd - FD_BASE].shared = shared_new(flags);
+    if (!fds[fd - FD_BASE].shared) {
+        memset(&fds[fd-FD_BASE],0,sizeof fds[0]);fdunlock(p);
+        vmo_put(of->obj);kfree(of);
+        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put)
+            (void)vn.mnt->ops->obj_put(vn.mnt,vn.ino);
+        return -EMBK_ENOMEM;
+    }
     fds[fd - FD_BASE].cloexec = (flags&O_CLOEXEC)!=0;
     fdunlock(p);
 
-    if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
-        struct vfs_stat st;
-        err = vn.mnt->ops->stat(&vn, &st);
-        if (err == EMBK_OK)
-            of->pos = st.size;
-    }
 
     return fd;
 }
@@ -889,19 +930,27 @@ int vfs_fd_poll(int fd, int events) {
 }
 
 int vfs_fd_get_flags(int fd) {
-    struct fd_entry *e = fd_lookup(fd);
-    if (!e)
-        return -EMBK_EBADF;
-    return e->flags;                 /* O_ACCMODE bits | O_NONBLOCK */
+    struct process *p=current_process;fdlock(p);struct fd_entry *e=fd_lookup(fd);
+    int rc=e?fd_entry_flags(e):-EMBK_EBADF;fdunlock(p);return rc;
 }
 
 int vfs_fd_set_nonblock(int fd, bool on) {
-    struct fd_entry *e = fd_lookup(fd);
-    if (!e)
-        return -EMBK_EBADF;
-    if (on) e->flags |= O_NONBLOCK;
-    else    e->flags &= ~O_NONBLOCK;
-    return EMBK_OK;
+    struct process *p=current_process;fdlock(p);
+    struct fd_entry *e=fd_lookup(fd);
+    if (e && e->shared) {
+        if (on) __atomic_fetch_or(&e->shared->flags,O_NONBLOCK,__ATOMIC_ACQ_REL);
+        else __atomic_fetch_and(&e->shared->flags,~O_NONBLOCK,__ATOMIC_ACQ_REL);
+    }
+    int rc=e && e->shared?0:-EMBK_EBADF;fdunlock(p);return rc;
+}
+int vfs_fd_set_status(int fd,int flags) {
+    struct process *p=current_process;fdlock(p);
+    struct fd_entry *e=fd_lookup(fd);
+    if (e && e->shared) {
+        int old=fd_entry_flags(e);
+        __atomic_store_n(&e->shared->flags,(old&O_ACCMODE)|(flags&(O_NONBLOCK|O_APPEND)),__ATOMIC_RELEASE);
+    }
+    int rc=e && e->shared?0:-EMBK_EBADF;fdunlock(p);return rc;
 }
 
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
@@ -945,7 +994,8 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
 
     if(strcmp(path,"/dev/null")==0) {
         struct fd_entry entry={0};entry.used=true;entry.backing=FD_BACKING_NULLDEV;
-        entry.ops=&nulldev_fd_ops;entry.flags=flags & ~O_CLOEXEC;
+        entry.ops=&nulldev_fd_ops;entry.shared=shared_new(flags);
+        if(!entry.shared)return -EMBK_ENOMEM;
         entry.cloexec=(flags&O_CLOEXEC)!=0;
         (void)fd_close_into(target,target_fd);target->fds[target_fd]=entry;return target_fd;
     }
@@ -1020,15 +1070,15 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     e->backing = FD_BACKING_VNODE;
     e->ops = &vnode_fd_ops;
     e->u.file.of = of;
-    e->flags = flags & ~O_CLOEXEC;
+    e->shared = shared_new(flags);
+    if (!e->shared) {
+        memset(e,0,sizeof *e);fdunlock(target);vmo_put(of->obj);kfree(of);
+        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put)
+            (void)vn.mnt->ops->obj_put(vn.mnt,vn.ino);
+        return -EMBK_ENOMEM;
+    }
     e->cloexec = (flags & O_CLOEXEC) != 0;
 
-    if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
-        struct vfs_stat st;
-        err = vn.mnt->ops->stat(&vn, &st);
-        if (err == EMBK_OK)
-            of->pos = st.size;
-    }
     fdunlock(target);
 
     return target_fd;
@@ -1055,89 +1105,54 @@ static int vnode_stat_cached(struct open_file *of, struct vfs_stat *out) {
     return EMBK_OK;
 }
 
-static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
-    if (!fd_readable(e->flags))
-        return -EMBK_EBADF;
-    struct open_file *of = e->u.file.of;
-    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->read)
-        return -EMBK_ENOSYS;
-
-    size_t bytes_read = 0;
-    int err;
-    if (of->obj) {
-        uint64_t done = 0;
-        err = vmo_read(of->obj, of->pos, buf, len, &done);
-        bytes_read = (size_t)done;
+static int vnode_fd_read(struct fd_entry *e,void *buf,size_t len,size_t *out) {
+    if (!fd_readable(fd_entry_flags(e)))return -EMBK_EBADF;
+    struct open_file *of=e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->read)return -EMBK_ENOSYS;
+    mutex_lock(&e->shared->io_lock);
+    uint64_t done=0;size_t bytes=0;int rc;
+    if(of->obj){rc=vmo_read(of->obj,of->pos,buf,len,&done);bytes=(size_t)done;}
+    else rc=of->vn.mnt->ops->read(&of->vn,of->pos,buf,len,&bytes);
+    if(!rc){of->pos+=bytes;*out=bytes;}
+    mutex_unlock(&e->shared->io_lock);return rc;
+}
+static int vnode_fd_write(struct fd_entry *e,const void *buf,size_t len,size_t *out) {
+    if (!fd_writable(fd_entry_flags(e)))return -EMBK_EBADF;
+    struct open_file *of=e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->write)return -EMBK_ENOSYS;
+    if(!len){*out=0;return 0;}
+    mutex_lock(&e->shared->io_lock);
+    uint64_t start=of->pos,done=0;size_t bytes=0;int rc;
+    bool append=(fd_entry_flags(e)&O_APPEND)!=0;
+    if(of->obj){
+        rc=append?vmo_append(of->obj,buf,len,&start,&done):vmo_write(of->obj,start,buf,len,&done);
+        bytes=(size_t)done;
+    } else if(append && current_thread) {
+        /* An uncached filesystem has no atomic append primitive. Refuse rather
+         * than race a stat+write against another open description. */
+        rc=-EMBK_ENOSYS;
     } else {
-        err = of->vn.mnt->ops->read(&of->vn, of->pos, buf, len, &bytes_read);
+        struct vfs_stat st;
+        rc=append?of->vn.mnt->ops->stat(&of->vn,&st):0;
+        if(append && !rc)start=st.size;
+        if(!rc && len>UINT64_MAX-start)rc=-EMBK_ERANGE;
+        if(!rc)rc=of->vn.mnt->ops->write(&of->vn,start,buf,len,&bytes);
     }
-    if (err)
-        return err;
-
-    of->pos += bytes_read;
-    *out_read = bytes_read;
-    return EMBK_OK;
+    if(!rc){of->pos=start+bytes;*out=bytes;}
+    mutex_unlock(&e->shared->io_lock);return rc;
 }
-
-static int vnode_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
-    if (!fd_writable(e->flags))
-        return -EMBK_EBADF;
-    struct open_file *of = e->u.file.of;
-    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->write)
-        return -EMBK_ENOSYS;
-
-    size_t bytes_written = 0;
-    int err;
-    if (of->obj) {
-        /* Into the cache, and the call returns. The bytes are on their way to
-         * the device, not on it -- fsync() is how a caller says it needs the
-         * difference, and the writeback thread bounds how long it lasts. */
-        uint64_t done = 0;
-        err = vmo_write(of->obj, of->pos, buf, len, &done);
-        bytes_written = (size_t)done;
-    } else {
-        err = of->vn.mnt->ops->write(&of->vn, of->pos, buf, len, &bytes_written);
-    }
-    if (err)
-        return err;
-
-    of->pos += bytes_written;
-    *out_written = bytes_written;
-    return EMBK_OK;
+static int vnode_fd_seek(struct fd_entry *e,int64_t delta,int whence,uint64_t *out) {
+    struct open_file *of=e->u.file.of;
+    if(!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)return -EMBK_ENOSYS;
+    if(whence<0 || whence>2)return -EMBK_EINVAL;
+    mutex_lock(&e->shared->io_lock);
+    struct vfs_stat st;int rc=0;uint64_t base=0,pos;
+    if(whence==1)base=of->pos;
+    if(whence==2){rc=vnode_stat_cached(of,&st);if(!rc)base=st.size;}
+    if(!rc)rc=fd_seek_compute(base,delta,&pos);
+    if(!rc){of->pos=pos;*out=pos;}
+    mutex_unlock(&e->shared->io_lock);return rc;
 }
-
-static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
-    struct open_file *of = e->u.file.of;
-    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
-        return -EMBK_ENOSYS;
-
-    /* SEEK_END means the END OF THE FILE, which now includes bytes that are
-     * only in the cache. Asking the device would report the length before the
-     * last writeback -- so an append loop (seek to end, write, repeat) would
-     * seek back over its own unflushed data and overwrite it. */
-    struct vfs_stat st;
-    int err = vnode_stat_cached(of, &st);
-    if (err)
-        return err;
-
-    uint64_t base;
-    switch (whence) {
-        case 0: base = 0; break; // SEEK_SET
-        case 1: base = of->pos; break; // SEEK_CUR
-        case 2: base = st.size; break; // SEEK_END
-        default: return -EMBK_EINVAL;
-    }
-
-    uint64_t new_pos;
-    err = fd_seek_compute(base, delta, &new_pos);
-    if (err)
-        return err;
-
-    of->pos = new_pos;
-    *out_offset = new_pos;
-    return EMBK_OK;
-}
-
 
 static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
     struct open_file *of = e->u.file.of;
@@ -1162,7 +1177,7 @@ static int vnode_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
      * The vnode's own reference is NOT bumped here: it belongs to the
      * description, which is what is being shared, and is released once when
      * the last descriptor onto it closes. */
-    *dst = *src;
+    int rc=shared_copy(dst,src);if(rc)return rc;
     of_get(dst->u.file.of);
     return EMBK_OK;
 }
@@ -1170,6 +1185,7 @@ static int vnode_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
 
 static void vnode_fd_close(struct fd_entry *e) {
     struct open_file *of = e->u.file.of;
+    shared_drop(e);
     if (!of_put(of))
         return;                 /* another descriptor still holds it */
     /* Before the vnode reference goes: the last descriptor onto a file is the
@@ -1188,6 +1204,7 @@ static void vnode_fd_close_locked(struct fd_entry *e) {
      * obj_puts from a normal schedulable thread holding nothing. This CLOSES
      * the pre-existing exit-time vnode refcount leak. */
     struct open_file *of = e->u.file.of;
+    shared_drop(e);
     if (!of_put(of))
         return;
     /* NOT vmo_put() here: it takes a sleeping lock and may write to the disk,
@@ -1274,17 +1291,9 @@ static int console_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
 }
 
 static int console_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
-    (void)dst; (void)src;
-    
-    *dst = *src; /* shallow copy is fine -- console fds are process-global, not per-process */
-    return EMBK_OK;
+    return shared_copy(dst,src);
 }
-
-static void console_fd_close(struct fd_entry *e) {
-    (void)e; 
-    /* Console fds are process-global, not per-process. Closing them is
-     * meaningless -- the console remains open for everyone. */
-}
+static void console_fd_close(struct fd_entry *e) { shared_drop(e); }
 
 static int64_t console_fd_avail(struct fd_entry *e) {
     (void)e;
@@ -1298,7 +1307,7 @@ static const struct fd_ops console_fd_ops = {
     .fstat = console_fd_fstat,
     .inherit = console_fd_inherit,
     .close = console_fd_close,
-    .close_locked = NULL,
+    .close_locked = console_fd_close,
     .avail = console_fd_avail,
 };
 
@@ -1332,11 +1341,8 @@ static int nulldev_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
     out->type = VFS_DT_CHAR;
     return EMBK_OK;
 }
-static int nulldev_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
-    *dst = *src;                   /* stateless singleton: a struct copy IS the inherit */
-    return EMBK_OK;
-}
-static void nulldev_fd_close(struct fd_entry *e) { (void)e; }
+static int nulldev_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) { return shared_copy(dst,src); }
+static void nulldev_fd_close(struct fd_entry *e) { shared_drop(e); }
 static int64_t nulldev_fd_avail(struct fd_entry *e) { (void)e; return 0; }
 
 static const struct fd_ops nulldev_fd_ops = {
@@ -1346,18 +1352,18 @@ static const struct fd_ops nulldev_fd_ops = {
     .fstat = nulldev_fd_fstat,
     .inherit = nulldev_fd_inherit,
     .close = nulldev_fd_close,
-    .close_locked = NULL,
+    .close_locked = nulldev_fd_close,
     .avail = nulldev_fd_avail,
 };
 
 static int pipe_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
     if (e->u.pipe.side != 0) return -EMBK_EBADF;    /* direction enforced at the
                                                       * op, per the one-kind design */
-    return pipe_read_flags(e->u.pipe.p,buf,len,out,(e->flags&O_NONBLOCK)!=0);
+    return pipe_read_flags(e->u.pipe.p,buf,len,out,(fd_entry_flags(e)&O_NONBLOCK)!=0);
 }
 static int pipe_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
     if (e->u.pipe.side != 1) return -EMBK_EBADF;
-    return pipe_write_flags(e->u.pipe.p,buf,len,out,(e->flags&O_NONBLOCK)!=0,true);
+    return pipe_write_flags(e->u.pipe.p,buf,len,out,(fd_entry_flags(e)&O_NONBLOCK)!=0,true);
 }
 static int pipe_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *out) {
     (void)e;(void)d;(void)w;(void)out; return -EMBK_ESPIPE;
@@ -1368,7 +1374,7 @@ static int pipe_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
      * mirror-image favor of the console's VFS_DT_CHAR making it true */
 }
 static int pipe_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
-    *dst = *src;
+    int rc=shared_copy(dst,src);if(rc)return rc;
     sched_lock();
     pipe_ref_locked(dst->u.pipe.p, dst->u.pipe.side);   /* a copy IS a new
                                                           * reference -- the exact
@@ -1378,10 +1384,10 @@ static int pipe_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
     return EMBK_OK;
 }
 static void pipe_fd_close(struct fd_entry *e) {
-    sched_lock(); pipe_unref_locked(e->u.pipe.p, e->u.pipe.side); sched_unlock();
+    sched_lock(); pipe_unref_locked(e->u.pipe.p, e->u.pipe.side); sched_unlock();shared_drop(e);
 }
 static void pipe_fd_close_locked(struct fd_entry *e) {
-    pipe_unref_locked(e->u.pipe.p, e->u.pipe.side);
+    pipe_unref_locked(e->u.pipe.p, e->u.pipe.side);shared_drop(e);
 }
 
 static int64_t pipe_fd_avail(struct fd_entry *e) {
@@ -1425,7 +1431,8 @@ static int install_pipe(struct process *target, int target_fd, struct pipe *p, i
     e->used = true;
     e->backing = FD_BACKING_PIPE;
     e->ops = &pipe_fd_ops;
-    e->flags = (side == 0) ? O_RDONLY : O_WRONLY;
+    e->shared = shared_new(side==0?O_RDONLY:O_WRONLY);
+    if (!e->shared) { memset(e,0,sizeof *e);fdunlock(target);return -EMBK_ENOMEM; }
     e->u.pipe.p = p;
     e->u.pipe.side = side;
 
@@ -1450,15 +1457,15 @@ int fd_install_pipe_any(struct process *target,struct pipe *p,int side) {
 
 /* ---- FD_BACKING_SOCKET: a TCP connection as a read/write fd (M4) --------- */
 static int sock_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
-    if (e->u.sock.conn < 0) return -EMBK_EINVAL;      /* not connected */
-    if (e->flags & O_NONBLOCK) {                       /* never wait: -EAGAIN if no data */
-        int n = net_tcp_recv_nb(e->u.sock.conn, buf, (uint32_t)len);
+    if (e->shared->conn < 0) return -EMBK_EINVAL;      /* not connected */
+    if (fd_entry_flags(e) & O_NONBLOCK) {                       /* never wait: -EAGAIN if no data */
+        int n = net_tcp_recv_nb(e->shared->conn, buf, (uint32_t)len);
         if (n == -2) return -EMBK_EAGAIN;
         if (n < 0)   return -EMBK_EIO;
         *out = (size_t)n;
         return EMBK_OK;
     }
-    int n = net_tcp_recv(e->u.sock.conn, buf, (uint32_t)len);
+    int n = net_tcp_recv(e->shared->conn, buf, (uint32_t)len);
     /* Timed out with the connection still open. NOT end-of-stream, and not an
      * I/O error either -- the distinction is the whole point (see
      * net_tcp_recv). A blocking reader gets EAGAIN and decides for itself
@@ -1471,8 +1478,8 @@ static int sock_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) 
 /* Readiness for select()/poll: connect-in-progress becomes writable on
  * ESTABLISHED; buffered data / FIN becomes readable. See net_tcp_ready(). */
 static int sock_fd_poll(struct fd_entry *e, int events) {
-    if (e->u.sock.conn < 0) return POLLNVAL;          /* unconnected socket */
-    int rdy = net_tcp_ready(e->u.sock.conn);
+    if (e->shared->conn < 0) return POLLNVAL;          /* unconnected socket */
+    int rdy = net_tcp_ready(e->shared->conn);
     if (rdy < 0) return POLLERR;
     int re = 0;
     if ((events & POLLIN)  && (rdy & TCP_RDY_READ))  re |= POLLIN;
@@ -1481,8 +1488,8 @@ static int sock_fd_poll(struct fd_entry *e, int events) {
     return re;
 }
 static int sock_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
-    if (e->u.sock.conn < 0) return -EMBK_EINVAL;
-    int n = net_tcp_send(e->u.sock.conn, buf, (uint32_t)len);
+    if (e->shared->conn < 0) return -EMBK_EINVAL;
+    int n = net_tcp_send(e->shared->conn, buf, (uint32_t)len);
     if (n < 0) return -EMBK_EIO;
     *out = (size_t)n;
     return EMBK_OK;
@@ -1494,20 +1501,14 @@ static int sock_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
     (void)e; out->size = 0; out->type = VFS_DT_FIFO;  /* not a tty; isatty(fd) == false */
     return EMBK_OK;
 }
-static int sock_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
-    /* A socket is not passed to children in M4; if one ever lands in inherited
-     * stdio, a struct copy is safe only because net_tcp_close/abort are
-     * idempotent (a second close on a freed conn is a no-op). */
-    *dst = *src;
-    return EMBK_OK;
-}
+static int sock_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) { return shared_copy(dst,src); }
 static void sock_fd_close(struct fd_entry *e) {
-    if (e->u.sock.conn >= 0) net_tcp_close(e->u.sock.conn);   /* graceful FIN (may poll) */
+    int conn=e->shared->conn;
+    if (shared_drop(e) && conn>=0) net_tcp_close(conn);
 }
 static void sock_fd_close_locked(struct fd_entry *e) {
-    /* Reap path, under g_sched_lock: the graceful close polls+schedules and must
-     * NOT run here, so drop the connection without blocking. */
-    if (e->u.sock.conn >= 0) net_tcp_abort(e->u.sock.conn);
+    int conn=e->shared->conn;
+    if (shared_drop(e) && conn>=0) net_tcp_abort(conn);
 }
 
 static const struct fd_ops sock_fd_ops = {
@@ -1530,8 +1531,9 @@ int fd_alloc_socket(struct process *p) {
     e->used = true;
     e->backing = FD_BACKING_SOCKET;
     e->ops = &sock_fd_ops;
-    e->flags = O_RDWR;
-    e->u.sock.conn = -1;                              /* unconnected until connect() */
+    e->shared = shared_new(O_RDWR);
+    if (!e->shared) { memset(e,0,sizeof *e);fdunlock(p);return -EMBK_ENOMEM; }
+    e->shared->conn = -1;                              /* unconnected until connect() */
     fdunlock(p);
     return fd;
 }
@@ -1540,23 +1542,23 @@ int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port
     if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
     struct fd_entry *e = &p->fds[fd - FD_BASE];
     if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
-    if (e->u.sock.conn >= 0) return -EMBK_EINVAL;     /* already connected */
+    if (e->shared->conn >= 0) return -EMBK_EINVAL;     /* already connected */
 
     /* Non-blocking connect: fire the SYN and return immediately with
      * -EINPROGRESS. The caller poll()s for POLLOUT (ESTABLISHED) via select().
      * net_tcp_connect_start does not block, so holding fdlock would be fine, but
      * we keep the same no-lock discipline as the blocking path below. */
-    if (e->flags & O_NONBLOCK) {
+    if (fd_entry_flags(e) & O_NONBLOCK) {
         int conn = net_tcp_connect_start(ip_host, port);
         if (conn < 0) return -EMBK_ECONNREFUSED;
-        e->u.sock.conn = conn;
+        e->shared->conn = conn;
         return -EMBK_EINPROGRESS;
     }
 
     /* net_tcp_connect blocks (polls) -- do NOT hold fdlock across it. */
     int conn = net_tcp_connect(ip_host, port);
     if (conn < 0) return -EMBK_ECONNREFUSED;
-    e->u.sock.conn = conn;
+    e->shared->conn = conn;
     return EMBK_OK;
 }
 
@@ -1564,15 +1566,16 @@ int fd_socket_bind(struct process *p, int fd, uint16_t port) {
     if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
     struct fd_entry *e = &p->fds[fd - FD_BASE];
     if (!e->used) return -EMBK_EBADF;
-    if (e->backing == FD_BACKING_SOCKET) { e->u.sock.bind_port = port; return EMBK_OK; }
+    if (e->backing == FD_BACKING_SOCKET) { e->shared->bind_port = port; return EMBK_OK; }
     if (e->backing == FD_BACKING_UDP)
-        return net_udp_bind(e->u.udp.us, port) == 0 ? EMBK_OK : -EMBK_EINVAL;
+        return net_udp_bind(e->shared->conn, port) == 0 ? EMBK_OK : -EMBK_EINVAL;
     return -EMBK_EBADF;
 }
 
 /* ---- FD_BACKING_UDP: a UDP datagram socket (M5) ------------------------- */
 static int udp_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
-    int n = net_udp_recvfrom(e->u.udp.us, buf, (uint32_t)len, 0, 0);   /* recv, drop the addr */
+    int n = (fd_entry_flags(e)&O_NONBLOCK)?net_udp_recvfrom_nb(e->shared->conn,buf,(uint32_t)len,0,0):net_udp_recvfrom(e->shared->conn,buf,(uint32_t)len,0,0);
+    if(n==-2)return -EMBK_EAGAIN;
     if (n < 0) return -EMBK_EIO;
     *out = (size_t)n;
     return EMBK_OK;
@@ -1587,13 +1590,17 @@ static int udp_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *o) {
 static int udp_fd_fstat(struct fd_entry *e, struct vfs_stat *o) {
     (void)e; o->size = 0; o->type = VFS_DT_FIFO; return EMBK_OK;
 }
-static int udp_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) { *dst = *src; return EMBK_OK; }
-static void udp_fd_close(struct fd_entry *e) { net_udp_close(e->u.udp.us); }
-static void udp_fd_close_locked(struct fd_entry *e) { net_udp_abort(e->u.udp.us); }
+static int udp_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) { return shared_copy(dst,src); }
+static void udp_fd_close(struct fd_entry *e) { int us=e->shared->conn;if(shared_drop(e))net_udp_close(us); }
+static void udp_fd_close_locked(struct fd_entry *e) { int us=e->shared->conn;if(shared_drop(e))net_udp_abort(us); }
 
+static int udp_fd_poll(struct fd_entry *e,int events) {
+    int ready=net_udp_ready(e->shared->conn);
+    return ready<0?POLLERR:((events&POLLOUT)|(ready?(events&POLLIN):0));
+}
 static const struct fd_ops udp_fd_ops = {
     .read = udp_fd_read, .write = udp_fd_write, .seek = udp_fd_seek, .fstat = udp_fd_fstat,
-    .inherit = udp_fd_inherit, .close = udp_fd_close, .close_locked = udp_fd_close_locked, .avail = NULL,
+    .inherit = udp_fd_inherit, .close = udp_fd_close, .close_locked = udp_fd_close_locked, .avail = NULL,.poll=udp_fd_poll,
 };
 
 int fd_alloc_udp(struct process *p) {
@@ -1607,8 +1614,9 @@ int fd_alloc_udp(struct process *p) {
     if (fd < 0) { fdunlock(p); net_udp_abort(us); return -EMBK_EMFILE; }
     struct fd_entry *e = &fds[fd - FD_BASE];
     memset(e, 0, sizeof(*e));
-    e->used = true; e->backing = FD_BACKING_UDP; e->ops = &udp_fd_ops; e->flags = O_RDWR;
-    e->u.udp.us = us;
+    e->used = true; e->backing = FD_BACKING_UDP; e->ops = &udp_fd_ops; e->shared=shared_new(O_RDWR);
+    if (!e->shared) { memset(e,0,sizeof *e);fdunlock(p);net_udp_abort(us);return -EMBK_ENOMEM; }
+    e->shared->conn = us;
     fdunlock(p);
     return fd;
 }
@@ -1619,7 +1627,7 @@ int fd_udp_sendto(struct process *p, int fd, uint32_t ip_host, uint16_t port,
     if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
     struct fd_entry *e = &p->fds[fd - FD_BASE];
     if (!e->used || e->backing != FD_BACKING_UDP) return -EMBK_EBADF;
-    int n = net_udp_sendto(e->u.udp.us, ip_host, port, data, len);
+    int n = net_udp_sendto(e->shared->conn, ip_host, port, data, len);
     return n < 0 ? -EMBK_EIO : n;
 }
 
@@ -1628,31 +1636,32 @@ int fd_udp_recvfrom(struct process *p, int fd, void *buf, uint32_t cap,
     if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
     struct fd_entry *e = &p->fds[fd - FD_BASE];
     if (!e->used || e->backing != FD_BACKING_UDP) return -EMBK_EBADF;
-    int n = net_udp_recvfrom(e->u.udp.us, buf, cap, src_ip, src_port);
-    return n < 0 ? -EMBK_EIO : n;
+    int n = (fd_entry_flags(e)&O_NONBLOCK)?net_udp_recvfrom_nb(e->shared->conn,buf,cap,src_ip,src_port):net_udp_recvfrom(e->shared->conn,buf,cap,src_ip,src_port);
+    return n==-2?-EMBK_EAGAIN:(n<0?-EMBK_EIO:n);
 }
 
 int fd_socket_listen(struct process *p, int fd) {
     if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
     struct fd_entry *e = &p->fds[fd - FD_BASE];
     if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
-    if (e->u.sock.bind_port == 0) return -EMBK_EINVAL;      /* bind() first */
-    int lc = net_tcp_listen(e->u.sock.bind_port);
+    if (e->shared->bind_port == 0) return -EMBK_EINVAL;      /* bind() first */
+    int lc = net_tcp_listen(e->shared->bind_port);
     if (lc < 0) return -EMBK_EMFILE;
-    e->u.sock.conn = lc;                                    /* fd now backs the listener */
+    e->shared->conn = lc;                                    /* fd now backs the listener */
     return EMBK_OK;
 }
 
 int fd_socket_accept(struct process *p, int fd) {
     if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
     struct fd_entry *le = &p->fds[fd - FD_BASE];
-    if (!le->used || le->backing != FD_BACKING_SOCKET || le->u.sock.conn < 0) return -EMBK_EBADF;
+    if (!le->used || le->backing != FD_BACKING_SOCKET || le->shared->conn < 0) return -EMBK_EBADF;
     /* net_tcp_accept blocks (polls) -- do NOT hold fdlock across it. */
-    int child = net_tcp_accept(le->u.sock.conn);
+    int child = (fd_entry_flags(le)&O_NONBLOCK)?net_tcp_accept_nb(le->shared->conn):net_tcp_accept(le->shared->conn);
+    if(child==-2)return -EMBK_EAGAIN;
     if (child < 0) return -EMBK_EIO;
     int nfd = fd_alloc_socket(p);                          /* a fresh fd for the connection */
     if (nfd < 0) { net_tcp_abort(child); return nfd; }
-    p->fds[nfd - FD_BASE].u.sock.conn = child;
+    p->fds[nfd - FD_BASE].shared->conn = child;
     return nfd;
 }
 
@@ -1855,12 +1864,12 @@ int vfs_fd_run_selftests(void)
 /* A PTY operation pins the object independently of descriptors. Closing the
  * last peer fd therefore wakes a blocked operation immediately, while the pin
  * keeps its storage alive until the operation unwinds. */
-static int pty_hold(struct fd_entry *e,struct fd_entry *copy) {
+static int pty_hold(struct fd_entry *e,struct fd_entry *copy,int *flags) {
     if (!current_thread) return -EMBK_ENOTTY;
     fdlock(current_process);
     if (!e || !e->used) { fdunlock(current_process); return -EMBK_EBADF; }
     if (e->backing!=FD_BACKING_PTY) { fdunlock(current_process); return -EMBK_ENOTTY; }
-    *copy=*e;
+    *copy=*e;if(flags)*flags=fd_entry_flags(e);
     sched_lock();
     pty_pin_locked(copy->u.pty.p); current_thread->io_pty=copy->u.pty.p;
     sched_unlock();
@@ -1870,30 +1879,31 @@ static void pty_drop(struct fd_entry *e) {
     sched_lock(); current_thread->io_pty=NULL; pty_unpin_locked(e->u.pty.p); sched_unlock();
 }
 static int pty_fd_read(struct fd_entry *e,void *buf,size_t len,size_t *out) {
-    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
-    rc=pty_read(held.u.pty.p,held.u.pty.side,buf,len,out,(held.flags&O_NONBLOCK)!=0);
+    struct fd_entry held;int flags; int rc=pty_hold(e,&held,&flags); if (rc) return rc;
+    rc=pty_read(held.u.pty.p,held.u.pty.side,buf,len,out,(flags&O_NONBLOCK)!=0);
     pty_drop(&held); return rc;
 }
 static int pty_fd_write(struct fd_entry *e,const void *buf,size_t len,size_t *out) {
-    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
-    rc=pty_write(held.u.pty.p,held.u.pty.side,buf,len,out,(held.flags&O_NONBLOCK)!=0);
+    struct fd_entry held;int flags; int rc=pty_hold(e,&held,&flags); if (rc) return rc;
+    rc=pty_write(held.u.pty.p,held.u.pty.side,buf,len,out,(flags&O_NONBLOCK)!=0);
     pty_drop(&held); return rc;
 }
 static int pty_fd_fstat(struct fd_entry *e,struct vfs_stat *out) {
     (void)e; memset(out,0,sizeof *out); out->type=VFS_DT_CHAR; out->mode=0600; return 0;
 }
 static int pty_fd_inherit(struct fd_entry *dst,const struct fd_entry *src) {
+    int rc=shared_copy(dst,src);if(rc)return rc;
     sched_lock(); pty_ref_locked(src->u.pty.p,src->u.pty.side); sched_unlock();
-    *dst=*src; return 0;
+    return 0;
 }
-static void pty_fd_close_locked(struct fd_entry *e) { pty_unref_locked(e->u.pty.p,e->u.pty.side); }
+static void pty_fd_close_locked(struct fd_entry *e) { pty_unref_locked(e->u.pty.p,e->u.pty.side);shared_drop(e); }
 static void pty_fd_close(struct fd_entry *e) { sched_lock(); pty_fd_close_locked(e); sched_unlock(); }
 static int64_t pty_fd_avail(struct fd_entry *e) {
-    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
+    struct fd_entry held;int flags; int rc=pty_hold(e,&held,&flags); if (rc) return rc;
     int64_t n=pty_avail(held.u.pty.p,held.u.pty.side); pty_drop(&held); return n;
 }
 static int pty_fd_poll(struct fd_entry *e,int events) {
-    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
+    struct fd_entry held;int flags; int rc=pty_hold(e,&held,&flags); if (rc) return rc;
     int n=pty_poll(held.u.pty.p,held.u.pty.side,events); pty_drop(&held); return n;
 }
 static const struct fd_ops pty_fd_ops={
@@ -1907,11 +1917,17 @@ int fd_alloc_pty(int pair[2]) {
     int fds[2],n=0;
     for (int i=FD_STDIO_MAX;i<FD_MAX_OPEN && n<2;i++) if (!current_process->fds[i].used) fds[n++]=i;
     if (n<2) { fdunlock(current_process); return -EMBK_EMFILE; }
+    struct fd_shared *status[2]={shared_new(O_RDWR),shared_new(O_RDWR)};
+    if (!status[0] || !status[1]) {
+        for(int i=0;i<2;i++)if(status[i]){struct fd_entry drop={.shared=status[i]};shared_drop(&drop);}
+        fdunlock(current_process);return -EMBK_ENOMEM;
+    }
     struct pty *p; int rc=pty_create(&p);
+    if (rc)for(int i=0;i<2;i++){struct fd_entry drop={.shared=status[i]};shared_drop(&drop);}
     if (!rc) for (int side=0;side<2;side++) {
         struct fd_entry *e=&current_process->fds[fds[side]];
         memset(e,0,sizeof *e); e->used=true; e->backing=FD_BACKING_PTY;
-        e->ops=&pty_fd_ops; e->flags=O_RDWR; e->u.pty.p=p; e->u.pty.side=side;
+        e->ops=&pty_fd_ops; e->shared=status[side]; e->u.pty.p=p; e->u.pty.side=side;
         pair[side]=fds[side];
     }
     fdunlock(current_process); return rc;
@@ -1920,7 +1936,7 @@ int fd_terminal_control(int fd,unsigned op,void *data) {
     if (!current_thread) return -EMBK_ENOTTY;
     struct fd_entry held;
     if (fd<0 || fd>=FD_MAX_OPEN) return -EMBK_EBADF;
-    int rc=pty_hold(&current_process->fds[fd],&held); if (rc) return rc;
+    int rc=pty_hold(&current_process->fds[fd],&held,NULL); if (rc) return rc;
     uint32_t pid=0;
     if (op==EMBK_TERMINAL_FOREGROUND) {
         int handle=*(int *)data;
@@ -1933,7 +1949,7 @@ int fd_terminal_control(int fd,unsigned op,void *data) {
 }
 
 /* Descriptor flags are per descriptor. Duplication clears close-on-exec;
- * status flags retain the existing per-entry contract. */
+ * status flags and socket identity belong to the shared description. */
 int vfs_fd_get_cloexec(int fd) {
     struct process *p=current_process;fdlock(p);
     struct fd_entry *e=fd_lookup(fd);
@@ -1973,12 +1989,6 @@ int fd_snapshot_into(struct process *target) {
     for(int i=0;i<FD_MAX_OPEN;i++) {
         const struct fd_entry *src=&current_process->fds[i];
         if(!src->used)continue;
-        /* Network backings have no shared lifetime yet. Never copy a socket
-         * whose close in the child would tear down the parent's connection. */
-        if(src->backing==FD_BACKING_SOCKET || src->backing==FD_BACKING_UDP) {
-            if(src->cloexec)continue;
-            rc=-EMBK_ENOSYS;break;
-        }
         if(!src->ops || !src->ops->inherit){rc=-EMBK_ENOSYS;break;}
         rc=src->ops->inherit(&target->fds[i],src);
         if(rc)break;

@@ -2013,7 +2013,7 @@ int process_fds_snapshot(uint32_t pid, struct fd_snap_info *out, int max) {
         if (!f->used) continue;
         out[n].fd = i + FD_BASE;
         out[n].backing = (uint8_t)f->backing;
-        out[n].flags = f->flags;
+        out[n].flags = fd_entry_flags(f);
         out[n].ino = 0;
         out[n].pos = 0;
         out[n].vtype = 0;

@@ -10689,6 +10689,17 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if(strcmp(cmd,"test fd-sharing")==0 || strcmp(cmd,"test fd-network")==0) {
+        unsigned before=fd_shared_live_count(),pipes=pipe_live_count(),ptys=pty_live_count();
+        char *argv[]={"/data/apps/fdprobe/fdprobe.elf",NULL,NULL};
+        int argc=1;if(strcmp(cmd,"test fd-network")==0){argv[1]="--network";argc=2;}
+        int pid=process_create(argv[0],argv,argc,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=fd_shared_live_count();
+        kprintf("\n[cmd] %s: exit=%d, descriptions=%u->%u -> %s\n",cmd,code,before,after,
+            pid>=0 && code==0 && before==after && pipes==pipe_live_count() && ptys==pty_live_count()?"OK":"FAIL");return 1;
+    }
+
     if(strcmp(cmd,"test posix-shell")==0) {
         unsigned before=pipe_live_count();
         char *argv[]={"/data/apps/shprobe/shprobe.elf",NULL};

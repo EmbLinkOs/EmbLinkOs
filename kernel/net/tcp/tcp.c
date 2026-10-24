@@ -371,7 +371,7 @@ int net_tcp_ready(int conn) {
 
     int r = 0;
     /* Readable: buffered data, or a FIN/reset (recv would return 0/EOF, not block). */
-    if (t->rx_len > 0 || t->peer_fin || t->reset || t->state == TCP_CLOSED)
+    if ((t->state==TCP_LISTEN && t->accept_n>0) || t->rx_len > 0 || t->peer_fin || t->reset || t->state == TCP_CLOSED)
         r |= TCP_RDY_READ;
     /* Writable: established (send never blocks here). */
     if (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT)
@@ -405,7 +405,7 @@ int net_tcp_listen(uint16_t port) {
 /* Block until a connection has completed its handshake on this listener, then
  * hand back its conn index (an ESTABLISHED connection ready to read/write).
  * Returns -1 on a bad listener or if none arrived within the bound. */
-int net_tcp_accept(int listen_conn) {
+static int accept_flags(int listen_conn,bool nonblock) {
     if (listen_conn < 0 || listen_conn >= TCP_CONNS) return -1;
     net_lock();
     struct tcb *lis = &tcbs[listen_conn];
@@ -413,18 +413,23 @@ int net_tcp_accept(int listen_conn) {
 
     int child = -1;
     uint64_t deadline = net_ticks() + NET_TMO_TICKS;
-    while (child < 0 && net_ticks() < deadline) {
+    while (child < 0) {
+        if (!lis->in_use || lis->state!=TCP_LISTEN)break;
         if (lis->accept_n > 0) {
             child = lis->accept_q[0];
             for (int j = 1; j < lis->accept_n; j++) lis->accept_q[j - 1] = lis->accept_q[j];
             lis->accept_n--;
             break;
         }
+        if(nonblock){child=-2;break;}
+        if(net_ticks()>=deadline)break;
         net_wait();
     }
     net_unlock();
     return child;
 }
+int net_tcp_accept(int conn) { return accept_flags(conn,false); }
+int net_tcp_accept_nb(int conn) { return accept_flags(conn,true); }
 
 int net_tcp_send(int conn, const void *data, uint32_t len) {
     if (conn < 0 || conn >= TCP_CONNS) return -1;

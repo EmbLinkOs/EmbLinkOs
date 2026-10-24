@@ -636,14 +636,13 @@ int vmo_read(struct vm_object *o, uint64_t off, void *buf, uint64_t len,
     return rc;
 }
 
-int vmo_write(struct vm_object *o, uint64_t off, const void *buf, uint64_t len,
+static int write_locked(struct vm_object *o, uint64_t off, const void *buf, uint64_t len,
               uint64_t *out_done) {
     if (!o || (!buf && len) || !out_done)
         return -EMBK_EINVAL;
     *out_done = 0;
 
-    mutex_lock(&g_lock);
-
+    if (len>UINT64_MAX-off) return -EMBK_ERANGE;
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t done = 0;
     int rc = EMBK_OK;
@@ -678,9 +677,22 @@ int vmo_write(struct vm_object *o, uint64_t off, const void *buf, uint64_t len,
             o->size = off + done;
     }
 
-    mutex_unlock(&g_lock);
     *out_done = done;
     return rc;
+}
+
+int vmo_write(struct vm_object *o,uint64_t off,const void *buf,uint64_t len,uint64_t *out_done) {
+    if (!o || (!buf && len) || !out_done)return -EMBK_EINVAL;
+    mutex_lock(&g_lock);
+    int rc=write_locked(o,off,buf,len,out_done);
+    mutex_unlock(&g_lock);return rc;
+}
+int vmo_append(struct vm_object *o,const void *buf,uint64_t len,uint64_t *out_offset,uint64_t *out_done) {
+    if (!o || (!buf && len) || !out_offset || !out_done)return -EMBK_EINVAL;
+    mutex_lock(&g_lock);
+    *out_offset=o->size;
+    int rc=write_locked(o,*out_offset,buf,len,out_done);
+    mutex_unlock(&g_lock);return rc;
 }
 
 int vmo_flush(struct vm_object *o) {

@@ -912,7 +912,7 @@ int fcntl(int fd, int cmd, ...) {
     case F_GETFL: {
         int64_t fl=embk_syscall3(EMBK_SYS_fcntl,fd,3,0);
         if(fl<0)return embk_fail(fl);
-        return ((int)fl&3)|((fl&4)?O_NONBLOCK:0);
+        return ((int)fl&3)|((fl&4)?O_NONBLOCK:0)|((fl&8)?O_APPEND:0);
     }
     case F_DUPFD: {
         va_list ap; va_start(ap, cmd);
@@ -925,11 +925,10 @@ int fcntl(int fd, int cmd, ...) {
         va_list ap; va_start(ap, cmd);
         int flags = va_arg(ap, int);
         va_end(ap);
-        /* Honor O_NONBLOCK for real now: the kernel supports non-blocking
-         * sockets (connect -> EINPROGRESS, recv -> EAGAIN, select for readiness).
-         * For a non-socket fd the flag is stored but every op stays blocking,
-         * which is correct -- files never block. sys_fcntl cmd 2 = set it. */
-        int64_t r = embk_syscall3(EMBK_SYS_fcntl, fd, 2, (flags & O_NONBLOCK) ? 1 : 0);
+        if (flags&~(O_ACCMODE|O_NONBLOCK|O_APPEND)) { errno=EINVAL;return -1; }
+        /* Stable native wire bits; access mode cannot change after open. */
+        int64_t r = embk_syscall3(EMBK_SYS_fcntl, fd, 6,
+                ((flags&O_NONBLOCK)?4:0)|((flags&O_APPEND)?8:0));
         if (embk_is_err(r)) return embk_fail(r);
         return 0;
     }

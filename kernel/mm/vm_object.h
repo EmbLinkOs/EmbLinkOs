@@ -163,6 +163,9 @@ int vmo_read(struct vm_object *o, uint64_t off, void *buf, uint64_t len,
              uint64_t *out_done);
 int vmo_write(struct vm_object *o, uint64_t off, const void *buf, uint64_t len,
               uint64_t *out_done);
+/* Choose EOF and write while holding the same cache lock as normal writes. */
+int vmo_append(struct vm_object *o,const void *buf,uint64_t len,
+               uint64_t *out_offset,uint64_t *out_done);
 
 /* Push every dirty page of this object to the device. What fsync() is. */
 int vmo_flush(struct vm_object *o);

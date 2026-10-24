@@ -323,7 +323,7 @@ ARM_PIE_SYSCALLS := $(ARM_USER)/syscalls_pic.o
 # and it builds; nothing else needs editing.
 # Static newlib console programs (-T newlib.ld, no libembk.so).
 ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn lockdemo jitter \
-                    crasher ioracer processprobe spawnprobe shprobe sh sockdemo udptest nbsock httpget \
+                    crasher ioracer processprobe spawnprobe shprobe fdprobe sh sockdemo udptest nbsock httpget \
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \
                     $(if $(HAVE_QJS),js,) \

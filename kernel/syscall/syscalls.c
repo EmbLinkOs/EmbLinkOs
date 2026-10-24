@@ -382,6 +382,9 @@ static int64_t sys_fcntl(const struct sysargs *a) {
     }
     case 2:
         return vfs_fd_set_nonblock(fd, arg != 0);
+    case 6:
+        if (arg&~12) return -EMBK_EINVAL;
+        return vfs_fd_set_status(fd,((arg&4)?O_NONBLOCK:0)|((arg&8)?O_APPEND:0));
     case 4: return vfs_fd_get_cloexec(fd);
     case 5: return vfs_fd_set_cloexec(fd,arg!=0);
     case 3: {
@@ -389,7 +392,7 @@ static int64_t sys_fcntl(const struct sysargs *a) {
         if(fl<0)return fl;
         /* Stable wire flags: access mode in bits 0..1, nonblocking in bit 2.
          * libc O_NONBLOCK has a different value from the native fd flag. */
-        return (fl&O_ACCMODE)|((fl&O_NONBLOCK)?4:0);
+        return (fl&O_ACCMODE)|((fl&O_NONBLOCK)?4:0)|((fl&O_APPEND)?8:0);
     }
     default:
         return -EMBK_EINVAL;

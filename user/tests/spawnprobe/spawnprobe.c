@@ -229,15 +229,14 @@ static void paths_and_errors(void) {
     CHECK(posix_spawnp(&pid,SELF,NULL,NULL,args,NULL)==0);collect(pid,42);
     pid=98765;CHECK(posix_spawnp(&pid,"missing-command",NULL,NULL,args,NULL)==ENOENT && pid==98765);
     posix_spawn_file_actions_destroy(&a);
-    /* Network backings cannot yet share lifetime. Refuse instead of silently
-     * closing the parent's socket when a copied child descriptor closes. */
+    /* A child may close its inherited socket without destroying the parent. */
     int sock=socket(AF_INET,SOCK_STREAM,0);CHECK(sock>=0);
     if(sock>=0) {
-        CHECK(run("--return",NULL,NULL,&pid)==ENOSYS);
+        CHECK(run("--return",NULL,NULL,&pid)==0);collect(pid,42);
         CHECK(fcntl(sock,F_SETFD,FD_CLOEXEC)==0);
         CHECK(run("--return",NULL,NULL,&pid)==0);collect(pid,42);close(sock);
     }
-    puts("Spawn errors: unchanged PID/errno, PATH search, action rollback and socket refusal verified.");
+    puts("Spawn errors: unchanged PID/errno, PATH search, action rollback and socket inheritance verified.");
 }
 static void pressure(void) {
     pid_t pids[32];int count=0;

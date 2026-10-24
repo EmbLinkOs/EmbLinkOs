@@ -20,7 +20,7 @@ def digest(path):
     return h.hexdigest()
 
 class Guest:
-    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None):
+    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None):
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
         shutil.copyfile(firmware/'OVMF_VARS_4M.fd',out/'vars.fd')
@@ -35,6 +35,8 @@ class Guest:
                   '-device','nvme,drive=bootdisk,serial=EMBLINKBOOT']
         else:
             cmd+=['-drive',f'format=raw,file={disk},if=ide,index=0']
+        if nic:
+            cmd+=['-netdev','user,id=fixture-net','-device',f'{nic},netdev=fixture-net']
         if target:
             cmd+=['-drive',f'format=raw,file={target},if=none,id=target',
                   '-device','nvme,drive=target,serial=EMBLINKINSTALL']

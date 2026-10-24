@@ -20,9 +20,7 @@ struct vm_object;   /* mm/vm_object.h -- the file's resident pages */
  * process.h is actually included. */
 struct process;
 
-/* open() flags. bit values are our own; only O_CREAT/O_EXCL act in v1.
- * O_TRUNC and O_APPEND are reserved - declared so callers can compile against
- * the final ABI, but the open/write path don't use them yet*/
+/* Native open/status bits; libc translates its own ABI values. */
 
 #define O_RDONLY     0x0000
 #define O_WRONLY     0x0001
@@ -32,14 +30,14 @@ struct process;
 #define O_EXCL       0x0080
 #define O_NONBLOCK   0x0800  /* fd is non-blocking: read/recv return -EAGAIN and
                               * connect() returns -EINPROGRESS instead of waiting.
-                              * Stored in fd_entry.flags; set via sys_fcntl. */
+                              * Shared across dup/spawn copies. */
 #define O_TRUNC      0x0200  /* LIVE: open() shrinks the file to 0 via the
                               * per-fs truncate op (EMBKFS: a real COW
                               * transaction). Needs writable access; a fs
                               * without the op fails -ENOSYS, never silently
                               * keeps stale bytes. */
 #define O_CLOEXEC    0x100000 /* descriptor inheritance flag, not file status */
-#define O_APPEND     0x0400  /* reserved  (write is cursor-driven for now)*/
+#define O_APPEND     0x0400  /* select EOF atomically on every cached-file write */
 
 /* Fds 0/1/2 conventionally hold stdin/stdout/stderr. Allocation uses the
  * lowest free slot, so closed standard descriptors can be reused. Public (not fd.c-local) because
@@ -155,17 +153,16 @@ struct open_file {
     struct vm_object *obj;
 };
 
+struct fd_shared;
 struct fd_entry {
     bool used;
     bool cloexec;
     enum fd_backing backing;    /**< selects which fd_ops table applies */
     const struct fd_ops *ops;   /**< per-backing dispatch (NULL when unused) */
-    int flags;
+    struct fd_shared *shared;  /* status flags, socket identity and cursor lock */
     union {
         struct { struct open_file *of; } file;           /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
-        struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
-        struct { int us; } udp;                          /**< FD_BACKING_UDP (UDP socket index) */
         struct { struct pty *p; int side; } pty;
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
@@ -184,7 +181,10 @@ int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */
 int vfs_fd_poll(int fd, int events);          /* ready POLL* bits for one fd */
-int vfs_fd_get_flags(int fd);                 /* O_ACCMODE | O_NONBLOCK, or -errno */
+int fd_entry_flags(const struct fd_entry *e); /* caller owns entry or table lock */
+unsigned fd_shared_live_count(void);
+int vfs_fd_get_flags(int fd);                 /* access + supported status bits */
+int vfs_fd_set_status(int fd, int flags);     /* mutable O_NONBLOCK / O_APPEND */
 int vfs_fd_set_nonblock(int fd, bool on);     /* set/clear O_NONBLOCK; 0 or -errno */
 int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
 int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */

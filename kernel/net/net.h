@@ -193,6 +193,7 @@ int  net_tcp_ready(int conn);
 #define TCP_RDY_WRITE 0x2
 #define TCP_RDY_ERR   0x4
 int  net_tcp_listen(uint16_t port);                         /* passive open -> a listen conn index */
+int  net_tcp_accept_nb(int listen_conn); /* -2 when no queued peer */
 int  net_tcp_accept(int listen_conn);                       /* block for a client -> its conn index */
 int  net_tcp_send(int conn, const void *data, uint32_t len);/* send + wait for ACK */
 int  net_tcp_recv(int conn, void *buf, uint32_t cap);       /* bytes; 0 = peer FIN/EOF; -2 = timed out, still open; -1 = bad conn */
@@ -205,6 +206,8 @@ int  net_udp_open(void);
 int  net_udp_bind(int us, uint16_t port);
 int  net_udp_sendto(int us, uint32_t dst_ip, uint16_t dst_port, const void *data, uint32_t len);
 int  net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port);
+int net_udp_recvfrom_nb(int us,void *buf,uint32_t cap,uint32_t *src_ip,uint16_t *src_port);
+int net_udp_ready(int us); /* -1 invalid, 0 empty, 1 datagram queued */
 void net_udp_close(int us);
 void net_udp_abort(int us);                                 /* lock-free free (fd reap path) */
 
