@@ -478,10 +478,30 @@ static void t8_magnifier_press(void) {
     done();
 }
 
+/* A retained text node must allow its selection owner to remove a highlight,
+ * including when text/font/colour are otherwise identical. */
+static void t9_text_highlight(void) {
+    fresh();
+    struct color selection={.r=.2f,.g=.5f,.b=.6f,.a=.5f};
+    ui_frame_begin();ui_set_text_bg(selection);ui_text("selected");ui_frame_end();
+    struct node_handle h=ui_scene_of(ui_first_child(ui_root()));
+    struct scene_node *n=scene_resolve(&SA,h);
+    CHECK(n && n->data.text.bg.a==.5f,"text accepts an explicit highlight");
+    ui_frame_begin();ui_text("selected");ui_frame_end();
+    CHECK(n->data.text.bg.a==.5f,"no background request preserves a post-layout owner's highlight");
+    ui_frame_begin();ui_set_text_bg((struct color){0});ui_text("selected");ui_frame_end();
+    CHECK(n->data.text.bg.a==0,"explicit transparent background clears unchanged retained text");
+    uint32_t before=ui_debug_mutation_count();
+    ui_frame_begin();ui_set_text_bg((struct color){0});ui_text("selected");ui_frame_end();
+    CHECK(ui_debug_mutation_count()==before,"unchanged transparent background avoids dirtying text again");
+    done();
+}
+
 int main(void) {
     t8_magnifier_press();
     printf("=== EmbLink UI Piece 7: declarative-API selftests ===\n");
     t1_reuse();
+    t9_text_highlight();
     t2_sweep();
     t3_fine_grained();
     t4_props_change();

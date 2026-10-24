@@ -104,6 +104,7 @@ static float g_wheel;                       /* per-frame scroll-wheel delta, con
 static uint32_t g_font;
 static float    g_text_size = 16.0f;
 static struct color g_text_color = { 0, 0, 0, 1 };
+static bool g_text_bg_set;
 static struct color g_text_bg;      /* a==0: none. One-shot, like the gradient. */
 
 uint32_t ui_debug_mutation_count(void) { return g_mutation_count; }
@@ -718,7 +719,7 @@ bool ui_open_content_extent(float *content_h, float *viewport_h) {
     return true;
 }
 void ui_set_text_color(struct color c) { g_text_color = c; }
-void ui_set_text_bg(struct color c) { g_text_bg = c; }
+void ui_set_text_bg(struct color c) { g_text_bg = c; g_text_bg_set=true; }
 
 /* One-shot gradient for the NEXT text: set just before ui_text(), consumed and
  * cleared by it (so it never leaks to later text). PAINT_NONE = flat color. */
@@ -740,15 +741,11 @@ static void set_text_on(struct instance_handle h, const char *str,bool no_wrap) 
      * ever applying it -- and the highlight would appear on the next unrelated
      * edit instead of on the click.
      *
-     * Only ever SETS, never clears. Clearing here would make every build wipe
-     * the highlight and every post-layout pass write it back, so each selected
-     * run would be marked content-dirty TWICE a frame -- turning a live
-     * selection into a full repaint per frame, which is the exact cost the
-     * dirty-rect path exists to avoid. Whoever set a background owns removing
-     * it. */
-    if (g_text_bg.a > 0) {
-        scene_set_text_bg(g_sa, n->scene_node, g_text_bg);
-        g_text_bg.a = 0;
+     * An explicit transparent background removes a widget-owned highlight.
+     * No pending request leaves post-layout selection owners untouched. */
+    if (g_text_bg_set) {
+        scene_set_text_bg(g_sa,n->scene_node,g_text_bg);
+        g_text_bg_set=false;g_text_bg.a=0;
     }
     bool grad = (g_text_paint.kind != PAINT_NONE);
     if (!grad && n->shadow.has_text && strncmp(n->shadow.text, str, sizeof n->shadow.text) == 0 &&

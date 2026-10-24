@@ -21,7 +21,7 @@ def main():
         for c in value:d.key(extra[c] if c in extra else keyname(c))
     def prompt(w):return screen.integer(w,'g_at_prompt',1)==1
     def text(w,s):return s in screen.text(w)
-    def edit_text(w):return d.read('edit',w['pid'],'g_doc',8192).split(b'\0',1)[0].decode()
+    def edit_text(w):return d.read('edit',w['pid'],'g_doc',32768).split(b'\0',1)[0].decode()
     def focus_id():return d.debug("import gdb,json\nprint('RESULT '+json.dumps(int(gdb.parse_and_eval(\"'kernel/gfx/compositor.c'::g_top_id\"))))")
     try:
         d.g.wait(b'TopBar: first frame presented');d.g.wait(b'home: time zone')
@@ -60,6 +60,7 @@ def main():
         d.key('meta_l-c');d.key('meta_l-tab');eventually(lambda:focus_id()==editor['id'],'focus Editor for screen text')
         d.key('meta_l-a');d.key('meta_l-v');eventually(lambda:'Bracketed paste verified' in edit_text(editor),'copy full rendered screen text')
         assert '\x1b' not in edit_text(editor),'copy included escape sequences'
+        assert int.from_bytes(d.read('edit',editor['pid'],'g_cur',4),'little')==len(edit_text(editor).encode()),'paste caret did not reach the end'
         d.snap('screen-editor-copy')
         d.key('meta_l-tab');eventually(lambda:focus_id()==w['id'],'focus terminal to exit screen child')
         d.key('q');eventually(lambda:prompt(w) and not screen.state(w)['alt'],'alternate-screen exit')
@@ -68,8 +69,20 @@ def main():
         d.snap('screen-primary-restored')
         d.key('meta_l-v');d.g.pump(1)
         assert prompt(w) and screen.integer(w,'g_in_n')==0,'oversized paste executed or partially inserted'
+        # Build a >8 KiB clipboard using real editor commands, then exercise
+        # Note++'s custom hook as well as the shared TextEditor paste path.
+        d.key('meta_l-tab');eventually(lambda:focus_id()==editor['id'],'focus Editor for long clipboard')
+        while len(edit_text(editor).encode())<9000:
+            old=edit_text(editor)
+            d.key('meta_l-a');d.key('meta_l-c');d.key('right');d.key('meta_l-v')
+            eventually(lambda:edit_text(editor)==old+old,'long multiline clipboard paste')
+        long_text=edit_text(editor)
+        d.key('meta_l-a');d.key('meta_l-c')
+        note=d.launch('Note++','Note++');d.key('meta_l-v')
+        eventually(lambda:int.from_bytes(d.read('notepp',note['pid'],'ED',4,16),'little')==len(long_text.encode()),'Note++ long clipboard paste')
+        d.snap('screen-long-editor-paste')
         assert b'PANIC' not in d.g.seen
-        print('PASS: native VT screen, application-cursor keys, confined scrolling, Unicode/colors, DSR replies, live resize, cross-app bracketed paste/copy and primary-screen restoration',flush=True)
+        print('PASS: native VT screen, application-cursor keys, confined scrolling, Unicode/colors, DSR replies, live resize, cross-app bracketed paste/copy, primary-screen restoration and long Editor/Note++ paste',flush=True)
     finally:
         try:d.snap('last')
         finally:d.g.close()

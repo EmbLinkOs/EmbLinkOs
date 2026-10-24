@@ -3534,7 +3534,7 @@ static void te_run(const char *src, int a, int b, Color col, int selected,
     int n = b - a;
     if (n > (int)sizeof tmp - 1) n = (int)sizeof tmp - 1;
     memcpy(tmp, src + a, (size_t)n); tmp[n] = 0;
-    if (selected) ui_set_text_bg(t->selection);
+    ui_set_text_bg(selected?t->selection:(Color){0});
     EmProps tp = { .font = Body, .color = col };
     em_text_impl(tmp, tp);
 }

@@ -1265,7 +1265,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             }                                                                   \
             run[n_] = 0;                                                        \
             if (run[0]) {                                                       \
-                if (selected) ui_set_text_bg(CP(selection, t->selection));      \
+                ui_set_text_bg((selected)?CP(selection, t->selection):(struct color){0});      \
                 text_role_line(t->font_regular, t->text_body, fg, run);              \
             }                                                                   \
         } while (0)

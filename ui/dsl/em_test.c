@@ -59,6 +59,14 @@ static int  CUR;
 static uint64_t g_ms = 1000;
 static uint64_t fake_clock(void) { return g_ms; }
 
+static int highlights(struct instance_handle h) {
+    struct scene_node *n=scene_resolve(&SA,ui_scene_of(h));
+    int count=n && n->kind==SCENE_NODE_TEXT && n->data.text.bg.a>0;
+    for(struct instance_handle c=ui_first_child(h);c.index;c=ui_next_sibling(c))
+        count+=highlights(c);
+    return count;
+}
+
 static void view(void) { em_text_editor(DOC, sizeof DOC, &CUR, 200); }
 
 static void frame(const char *keys) {
@@ -364,7 +372,8 @@ int main(void) {
     /* One queued command must carry more than both the 32-key input queue
      * and the former 2048-byte editor scratch buffer. */
     memset(g_clip,'x',5000);g_clip[100]='\n';g_clip[2100]='\t';g_clip_n=5000;
-    frame(SALL PASTE);
+    frame(SALL);CHECK(highlights(ui_root())>0,"select-all paints a highlight");frame(PASTE);
+    CHECK(highlights(ui_root())==0,"paste removes retained selection highlights");
     CHECK(strlen(DOC)==5000 && DOC[100]=='\n' && DOC[2100]=='\t' && CUR==5000,
           "one paste replaces selection with a long multiline block");
     frame("!");
