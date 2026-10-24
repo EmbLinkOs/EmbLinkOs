@@ -2606,6 +2606,8 @@ compile-commands:
 terminal-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/tty/pty_host.c -o $(BUILD)/pty_host_test
 	$(BUILD)/pty_host_test
+	python3 tests/tty/sdk_staging.py
+
 # The structured shell's pure pipeline (lexer -> parser -> evaluator ->
 # builtins + the wire round-trip), host-run. The two OS-backed pieces (ls,
 # external spawn) link as stubs; they get exercised live by `test shell`.
