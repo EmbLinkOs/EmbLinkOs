@@ -36,7 +36,7 @@ static struct layout_arena LA;
 
 /* A clipboard of our own -- the kit takes one as two function pointers exactly
  * so that copy and cut can be tested here instead of only in QEMU. */
-static char g_clip[512];
+static char g_clip[65537];
 static unsigned g_clip_n;
 static int clip_set(const char *b, unsigned n) {
     if (n > sizeof g_clip) n = sizeof g_clip;
@@ -47,11 +47,11 @@ static int clip_get(char *b, unsigned cap) {
     memcpy(b, g_clip, n); return (int)n;
 }
 static const char *clip_text(void) {
-    static char out[513];
+    static char out[65538];
     memcpy(out, g_clip, g_clip_n); out[g_clip_n] = 0; return out;
 }
 
-static char DOC[512];
+static char DOC[8192];
 static int  CUR;
 
 /* A clock the test winds by hand -- double-click is a real elapsed time, and
@@ -360,6 +360,21 @@ int main(void) {
     frame(PASTE);
     CHECK(!strcmp(DOC, "hello\nhellohello\nhello"),
           "a pasted block keeps its newlines instead of being flattened");
+
+    /* One queued command must carry more than both the 32-key input queue
+     * and the former 2048-byte editor scratch buffer. */
+    memset(g_clip,'x',5000);g_clip[100]='\n';g_clip[2100]='\t';g_clip_n=5000;
+    frame(SALL PASTE);
+    CHECK(strlen(DOC)==5000 && DOC[100]=='\n' && DOC[2100]=='\t' && CUR==5000,
+          "one paste replaces selection with a long multiline block");
+    frame("!");
+    CHECK(strlen(DOC)==5001 && DOC[5000]=='!',"paste collapses selection at the new caret");
+    memset(g_clip,'z',9000);g_clip_n=9000;
+    frame(SALL PASTE);
+    CHECK(strlen(DOC)==5001 && DOC[0]=='x',"oversized paste preserves document and selection");
+    frame("Q");CHECK(!strcmp(DOC,"Q"),"failed paste preserves selection for the next edit");
+    clip_set("a\r\nb\tc\033\001",9);frame(SALL PASTE);
+    CHECK(!strcmp(DOC,"a\nb\tc"),"multiline paste normalizes CRLF and filters controls");
 
     DOC[0] = 0; CUR = 0; g_clip_n = 0;
     frame(NULL);

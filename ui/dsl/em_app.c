@@ -622,46 +622,15 @@ int em_app_run(const EmApp *app) {
              * (especially the system bar) that owns an open dropdown. */
             if (em_menu_key(c)) {had_key=1;continue;}
             int captured=ui_focus_scope_active();
-            /* THE HOOK GETS FIRST REFUSAL ON PASTE TOO. The replay below turns
-             * newlines and tabs into spaces, which is right for a terminal --
-             * a paste must never execute anything -- and wrong for an editor,
-             * where it silently flattens a pasted block onto one line. An app
-             * that wants the raw clipboard handles 0x16 itself; every app that
-             * does not still gets the safe replay. */
-            /* TWO KEYS, ONE PASTE. Ctrl+V is what this OS has always used and
-             * what its terminal-shaped apps expect; EMBK_KEY_PASTE is the GUI
-             * key's (Cmd+V), which is where the rest of the editing commands
-             * live now -- Ctrl+C could never be copy here, because 0x03 is the
-             * console interrupt. Keeping both means nothing that worked stops
-             * working. */
-            if ((c == 0x16 || c == EMBK_KEY_PASTE) &&
-                g_em_key_hook && (!captured || c==27) && g_em_key_hook(c)) { had_key = 1; continue; }
-            if (c == 0x16 || c == EMBK_KEY_PASTE) {   /* paste, app-wide */
-                /* The runtime replays the clipboard through the SAME delivery
-                 * path as typing -- key hook first, else the focused field --
-                 * so every app that can take a keystroke can take a paste,
-                 * with zero code of its own. Control bytes become spaces: a
-                 * paste must never EXECUTE anything (a newline reaching a
-                 * terminal's Enter path would run half a paste as commands). */
-                static char clip[4096];
-                int64_t held = embk_clip_get(clip, sizeof clip);
-                int n = held < 0 ? 0 : (held > (int64_t)sizeof clip ? (int)sizeof clip : (int)held);
-                for (int i = 0; i < n; i++) {
-                    int ch = (unsigned char)clip[i];
-                    if (ch == '\n' || ch == '\t') ch = ' ';
-                    /* CONTROL BYTES OUT, UTF-8 THROUGH. The old bound was
-                     * 0x20..0x7E, which dropped every byte of every accented
-                     * character: you could TYPE é into a field (the driver
-                     * encodes UTF-8 now) and then not paste it, in the same
-                     * field, on the same machine. 0x80 and above is a byte of a
-                     * real character; the bytes of one arrive consecutively and
-                     * the caret advances one at a time, so it lands intact. */
-                    if (ch < 0x20 || ch == 0x7F) continue;
-                    if (!captured && g_em_key_hook && g_em_key_hook(ch)) continue;
-                    ui_input_char(ch);
+            /* Apps such as Terminal and Note++ own their paste policy. Other
+             * apps deliver ONE command to the focused widget: replaying bytes
+             * here loses multiline text and overflows the bounded key queue. */
+            if (c == 0x16 || c == EMBK_KEY_PASTE) {
+                if (g_em_key_hook && !captured && g_em_key_hook(c)) {
+                    had_key=1; continue;
                 }
-                had_key = 1;
-                continue;
+                ui_input_key(UI_KEY_PASTE,(unsigned)g_key_modifiers);
+                had_key=1; continue;
             }
             if (g_em_key_hook && (!captured || c==27) && g_em_key_hook(c)) { had_key = 1; continue; }
             if (c==27 && em_overlay_escape()){had_key=1;continue;}

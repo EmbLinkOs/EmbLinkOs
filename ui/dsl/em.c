@@ -3810,19 +3810,15 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                     break;
                 }
                 case EMK_PASTE: {
-                    /* Unlike the single-line field, this editor pastes ITSELF.
-                     * The runtime's app-wide replay flattens newlines to spaces
-                     * -- correct for a terminal, where a pasted newline would
-                     * execute something, and wrong here, where it silently
-                     * collapses a pasted block onto one line. An editor is
-                     * exactly the case that has to handle its own. */
-                    char clip[2048];
-                    int got = ui_clipboard_get(clip, (unsigned)sizeof clip);
-                    if (got > 0) {
+                    static char clip[65537];
+                    int got=ui_clipboard_text(clip,sizeof clip,true);
+                    /* Refuse a paste that cannot fit; keep the document and
+                     * selection intact instead of silently losing its tail. */
+                    if (got>0 && (size_t)got<cap-(size_t)(len-(hi-lo))) {
                         TED_DROP();
-                        for (int k = 0; k < got; k++)
-                            te_insert(buf, cap, &len, &cur, clip[k]);
-                        ted_anchor = cur;
+                        memmove(buf+cur+got,buf+cur,(size_t)(len-cur+1));
+                        memcpy(buf+cur,clip,(size_t)got);
+                        len+=got;cur+=got;ted_anchor=cur;
                     }
                     break;
                 }
