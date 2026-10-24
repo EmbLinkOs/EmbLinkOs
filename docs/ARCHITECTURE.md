@@ -1,5 +1,21 @@
 # EmbLinkOS — Architecture
 
+## Contour desktop contract (2026-10-24)
+
+Shared semantic tokens, original SVG/EIC icons and `oscfg` snapshots now drive
+the shell, native applications and widget runtime. Syscall 147,
+`desktop_control`, publishes a versioned work-area, palette, effects, cursor,
+shortcut and workspace contract. Only the desktop-layer owner can configure it;
+workspace actions respect session locks. Hidden workspaces are excluded from
+rendering and input. The compositor retains its CPU-rendered fallback.
+
+The native ABI has 147 unique calls. Configuration, accessibility boundaries,
+coverage and acceptance are recorded in [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+
+## Document workspace platform (2026-10-23)
+
+Document saving, shared file dialogs, acknowledged close requests and per-process recovery drafts now share a platform contract. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) for ordering, failure semantics, authority and remaining races.
+
 *Living document — last updated 2026-07-13.*
 
 **Status legend:**
@@ -221,3 +237,9 @@ is unlinked reference code. GPT partition identity chooses the actual boot root;
 Recovery mounts it read-only and installs only through an explicit disk plan.
 ARM shared code still cross-links; laptop screen/policy services report ENOTSUP
 there. See DAILY_USE.md and LAPTOP_VALIDATION.md for behavior and evidence.
+
+System-menu focus is window-owned state (`win_menu`, syscall 144). It overrides
+normal app focus only while a translucent menu is open, and cannot override the
+session lock owner. The bar applies asynchronous preference snapshots on its
+render thread. See EMUI_INTERNALS.md and DESKTOP_MENUS.md for the lifecycle and
+native interaction tests.

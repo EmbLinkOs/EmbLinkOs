@@ -10,6 +10,29 @@ compositor, retained updates under the hood) instead of *how to use it*, see
 [EMUI_INTERNALS.md](EMUI_INTERNALS.md). If you haven't built the toolchain
 yet, do that first: [BUILD_SETUP.md](BUILD_SETUP.md).
 
+## Contour appearance
+
+The runtime applies the user's shared appearance snapshot and refreshes open
+windows when it changes. Use `ui_theme` semantic roles and dimensions instead
+of literal colours or a private theme loader. Natural text wraps at its arranged
+width; code content and single-line fields retain preformatted behavior.
+`user/lib/appearance.h` is the single adapter for toolkit fonts, palette, density and compositor preferences.
+`CodeSurface() { ... }` scopes monospace regular/bold faces to code or terminal
+content while retaining the selected family in surrounding chrome.
+
+Text/password fields honor authored `.width` and `.height`; zero retains their
+growing/intrinsic defaults. Set `EmApp.min_size` for usable compact layouts.
+Use `.tooltip("…")` for icon-only actions; decorative overlays must pass pointer
+input through. Controls supply
+Tab/Shift+Tab focus, scroll revelation and Return/Space activation. Standard
+overlays contain focus and restore the initiating control. Handle
+`OverlayDismissed()` to cancel an overlay with Escape or an outside click. See
+[KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md) for menu and modifier semantics. Keep
+page/container identities
+stable with `.key` when a conditional page changes widget structure, and reset
+fixed dimensions when reusing a node for intrinsic layout. See
+[CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md) for supported preferences and limits.
+
 ## Mental model
 
 EmUI apps are **immediate-mode declarative**: you write a `view()` function
@@ -210,7 +233,8 @@ IconButton(IconGear).id("settings");
 if (Clicked("settings")) open_settings();   // checked elsewhere in the tree
 ```
 
-Icons are Unicode codepoints from a DejaVu-Sans-safe set —
+Icons retain stable integer aliases and resolve to the original Contour EIC
+line assets; font glyphs provide a fallback when an asset cannot load. Use
 `IconCheck`, `IconClose`, `IconStar`, `IconGear`, `IconSearch`, `IconBolt`,
 `IconChevronR/L/U/D`, `IconGrid`, `IconFiles`, `IconFolder`, `IconTrash`,
 `IconCloud`, and more — see the bottom of `ui/dsl/em.h` for the full list.
@@ -282,7 +306,16 @@ MenuBar() {
 `MenuItem(label)` and `MenuItemK(label, shortcut)` each **return `bool`** — true
 on the frame they're chosen (act on it directly in an `if`). `MenuSeparator()`
 draws a divider. Clicking a bar `Menu` toggles its panel open at the label; an
-item click or an outside click closes it.
+item click or an outside click closes it. The panel anchors to the label's
+rectangle, so clicking either edge opens it in the same place. Idle rows share
+the panel material; only hovered/pressed rows receive an accent highlight.
+The panel follows the active light/dark palette with a dense tint for legibility.
+
+In `EM_APPLICATION`, Escape dismisses an open menu-bar dropdown before any
+application exit handling. A translucent system bar temporarily borrows keyboard
+focus while its dropdown is open, and releases it on dismissal. Its transparent
+outside-click surface covers the display only while open; the bar returns to
+its original thin size afterward.
 
 **Context menu** — anchor a popover where the pointer was right-pressed:
 
@@ -558,3 +591,24 @@ launcher entry; move one there and it appears.
 - [`user/apps/clockw/clockw.c`](../user/apps/clockw/clockw.c) — the minimal widget reference.
 - [`ui/dsl/showcase_v2.c`](../ui/dsl/showcase_v2.c) — every component
   exercised for the host-render test loop.
+
+## Document applications: save and close
+
+Use `embk_file_panel` for Open and Save As. A return of 1 is a complete chosen
+absolute path, 0 is cancellation, and a negative result is a service/protocol
+error. The path still requires namespace authority. Use `emdoc_read` to refuse
+oversized/binary text without replacing the old buffer, and `emdoc_save` for
+synced temporary-file replacement and advisory external-edit detection.
+
+Install `em_set_close_hook` for an app with unsaved state. Return 0 to show a
+Save/Discard/Cancel dialog. Once the user answers, call `em_app_request_exit`
+again and let the hook return 1. This covers Escape, toolkit controls and GUI+W.
+The runtime acknowledges compositor close requests while the dialog is pending;
+a user deciding where to save is not subject to the unresponsive-app timeout.
+See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) and the two editor apps for
+recovery, multi-document quit handling and save-failure behavior.
+
+Key hooks that interpret Ctrl/Shift chords should use `em_key_modifiers()`,
+which describes the current queued character, rather than `embk_key_mods()`,
+which describes what is physically held now. This keeps delayed Ctrl+S distinct
+from the legacy Up byte after the modifier has been released.

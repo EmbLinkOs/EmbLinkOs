@@ -491,6 +491,7 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
 #endif
 #ifndef EMBK_E2BIG
 #define EMBK_E2BIG    7
+#define EMBK_ENAMETOOLONG 36
 #endif
 
 /* --- sessions: whose a process is -------------------------------------------
@@ -978,6 +979,16 @@ static inline int embk_key_event_poll(struct embk_key_event *ev) {
 }
 /* What is held RIGHT NOW (EMBK_KM_*), which events alone cannot tell you if
  * you missed the press. */
+/* Same character queue as key_poll, with modifiers captured when that byte
+ * was produced. Zero means empty; bits 0..7 are the byte, 8..15 EMBK_KM_*.
+ * This distinguishes queued Ctrl+S from Up after Ctrl has been released. */
+#include "embk_desktop.h"
+static inline int embk_desktop_control(unsigned operation,struct embk_desktop *state) {
+    return (int)embk_syscall3(EMBK_SYS_desktop_control,operation,(int64_t)(uintptr_t)state,sizeof *state);
+}
+static inline int embk_key_poll_input(void) {
+    return (int)embk_syscall0(EMBK_SYS_key_poll_input);
+}
 static inline int embk_key_mods(void) {
     return (int)embk_syscall0(EMBK_SYS_key_mods);
 }
@@ -1187,6 +1198,17 @@ static inline int embk_proc_alive(int handle) {
     return (int)embk_syscall1(EMBK_SYS_proc_alive, handle);
 }
 
+/* Accept a close request without exiting (e.g. an unsaved-changes dialog).
+ * Cancels the compositor grace timer for this caller-owned window only. */
+static inline int embk_win_close_ack(uint32_t win) {
+    return (int)embk_syscall1(EMBK_SYS_win_close_ack,win);
+}
+/* Temporarily give a caller-owned translucent menu window keyboard focus.
+ * Release on dismissal; window destruction/reaping also releases it. */
+static inline int embk_win_menu(uint32_t win,int active) {
+    return (int)embk_syscall2(EMBK_SYS_win_menu,win,active);
+}
+
 /* Screen (framebuffer) size, so a windowed app can size itself to fit -- e.g.
  * clamp a tall window so it isn't rejected on a short display. */
 static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
@@ -1209,6 +1231,7 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * sit in its window unread. The runtime turns this into a frame; the payload
  * still comes from embk_drop_take. */
 #define EMBK_WIN_ACTION_DROP      0x80000003u
+#define EMBK_WIN_ACTION_LAUNCHER  0x80000007u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *

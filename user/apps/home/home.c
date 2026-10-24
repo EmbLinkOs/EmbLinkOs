@@ -21,7 +21,7 @@
 #include "embk.h"
 #include "appauth.h"
 #include "emauth.h"   /* the screen lock asks authd, which is outside this session */
-#include "oscfg.h"   /* the user's dock preferences, re-read live */
+#include "appearance.h"   /* the user's dock preferences, re-read live */
 #include "emnotify.h" /* banners, for the failures a log cannot show anyone */
 #include "kit.h"
 #include "ui.h"
@@ -75,7 +75,7 @@ struct app_item {
  * DESK_ICON is the one knob for how big desktop apps look. Keep it 8 above a
  * level in the .eic ladder (docs/ICONS.md) -- the art is drawn into size-8, so
  * 48 lands exactly on the 40 level and needs no resampling. */
-#define DESK_ICON   48
+#define DESK_ICON   (g_cfg.desktop_icon_size)
 #define DESK_CELL_W 76
 #define DESK_CELL_H 76
 #define DESK_MARGIN 16
@@ -147,8 +147,10 @@ static unsigned g_apps_gen = 0;
  * each one's presentation manifest. home's namespace grants `ro /data/apps`. */
 static void scan_apps(void) {
     g_all_n = 0;
-    struct embk_dirent ents[64];
-    int64_t n = embk_readdir("/data/apps", ents, 64);
+    /* Internal tools share this directory. A 64-entry read silently hid
+     * declared apps later in the directory, including Terminal. */
+    static struct embk_dirent ents[256];
+    int64_t n = embk_readdir("/data/apps", ents, 256);
     for (int64_t i = 0; i < n && g_all_n < 48; i++) {
         if (ents[i].type != EMBK_DT_DIR) continue;
         const char *nm = ents[i].name;
@@ -319,6 +321,7 @@ static void lock_set(int on) {
     if(gate<0){embk_puts(1,"home: lock ownership request failed\n");return;}
     g_locked = on;
     if (on) {
+        ui_request_focus(INSTANCE_HANDLE_NULL); /* password owns the new modal */
         g_apps_open = 0;                      /* one modal surface at a time */
         g_lock_gen++;
         g_lock_msg[0] = 0;
@@ -380,7 +383,7 @@ static void poll_lock_request(void) {
 
 static void apps_set_open(int open) {
     if (open == g_apps_open) return;
-    if (open) { scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
+    if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
     g_apps_open = open;
     /* Render the new state BEFORE moving the layer when closing, and move it
      * before rendering when opening -- either way the compositor's recompose
@@ -398,6 +401,7 @@ static void apps_set_open(int open) {
      * front (hiding the menu bar, which is how it looked like a crash) over a
      * desktop that had simply not drawn its launcher. */
     em_structure_changed();
+    g_invalidate = 2; /* Home owns its loop; it must consume structural invalidation. */
     g_full_present = 3;
     g_dock_dirty = 1;
     /* Say so on the serial console. The launcher is reachable only from the
@@ -443,6 +447,34 @@ static struct app_item grid_to_item(int i) {
  * Renders the icon
  * (with hover styling) and tracks a press as either a click or a drag; the drop
  * is resolved after the frame in dock_resolve_drop(). */
+static Color    g_desk_ink = { .r = .93f, .g = .94f, .b = .96f, .a = 1.f };
+
+/* Colour tiles have opaque backgrounds, so alpha-tinting the whole tile
+ * erases its glyph. Monochrome uses the matching original line silhouette. */
+static const char *monochrome_icon(const char *path) {
+    static const struct {const char *file,*symbol;} family[]={
+        {"files.eic","/system/images/ui-folder.eic"},
+        {"terminal.eic","/system/images/ui-terminal.eic"},
+        {"setting.eic","/system/images/ui-gear.eic"},
+        {"editor.eic","/system/images/ui-edit.eic"},
+        {"notepp.eic","/system/images/ui-document.eic"},
+        {"photos.eic","/system/images/ui-photo.eic"},
+        {"music.eic","/system/images/ui-music.eic"},
+        {"monitor.eic","/system/images/ui-monitor.eic"},
+        {"calc.eic","/system/images/ui-calculator.eic"},
+        {"vellum.eic","/system/images/ui-window.eic"},
+        {"netsurf.eic","/system/images/ui-network.eic"},
+        {"file.eic","/system/images/ui-document.eic"},
+        {"notifications.eic","/system/images/ui-bell.eic"},
+        {"launcher.eic","/system/images/ui-launcher.eic"},
+        {"app_launcher.eic","/system/images/ui-grid.eic"}
+    };
+    const char *file=strrchr(path,'/');file=file?file+1:path;
+    for(unsigned i=0;i<sizeof family/sizeof family[0];i++)
+        if(!strcmp(file,family[i].file))return family[i].symbol;
+    return "/system/images/ui-grid.eic";
+}
+
 static void drag_icon(struct app_item it, int size, int kind, int idx) {
     /* Key by the app's IDENTITY (its unique path), NOT its slot index. When the
      * list shifts (remove/reorder), an index-keyed instance gets reused for a
@@ -455,7 +487,8 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
     ui_set_align(ALIGN_CENTER);
     /* ALWAYS set opacity, so an instance never stays dimmed after its drag ends */
     ui_set_opacity((g_drag == kind && g_drag_i == idx && g_drag_moved) ? 0.3f : 1.0f);
-    ImageButton(it.icon, size);         /* styling only; click/drag handled below */
+    if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(it.icon),size,kind==1?g_desk_ink:ui_theme()->text);
+    else ImageButton(it.icon, size);         /* styling only; click/drag handled below */
     if (ui_is_active()) {
         g_any_active = 1;
         float px, py; ui_pointer_pos(&px, &py);
@@ -505,7 +538,9 @@ static void wins_poll(void);                 /* likewise: the live window list *
 
 
 static struct oscfg g_cfg;
-static uint64_t     g_cfg_next = 0;
+static uint64_t g_cfg_next=0;
+static struct oscfg g_cfg_published;
+static embk_mutex g_cfg_mutex=EMBK_MUTEX_INIT;
 
 /* REDRAW EVERYTHING, NOW. For a change the renderer's dirty tracking cannot
  * see: a theme whose colours moved under an unchanged tree, or a background
@@ -524,6 +559,12 @@ static void cfg_poll(void) {
     g_cfg_next = now + 1000;
     struct oscfg was = g_cfg;
     oscfg_load(&g_cfg);
+    static int preferences_established;
+    if(!preferences_established) {
+        preferences_established=1;
+        struct embk_stat st;
+        if(embk_stat(oscfg_path(),&st)<0)oscfg_save(&g_cfg);
+    }
     if(g_cfg.volume!=was.volume || g_cfg.muted!=was.muted)embk_audio_volume(g_cfg.volume,g_cfg.muted);
     if(g_cfg.idle_dim_seconds!=was.idle_dim_seconds || g_cfg.idle_lock_seconds!=was.idle_lock_seconds ||
        g_cfg.lid_lock!=was.lid_lock || g_cfg.power_profile!=was.power_profile) {
@@ -553,14 +594,15 @@ static void cfg_poll(void) {
         embk_kbd_layout(oscfg_keymaps[k].name, 0, 0);
     }
 
-    if (g_cfg.accent != was.accent || g_cfg.dark != was.dark ||
-        g_cfg.ui_scale != was.ui_scale) {
-        ui_theme_use_dark(g_cfg.dark != 0);
-        ui_theme_set_scale((float)g_cfg.ui_scale / 100.0f);
-        const struct oscfg_accent *a = &oscfg_accents[g_cfg.accent];
-        ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
-        force_repaint();
+    static int appearance_applied;
+    if(!appearance_applied || memcmp(&g_cfg,&was,sizeof g_cfg)) {
+        oscfg_apply_appearance(&g_cfg);
+        /* A lock can temporarily gate publication. Retry the same snapshot
+         * after ownership returns instead of leaving chrome/insets stale. */
+        appearance_applied=oscfg_publish_desktop(&g_cfg)>=0;force_repaint();
     }
+
+    embk_mutex_lock(&g_cfg_mutex);g_cfg_published=g_cfg;embk_mutex_unlock(&g_cfg_mutex);
 
     /* A NEW DESKTOP PICTURE REPAINTS NOTHING BY ITSELF. The renderer draws what
      * it can see has CHANGED, and swapping the path a BackgroundImage points at
@@ -618,7 +660,9 @@ static void prefs_listener(long arg) {
     for (;;) {
         int ch = (int)embk_chan_accept(lh);
         if (ch < 0) { embk_sleep_ms(100); continue; }
-        oscfg_serve_one(ch, &g_cfg);
+        struct oscfg snapshot;
+        embk_mutex_lock(&g_cfg_mutex);snapshot=g_cfg_published;embk_mutex_unlock(&g_cfg_mutex);
+        oscfg_serve_one(ch,&snapshot);
         embk_chan_close(ch);
     }
 }
@@ -641,7 +685,7 @@ static void prefs_listener(long arg) {
  * of the dock and swallowed its clicks. A contract in a shared header cannot
  * drift the way two copies of a constant did. */
 #define DOCK_BAND   ((float)oscfg_dock_band(&g_cfg))
-#define BAR_RESERVE 26.0f      /* must match topbar.c's BAR_H */
+#define BAR_RESERVE ((float)g_cfg.bar_size)      /* must match topbar.c's BAR_H */
 
 /* WHAT COLOUR A DESKTOP LABEL SHOULD BE, which is the WALLPAPER's business and
  * not the theme's.
@@ -661,7 +705,6 @@ static void prefs_listener(long arg) {
  *
  * The two thresholds are hysteresis. One would make a label flicker between
  * inks on a wallpaper that happens to sit near it. */
-static Color    g_desk_ink = { .r = .93f, .g = .94f, .b = .96f, .a = 1.f };
 static int      g_desk_ink_dark = 0;
 static uint64_t g_desk_ink_next = 0;
 static void desk_ink_poll(void) {
@@ -697,10 +740,11 @@ static float dock_slot_x0(int i) { return g_dockr[0] + 12.0f + (float)i * DOCK_P
 static int dock_hover_index(void) {
     if (!g_have_dockr || g_drag) return -1;
     float px, py; ui_pointer_pos(&px, &py);
-    if (py < g_dockr[1] || py > g_dockr[3]) return -1;
-    for (int i = 0; i < g_dock_n; i++) {
-        float x0 = dock_slot_x0(i);
-        if (px >= x0 && px < x0 + DOCK_SLOT_W) return i;
+    if(px<g_dockr[0] || px>g_dockr[2] || py<g_dockr[1] || py>g_dockr[3])return -1;
+    for(int i=0;i<g_dock_n;i++) {
+        float origin=g_cfg.dock_edge?g_dockr[1]+12+i*DOCK_PITCH:dock_slot_x0(i);
+        float pos=g_cfg.dock_edge?py:px;
+        if(pos>=origin && pos<origin+DOCK_SLOT_W)return i;
     }
     return -1;
 }
@@ -712,7 +756,7 @@ static int dock_hover_index(void) {
  * (the drag-ghost pattern): it costs no layout and moves nothing. */
 static void dock_label(void) {
     int i = dock_hover_index();
-    if (i < 0 || !g_dock[i].label[0]) return;
+    if (i < 0 || !g_cfg.dock_labels || !g_dock[i].label[0]) return;
     float cx = dock_slot_x0(i) + DOCK_SLOT_W * 0.5f;
     /* rough centring: the toolkit measures the text, we only have its length,
      * and being a few pixels off is invisible next to a 46px icon */
@@ -733,7 +777,8 @@ static void dock_label(void) {
                 (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
     ui_set_clip_children(false);
     ui_begin_vstack(1);
-    ui_set_offset(cx - w * 0.5f, g_dockr[1] - 34.0f);
+    ui_set_offset(g_cfg.dock_edge==1?g_dockr[2]+8:g_cfg.dock_edge==2?g_dockr[0]-w-8:cx-w*.5f,
+                  g_cfg.dock_edge?g_dockr[1]+12+i*DOCK_PITCH:g_dockr[1]-32);
     HStack(.px = 10, .py = 4, .corner = 9, .glass = 1, .border = 1) {
         Text(g_dock[i].label).caption();
     }
@@ -754,6 +799,12 @@ static void dock_pill(void) {
      * touches the edge is a taskbar), still bottom-aligned. */
     HStack(.height = DOCK_PILL_H, .spacing = 10, .px = 12, .pb = 6, .align = Center,
            .glass = 1, .corner = 14, .border = 1, .shadow = 2) {
+        if(g_cfg.dock_edge) {
+            ui_set_axis(AXIS_COLUMN);
+            ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=DOCK_PILL_H},
+                        (struct layout_size){.mode=SIZE_INTRINSIC});
+            ui_set_padding(12,6,12,6);
+        }
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
           if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
@@ -778,8 +829,8 @@ static void dock_pill(void) {
             Color edge   = { 0, 0, 0, 0 };
             float edge_w = EmZero;
             if (running && g_cfg.dock_dots) {
-                plate  = t->accent_soft;
-                edge   = t->accent;
+                plate  = t->surface_alt;
+                edge   = t->border_strong;
                 edge_w = 1;
             }
             if (over) {
@@ -796,6 +847,7 @@ static void dock_pill(void) {
                    .justify = Center, .corner = 10, .background = plate,
                    .border = edge_w, .border_color = edge) {
                 drag_icon(g_dock[i], (int)DOCK_BASE, 2, i);
+                HStack(.width=running && g_cfg.dock_dots?12:1,.height=2,.background=running && g_cfg.dock_dots?t->accent:T.clear,.corner=1) {}
             }
         }
         if (g_dock_n == 0) { EmProps hp = {0}; (void)hp; Text("  drag apps here  ").caption().secondary(); }
@@ -805,49 +857,21 @@ static void dock_pill(void) {
 /* The ghost: the dragged icon following the cursor (an out-of-flow overlay). */
 static void drag_ghost(void) {
     if (!(g_drag && g_drag_moved)) return;
-    ui_begin_vstack(0x6057);
-    ui_set_overlay(true);            /* fill parent, out of flow */
-    ui_set_layer(2);                 /* ABOVE dialog scrims: the ghost must ride
-                                      * over the launcher while dragging out of it */
-    ui_begin_vstack(1);
-    ui_set_offset(g_drag_x - 22.0f, g_drag_y - 22.0f);
-    ui_set_opacity(0.85f);
-    ImageButton(g_drag_item.icon, 44);
-    ui_end_stack();
-    ui_end_stack();
+    const struct ui_theme *t=ui_theme();
+    ui_begin_vstack(0x6057);ui_set_overlay(true);ui_set_layer(2);ui_set_hit_passthrough(true);
+    ui_begin_vstack(1);ui_set_offset(g_drag_x-22,g_drag_y-22);ui_set_opacity(.85f);
+    ui_set_padding(t->icon_theme?4:0,t->icon_theme?4:0,t->icon_theme?4:0,t->icon_theme?4:0);
+    ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=t->icon_theme?t->surface:(Color){0,0,0,0}});
+    ui_set_corner_radius(t->radius_sm);ui_set_border(t->icon_theme?1:0,t->border);
+    if(t->icon_theme) {
+        uint32_t w=0,h=0;const uint32_t *px=em_image_at(monochrome_icon(g_drag_item.icon),36,&w,&h);
+        if(px)ui_image_sized_tinted(1,px,w,h,36,36,t->text);
+    } else Image(g_drag_item.icon,.height=44);
+    ui_end_stack();ui_end_stack();
 }
 
-/* THE APPLICATIONS LAUNCHER -- Launchpad, not a dialog.
- *
- * It used to be a 480px card floating over the desktop, and that was wrong in
- * two ways at once. It read as a file-picker rather than as the place all your
- * applications live; and at 480x430 it did not FIT a 640x480 display, so its
- * header slid up under the menu bar and the app names printed over the clock.
- * A modal card has to be sized against a screen it cannot know.
- *
- * Full-bleed instead: the launcher IS the screen while it is up. The wallpaper
- * home already painted stays visible through a frosted sheet, the grid is
- * centred in the work area, and everything is sized from the live viewport, so
- * there is no resolution at which it can overflow. This is also why the layer
- * comes to the front (see apps_set_open): a full-screen surface behind the
- * windows is just an invisible one. */
-/* The tint the launcher's glass carries, and why it carries one at all.
- *
- * "Blur the desktop and dim it" is the whole of this effect on a Mac, and it
- * works there because the wallpaper has colour in it to blur. This OS ships a
- * near-black one, so frosting it lands on black and stays black -- the launcher
- * came out looking like the screen had been switched off, which is a fair
- * description of a dark rectangle with small icons on it.
- *
- * So the glass is tinted rather than merely dimmed: a cool indigo at low alpha,
- * bright enough to give the surface somewhere to catch light and read as a
- * material over a dark room, faint enough that it is still the wallpaper you
- * are looking through. */
-static Color launch_tint(void) {
-    Color c = { .r = 0.10f, .g = 0.12f, .b = 0.22f, .a = 0.52f };
-    return c;
-}
-
+/* The application library uses a bounded search/grid surface. Its dimensions
+ * follow the work area, including side docks and either command-strip edge. */
 /* The lock's wash is DARKER and far more opaque than the launcher's: the point
  * of the launcher is that you can still see your desktop behind it, and the
  * point of this is that you cannot. What is on your screen is as much yours as
@@ -958,79 +982,49 @@ static void lock_ui(void) {
 }
 
 static void apps_grid(void) {
-    if (!g_apps_open) return;
+    if(!g_apps_open)return;
     g_apps_frames++;
-    const struct ui_theme *t = ui_theme();
-
-    /* Sized from the screen, never from a constant. Columns grow with width so
-     * the grid stays a grid rather than a column on a narrow display. */
-    float cell   = 116.0f;
-    float availw = g_sw - 72.0f;
-    if (availw < 240.0f) availw = 240.0f;
-    int cols = (int)(availw / cell);
-    if (cols < 3) cols = 3;
-    if (cols > 7) cols = 7;
-    float body = g_sh - 34.0f - 76.0f - 62.0f;    /* minus bar, dock, search row */
-    if (body < 120.0f) body = 120.0f;
-
+    float width=g_sw-96;if(width>720)width=720;
+    float height=g_sh-132;if(height>536)height=536;
+    int cols=width<560?4:6;
+    char sheet[24];snprintf(sheet,sizeof sheet,"apps%u",g_apps_gen);
     Overlay() {
-        /* The sheet is the whole screen. Two layers make it read as a material
-         * rather than a black rectangle: the frost, and a wash over it.
-         *
-         * The wash matters more than it sounds. This OS ships a near-black
-         * wallpaper, so "blur the desktop and dim it" -- which is the whole of
-         * the effect on a Mac -- lands on black and stays black, and the
-         * launcher came out looking like the screen had been switched off. A
-         * faint accent-tinted gradient gives the surface somewhere to catch
-         * light, so it reads as glass over a dark room instead of as an
-         * absence. */
-        /* KEYED BY A GENERATION, so each opening is a NEW subtree rather than
-         * the previous one rebuilt.
-         *
-         * Reconciliation matches children by position and the renderer caches
-         * a rect per NODE INDEX -- and indices are reused. Torn down and put
-         * back identically, the launcher landed on the same indices holding
-         * the same cached geometry, so the renderer decided nothing had
-         * changed and painted none of it: the desktop came up with no launcher
-         * on it, every time after the first. A key that differs per opening
-         * makes them genuinely different instances, which is the same fix, for
-         * the same reason, as the browser keying a document by load. */
-        char sheet[24];
-        snprintf(sheet, sizeof sheet, "apps%u", g_apps_gen);
-        Glass(.width = g_sw, .height = g_sh, .align = Fill, .spacing = 0,
-              .pt = 30, .pb = 70, .px = 36, .blur = 30,
-              .background = launch_tint(), .key = sheet) {
-            /* SEARCH, centred, where Launchpad puts it -- and no title. The
-             * word "Applications" over a screen of applications is a label for
-             * something already obvious, and it was the thing overlapping the
-             * menu bar. A search field earns the row: it is the fastest way to
-             * start an app once there are more than a screenful. */
-            HStack(.align = Center, .justify = Center, .py = 6) {
-                HStack(.width = 280, .align = Center) {
-                    SearchField(g_apps_q, sizeof g_apps_q, "Search");
+        VStack(.width=g_sw,.height=g_sh,.align=Center,.justify=Center,.key=sheet) {
+            Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
+                HStack(.spacing=12,.align=Center) {
+                    Icon(IconGrid).color(T.accent);
+                    Text("Applications").title();Spacer();
+                    if(IconButton(IconClose).width(26).height(26).clicked())apps_set_open(0);
                 }
-            }
-
-            ScrollView(&g_apps_scroll, body, .key = "appsgrid") {
-                Grid(cols, .spacing = 10) {
-                    for (int i = 0; i < g_all_n; i++) {
-                        if (!app_matches(g_all[i].label, g_apps_q)) continue;
-                        VStack(.spacing = 9, .align = Center, .py = 8) {
-                            /* Big. An app icon is the thing you aim at and the
-                             * thing that tells you which app it is, and at 48px
-                             * -- the size a DESKTOP icon wants, which is what
-                             * this borrowed -- it was doing neither. */
-                            drag_icon(grid_to_item(i), 72, 3, i);
-                            Text(g_all[i].label).caption().color(t->text);
-                        }
+                em_field_autofocus();
+                if(SearchField(g_apps_q,sizeof g_apps_q,"Find an application").submitted()) {
+                    for(int i=0;i<g_all_n;i++)if(app_matches(g_all[i].label,g_apps_q)) {
+                        open_item(grid_to_item(i));apps_set_open(0);break;
                     }
                 }
+                Divider();
+                ScrollView(&g_apps_scroll,height-158,.key="appsgrid") {
+                    int count=0;
+                    Grid(cols,.spacing=8) {
+                        for(int i=0;i<g_all_n;i++) {
+                            if(!app_matches(g_all[i].label,g_apps_q))continue;
+                            count++;
+                            VStack(.spacing=6,.align=Center,.py=5) {
+                                drag_icon(grid_to_item(i),54,3,i);
+                                Text(g_all[i].label).caption();
+                            }
+                        }
+                    }
+                    if(!count) {
+                        Text("No applications found").body();
+                        Text("Try a shorter name or clear the search.").caption().secondary();
+                    }
+                }
+                Text("Drag an application to the dock to keep it close.").caption().secondary();
             }
         }
     }
-    /* Click anywhere off an icon closes, and so does Esc -- debounced so the
-     * press that OPENED it does not immediately dismiss it. */
-    if (g_apps_frames >= 3 && OverlayDismissed()) apps_set_open(0);
+    if(g_apps_frames>=3 && OverlayDismissed())apps_set_open(0);
 }
 
 /* --- free desktop placement -------------------------------------------------
@@ -1165,7 +1159,7 @@ static void dock_resolve_drop(void) {
                 desk_save_layout();
             }                                       /* at the minimum -> snaps back */
         } else if (g_dockr[2] > g_dockr[0]) {       /* reorder by x */
-            int tgt = (int)(((g_drag_x - g_dockr[0]) / (g_dockr[2] - g_dockr[0])) * g_dock_n);
+            int tgt = (int)(((g_cfg.dock_edge?g_drag_y-g_dockr[1]:g_drag_x-g_dockr[0]) / (g_cfg.dock_edge?g_dockr[3]-g_dockr[1]:g_dockr[2]-g_dockr[0])) * g_dock_n);
             if (tgt < 0) tgt = 0;
             if (tgt >= g_dock_n) tgt = g_dock_n - 1;
             if (tgt != g_drag_i) {
@@ -1396,29 +1390,24 @@ static void home_ui(void) {
                 ui_box_end();
             }
         }
-        VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
-               .align = Fill) {
-            /* Reserve the top strip for our own floating menu bar (topbar.elf,
-             * spawned at startup) -- its drag handle, dock and pin live there.
-             * No desktop-drawn top bar anymore. */
-            VStack(.width = g_sw, .height = BAR_RESERVE, .padding = 0) { }
-
-            /* Exact work-area height: the layout engine's `.grow` is intended
-             * for siblings inside a measured row and did not consume the
-             * remaining desktop height here, which left the taskbar mid-screen.
-             * The icons themselves no longer flow inside it -- they are placed
-             * individually by desktop_icons() -- but the strip still reserves
-             * the space between the top bar and the dock. */
-            HStack(.height = g_sh - BAR_RESERVE - DOCK_BAND) { Spacer(); }
-
-            /* the app dock: a centered pill sized to its apps (not full-width) */
-            /* Leading (= top of the band): the pill sits at the top of its
-             * band and the gap lands UNDER it, against the screen edge. */
-            HStack(.width = g_sw, .height = DOCK_BAND, .align = Leading, .justify = Center) {
-                dock_pill();
-            }
+        {
+            float px,py;ui_pointer_pos(&px,&py);
+            int band=oscfg_dock_band(&g_cfg);
+            int show=!g_cfg.dock_autohide || g_drag ||
+                (g_cfg.dock_edge==1?px<band:g_cfg.dock_edge==2?px>g_sw-band:py>g_sh-band-(g_cfg.bar_edge?g_cfg.bar_size:0));
+            float extent=24+g_dock_n*DOCK_SLOT_W+(g_dock_n?g_dock_n-1:0)*10;
+            float x=g_cfg.dock_edge==1?10:g_cfg.dock_edge==2?g_sw-DOCK_PILL_H-10:(g_sw-extent)*.5f;
+            float y=g_cfg.dock_edge?(g_sh-extent)*.5f:g_sh-DOCK_BAND-(g_cfg.bar_edge?g_cfg.bar_size:0);
+            em_flush();ui_begin_vstack(0xD0C4B0);ui_set_overlay(true);
+            ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=0},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=0});
+            ui_set_clip_children(false);
+            ui_begin_vstack(1);ui_set_offset(x,y);
+            if(show)dock_pill();
+            else HStack(.width=g_cfg.dock_edge?3:72,.height=g_cfg.dock_edge?72:3,.background=T.border_strong,.corner=2) {}
+            ui_end_stack();ui_end_stack();
         }
-        desktop_icons();       /* freely-placed icons; zero-sized root, so it
+        if(g_cfg.desktop_icons)desktop_icons();
+       /* freely-placed icons; zero-sized root, so it
                                 * can sit last without shadowing anything */
 
         /* Right-click the desktop. Every item does something REAL and
@@ -1438,6 +1427,7 @@ static void home_ui(void) {
             if (MenuItem("Open Files"))   launch_folder(getenv("HOME") ? getenv("HOME") : "/");
             MenuSeparator();
             if (MenuItem("Show Applications")) apps_set_open(1);
+            if(MenuItem("Desktop Settings"))g_launch="/data/apps/settings/settings.elf";
             MenuSeparator();
             if (MenuItem("Take Screenshot")) g_want_shot = 1;
             if (MenuItem("Clean Up Icons")) {
@@ -1449,7 +1439,7 @@ static void home_ui(void) {
         }
         apps_grid();           /* the Apps launcher (modal grid), when open */
         lock_ui();             /* ...and the screen lock, over even that */
-        dock_label();          /* names the dock icon under the pointer (overlay) */
+        if(!g_locked && !g_apps_open)dock_label();          /* names the dock icon under the pointer (overlay) */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
     dock_resolve_drop();       /* act on a released drag (add / remove / reorder) */
@@ -1479,7 +1469,7 @@ static struct {
  * table for every one of those would be a syscall per mouse event to answer a
  * question whose answer changes when an app opens or closes. Half a second is
  * faster than a person can notice and thousands of times cheaper. */
-#define WINS_MAX 16
+#define WINS_MAX 32
 static struct embk_win_info g_wins[WINS_MAX];
 static int      g_wins_n;
 static uint64_t g_wins_next;
@@ -1727,7 +1717,7 @@ static void dock_prune_missing(void) {
 
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
-    g_session_env = envp;
+    g_session_env = envp;oscfg_defaults(&g_cfg_published);
     dock_prune_missing();                   /* offer only what can actually run */
     embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
     embk_thread_create(prefs_listener, 0);  /* ...and what it wears while it draws */
@@ -1813,23 +1803,29 @@ int main(int argc, char **argv, char **envp) {
          * password field -- there is nothing else on the screen to type into,
          * and nothing behind it may have them either. */
         if (g_locked) {
-            for (int c; (c = embk_key_poll()) > 0; )
-                if (!g_lock_checking) ui_input_char(c);
+            for (int input; (input=embk_key_poll_input())>0; )
+                if(!g_lock_checking)ui_input_key(input&255,(unsigned)(input>>8)&255);
         } else if (g_apps_open) {
-            for (int c; (c = embk_key_poll()) > 0; ) {
+            for (int input; (input=embk_key_poll_input())>0; ) {
+                int c=input&255;
                 if (c == 27) { apps_set_open(0); break; }   /* Esc dismisses */
                 /* Everything else goes to the search field. The desktop has no
                  * other text to type into, so there is nothing to arbitrate
                  * between -- and typing straight into the search box, without
                  * clicking it first, is most of why searching a launcher is
                  * faster than looking through it. */
-                ui_input_char(c);
+                ui_input_key(c,(unsigned)(input>>8)&255);
             }
+        } else {
+            /* The kernel focus gate permits only desktop-owned input here.
+             * Discard idle desktop typing rather than replaying it into search. */
+            while(embk_key_poll()>0){}
         }
 
         /* pointer: the compositor routes the desktop's content-local mouse to us */
         struct embk_win_input in;
         embk_win_input(&in);
+        if(in.win==EMBK_WIN_ACTION_LAUNCHER && !g_locked)apps_set_open(!g_apps_open);
         /* the SAME feed em_app_run uses -- home has its own loop (it owns the
          * back-pinned desktop layer, which the app runtime does not create),
          * but it must never have its own idea of what the toolkit needs. */
@@ -1848,17 +1844,11 @@ int main(int argc, char **argv, char **envp) {
 
         g_launch = 0;
         g_launch_dir = 0;
-        ui_frame_begin(); em_new_frame(); home_ui(); em_flush(); ui_frame_end();
+        ui_frame_begin(); em_new_frame(); home_ui(); em_flush();em_tooltip_host();ui_frame_end();
         ui_run_layout((float)sw, (float)sh);
 
-        /* NOT invalidating the render cache here, though it is what the second
-         * open needs. scene_render_invalidate() does make it start painting
-         * again -- and it paints at the WRONG GEOMETRY, the search field
-         * landing in the top-left corner instead of centred, which over the
-         * menu bar looks worse than not painting at all. The staleness and the
-         * bad layout are two faults and only one of them is understood. */
-
-        /* No forced full repaints. This loop used to nuke the renderer's rect
+        /* Structural transitions invalidate a bounded number of frames above.
+         * Ordinary dock changes and drags keep partial repaints. This loop used to nuke the renderer's rect
          * cache (two whole frames' worth) on every dock change and all through
          * a drag, because the dirty tracker lost the pixels of MOVED and
          * DESTROYED nodes -- the closed launcher stayed painted, dragged icons

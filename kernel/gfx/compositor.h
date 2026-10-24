@@ -26,10 +26,14 @@
 #include <stdint.h>
 #include "include/types.h"
 
+struct embk_desktop;
+int compositor_request_launcher(void);
+int compositor_workspace_key(int target,int move);
+int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *state);
 struct process;   /* fwd decl -- compositor.h must not include process.h */
 
-#define COMP_MAX_WINDOWS   8
-#define COMP_TITLEBAR_H    26     /* px; kernel-drawn chrome above the content */
+#define COMP_MAX_WINDOWS   24
+#define COMP_TITLEBAR_H    34     /* px; kernel-drawn chrome above the content */
 #define COMP_BORDER        1      /* px; 1px frame around the whole window     */
 #define COMP_TITLE_MAX     31
 
@@ -187,6 +191,8 @@ void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
+int compositor_win_menu(int pid,uint32_t id,int active);
+int compositor_win_close_ack(int pid,uint32_t id);
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 /* `when` is the millisecond the reported button state was MADE, which for a
  * replayed press is when the finger went down and not when this poll happened.

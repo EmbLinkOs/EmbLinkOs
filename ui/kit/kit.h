@@ -39,6 +39,10 @@ void ui_secondary(const char *fmt, ...);
 void ui_caption(const char *fmt, ...);
 
 /* --- controls (return true on the frame they were clicked) --- */
+bool ui_control_interact(struct instance_handle control);
+int ui_control_navigation(void);
+bool ui_keyboard_pending(void);
+
 bool ui_button_primary(const char *label);
 bool ui_button_secondary(const char *label);
 bool ui_button_ghost(const char *label);
@@ -100,6 +104,9 @@ struct color ui_ctl_color_(int which, struct color dflt);
  * outside the kit that has to aim at it -- the DSL's right-click menu asks
  * whether a click landed in the field its commands would reach. */
 int ui_focused_field_rect(float *x, float *y, float *w, float *h);
+
+/* Layout for the next field; zero keeps the growing/intrinsic default. */
+void ui_text_field_next_size(float width,float height);
 
 bool ui_text_field(char *buf, unsigned long cap, const char *placeholder);
 bool ui_password_field(char *buf, unsigned long cap, const char *placeholder);

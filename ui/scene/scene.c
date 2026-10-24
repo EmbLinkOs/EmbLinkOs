@@ -356,6 +356,12 @@ void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const 
     DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
+void scene_set_text_wrap(struct scene_arena *a,struct node_handle h,bool wrap) {
+    struct scene_node *n=scene_resolve(a,h);
+    if(!n || n->kind!=SCENE_NODE_TEXT || n->data.text.no_wrap==!wrap)return;
+    n->data.text.no_wrap=!wrap;DMARK(n);n->dirty=n->dirty_content=true;
+}
+
 void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n || n->kind != SCENE_NODE_TEXT) return;

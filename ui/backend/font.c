@@ -600,7 +600,7 @@ struct glyph_cache_entry *glyph_cache_lookup_or_rasterize(
     /* miss: rasterize */
     uint32_t gi = font_codepoint_to_glyph(f, codepoint);   /* 0 == .notdef, still rendered */
     uint8_t *cov = 0; int w = 0, h = 0, bx = 0, by = 0; float adv = 0;
-    if (!font_rasterize_glyph(f, gi, size_px, &cov, &w, &h, &bx, &by, &adv)) return 0;
+    if (!font_rasterize_glyph(f,gi,(float)sx4/4.0f,&cov,&w,&h,&bx,&by,&adv)) return 0;
 
     /* pack into the shelf; clear-and-restart on exhaustion (Section 5) */
     if (w > 0 && h > 0) {
@@ -734,32 +734,76 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
     }
 }
 
-static void backend_draw_text_impl(struct render_target *rt, float x, float y, const char *utf8,
-                                   uint32_t font_handle, float size_px, struct color color, float opacity,
-                                   const struct paint *paint, float box_w, float box_h) {
-    struct font *f = font_for_handle(font_handle);
-    if (!f || !utf8) return;
-    /* `y` is the top of the text's line box (what layout hands us); the glyph
-     * baseline sits ASCENT below that. Without this offset every glyph is drawn
-     * up by ~ascent and floats above its box. */
-    float ascent_px = (float)f->ascent * (size_px / (float)f->units_per_em);
-    float pen_x = x, pen_y = y + ascent_px;
-    const char *p = utf8;
-    /* Bound the scan: a dangling/non-NUL-terminated utf8 pointer (a corrupt
-     * scene-text node) would otherwise read off the end forever. Real UI strings
-     * are far shorter than this cap. */
-    for (int guard = 0; *p && guard < 8192; guard++) {
-        uint32_t cp;
-        p += font_utf8_decode(p, &cp);
-        struct glyph_cache_entry *g = glyph_cache_lookup_or_rasterize(&g_atlas, f, cp, size_px);
-        if (g) {
-            if (g->atlas_w > 0 && g->atlas_h > 0)
-                blit_coverage_tinted(rt, (int)(pen_x + g->bearing_x), (int)(pen_y - g->bearing_y),
-                                     &g_atlas, g->atlas_x, g->atlas_y, g->atlas_w, g->atlas_h,
-                                     color, opacity, x, y, box_w, box_h, paint);
-            pen_x += g->advance_px;
+/* One allocation-free line walk for measurement and painting. Spaces retain
+ * their advances; a wrap drops the separator before the next word. Width zero
+ * preserves preformatted rows. Explicit line breaks are always honored. */
+static float layout_advance(struct font *f,uint32_t cp,float size) {
+    float canonical=(float)(uint16_t)(size*4.0f+.5f)/4.0f;
+    return glyph_advance(f,font_codepoint_to_glyph(f,cp))*canonical/f->units_per_em;
+}
+int font_layout_text(struct font *f,const char *text,float size,float width,
+                     font_text_visitor visit,void *context) {
+    if(!f || !text || !f->units_per_em)return 1;
+    if(!visit && width<=0) {
+        int lines=1;
+        for(int i=0;text[i] && i<8192;i++) {
+            if(text[i]=='\n')lines++;
+            else if(text[i]=='\r'){lines++;if(text[i+1]=='\n')i++;}
+        }
+        return lines;
+    }
+    float line_height=(f->ascent+f->descent+f->line_gap)*size/f->units_per_em;
+    float x=0;int line=0,scanned=0;const char *p=text;
+    while(*p && scanned<8192) {
+        if(*p=='\n' || *p=='\r') {
+            char ch=*p++;scanned++;
+            if(ch=='\r' && *p=='\n'){p++;scanned++;}
+            line++;x=0;continue;
+        }
+        if(*p==' ' || *p=='\t') {
+            x+=layout_advance(f,' ',size)*(*p=='\t'?4:1);p++;scanned++;continue;
+        }
+        const char *end=p;float word=0;int bytes=0;
+        while(*end && *end!=' ' && *end!='\t' && *end!='\n' && *end!='\r' && scanned+bytes<8192) {
+            uint32_t cp;int n=font_utf8_decode(end,&cp);end+=n;bytes+=n;
+            word+=layout_advance(f,cp,size);
+        }
+        if(width>0 && x>0 && x+word>width+.01f){line++;x=0;}
+        if(!visit && (width<=0 || word<=width)) {
+            x+=word;p=end;scanned+=bytes;continue;
+        }
+        while(p<end) {
+            uint32_t cp;int n=font_utf8_decode(p,&cp);p+=n;scanned+=n;
+            float advance=layout_advance(f,cp,size);
+            if(width>0 && x>0 && x+advance>width+.01f){line++;x=0;}
+            if(visit)visit(context,cp,x,line*line_height);
+            x+=advance;
         }
     }
+    return line+1;
+}
+
+struct text_draw_context {
+    struct render_target *rt;struct font *font;float x,y,size,ascent,opacity,width,height;
+    struct color color;const struct paint *paint;
+};
+static void draw_positioned_glyph(void *opaque,uint32_t cp,float x,float y) {
+    struct text_draw_context *c=opaque;
+    if(c->height>0 && y>=c->height)return;
+    struct glyph_cache_entry *g=glyph_cache_lookup_or_rasterize(&g_atlas,c->font,cp,c->size);
+    if(g && g->atlas_w>0 && g->atlas_h>0)
+        blit_coverage_tinted(c->rt,(int)(c->x+x+g->bearing_x),(int)(c->y+y+c->ascent-g->bearing_y),
+            &g_atlas,g->atlas_x,g->atlas_y,g->atlas_w,g->atlas_h,c->color,c->opacity,
+            c->x,c->y,c->width,c->height,c->paint);
+}
+static void backend_draw_text_impl(struct render_target *rt,float x,float y,const char *utf8,
+                                   uint32_t handle,float size,struct color color,float opacity,
+                                   const struct paint *paint,float width,float height,bool wrap) {
+    struct font *f=font_for_handle(handle);if(!f || !utf8)return;
+    struct text_draw_context c={.rt=rt,.font=f,.x=x,.y=y,.size=size,
+        .ascent=f->ascent*size/f->units_per_em,.opacity=opacity,.width=width,.height=height,
+        .color=color,.paint=paint};
+    font_layout_text(f,utf8,size,wrap?width:0,draw_positioned_glyph,&c);
 }
 
 /* THE ONE LINE that ties this file to the toolkit. Everything above it is a

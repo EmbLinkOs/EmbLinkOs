@@ -103,6 +103,10 @@ int mouse_take_press(uint32_t *when_ms) {
     spin_unlock(&pointer_state_lock);return result;
 }
 
+void mouse_discard_presses(void) {
+    spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;spin_unlock(&pointer_state_lock);
+}
+
 static int32_t  g_w = 1024, g_h = 768;
 
 static uint8_t  g_pkt[4];
@@ -228,7 +232,9 @@ static void mouse_handler_inner(void) {
             apply_motion();
             int32_t z = g_pkt[3] & 0x0F;    /* 4-bit two's-complement scroll delta */
             if (z & 0x08) z |= ~0x0F;
-            g_wheel += z;
+            /* IntelliMouse Z is positive down; the shared pointer ABI and
+             * HID/virtio transports use positive up. Normalize at this seam. */
+            g_wheel -= z;
             break;
         }
     }

@@ -296,7 +296,7 @@ static void MusicView(void)
 {
     labels();
 
-    Window("Music", .corner = 14, .clip = 1) {
+    Window("Music", .corner = ui_theme()->radius_lg, .clip = 1) {
         AppBar(g_title) {
             if (Button(g_playing ? "Pause" : "Play").primary().clicked()) toggle();
         }
@@ -328,7 +328,7 @@ static void MusicView(void)
                         }
                     }
                     if (g_count == 0)
-                        Text("No .mp3 files in this folder").caption().secondary();
+                        EmptyState(IconVolume,"Your music library is empty","Add MP3 files to your Music folder.");
                 }
             }
         }
@@ -337,6 +337,7 @@ static void MusicView(void)
 
 static EmApp g_spec = {
     .title  = "Music",
+    .min_size = { 480, 320 },
     .size   = { 720, 520 },
     .theme  = Dark,
     .chrome = Chromeless,

@@ -261,7 +261,7 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
             if (be->draw_text)
                 be->draw_text(target, dx, dy, n->data.text.utf8, n->data.text.font_handle,
                               n->data.text.size_px, n->data.text.color, 1.0f,
-                              &n->data.text.paint, w, h);
+                              &n->data.text.paint, w, h, !n->data.text.no_wrap);
             break;
         case SCENE_NODE_GROUP:
         default: break;

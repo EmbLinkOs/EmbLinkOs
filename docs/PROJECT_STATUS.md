@@ -1,5 +1,38 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Keyboard interaction milestone (2026-10-24)
+
+Shared fields and controls support Tab/Shift+Tab with queued modifier snapshots,
+focus revelation inside scroll views, nested dialog containment/restoration and
+keyboard menu navigation. Application hooks cannot consume ordinary keys behind
+a modal decision. Context-menu editing returns to the original field/selection.
+The Settings reset cancels with Escape without exiting the app. Native keyboard
+acceptance passes for Settings, system menus and a dirty Editor document; shared
+host suites cover nested scopes, hidden menus, mixed queues and slider input.
+Details and limits: [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md).
+
+## Contour desktop milestone (2026-10-24)
+
+Contour replaces fragmented shell/app styling with shared semantic surfaces,
+real regular/bold type families, original icons and compact native controls.
+The new command strip, searchable library, side docks, live Settings and
+isolated workspaces share a versioned compositor contract (native syscall 147).
+Application chrome, document/code surfaces and authentication screens follow the
+same system. Defaults, curated presets and validated custom colours persist.
+
+The x86 images, shared UI/appearance/document host suites, sanitizer checks,
+native desktop/customization runs, three-boot document workflow and native
+integration batch pass. Layout regressions cover complete wrapped dialog
+explanations, and icon-cache coverage loads both complete shipped families. Current scope, evidence and remaining accessibility,
+customization and hardware work: [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+The [progress gallery](media/laptop-progress/README.md) retains earlier milestones
+and adds original-pixel redesign captures. Browser engine development remains
+with the user; this milestone applies shared native chrome.
+
+## Document workspace milestone (2026-10-23)
+
+Editor and Note++ now share guarded close, Open/Save, conflict detection, synced replacement and recoverable drafts. Files creates documents and passes the authenticated home to Editor. The native ABI now has 146 unique calls; queued keyboard modifier snapshots distinguish document shortcuts from navigation. Details and test commands: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).
+
 *Last updated: 2026-07-19. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical
 version. If you're returning to this after time away, read `ARCHITECTURE.md`
@@ -7,6 +40,15 @@ first (the intended design and the decisions behind it), then this file
 (what's actually built), then `TODO.md` (what's left). The repo and git
 history are ground truth; this file is reconstructed for the design record —
 if it disagrees with the code, the code wins.*
+
+## Desktop menu polish, 2026-10-23
+
+After PR #40, system dropdowns follow live appearance preferences, share a
+legible panel surface and open beneath their labels. Escape dismisses an open
+menu; outside clicks cover the display while open, then dock/app input returns.
+The compositor now supports temporary window-owned menu keyboard focus and
+resizing a translucent bar back to its thin height. See
+[DESKTOP_MENUS.md](DESKTOP_MENUS.md) for scope and acceptance.
 
 ## Laptop integration, 2026-10-23
 

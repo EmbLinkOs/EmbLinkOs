@@ -56,7 +56,7 @@ DOCK_BAND    = (400, 690, 630, 745)   # x0, y0, x1, y1: the dock pill
 # showing the desktop, so this band is checked as well as the dock's.
 ICON_BAND    = (20, 45, 95, 120)
 
-KEYS = {' ': 'spc', '\t': 'tab', '\n': 'ret', '-': 'minus', '_': 'shift-minus', '.': 'dot'}
+KEYS = {' ': 'spc', '\t': 'tab', '\n': 'ret', '-': 'minus', '_': 'shift-minus', '.': 'dot', '+': 'shift-equal'}
 
 
 def keyname(c):

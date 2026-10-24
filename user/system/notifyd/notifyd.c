@@ -142,7 +142,10 @@ static void banners(void) {
      * mover acts on the BOUND window, which only exists once the runtime has
      * created it -- and re-asserted on the first frame of each appearance,
      * since every burst of banners is a new window. */
-    if (!g_placed) { g_placed = 1; em_window_move_to(g_place_x, 34); }
+    if(!g_placed) {
+        g_placed=1;struct embk_desktop desktop={.version=1};embk_desktop_control(EMBK_DESKTOP_GET,&desktop);
+        em_window_move_to(g_place_x,(int)desktop.top+8);
+    }
 
     struct note notes[NOTE_MAX];
     embk_mutex_lock(&note_lock);memcpy(notes,g_notes,sizeof notes);embk_mutex_unlock(&note_lock);

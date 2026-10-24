@@ -35,6 +35,8 @@ void ui_set_opacity(float opacity);   /* 0..1; wraps the subtree in a group */
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);
+void ui_set_hit_passthrough(bool enabled);
+void ui_hit_passthrough_for(struct instance_handle node,bool enabled);
 void ui_set_overlay(bool on);   /* fill parent, out of flow (modal/popover layer) */
 /* CSS top/right/bottom/left on the open box. `set` is a bitmask -- bit 0 top,
  * 1 right, 2 bottom, 3 left -- because 0 is an ordinary offset and has to be
@@ -77,6 +79,8 @@ void ui_set_text_bg(struct color c);
 
 /* --- leaves --- */
 void ui_text(const char *fmt, ...);
+/* Preformatted/single-line content: no automatic word wrapping. */
+void ui_text_line(const char *fmt, ...);
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px);
 void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                     float width_px, float height_px);
@@ -134,10 +138,29 @@ bool ui_open_rect(float *x, float *y, float *w, float *ht);
 
 /* --- keyboard focus + typed input (text fields) --- */
 void ui_input_char(int c);                        /* loop feeds each key byte here */
+struct ui_key_input { unsigned char code, modifiers; };
+void ui_input_key(int c, unsigned modifiers);     /* modifiers captured with this key */
+int  ui_input_take_keys(struct ui_key_input *dst, int max);
 int  ui_input_take(char *dst, int max);           /* focused field drains queued chars */
 void ui_request_focus(struct instance_handle h);
 bool ui_has_focus(struct instance_handle h);
 bool ui_any_focus(void);       /* is ANY text field focused? (app key hooks) */
+bool ui_focus_register(struct instance_handle h);
+struct instance_handle ui_focus_previous(struct instance_handle h);
+void ui_focus_own_horizontal(struct instance_handle h);
+bool ui_focus_owns_horizontal(void);
+bool ui_focus_move(int direction);              /* cycle the active scope */
+bool ui_focus_edge(bool last);
+#define UI_FOCUS_MENU 1u
+#define UI_FOCUS_KEEP_INPUT 2u
+void ui_focus_scope_begin(struct instance_handle root, struct instance_handle restore,unsigned policy);
+void ui_focus_scope_end(struct instance_handle root);
+bool ui_focus_scope_active(void);
+void ui_focus_defer_key(int code);               /* deliver to restored scope owner */
+uint64_t ui_focus_scope_serial(void);
+void ui_set_focus_excluded(bool excluded);       /* current subtree, e.g. hidden menus */
+bool ui_focus_reveal(float *scroll_offset);      /* reveal new focus in current viewport */
+bool ui_focus_needs_frame(void);                 /* read-and-clear redraw request */
 uint64_t ui_frame_serial(void); /* changes every frame; for per-frame widget state */
 
 /* --- scroll --- */

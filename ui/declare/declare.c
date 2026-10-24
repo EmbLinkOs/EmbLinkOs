@@ -75,7 +75,8 @@ static struct instance_handle g_clicked;   /* deepest instance a press landed on
  * is the only way an app can tell, and nothing else in the stack remembers. */
 static int g_press_edges;
 static struct instance_handle g_active;    /* instance that owns the current drag (pointer capture) */
-static struct instance_handle g_focused;   /* instance with keyboard focus (text field) */
+static struct instance_handle g_focused;
+static struct instance_handle g_focus_parent;   /* instance with keyboard focus (text field) */
 static bool g_focus_seen;                   /* the focused widget asked this frame */
 static float g_ptr_x, g_ptr_y;
 static bool  g_ptr_down;
@@ -83,8 +84,22 @@ static bool  g_press_edge;                  /* a press landed this frame (for de
 static bool  g_focus_claimed;               /* a widget claimed focus this frame */
 /* per-frame typed-character queue: the loop feeds keys via ui_input_char, the
  * focused text field drains it via ui_input_take; cleared each ui_frame_end. */
-static char  g_input_buf[32];
+static struct ui_key_input g_input_buf[32];
 static int   g_input_n;
+static uint64_t g_frame_serial;
+#define FOCUS_MAX 512
+#define FOCUS_SCOPES 8
+static struct instance_handle g_focus_nodes[2][FOCUS_MAX];
+static unsigned g_focus_counts[2];
+static struct { struct instance_handle root,restore,first; uint64_t seen; unsigned policy; } g_focus_scopes[FOCUS_SCOPES];
+static unsigned g_focus_depth;
+static bool g_focus_redraw;
+static uint64_t g_focus_context,g_focus_sequence;
+static struct instance_handle g_deferred_focus,g_horizontal_focus;
+static unsigned char g_deferred_key;
+static void focus_frame_end(void);
+static void focus_recover_missing(struct instance_handle parent);
+
 static float g_wheel;                       /* per-frame scroll-wheel delta, consumed by the hovered scroll view */
 static uint32_t g_font;
 static float    g_text_size = 16.0f;
@@ -580,6 +595,12 @@ void ui_set_layer(int l) {
     scene_set_layer(g_sa, b->scene_node, (uint8_t)(l < 0 ? 0 : l > 3 ? 3 : l));
 }
 
+void ui_hit_passthrough_for(struct instance_handle node,bool enabled) {
+    struct instance *i=instance_resolve(node);
+    struct scene_node *n=i?scene_resolve(g_sa,i->scene_node):0;
+    if(n)n->hit_passthrough=enabled;
+}
+void ui_set_hit_passthrough(bool enabled){ui_hit_passthrough_for(ui_open(),enabled);}
 void ui_set_overlay(bool on) {
     struct instance *b = cur_box(); if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
@@ -672,7 +693,7 @@ void ui_set_scroll_offset(float dy) {
 }
 /* Open box's content height (sum of children, unclamped) and viewport height
  * (resolved) from the last layout -- a scroll view uses these to clamp its
- * offset. We sum children rather than read intrinsic_h because a scroll viewport
+ * offset. We sum arranged children rather than read intrinsic_h because a scroll viewport
  * has a FIXED height, so its own intrinsic_h is that fixed size, not the content. */
 bool ui_open_content_extent(float *content_h, float *viewport_h) {
     struct instance *b = cur_box(); if (!b) return false;
@@ -682,7 +703,12 @@ bool ui_open_content_extent(float *content_h, float *viewport_h) {
     for (struct layout_handle c = ln->first_child; !layout_handle_is_null(c); ) {
         struct layout_node *cn = layout_resolve(g_la, c);
         if (!cn) break;
-        sum += cn->intrinsic_h; cnt++;
+        /* Intrinsic heights precede width-dependent wrapping. Use the last
+         * arranged height, as the thumb and clamp describe what was laid out,
+         * or a long nested paragraph makes the final controls unreachable. */
+        if(!cn->is_overlay) {
+            sum += cn->resolved_h>0?cn->resolved_h:cn->intrinsic_h;cnt++;
+        }
         c = cn->next_sibling;
     }
     if (cnt > 1) sum += ln->spacing * (cnt - 1);
@@ -705,9 +731,10 @@ void ui_set_text_gradient(const struct paint *p) {
 /* text + button + spacer                                                    */
 /* ------------------------------------------------------------------------- */
 
-static void set_text_on(struct instance_handle h, const char *str) {
+static void set_text_on(struct instance_handle h, const char *str,bool no_wrap) {
     struct instance *n = instance_resolve(h);
     if (!n) return;
+    scene_set_text_wrap(g_sa,n->scene_node,!no_wrap);
     /* BEFORE the no-op guard below: a run whose only change is being selected
      * has identical text, font and colour, so the guard would return before
      * ever applying it -- and the highlight would appear on the next unrelated
@@ -746,12 +773,17 @@ static void set_text_on(struct instance_handle h, const char *str) {
 void ui_text(const char *fmt, ...) {
     char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, 0, false, &created);
-    set_text_on(h, buf);
+    set_text_on(h, buf,false);
+}
+void ui_text_line(const char *fmt, ...) {
+    char buf[256];va_list ap;va_start(ap,fmt);vsnprintf(buf,sizeof buf,fmt,ap);va_end(ap);
+    bool created;struct instance_handle h=match_or_create(INSTANCE_TEXT,0,0,false,&created);
+    set_text_on(h,buf,true);
 }
 void ui_text_keyed(uint64_t key, const char *fmt, ...) {
     char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     bool created; struct instance_handle h = match_or_create(INSTANCE_TEXT, 0, key, key != 0, &created);
-    set_text_on(h, buf);
+    set_text_on(h, buf,false);
 }
 
 void ui_spacer(void) {
@@ -846,6 +878,7 @@ void ui_init(struct scene_arena *sa, struct layout_arena *la) {
     g_hovered = INSTANCE_HANDLE_NULL; g_clicked = INSTANCE_HANDLE_NULL;
     g_active = INSTANCE_HANDLE_NULL; g_focused = INSTANCE_HANDLE_NULL; g_ptr_down = false;
     g_press_edge = false; g_focus_claimed = false; g_input_n = 0; g_wheel = 0.0f;
+    g_focus_counts[0]=g_focus_counts[1]=g_focus_depth=0;g_focus_redraw=false;g_focus_context++;g_deferred_key=0;
     struct instance_handle h = inst_alloc();
     struct instance *n = instance_resolve(h);
     n->kind = INSTANCE_BOX;
@@ -906,18 +939,22 @@ bool ui_pointer_down(void) { return g_ptr_down; }
 /* A number that changes every frame -- for widget code that keeps a little
  * per-frame state of its own (keyboard focus traversal, in kit.c) and has to
  * know when a frame boundary passed. */
-static uint64_t g_frame_serial;
 uint64_t ui_frame_serial(void) { return g_frame_serial; }
 
 void ui_frame_begin(void) {
     g_frame_serial++;
+    g_focus_counts[0]=g_focus_counts[1];
+    memcpy(g_focus_nodes[0],g_focus_nodes[1],g_focus_counts[0]*sizeof g_focus_nodes[0][0]);
+    g_focus_counts[1]=0;
     g_depth_overflowed = 0; g_cursor_over = 0;
     g_cursor_top = -1;
     reset_children_unvisited(g_root);
     g_cursor[++g_cursor_top] = (struct reconcile_cursor){ g_root, INSTANCE_HANDLE_NULL };
 }
 void ui_frame_end(void) {
+    struct instance_handle focus_parent=g_focus_parent;
     sweep_unvisited_children(g_root);
+    focus_frame_end();focus_recover_missing(focus_parent);
     g_cursor_top = -1;
     /* a press that landed on no focusable widget clears keyboard focus */
     if (g_press_edge && !g_focus_claimed) g_focused = INSTANCE_HANDLE_NULL;
@@ -930,6 +967,12 @@ void ui_frame_end(void) {
     g_press_edge = false;
     g_focus_claimed = false;
     g_input_n = 0;                 /* typed queue is consumed within the frame */
+    if(g_deferred_key) {
+        if(!instance_resolve(g_deferred_focus))g_deferred_key=0;
+        else if(ui_any_focus() && g_focused.index==g_deferred_focus.index && g_focused.generation==g_deferred_focus.generation) {
+            ui_input_key(g_deferred_key,0);g_deferred_key=0;g_focus_redraw=true;
+        }
+    }
     g_wheel = 0.0f;                /* unconsumed wheel delta does not carry over */
 }
 void ui_run_layout(float W, float H) {
@@ -990,6 +1033,7 @@ static void hit_rec(struct hit_ctx *c, struct node_handle h, const float wparent
                     float cx0, float cy0, float cx1, float cy1, int layer) {
     struct scene_node *n = scene_resolve(g_sa, h);
     if (!n) return;
+    if(n->hit_passthrough)return;
     float local[16], world[16];
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);
@@ -1078,22 +1122,165 @@ static uint64_t g_ptr_time;
 void     ui_pointer_at_time(uint64_t ms) { g_ptr_time = ms; }
 uint64_t ui_pointer_time(void) { return g_ptr_time; }
 
-void ui_input_char(int c) {
-    if (c && g_input_n < (int)sizeof(g_input_buf)) g_input_buf[g_input_n++] = (char)c;
+void ui_input_key(int c,unsigned modifiers) {
+    if(c && g_input_n<(int)(sizeof g_input_buf/sizeof g_input_buf[0]))
+        g_input_buf[g_input_n++]=(struct ui_key_input){(unsigned char)c,(unsigned char)modifiers};
 }
-/* Drain the queued characters into dst (up to max); returns the count. Does not
- * clear the queue (ui_frame_end does) so only the focused field applies them. */
-int ui_input_take(char *dst, int max) {
-    int n = g_input_n < max ? g_input_n : max;
-    for (int i = 0; i < n; i++) dst[i] = g_input_buf[i];
+void ui_input_char(int c) { ui_input_key(c,0); }
+int ui_input_take_keys(struct ui_key_input *dst,int max) {
+    int n=g_input_n<max?g_input_n:max;
+    if(n>0)memcpy(dst,g_input_buf,(size_t)n*sizeof *dst);
     return n;
 }
-void ui_request_focus(struct instance_handle h) { g_focused = h; g_focus_claimed = true; }
-bool ui_any_focus(void) { return !instance_handle_is_null(g_focused); }
+int ui_input_take(char *dst,int max) {
+    int n=g_input_n<max?g_input_n:max;
+    for(int i=0;i<n;i++)dst[i]=(char)g_input_buf[i].code;
+    return n;
+}
+static bool focus_descendant(struct instance_handle root,struct instance_handle h) {
+    for(unsigned depth=0;depth<CURSOR_STACK_MAX;depth++) {
+        struct instance *a=instance_resolve(h);if(!a)return false;
+        if(h.index==root.index && h.generation==root.generation)return true;
+        h=a->parent;
+    }
+    return false;
+}
+static bool focus_allowed(struct instance_handle h) {
+    if(!instance_resolve(h))return false;
+    if(g_focus_depth && !focus_descendant(g_focus_scopes[g_focus_depth-1].root,h))return false;
+    for(unsigned depth=0;depth<CURSOR_STACK_MAX;depth++) {
+        struct instance *a=instance_resolve(h);if(!a)break;
+        struct scene_node *n=scene_resolve(g_sa,a->scene_node);
+        if(a->focus_excluded || (n && (n->hit_passthrough || n->opacity<=0)))return false;
+        h=a->parent;
+    }
+    return true;
+}
+void ui_request_focus(struct instance_handle h) {
+    if(h.index && !focus_allowed(h))return;
+    if(h.index!=g_focused.index || h.generation!=g_focused.generation){g_focus_redraw=true;g_focus_sequence++;}
+    g_focused=h;g_focus_claimed=true;
+    struct instance *focused=instance_resolve(h);g_focus_parent=focused?focused->parent:INSTANCE_HANDLE_NULL;
+}
+bool ui_any_focus(void) {return focus_allowed(g_focused);}
 bool ui_has_focus(struct instance_handle h) {
-    bool yes = h.index == g_focused.index && h.generation == g_focused.generation && h.index != 0;
-    if (yes) g_focus_seen = true;
+    bool yes=h.index==g_focused.index && h.generation==g_focused.generation && focus_allowed(h);
+    if(yes)g_focus_seen=true;
     return yes;
+}
+void ui_set_focus_excluded(bool excluded) {
+    struct instance *a=instance_resolve(ui_open());if(a)a->focus_excluded=excluded;
+}
+bool ui_focus_register(struct instance_handle h) {
+    if(!focus_allowed(h))return false;
+    unsigned n=g_focus_counts[1];
+    if(n<FOCUS_MAX)g_focus_nodes[1][g_focus_counts[1]++]=h;
+    if(g_focus_depth && !g_focus_scopes[g_focus_depth-1].first.index) {
+        g_focus_scopes[g_focus_depth-1].first=h;
+        if((g_focus_scopes[g_focus_depth-1].policy&UI_FOCUS_MENU) && !ui_any_focus())ui_request_focus(h);
+    }
+    return true;
+}
+struct instance_handle ui_focus_previous(struct instance_handle h) {
+    /* Prefer this frame's order, which already excludes removed controls. At
+     * its first control, wrap through the last complete retained frame. */
+    struct instance_handle previous=INSTANCE_HANDLE_NULL;
+    for(unsigned i=0;i<g_focus_counts[1];i++) {
+        struct instance_handle a=g_focus_nodes[1][i];
+        if(a.index==h.index && a.generation==h.generation)break;
+        if(focus_allowed(a))previous=a;
+    }
+    if(previous.index)return previous;
+    for(unsigned i=g_focus_counts[0];i>0;i--)if(focus_allowed(g_focus_nodes[0][i-1]))return g_focus_nodes[0][i-1];
+    return h;
+}
+bool ui_focus_edge(bool last) {
+    unsigned list=1,n=g_focus_counts[list];
+    for(unsigned i=0;i<n;i++) {
+        struct instance_handle h=g_focus_nodes[list][last?n-i-1:i];
+        if(focus_allowed(h)){ui_request_focus(h);return true;}
+    }
+    return false;
+}
+void ui_focus_own_horizontal(struct instance_handle h) {g_horizontal_focus=h;}
+bool ui_focus_owns_horizontal(void) {
+    return ui_any_focus() && g_horizontal_focus.index==g_focused.index && g_horizontal_focus.generation==g_focused.generation;
+}
+bool ui_focus_move(int direction) {
+    unsigned list=g_cursor_top<0?1:0,n=g_focus_counts[list];if(!n)return false;
+    int current=-1;
+    for(unsigned i=0;i<n;i++)if(g_focus_nodes[list][i].index==g_focused.index &&
+        g_focus_nodes[list][i].generation==g_focused.generation)current=(int)i;
+    if(current<0)return ui_focus_edge(direction<0);
+    for(unsigned step=1;step<=n;step++) {
+        int i=(current+(direction<0?-(int)step:(int)step)+(int)n)%(int)n;
+        if(focus_allowed(g_focus_nodes[list][i])){ui_request_focus(g_focus_nodes[list][i]);return true;}
+    }
+    return false;
+}
+void ui_focus_scope_begin(struct instance_handle root,struct instance_handle restore,unsigned policy) {
+    for(unsigned i=0;i<g_focus_depth;i++)if(g_focus_scopes[i].root.index==root.index &&
+        g_focus_scopes[i].root.generation==root.generation) {
+        g_focus_scopes[i].seen=g_frame_serial;g_focus_scopes[i].first=INSTANCE_HANDLE_NULL;g_focus_scopes[i].policy=policy;return;
+    }
+    /* A sibling popover replaces the previous one; a descendant nests. */
+    while(g_focus_depth && !focus_descendant(g_focus_scopes[g_focus_depth-1].root,root)) {
+        struct instance_handle prior=g_focus_scopes[--g_focus_depth].restore;g_focus_context++;ui_request_focus(prior);
+    }
+    if(g_focus_depth==FOCUS_SCOPES)return;
+    unsigned i=g_focus_depth++;g_focus_context++;
+    g_focus_scopes[i].root=root;g_focus_scopes[i].restore=restore.index?restore:g_focused;
+    g_focus_scopes[i].first=INSTANCE_HANDLE_NULL;g_focus_scopes[i].seen=g_frame_serial;g_focus_scopes[i].policy=policy;
+    ui_request_focus(INSTANCE_HANDLE_NULL);if(!(policy&UI_FOCUS_KEEP_INPUT))g_input_n=0;
+}
+void ui_focus_scope_end(struct instance_handle root) {
+    if(g_focus_depth && g_focus_scopes[g_focus_depth-1].root.index==root.index && !ui_any_focus())
+        ui_request_focus(g_focus_scopes[g_focus_depth-1].first);
+}
+bool ui_focus_scope_active(void) {return g_focus_depth>0;}
+void ui_focus_defer_key(int code) {
+    if(g_focus_depth) {
+        g_deferred_focus=g_focus_scopes[g_focus_depth-1].restore;g_deferred_key=(unsigned char)code;
+    }
+}
+uint64_t ui_focus_scope_serial(void) {return g_focus_context;}
+bool ui_focus_reveal(float *offset) {
+    struct instance_handle root=ui_open();struct instance *container=instance_resolve(root);
+    if(!container || !offset || container->focus_reveal_seen==g_focus_sequence)return false;
+    if(!ui_any_focus() || !focus_descendant(root,g_focused)) {
+        container->focus_reveal_seen=g_focus_sequence;return false;
+    }
+    float x,y,w,h,fx,fy,fw,fh;
+    if(!ui_rect_of(root,&x,&y,&w,&h) || !ui_rect_of(g_focused,&fx,&fy,&fw,&fh) || h<=0 || fh<=0)return false;
+    container->focus_reveal_seen=g_focus_sequence;
+    float delta=0;
+    if(fy<y)delta=fy-y;
+    else if(fy+fh>y+h)delta=fh>h?fy-y:fy+fh-y-h;
+    if(delta==0)return false;
+    *offset+=delta;if(*offset<0)*offset=0;g_focus_redraw=true;return true;
+}
+bool ui_focus_needs_frame(void) {bool changed=g_focus_redraw;g_focus_redraw=false;return changed;}
+/* A removed field can hand focus to the next surviving sibling without
+ * handing over its identity or its queued text. A replaced page cannot. */
+static void focus_recover_missing(struct instance_handle parent) {
+    if(!g_focused.index || instance_resolve(g_focused) || !instance_resolve(parent))return;
+    unsigned n=g_focus_counts[0];int old=-1;
+    for(unsigned i=0;i<n;i++)if(g_focus_nodes[0][i].index==g_focused.index &&
+        g_focus_nodes[0][i].generation==g_focused.generation)old=(int)i;
+    if(old<0)return;
+    for(unsigned step=1;step<=n;step++) {
+        struct instance_handle next=g_focus_nodes[0][((unsigned)old+step)%n];
+        if(!focus_allowed(next) || !focus_descendant(parent,next))continue;
+        for(unsigned j=0;j<g_focus_counts[1];j++)if(next.index==g_focus_nodes[1][j].index &&
+            next.generation==g_focus_nodes[1][j].generation){ui_request_focus(next);return;}
+    }
+}
+static void focus_frame_end(void) {
+    while(g_focus_depth && (g_focus_scopes[g_focus_depth-1].seen!=g_frame_serial ||
+        !instance_resolve(g_focus_scopes[g_focus_depth-1].root))) {
+        struct instance_handle restore=g_focus_scopes[--g_focus_depth].restore;g_focus_context++;
+        ui_request_focus(instance_resolve(restore)?restore:INSTANCE_HANDLE_NULL);
+    }
 }
 
 /* Scroll wheel: the loop feeds this frame's delta; the open box consumes it only

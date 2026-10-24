@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""Every Icon* in the toolkit must be a codepoint the shipped font can draw.
+"""Check every public symbol's Contour asset or shipped-font fallback.
 
-The icon set is Unicode codepoints rendered from DejaVuSans, which is the font
-mkfs bakes into the image. Seven of them were in the emoji planes -- a bell, a
-clock, a magnifier, a folder, a document, a trash can, a person -- and DejaVu
-has none of those. Each one drew a tofu box, in every app that asked for it,
-and had done since the icon set was written: nothing checks a codepoint at
-build time, and a missing glyph is not an error at run time either. The browser
-put one in its toolbar and that is how they were noticed.
-
-    python3 tools/checkicons.py        # fail if any icon has no glyph
-
-The cmap reader here is deliberately minimal -- format 4 is all DejaVu's
-Unicode subtable uses, and this reads a file the build already trusts.
+Both hexadecimal legacy codepoints and decimal private-use IDs are inspected.
+A mapped icon must have its reproducible SVG master and a valid EIC ladder.
 """
 import os, re, struct, sys
 
@@ -69,19 +59,33 @@ def main():
     if not os.path.exists(FONT):
         print("icon-check: %s not present, skipped" % FONT)
         return 0
-    have = cmap_of(FONT)
-    bad = []
-    for m in re.finditer(r"#define\s+(Icon\w+)\s+(0x[0-9A-Fa-f]+)", open(HEADER).read()):
-        cp = int(m.group(2), 16)
-        if cp not in have:
-            bad.append((m.group(1), cp))
-    if bad:
-        print("icon-check: %d icon(s) have NO GLYPH in %s -- each draws a tofu box:"
-              % (len(bad), os.path.basename(FONT)))
-        for name, cp in bad:
-            print("    %-14s U+%04X" % (name, cp))
-        return 1
-    print("icon-check: OK (every Icon* in em.h has a glyph)")
+    have=cmap_of(FONT)
+    definitions={m.group(1):int(m.group(2),0) for m in re.finditer(
+        r"#define\s+(Icon\w+)\s+(0x[0-9A-Fa-f]+|[0-9]+)",open(HEADER).read())}
+    implementation=open(os.path.join(ROOT,"ui/dsl/em.c")).read()
+    routes={definitions[m.group(1)]:m.group(2) for m in re.finditer(
+        r'case (Icon\w+): path="/system/images/([^"/]+)\.eic";',implementation)}
+    errors=[];assets=0
+    for name,cp in definitions.items():
+        if cp not in routes:
+            if cp not in have:errors.append(f"{name}: no asset and no font fallback")
+            continue
+        stem=routes[cp];master=os.path.join(ROOT,"icons/masters",stem+".svg")
+        path=os.path.join(ROOT,"system/images",stem+".eic")
+        if not os.path.isfile(master) or not os.path.isfile(path):
+            errors.append(f"{name}: missing master or EIC for {stem}");continue
+        d=open(path,"rb").read()
+        if len(d)<32 or d[:4]!=b'EICO':errors.append(f"{name}: invalid EIC header");continue
+        version,count=struct.unpack_from('<HH',d,4)
+        if version!=1 or count<3 or 32+16*count>len(d):errors.append(f"{name}: invalid EIC ladder");continue
+        for i in range(count):
+            w,h,stride,offset,length=struct.unpack_from('<HHIII',d,32+16*i)
+            if not w or w!=h or stride!=w*4 or length!=stride*h or offset<32+16*count or offset+length>len(d):
+                errors.append(f"{name}: invalid level {i}")
+        assets+=1
+    if errors:
+        print("icon-check: FAIL\n"+"\n".join(errors));return 1
+    print(f"icon-check: OK ({len(definitions)} symbols, {assets} Contour assets, valid fallback mappings)")
     return 0
 
 

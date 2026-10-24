@@ -487,3 +487,36 @@ visual host-side check. Only once pixels look right in the showcase does it
 make sense to boot `make run-ui` / `run-embkfs-cow` and check live
 interaction, keyboard/mouse routing, and window-manager behavior that can't
 be exercised outside a running compositor.
+
+## System-menu ownership and preferences
+
+The bar's preferences worker publishes a complete snapshot under a user mutex;
+only the render thread applies palette/accent/scale changes. Menu rows use a
+shared panel material rather than opaque per-row cards, and label rectangles
+provide stable dropdown anchors.
+
+The compositor normally excludes translucent chrome from keyboard ownership.
+`win_menu` (native syscall 144) temporarily lends a caller-owned translucent
+window the keyboard. The flag lives in the window and disappears with its
+backing; destroy/reap cannot leave a global grab. Session lock ownership takes
+precedence. GPU capability, exact boolean/ID bounds and window ownership are
+checked. The EmApp runtime changes this state only on open/close transitions.
+
+While open, a bar grows a transparent outside-click surface to the display
+edges. On dismissal it must resize to its original height. The compositor
+therefore accepts translucent bars down to 24 pixels; ordinary app windows
+retain their 90-pixel minimum. Previously the shared resize minimum rejected
+26-pixel bars and left an invisible canvas intercepting clicks after dismissal.
+`tools/menu_smoke.py` tests actual Escape, outside clicks, stable anchoring,
+live appearance changes and subsequent dock use; devicecheck covers ownership,
+capability/bounds and the thin resize round trip.
+
+## Deferred close requests
+
+EmApp routes Escape, window close state and explicit exit requests through one
+optional close callback before teardown. A veto consumes the request and asks
+for another frame. A caller-owned `win_close_ack` cancels the compositor close
+grace timer; the runtime sends it immediately on receiving a close request when
+a hook is installed, including input polls while idle. Apps without a hook keep
+the existing timeout. The state belongs to the window and does not confer
+process-control authority over other apps. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).

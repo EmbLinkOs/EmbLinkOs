@@ -1,3 +1,4 @@
+#include "include/kstring.h"
 #if defined(__x86_64__)
 #include "power/policy.h"
 #define INPUT_ACTIVITY() power_activity()
@@ -152,6 +153,7 @@ static void kbd_event_push(uint16_t code, int pressed) {
 // Circular buffer for storing incoming characters from the keyboard
 #define KBD_BUFFER_SIZE 128
 static char kbd_buffer[KBD_BUFFER_SIZE];
+static uint8_t kbd_buffer_mods[KBD_BUFFER_SIZE];
 static volatile uint32_t buf_head = 0;   // write index (IRQ writes here)
 static volatile uint32_t buf_tail = 0;   // read index (kernel reads here)
 
@@ -163,6 +165,7 @@ static void buffer_push(char c) {
     
     }
     kbd_buffer[buf_head] = c;
+    kbd_buffer_mods[buf_head] = g_mods;
     buf_head = next_head;
 }
 
@@ -187,6 +190,8 @@ static void keyboard_deliver(char c);
 /* The pending system shortcut, decided in IRQ context and performed by the
  * kernel's main loop -- see SYSKEY_* in keyboard.h. */
 static volatile int g_syskey;
+static volatile unsigned g_shortcut_modifier;
+void keyboard_set_shortcut_modifier(unsigned mode){g_shortcut_modifier=mode;}
 int keyboard_take_syskey(void) { int k = g_syskey; g_syskey = SYSKEY_NONE; return k; }
 void        kbd_translate(uint8_t make, int pressed);   /* the testable seam */
 static void keyboard_deliver_cp(uint32_t cp);   /* one codepoint, as UTF-8 */
@@ -454,15 +459,26 @@ void kbd_translate(uint8_t make, int pressed) {
      * values, not codepoints, and encoding 0xFD as UTF-8 would turn one command
      * into the two bytes of ý. Unclaimed GUI+letter combinations fall through
      * and type their letter, so the key is not a hole. */
+    if(g_shortcut_modifier?((g_mods&(EKM_CTRL|EKM_ALT))==(EKM_CTRL|EKM_ALT)):(g_mods&EKM_GUI)) {
+        char system=base;
+        if(system>='A' && system<='Z')system+=32;
+        if(system=='\t'){g_syskey=SYSKEY_NEXT_WINDOW;return;}
+        if(system=='w'){g_syskey=SYSKEY_CLOSE_WINDOW;return;}
+        if(system=='q'){g_syskey=SYSKEY_QUIT_APP;return;}
+        if(system==' '){g_syskey=SYSKEY_LAUNCHER;return;}
+        if(system=='['){g_syskey=SYSKEY_SPACE_PREVIOUS;return;}
+        if(system==']'){g_syskey=SYSKEY_SPACE_NEXT;return;}
+        if(system>='1' && system<='6') {g_syskey=((g_mods&EKM_SHIFT)?SYSKEY_MOVE_SPACE_1:SYSKEY_SPACE_1)+system-'1';return;}
+    }
     if (g_mods & EKM_GUI) {
         uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
         /* SYSTEM shortcuts first, and they are swallowed: see SYSKEY_* in
          * keyboard.h for why an application must not be able to see -- and so
          * decline -- the window switcher. Recorded, not performed: this is IRQ
          * context and the compositor is not safe to call from one. */
-        if (low == '\t') { g_syskey = SYSKEY_NEXT_WINDOW;  return; }
-        if (low == 'w')   { g_syskey = SYSKEY_CLOSE_WINDOW; return; }
-        if (low == 'q')   { g_syskey = SYSKEY_QUIT_APP;     return; }
+
+
+
         char cmd = 0;
         switch (low) {
             case 'a': cmd = (char)EK_SEL_ALL; break;
@@ -913,6 +929,31 @@ char keyboard_getchar(void) {
 }
 
 
+uint32_t keyboard_poll_input(void) {
+    char c;uint32_t value=0;
+    sched_lock();
+    if(buf_head!=buf_tail) {
+        uint8_t mods=kbd_buffer_mods[buf_tail];
+        if(buffer_pop(&c))value=(uint8_t)c|((uint32_t)mods<<8);
+    }
+    sched_unlock();return value;
+}
+int keyboard_input_snapshot_selftest(void) {
+    /* Preserve live input and modifier state; do not inject test keys into a
+     * desktop. Match the producer's input-state -> scheduler lock order. */
+    spin_lock(&input_state_lock);sched_lock();
+    char bytes[KBD_BUFFER_SIZE];uint8_t mods[KBD_BUFFER_SIZE];
+    memcpy(bytes,kbd_buffer,sizeof bytes);memcpy(mods,kbd_buffer_mods,sizeof mods);
+    uint32_t head=buf_head,tail=buf_tail;uint8_t held=g_mods;
+    buf_head=buf_tail=0;g_mods=EKM_CTRL;buffer_push(0x13);
+    g_mods=0;buffer_push(EK_UP);
+    int ok=kbd_buffer_mods[0]==EKM_CTRL && kbd_buffer_mods[1]==0;
+    char c;ok=ok && buffer_pop(&c) && c==0x13 && buf_tail==1;
+    ok=ok && buffer_pop(&c) && c==EK_UP && buf_head==buf_tail;
+    memcpy(kbd_buffer,bytes,sizeof bytes);memcpy(kbd_buffer_mods,mods,sizeof mods);
+    buf_head=head;buf_tail=tail;g_mods=held;
+    sched_unlock();spin_unlock(&input_state_lock);return ok;
+}
 int keyboard_has_char(void) {
     return buf_head != buf_tail;
 }

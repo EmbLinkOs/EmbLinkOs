@@ -52,12 +52,12 @@ static void view(void) {
     if (side < 32) side = 32;
     if (side > 120) side = 120;
     Screen(.padding = -1, .justify = Center, .align = Center) {
-        BackgroundImage("/system/images/colibri-user.ppm");
+        BackgroundImage("/system/images/login-wallpaper.ppm");
         HStack(.width = em_viewport_width(), .height = em_viewport_height(),
                .padding = side, .align = Center) {
             Glass(.width = panel, .spacing = 14, .padding = 32, .align = Fill,
-                  .background = { .r = 0.045f, .g = 0.055f, .b = 0.09f, .a = 0.92f },
-                  .corner = 20, .border = 1, .shadow = 1) {
+                  .background = T.surface,
+                  .corner = 8, .border = 1, .shadow = 1) {
                 Text("Welcome to EmbLink OS").title();
                 Text("Create the first account").heading();
                 Text(status).body().secondary();

@@ -52,6 +52,10 @@ struct emfile_rep {
  * different answers. */
 static inline int embk_file_panel(int mode, const char *title, const char *start,
                                   const char *suggest, char *out, int cap) {
+    if ((mode != EMFILE_OPEN && mode != EMFILE_SAVE) || !out || cap < 2)
+        return -EMBK_EINVAL;
+    if (start && __builtin_strlen(start) >= sizeof(((struct emfile_req *)0)->start))
+        return -EMBK_ENAMETOOLONG;
     struct emfile_req q;
     for (unsigned i = 0; i < sizeof q; i++) ((unsigned char *)&q)[i] = 0;
     q.mode = (uint32_t)mode;
@@ -68,7 +72,12 @@ static inline int embk_file_panel(int mode, const char *title, const char *start
 
     int n = emsvc_call("files", EMSVC_T_FILE_PANEL, &q, sizeof q, &r, sizeof r);
     if (n < 0) return n;
+    if (n != sizeof r || (r.chosen != 0 && r.chosen != 1)) return -EMBK_EINVAL;
     if (!r.chosen) return 0;
+    unsigned length=0;
+    while (length < sizeof r.path && r.path[length]) length++;
+    if (length == sizeof r.path || r.path[0] != '/') return -EMBK_EINVAL;
+    if (length >= (unsigned)cap) return -EMBK_ENAMETOOLONG;
 
     int i = 0;
     while (r.path[i] && i < cap - 1) { out[i] = r.path[i]; i++; }

@@ -1,3 +1,38 @@
+## Contour follow-up (2026-10-24)
+
+- [x] Shared semantic palette, real regular/bold font families, density and text metrics.
+- [x] Original icon family, command strip, bounded application library and side/bottom docks.
+- [x] Shared work areas, live cursor/chrome/effects and isolated configurable workspaces.
+- [x] Searchable Settings, coordinated presets, live preferences and confirmed reset.
+- [x] Align native application chrome, document/code surfaces and authentication surfaces.
+- [x] Reverse Tab, directional menu navigation, modal focus containment and scroll revelation.
+- [ ] Assistive-technology semantics, labels, announcements and platform integration.
+- [ ] Arbitrary font/icon-pack installation, shortcut recording and free panel-item ordering.
+- [ ] Per-monitor scaling, display profiles and compositor-backed overlay auto-hide.
+- [ ] Validate physical laptop rendering, pointer/input, power and graphics performance.
+
+Scope and current evidence: [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+
+## Desktop menu follow-up (2026-10-23)
+
+## Document workspace follow-up (2026-10-23)
+
+- [x] Shared session Open/Save with actual user places and replacement confirmation.
+- [x] Safe replacement, external-edit detection, whole-window dirty guards and separate recovery drafts.
+- [x] Files document creation and home-scoped Editor launch.
+- [ ] Desktop-wide quit/logout/power negotiation for unsaved documents.
+- [ ] Filesystem compare-and-swap for concurrent-writer conflicts.
+- [ ] Transferable open-file capabilities from the picker.
+- [ ] Large/binary document tools, recovery management UI, persistent undo and PID-reuse-independent recovery leases.
+
+Design and limits: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).
+
+- [x] Live system-menu palette, stable label anchors, one panel surface,
+  Escape dismissal, full-display outside clicks and restored thin bar/input.
+- [ ] Arrow-key menu navigation, type-to-select, keyboard menu activation,
+  accessible menu roles and context-menu Escape behavior.
+- [ ] Consistent focus indication, dialogs and unsaved-document handling across apps.
+
 ## Laptop integration follow-up (2026-10-23)
 
 - [x] Preserve master ABI/ARM architecture and integrate laptop services into the current desktop.
@@ -7640,3 +7675,7 @@ for them to run against:
       a long sequential run; the rerun passed. The harness missed the verdict
       line rather than the program failing -- but that is an inference, not a
       measurement.
+
+- [ ] Give the parallel raw key-event stream explicit event-time process/session
+  ownership, including queued-event handling across login/lock transitions;
+  the new character/modifier poll retains the existing focused-reader gate.

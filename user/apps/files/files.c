@@ -30,6 +30,7 @@
 
 #include "embk.h"
 #include "fileops.h"
+#include "document.h"
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -61,6 +62,7 @@ static char  g_fwd[24][512];   static int g_fwd_n;
  * folder" you rename afterwards -- there is no rename yet, so an untitled
  * folder would be permanent. */
 static bool  g_naming = false;
+static bool g_naming_document;
 static char  g_newname[NAME_LEN] = "";
 
 /* Right-click target and the three destructive-ish verbs. Everything that can
@@ -182,7 +184,9 @@ static void open_file(const char *name) {
     join(full, sizeof full, name);
     snprintf(envbuf, sizeof envbuf, "EDIT_FILE=%s", full);
     char *argv[] = { "edit", NULL };
-    char *env[]  = { envbuf, NULL };
+    char home_env[320];const char *home=getenv("HOME");
+    snprintf(home_env,sizeof home_env,"HOME=%s",home&&home[0]?home:"/home");
+    char *env[]  = { envbuf, home_env, NULL };
     int64_t h = embk_spawn_env("/data/apps/edit/edit.elf", argv, env, NULL, 0);
     snprintf(g_status, sizeof g_status, h >= 0 ? "Opened %s" : "Could not open %s", name);
 }
@@ -191,8 +195,13 @@ static void create_folder(void) {
     if (!g_newname[0]) { g_naming = false; return; }
     char full[600];
     join(full, sizeof full, g_newname);
-    if (embk_mkdir(full) >= 0) snprintf(g_status, sizeof g_status, "Created %s", g_newname);
-    else                       snprintf(g_status, sizeof g_status, "Could not create %s here", g_newname);
+    if(!embk_file_valid_name(g_newname)){snprintf(g_status,sizeof g_status,"Enter a valid name");return;}
+    struct emdoc_stamp absent={0};
+    int rc=g_naming_document?emdoc_save(full,"",0,&absent,0):embk_mkdir(full);
+    if(rc>=0) {
+        snprintf(g_status,sizeof g_status,"Created %s",g_newname);
+        if(g_naming_document)open_file(g_newname);
+    } else {snprintf(g_status,sizeof g_status,"Cannot create here, or name already exists");return;}
     g_newname[0] = 0; g_naming = false; g_dirty = true;
 }
 
@@ -544,7 +553,7 @@ static void sidebar_item(int icon, const char *label, const char *path) {
     const struct ui_theme *t = ui_theme();
     bool here = path && !strcmp(path, g_cwd);
     HStack(.spacing = 7, .align = Center, .px = 7, .py = 1, .corner = 5, .grow = 1,
-           .background = here ? (Color){ .r=.24f, .g=.26f, .b=.34f, .a=1.f }
+           .background = here ? t->accent_soft
                               : (Color){ 0, 0, 0, 0 }) {
         Icon(icon).caption().color(here ? t->accent : t->text_secondary);
         /* .py(1): the row's height was never the HStack's to give. A ghost
@@ -650,7 +659,7 @@ static void app(void) {
             Segmented(views, 2, &g_view);
         }
 
-        Split(212) {
+        Split(em_viewport_width()<760?168:208) {
             SidebarPane() {
                 Text("Favourites").caption().tertiary();
                 sidebar_item(IconHome,   "Home",      home);
@@ -678,11 +687,11 @@ static void app(void) {
                     if (IconButton(IconChevronR).clicked()) go_forward();
                     if (IconButton(IconChevronU).clicked()) go_up();
                     Card(.padding = 5, .grow = 1, .corner = 6,
-                         .background = { .r=.12f, .g=.125f, .b=.145f, .a=1.f }) {
+                         .background = T.surface_alt) {
                         Text(g_cwd).caption();
                     }
                     if (g_naming) {
-                        TextField(g_newname, sizeof g_newname, "Folder name");
+                        TextField(g_newname, sizeof g_newname,g_naming_document?"Document name":"Folder name");
                         if (Button("Create").primary().clicked()) create_folder();
                         if (Button("Cancel").ghost().clicked()) { g_naming = false; g_newname[0] = 0; }
                     } else if (in_trash()) {
@@ -707,7 +716,10 @@ static void app(void) {
                     } else {
                         if (Button("New Folder").ghost().font(Caption)
                                 .color(ui_theme()->text).clicked()) {
-                            g_naming = true; g_newname[0] = 0;
+                            g_naming_document=false;g_naming = true; g_newname[0] = 0;
+                        }
+                        if(Button("New Document").ghost().font(Caption).color(ui_theme()->text).clicked()) {
+                            g_naming_document=true;g_naming=true;snprintf(g_newname,sizeof g_newname,"Untitled.txt");
                         }
                         /* Paste acts on the FOLDER you are in, so it belongs on
                          * the toolbar; the per-item verbs live in the context
@@ -800,7 +812,7 @@ static void app(void) {
                 }
                 if (g_menu_open && g_menu_i < 0) {
                     ContextMenu(&g_menu_open, g_menu_x, g_menu_y) {
-                        if (MenuItem("New Folder")) { g_naming = true; g_newname[0] = 0; }
+                        if (MenuItem("New Folder")) { g_naming_document=false;g_naming = true; g_newname[0] = 0; }
                         if (g_clip_path[0]) {
                             char lbl[NAME_LEN + 16];
                             snprintf(lbl, sizeof lbl, "Paste %s", g_clip_name);
@@ -910,6 +922,7 @@ static void app(void) {
 
 EM_APPLICATION {
     .title  = "Files",
+    .min_size = { 540, 360 },
     /* Fits the work area: 768 less the 26px menu bar and the dock's band.
      * A default window that runs under the dock is a window that ships with
      * its own status bar hidden. */

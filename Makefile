@@ -1582,7 +1582,11 @@ $(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_fileops.o: user/lib/fileops.c user/lib/fileops.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-LIBEMBK_OBJS = $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+$(BUILD)/picobj_document.o: user/lib/document.c user/lib/document.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_workspace.o: user/lib/workspace.c user/lib/workspace.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_workspace.o  $(BUILD)/picobj_document.o  $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
@@ -3493,3 +3497,24 @@ test-tls-crypto:
 	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
 	    tools/tls/test_constraints.c -o /tmp/embk_test_constraints && /tmp/embk_test_constraints
 
+
+.PHONY: document-test
+document-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -DEMDOC_FAULT_TEST -Iuser/lib user/lib/document.c user/lib/document_test.c -Wl,--wrap=write,--wrap=fsync,--wrap=rename -o $(BUILD)/document_test
+	$(BUILD)/document_test
+
+.PHONY: service-test
+service-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/lib user/lib/service_test.c -o $(BUILD)/service_test
+	$(BUILD)/service_test
+
+.PHONY: doc-model-test
+doc-model-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/note user/note/doc.c user/note/syntax.c user/note/doc_test.c -o $(BUILD)/doc_model_test
+	$(BUILD)/doc_model_test
+
+.PHONY: contour-test
+contour-test:
+	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 $(UI_INC) -Iuser/lib \
+	    ui/theme/theme.c tests/desktop/appearance_test.c -lm -o $(BUILD)/contour_test
+	$(BUILD)/contour_test

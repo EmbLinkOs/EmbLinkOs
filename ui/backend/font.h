@@ -137,6 +137,11 @@ void font_install_backend(void);
  * string with this, or it will measure a different string than gets drawn. */
 int  font_utf8_decode(const char *s, uint32_t *cp);
 
+typedef void (*font_text_visitor)(void *context,uint32_t codepoint,float x,float y);
+/* Shared UTF-8 word/character wrapping. A zero width disables automatic wrapping. */
+int font_layout_text(struct font *font,const char *text,float size,float width,
+                     font_text_visitor visit,void *context);
+
 /* Exposed for tests: the shared process-wide atlas draw_text uses. */
 struct glyph_atlas *font_global_atlas(void);
 

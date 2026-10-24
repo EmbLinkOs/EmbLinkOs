@@ -1,18 +1,9 @@
 #ifndef __EMBLINK_UI_THEME_H__
 #define __EMBLINK_UI_THEME_H__
 
-/* ui/theme/theme.h -- EmbLink UI: the design-token system.
- *
- * A curated set of semantic tokens (color roles, a spacing grid, a type scale,
- * radii, shadow presets) that make clean UI the DEFAULT. The widget kit
- * (ui/kit) reads exclusively from these tokens, so an app author gets a
- * coherent look without picking a single raw colour -- and restyling the whole
- * OS is one call, ui_theme_use_dark().
- *
- * Aesthetic: restrained, modern, dev-tool -- cool-biased neutrals, hairline
- * borders, soft layered shadows, a single confident indigo accent, generous
- * spacing on an 8px grid. Hierarchy comes from size + weight + colour, not
- * decoration. */
+/* Contour semantic tokens. Surface families, readable text, shared geometry,
+ * typography, materials and motion are coordinated here. Applications use
+ * semantic roles; user preferences are applied by user/lib/appearance.h. */
 
 #include <stdint.h>
 #include "scene.h"   /* struct color */
@@ -21,6 +12,10 @@ struct ui_shadow_spec { float dx, dy, blur; struct color color; };
 
 struct ui_theme {
     /* --- surfaces & lines --- */
+    struct color sidebar, chrome;
+    float control_height, toolbar_height, control_py, control_px;
+    float material_alpha, blur, motion_ms;
+    int reduced_motion, icon_theme, decoration;
     struct color bg;             /* app background */
     struct color surface;        /* cards, panels */
     struct color surface_alt;    /* insets, subtle fills (input wells, hovers) */
@@ -61,6 +56,13 @@ struct ui_theme {
     /* --- fonts (set by the app after loading its .ttf files) --- */
     uint32_t font_regular, font_bold;
 };
+
+struct ui_appearance {
+    int surface_style, density, contrast, transparency, blur, reduce_motion;
+    int radius, shadows, icon_theme, decoration, text_scale;
+    uint32_t surface_rgb;
+};
+void ui_theme_configure(const struct ui_appearance *appearance);
 
 /* The active theme. Never NULL. */
 const struct ui_theme *ui_theme(void);
