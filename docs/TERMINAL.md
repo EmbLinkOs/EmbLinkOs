@@ -195,7 +195,11 @@ GDB inspection observes state; all graphical actions use real QMP input.
 
 ## Remaining milestones
 
-1. **Unix shell compatibility:** supply the missing process/libc semantics for
+The [pipe and child-status foundation](PROCESS_COMPATIBILITY.md) now supplies
+real descriptor pipes, actual-PID waits, retained exit status and a native
+multi-child pipeline witness. It does not yet provide a `posix_spawn` adapter.
+
+1. **Unix shell compatibility:** supply the remaining process/libc semantics for
    a small POSIX shell, prove scripts and pipelines, then port an interactive
    shell such as zsh. Preserve the native structured shell alongside it.
 2. **Job control:** process groups, controlling-terminal rules, Ctrl+Z/`fg`/`bg`

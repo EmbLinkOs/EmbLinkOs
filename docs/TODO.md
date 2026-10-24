@@ -8,7 +8,11 @@
 - [x] Shared controls receive paste commands without key-queue truncation.
 - [ ] Terminal range selection, complete grapheme rendering and modified-key identity.
 - [ ] Terminfo/application compatibility and mouse reporting.
-- [ ] POSIX shell port and the required process/libc compatibility.
+- [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
+- [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
+- [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.
+- [ ] posix_spawn/posix_spawnp action translation, descriptor inheritance policy and explicit starting-directory context.
+- [ ] POSIX shell port and the remaining process/libc compatibility.
 - [ ] Full process-group job control and resize notifications.
 - [ ] Broader developer utilities, Python subprocess and packaged SDK workflows.
 - [ ] SSH, USB serial/debug probes and physical board workflows.

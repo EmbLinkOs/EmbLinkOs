@@ -2137,6 +2137,26 @@
       "featured": true,
       "milestone": "VT screen emulation and cross-application clipboard",
       "historical": false
+    },
+    {
+      "id": "111-process-pipeline-waits",
+      "phase": "Process compatibility foundation",
+      "title": "Pipes and child waits in the native terminal",
+      "caption": "The native process witness passes 203 checks inside Terminal, retaining 32 child statuses and transforming 66,049 bytes through two child processes. It verifies EOF, nonblocking writes, actual PIDs, copyout retry and competing waiters; a following shell command succeeds. This is the spawn-based compatibility foundation, not a ported Unix shell.",
+      "alt": "Pipes and child waits in the native terminal in EmbLinkOS",
+      "file": "111-process-pipeline-waits.png",
+      "capture_date": "2026-10-24",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe; live desktop session",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "994694d591670b7fde24ede85e456e28a47c20ecf0afd157d42546db84009f18",
+      "source_capture": "process-pipeline-and-waits.ppm",
+      "source_sha256": "52f68d17afe9c216da66223e18967687f1fe6c807ca5431ca3ea8679858536fe",
+      "source_commit": "66795c9044a434233392d3269f6a08b2fa7a5929",
+      "featured": true,
+      "milestone": "Descriptor pipes and retained child-status waits",
+      "historical": false
     }
   ]
 }

@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-110 actual EmbLinkOS captures document the original laptop work, its
+111 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions and VT screen emulation. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation and process compatibility. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -13,6 +13,14 @@ Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show t
 merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
+
+## Latest: process compatibility
+
+The native process witness passes 203 checks inside Terminal, retaining 32 child statuses and transforming 66,049 bytes through two child processes. It verifies EOF, nonblocking writes, actual PIDs, copyout retry and competing waiters; a following shell command succeeds. This is the spawn-based compatibility foundation, not a ported Unix shell.
+
+This original-pixel QMP capture uses a disposable UEFI/NVMe live session without a synthetic ACPI fixture.
+
+![Pipes and child waits in the native terminal](111-process-pipeline-waits.png)
 
 ## Latest: full-screen terminal
 

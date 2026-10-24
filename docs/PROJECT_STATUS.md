@@ -1,5 +1,31 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Process compatibility foundation (2026-10-24)
+
+Newlib now has real descriptor `pipe()`, actual-PID `waitpid()` and `wait()`
+on EmbLink's spawn/handle model. Pipes allocate the lowest free slots, honour
+nonblocking mode and preserve small-write atomicity. File status queries report
+actual access modes. Native typed child results separate negative exit values
+from errors, copy status before collection and retain explicitly requested
+statuses under handle pressure. Competing waiters use the shared parent queue
+without losing another child's wakeup. Failed unpublished spawns are cleaned up.
+
+The original pipe syscall keeps its one-argument object-handle contract; new
+calls 149/150 add owned child control and descriptor pipe creation. All 150
+native syscall IDs match the SDK, and capability IDs are unchanged. The
+[process compatibility contract](PROCESS_COMPATIBILITY.md) records behavior,
+validation commands and the remaining descriptor/signal limitations.
+
+This is preparation for a Unix shell port. `posix_spawn` action translation,
+starting-directory handoff, descriptor inheritance policy, process-group job
+control and a POSIX shell itself remain open. The native structured shell and
+`TERM=emlink` remain available. Native acceptance passes 203 checks twice through
+the serial wrapper and again inside Terminal, followed by another shell command.
+Pipes return to their allocation baseline. Legacy handle reclamation, scheduler
+waits, 108 terminal checks and the wider kernel integration suite pass. Production
+pipe state-machine tests pass ASan/UBSan; x86 images and the AArch64 kernel link.
+The [progress gallery](media/laptop-progress/README.md) now has 111 actual captures.
+
 ## Full-screen terminal milestone (2026-10-24)
 
 Terminal now has a bounded VT parser and cell model, primary/alternate screens,
