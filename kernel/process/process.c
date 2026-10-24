@@ -10,6 +10,9 @@
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
 #include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
 #include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
+#include "tty/pty.h"
+#include "../../user/lib/embk_child.h"
+#include "include/usercopy.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/vma.h"
@@ -205,6 +208,7 @@ static struct process *process_alloc(void) {
              * from the previous occupant would make this process born cancelled
              * -- every blocking syscall failing -ECANCELED before it ran a line. */
             process_table[i].cancelled = false;
+            process_table[i].force_terminated=false;
             /* Same reasoning, same hazard: a reused slot must not be born
              * catching interrupts it never asked for, nor holding a backlog
              * of the previous occupant's. */
@@ -501,6 +505,7 @@ static void thread_reap_slot(struct thread *t) {
         return;
     }
 
+    if (t->io_pty) { pty_unpin_locked(t->io_pty); t->io_pty=NULL; }
     vmm_free_kernel_stack(t->kstack_top, KSTACK_SIZE);
     /* A thread that died still holding a declaration gives it back here -- by
      * RECOUNTING, never by decrementing.
@@ -876,7 +881,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
         if (!already_linked) {
             proc->zombie_next = proc->parent->zombie_head;
             proc->parent->zombie_head = proc;
-            wait_queue_wake_one(&proc->parent->child_wait);
+            wait_queue_wake_all(&proc->parent->child_wait);
         }
         return NULL;
     }
@@ -1262,20 +1267,17 @@ static void wake_expired_locked(void) {
  * ignore the flag forever. Escalation to the uncatchable process_kill() is the
  * PARENT's policy, not the kernel's.
  * -------------------------------------------------------------------- */
-int process_cancel(uint32_t pid) {
-    spin_lock(&g_sched_lock);
+int process_cancel_locked(uint32_t pid) {
 
     struct process *proc = process_find(pid);
     if (!proc) {
         /* EINVAL, matching process_handle_resolve()'s answer for a handle that
          * names nothing -- the kernel has no ESRCH. */
-        spin_unlock(&g_sched_lock);
         return -EMBK_EINVAL;
     }
     if (proc->live_thread_count == 0) {
         /* Already gone. Cancelling a corpse is not an error: the requested end
          * state ("it is not running") already holds. */
-        spin_unlock(&g_sched_lock);
         return EMBK_OK;
     }
 
@@ -1294,8 +1296,11 @@ int process_cancel(uint32_t pid) {
         }
     }
 
-    spin_unlock(&g_sched_lock);
     return EMBK_OK;
+}
+
+int process_cancel(uint32_t pid) {
+    sched_lock(); int rc=process_cancel_locked(pid); sched_unlock(); return rc;
 }
 
 /* See the comment on intr_catch in process.h for why this exists alongside
@@ -1388,7 +1393,27 @@ void process_kill_code(uint32_t pid, int code) {
         return;   // already fully exited; nothing left to force
     }
 
+    proc->force_terminated=true;
     end_every_thread_locked(proc, code);
+}
+
+/* No handle was published for this child. Detach before terminating so it
+ * follows the orphan auto-reap path, rather than leaving an unreachable zombie
+ * in the parent's list when all status-retaining handle slots are occupied. */
+void process_abort_spawn(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+    struct process *p=process_find(pid);
+    if(!p || p->parent!=current_process || p->parent_pid!=current_process->pid){spin_unlock(&g_sched_lock);return;}
+    child_list_remove(current_process,p);
+    struct process **link=&current_process->zombie_head;
+    while(*link && *link!=p)link=&(*link)->zombie_next;
+    if(*link)*link=p->zombie_next;
+    p->zombie_next=NULL;p->parent=NULL;p->parent_pid=0;
+    if(!p->live_thread_count) {
+        if(p->running_cpu==-1)process_reap_slot(p);
+        spin_unlock(&g_sched_lock);return;
+    }
+    p->force_terminated=true;end_every_thread_locked(p,-1);
 }
 
 /* END THE WHOLE PROCESS: every thread of `proc`, whoever asked.
@@ -1612,6 +1637,63 @@ int session_list(struct session_row *out, int max) {
  * §17's Phase D item -- replaces the earlier busy-poll sys_wait).
  * -------------------------------------------------------------------- */
 
+/* Child results are copied while still owned by the parent, BEFORE unlinking
+ * the zombie or releasing its handle. Exit codes never occupy the error return.
+ * The scheduler lock also serializes competing waiters and handle reuse. */
+int process_child_control(int selector,unsigned op,unsigned flags,void *user) {
+    bool info=op==EMBK_CHILD_INFO;
+    bool by_pid=op==EMBK_CHILD_WAIT_PID || op==EMBK_CHILD_WAIT_STATUS;
+    bool any=!info && selector==EMBK_CHILD_ANY;
+    if((selector<0 && !any) || (by_pid && selector==0))return -EMBK_ECHILD;
+    uint32_t pinned_pid=0;
+    uint64_t entry_flags=arch_irq_flags();
+    for(;;) {
+        spin_lock(&g_sched_lock);
+        bool found=false;
+        for(int h=0;h<PROC_HANDLE_MAX;h++) {
+            struct proc_handle *owned=&current_process->handles[h];
+            if(!owned->used)continue;
+            if(!any && (by_pid?owned->pid!=(uint32_t)selector:h!=selector))continue;
+            if(pinned_pid && owned->pid!=pinned_pid)continue;
+            struct process *target=process_find(owned->pid);
+            if(!target || target->parent!=current_process || target->parent_pid!=current_process->pid)continue;
+            found=true;if(!any)pinned_pid=owned->pid;
+            struct process **link=&current_process->zombie_head;
+            while(*link && (*link)->pid!=owned->pid)link=&(*link)->zombie_next;
+            bool done=*link && (*link)->running_cpu==-1;
+            if(!done && !info)continue;
+            struct embk_child_result result={.pid=owned->pid,.handle=h,
+                .exit_code=done?target->exit_code:0,
+                .flags=(done?EMBK_CHILD_DONE:0)|(done && target->force_terminated?EMBK_CHILD_KILLED:0)|(owned->retained?EMBK_CHILD_RETAINED:0)};
+            int rc;
+            if(op==EMBK_CHILD_WAIT_STATUS) {
+                /* Native forced termination has no general signal number.
+                 * Map that one disposition to SIGKILL; normal signed exits
+                 * retain the POSIX low eight bits, including exit(-1). */
+                int status=target->force_terminated?9:((unsigned)target->exit_code&255u)<<8;
+                rc=user?copy_to_user(user,&status,sizeof status):0;
+            } else rc=copy_to_user(user,&result,sizeof result);
+            if(rc){spin_unlock(&g_sched_lock);return -EMBK_EFAULT;}
+            if(!info) {
+                struct process *z=*link;*link=z->zombie_next;z->zombie_next=NULL;
+                *owned=(struct proc_handle){0};
+                process_reap_slot(z);
+                /* A second waiter for this child must observe ECHILD rather
+                 * than remaining asleep until an unrelated child exits. */
+                wait_queue_wake_all(&current_process->child_wait);
+            }
+            spin_unlock(&g_sched_lock);
+            return op==EMBK_CHILD_WAIT_STATUS?(int)result.pid:1;
+        }
+        if(!found){spin_unlock(&g_sched_lock);return -EMBK_ECHILD;}
+        if(flags&EMBK_CHILD_NOHANG){spin_unlock(&g_sched_lock);return 0;}
+        if(current_process->cancelled){spin_unlock(&g_sched_lock);return -EMBK_ECANCELED;}
+        wait_queue_block(&current_process->child_wait,current_thread);
+        schedule_locked();
+        arch_irq_restore(entry_flags);
+    }
+}
+
 int process_wait(uint32_t pid) {
     /* Capture the caller's interrupt state ONCE, before anything below
      * touches it. Reason this function -- uniquely -- must do its own
@@ -1735,9 +1817,7 @@ retry:
         /* Resumed (see the entry_flags comment at the top): re-establish
          * the interrupt state our caller actually had, since neither the
          * context switch nor spin_unlock could know it. */
-        if (entry_flags & (1ULL << 9)) {
-            arch_irq_enable();
-        }
+        arch_irq_restore(entry_flags);
     }
 }
 
@@ -2189,31 +2269,36 @@ int thread_resume(uint32_t tid)  { return set_thread_suspended(tid, false); }
  * Ring-3 process handle table (process.h's comment on PROC_HANDLE_MAX).
  * -------------------------------------------------------------------- */
 
-int process_handle_alloc(struct process *owner, uint32_t pid) {
-    for (int i = 0; i < PROC_HANDLE_MAX; i++) {
-        if (!owner->handles[i].used) {
-            owner->handles[i].used = true;
-            owner->handles[i].pid = pid;
-            return i;
-        }
+int process_handle_alloc_retained(struct process *owner,uint32_t pid,bool retained) {
+    spin_lock(&g_sched_lock);
+    for(int i=0;i<PROC_HANDLE_MAX;i++)if(!owner->handles[i].used) {
+        owner->handles[i]=(struct proc_handle){.pid=pid,.used=true,.retained=retained};
+        spin_unlock(&g_sched_lock);return i;
     }
-    return -EMBK_EMFILE;
+    spin_unlock(&g_sched_lock);return -EMBK_EMFILE;
+}
+int process_handle_alloc(struct process *owner,uint32_t pid) {
+    return process_handle_alloc_retained(owner,pid,false);
+}
+int process_handle_resolve(struct process *owner,int handle,uint32_t *out_pid) {
+    spin_lock(&g_sched_lock);
+    int rc=-EMBK_EINVAL;
+    if(handle>=0 && handle<PROC_HANDLE_MAX && owner->handles[handle].used) {
+        *out_pid=owner->handles[handle].pid;rc=0;
+    }
+    spin_unlock(&g_sched_lock);return rc;
+}
+void process_handle_free(struct process *owner,int handle) {
+    spin_lock(&g_sched_lock);
+    if(handle>=0 && handle<PROC_HANDLE_MAX)owner->handles[handle]=(struct proc_handle){0};
+    spin_unlock(&g_sched_lock);
 }
 
-int process_handle_resolve(struct process *owner, int handle, uint32_t *out_pid) {
-    if (handle < 0 || handle >= PROC_HANDLE_MAX || !owner->handles[handle].used) {
-        return -EMBK_EINVAL;
-    }
-    *out_pid = owner->handles[handle].pid;
-    return 0;
-}
-
-void process_handle_free(struct process *owner, int handle) {
-    if (handle < 0 || handle >= PROC_HANDLE_MAX) {
-        return;
-    }
-    owner->handles[handle].used = false;
-    owner->handles[handle].pid = 0;
+void process_handle_free_pid(struct process *owner,int handle,uint32_t pid) {
+    spin_lock(&g_sched_lock);
+    if(handle>=0 && handle<PROC_HANDLE_MAX && owner->handles[handle].used && owner->handles[handle].pid==pid)
+        owner->handles[handle]=(struct proc_handle){0};
+    spin_unlock(&g_sched_lock);
 }
 
 /* Reclaim handle slots that name children which have ALREADY EXITED -- zombies
@@ -2229,15 +2314,17 @@ void process_handle_free(struct process *owner, int handle) {
  * list); that's the only caller (sys_spawn reclaiming its own dead children so
  * a full table doesn't force it to KILL the child it just created). */
 int process_handle_reap_dead(struct process *owner) {
-    int reclaimed = 0;
-    for (int i = 0; i < PROC_HANDLE_MAX; i++) {
-        if (!owner->handles[i].used) continue;
-        uint32_t pid = owner->handles[i].pid;
-        if (process_alive(pid)) continue;     /* still running -- keep its handle */
-        process_wait(pid);                    /* non-blocking here: collect+reap the zombie */
-        owner->handles[i].used = false;
-        owner->handles[i].pid = 0;
-        reclaimed++;
+    int reclaimed=0;
+    for(int i=0;i<PROC_HANDLE_MAX;i++) {
+        spin_lock(&g_sched_lock);
+        struct proc_handle h=owner->handles[i];
+        spin_unlock(&g_sched_lock);
+        if(!h.used || h.retained || process_alive(h.pid))continue;
+        spin_lock(&g_sched_lock);
+        bool take=owner->handles[i].used && !owner->handles[i].retained && owner->handles[i].pid==h.pid;
+        if(take)owner->handles[i]=(struct proc_handle){0};
+        spin_unlock(&g_sched_lock);
+        if(take){process_wait(h.pid);reclaimed++;}
     }
     return reclaimed;
 }
@@ -2321,9 +2408,18 @@ int process_create_env(const char *path, char *const argv[], int argc,
                                EMBK_CAP_INHERIT);
 }
 
-/* Create a new process from an ELF executable, WITH an explicit capability
- * request. process_create_env() below is the requested_caps == EMBK_CAP_INHERIT
- * wrapper. */
+/* A rejected spawn may already own inherited terminal/pipe references.
+ * Release them before its unpublished process slot is reused. */
+static void spawn_discard_fds(struct process *proc) {
+    for (int i=0;i<FD_MAX_OPEN;i++) {
+        struct fd_entry *e=&proc->fds[i];
+        if (e->used && e->ops && e->ops->close) e->ops->close(e);
+        memset(e,0,sizeof *e);
+    }
+}
+
+/* Create a process with an explicit capability request. process_create_env()
+ * above supplies EMBK_CAP_INHERIT for callers using the native default. */
 int process_create_caps(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count,
@@ -2557,6 +2653,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             int fd = fd_open_into(proc, act->target_fd, act->path, act->flags, act->mode);
             if (fd < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return fd;  // fd_open_into failed
             }
@@ -2568,12 +2665,14 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * child. Needs a real spawning process holding the surface. */
             if (!current_thread) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EINVAL;
             }
             int dh = surface_transfer_to(current_process, act->target_fd, proc);
             if (dh < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return dh;  // transfer failed (bad handle / OOM)
             }
@@ -2582,14 +2681,24 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * the channel stays open, only the holder changes (Layer A). */
             if (!current_thread) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EINVAL;
             }
             int dh = channel_transfer_end_to(current_process, act->target_fd, proc);
             if (dh < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return dh;
+            }
+        } else if (act->kind == SPAWN_ACTION_INHERIT_FD) {
+            int rc=fd_inherit_into(proc,act->target_fd,act->src_obj_handle);
+            if (rc<0) {
+                vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
+                proc->pid = 0;
+                return rc;
             }
         } else if (act->kind == SPAWN_ACTION_INSTALL_OBJ) {
             /* Install a byte-stream obj-handle the PARENT holds as a plain fd
@@ -2602,17 +2711,20 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * worse than spawn failing outright (same policy as ACTION_OPEN). */
             if (!current_thread) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EINVAL;
             }
             if (act->src_obj_handle < 0 || act->src_obj_handle >= OBJ_HANDLE_MAX) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EBADF;
             }
             struct obj_handle *oh = &current_process->obj_handles[act->src_obj_handle];
             if (!oh->used) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EBADF;
             }
@@ -2634,9 +2746,12 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             }
             if (irc < 0) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return irc;
             }
+        } else if (act->kind == SPAWN_ACTION_KEEP_STATUS) {
+            /* Consumed atomically when sys_spawn publishes the child handle. */
         } else if (act->kind == SPAWN_ACTION_SET_CAPS) {
             /* Not a file action -- the capability request was already extracted
              * by sys_spawn and applied via requested_caps at creation. Skip it
@@ -2653,12 +2768,14 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             if (!current_process ||
                 !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_DEBUG))) {
                 vmm_destroy_address_space(pml4);
+                spawn_discard_fds(proc);
                 proc->pid = 0;
                 return -EMBK_EPERM;
             }
             want_debug = 1;
         } else {
             vmm_destroy_address_space(pml4);
+            spawn_discard_fds(proc);
             proc->pid = 0;
             return -EMBK_EINVAL;  // unknown spawn action kind
         }
@@ -2677,6 +2794,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                         PROT_READ | PROT_WRITE) != 0) {
         vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_ENOMEM;
     }
@@ -2688,6 +2806,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     if (!stack_phys) {
         vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_ENOMEM;  // Failed to allocate user stack
     }
@@ -2713,6 +2832,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             > PAGE_SIZE) {
         vma_destroy_all(proc);          /* the stack's frame is its object's, not ours to free */
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_E2BIG;
     }
@@ -2775,6 +2895,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         pmm_free_page(stack_phys);
         vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+        spawn_discard_fds(proc);
         proc->pid = 0;
         return -EMBK_EIO;  // Failed to allocate kernel stack
     }
@@ -2805,6 +2926,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
              * child the debugger asked to hold. */
             vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
+            spawn_discard_fds(proc);
             proc->pid = 0;
             return -EMBK_ENOMEM;
         }
@@ -3798,9 +3920,7 @@ retry:
         }
         wait_queue_block(&proc->join_wait, current_thread);
         schedule_locked();
-        if (entry_flags & (1ULL << 9)) {
-            arch_irq_enable();
-        }
+        arch_irq_restore(entry_flags);
     }
 }
 

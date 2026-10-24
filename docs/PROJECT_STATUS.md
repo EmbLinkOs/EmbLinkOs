@@ -1,5 +1,77 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Process compatibility foundation (2026-10-24)
+
+Newlib now has real descriptor `pipe()`, actual-PID `waitpid()` and `wait()`
+on EmbLink's spawn/handle model. Pipes allocate the lowest free slots, honour
+nonblocking mode and preserve small-write atomicity. File status queries report
+actual access modes. Native typed child results separate negative exit values
+from errors, copy status before collection and retain explicitly requested
+statuses under handle pressure. Competing waiters use the shared parent queue
+without losing another child's wakeup. Failed unpublished spawns are cleaned up.
+
+The original pipe syscall keeps its one-argument object-handle contract; new
+calls 149/150 add owned child control and descriptor pipe creation. All 150
+native syscall IDs match the SDK, and capability IDs are unchanged. The
+[process compatibility contract](PROCESS_COMPATIBILITY.md) records behavior,
+validation commands and the remaining descriptor/signal limitations.
+
+This is preparation for a Unix shell port. `posix_spawn` action translation,
+starting-directory handoff, descriptor inheritance policy, process-group job
+control and a POSIX shell itself remain open. The native structured shell and
+`TERM=emlink` remain available. Native acceptance passes 203 checks twice through
+the serial wrapper and again inside Terminal, followed by another shell command.
+Pipes return to their allocation baseline. Legacy handle reclamation, scheduler
+waits, 108 terminal checks and the wider kernel integration suite pass. Production
+pipe state-machine tests pass ASan/UBSan; x86 images and the AArch64 kernel link.
+The [progress gallery](media/laptop-progress/README.md) now has 111 actual captures.
+
+## Full-screen terminal milestone (2026-10-24)
+
+Terminal now has a bounded VT parser and cell model, primary/alternate screens,
+cursor and line editing, scroll regions, Unicode widths, SGR colour and live
+resizing. A retained fixed-cell renderer follows desktop appearance and scaling.
+Screen copy, safe prompt paste and application-controlled bracketed paste work
+across applications. The native prompt retains history and completion.
+
+A real ring-3 screen witness passes cursor-key selection, confined scrolling,
+cursor-position reply round trips, live dimensions, cross-app multiline paste,
+plain screen copy and primary-output restoration. Host VT parser/resize tests
+pass AddressSanitizer/UBSan. The private-terminal regression still passes all
+108 guest checks, with zero leaked devices, plus cooked/raw input, interruption,
+independent windows, EOF and close cleanup.
+
+Clipboard commands now reach focused fields/editors without overflowing the
+key queue. Long multiline replacement and undo stay within document bounds;
+retained selection highlights clear after collapse. Note++ validates the full
+clipboard length. Shared control and rendering suites pass sanitizer checks.
+
+This remains `TERM=emlink`, with a native structured shell. Unix process/libc
+compatibility, a POSIX shell port, job control, complete modified navigation,
+range selection and broader VT compatibility remain open. The
+[terminal contract](TERMINAL.md) separates implemented operations from limits.
+The [progress gallery](media/laptop-progress/README.md) includes actual guest
+screenshots; no physical-laptop or upstream shell compatibility is implied.
+
+## Interactive terminal sessions (2026-10-24)
+
+Terminal now launches the native shell on a private pseudo-terminal. Programs
+can choose canonical/raw input, receive keys without Enter, query measured
+window dimensions and use a per-device foreground Ctrl+C route. The native
+prompt retains its local history/completion/editor. Independent terminal
+sessions no longer depend on the global console discipline.
+
+Descriptor transfer, EOF records, nonblocking queue pressure, hangup and
+hard-killed I/O cleanup pass 108 real guest checks. Host state-machine and shell
+suites pass, including PTY AddressSanitizer/UBSan coverage. Native graphical
+acceptance verifies real cooked/raw input, Ctrl-letter/navigation distinction,
+interruptions, separate sessions and active-close cleanup. The ABI has 148
+unique calls; existing syscall and capability IDs retain their values.
+
+Broader VT compatibility, POSIX job control and a Unix shell port remain next.
+Contract and limitations: [TERMINAL.md](TERMINAL.md). Four new original-pixel
+captures extend the [progress gallery](media/laptop-progress/README.md).
+
 ## Keyboard interaction milestone (2026-10-24)
 
 Shared fields and controls support Tab/Shift+Tab with queued modifier snapshots,

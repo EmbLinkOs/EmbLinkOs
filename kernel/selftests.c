@@ -26,6 +26,7 @@
 #include "mm/pmm.h"
 #include "lib/ksym.h"         /* test debugsym: the panic symbolizer */
 #include "tty/tty.h"
+#include "tty/pty.h"
 #include "drivers/input/keyboard.h"
 #include "ipc/clipboard.h"                   /* test session: whose the clipboard is */
 #include "process/ksync.h"
@@ -606,6 +607,7 @@ static void selftests_print_commands(void)
     kprintf("  test usb\n");
     kprintf("  test gpu\n");
     kprintf("  test tty\n");
+    kprintf("  test process-compat\n");
     kprintf("  test dirtree\n");
     kprintf("  test layout\n");
 }
@@ -10682,6 +10684,28 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[cmd] test dirtree: %s (%d/%d)\n",
                 fail == 0 ? "OK" : "FAIL", pass, pass + fail);
         #undef DCHK
+        return 1;
+    }
+
+    if (strcmp(cmd,"test process-compat")==0) {
+        unsigned before=pipe_live_count();
+        char *argv[]={"/data/apps/processprobe/processprobe.elf",NULL};
+        int pid=process_create(argv[0],argv,1,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pipe_live_count();
+        kprintf("\n[cmd] test process-compat: exit=%d, pipes=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd,"test terminal")==0) {
+        unsigned before=pty_live_count();
+        char *argv[]={"/data/apps/ttyprobe/ttyprobe.elf","--selftest",NULL};
+        int pid=process_create(argv[0],argv,2,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pty_live_count();
+        kprintf("\n[cmd] test terminal: exit=%d, live=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");
         return 1;
     }
 

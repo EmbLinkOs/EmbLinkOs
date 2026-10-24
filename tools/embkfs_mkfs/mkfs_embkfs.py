@@ -1073,6 +1073,15 @@ def discover_userland_objects(build_dir="build"):
     # header-free toys. ~140 files, ~1.1 MB.
     objects.extend(_tree_objects(NEWLIB_INC, b"system/abi/include/", ".h"))
     objects.extend(_tree_objects(TCC_INC, b"data/apps/tcc/include/", ".h"))
+    # The installed SDK must use the same terminal declarations as the host
+    # build. Replace newlib's forwarding termios header (its target header is
+    # absent here), rather than packing two files with the same name.
+    for relative in ("termios.h", "sys/ioctl.h"):
+        header = _read_file("user/lib/" + relative)
+        if header is not None:
+            path = b"system/abi/include/" + relative.encode()
+            objects = [obj for obj in objects if obj[0] != path]
+            objects.append((path, L.DT_REG, L.S_IFREG | L.PERM_FILE, header))
 
     # EmbCC self-hosting fixed point (EmbCC M3, `test embcc self`): its OWN
     # source tree (preserving src/ subdirs so the relative quote-includes
@@ -1102,6 +1111,15 @@ def discover_userland_objects(build_dir="build"):
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".c"))
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".h"))
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".asm"))
+    # Shared wire declarations keep their relative location beside kernel/.
+    # In particular tty/pty.h includes ../../user/lib/embk_terminal.h. This
+    # also preserves the existing power/session/desktop header dependencies.
+    for filename in sorted(os.listdir("user/lib")):
+        if filename.startswith("embk_") and filename.endswith(".h"):
+            header = _read_file("user/lib/" + filename)
+            if header is not None:
+                objects.append((b"data/src/user/lib/" + filename.encode(),
+                                L.DT_REG, L.S_IFREG | L.PERM_FILE, header))
     kld = _read_file("kernel/linker.ld")
     if kld is not None:
         objects.append((b"data/src/kernel/linker.ld",
@@ -1288,6 +1306,8 @@ def discover_userland_objects(build_dir="build"):
                         # declaring the ABI joins the ABI (BUILD.md's rule).
                         ("user/lib/document.h",            b"system/abi/include/document.h"),
                         ("user/lib/embk_desktop.h",        b"system/abi/include/embk_desktop.h"),
+                        ("user/lib/embk_terminal.h",       b"system/abi/include/embk_terminal.h"),
+                        ("user/lib/embk_child.h",          b"system/abi/include/embk_child.h"),
                         ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
                         ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
                         ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),

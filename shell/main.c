@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <termios.h>
 
 
 #define LINE_MAX_LEN 512
@@ -38,6 +39,13 @@
  * fd_is_fifo, for the same reason: ride the standard stat shape the newlib stub 
  *already fills. */
 static int g_console_session = 0;
+static int g_terminal_session = 0;
+static struct termios g_prompt_attr;
+
+void shell_interrupt_route(int handle) {
+    if (g_terminal_session) (void)embk_terminal_foreground(0,handle);
+    else if (g_console_session) (void)embk_console_interrupt_route(handle);
+}
 
 static bool stdin_is_console(void) {
     struct stat st;
@@ -52,10 +60,19 @@ static bool stdin_is_console(void) {
  * so eval_extern can call them unconditionally. */
 void shell_tty_suspend(void) {
     if (g_console_session) embk_tty_mode(EMBK_TTY_COOKED);
+    if (g_terminal_session) {
+        struct termios child=g_prompt_attr; child.c_lflag|=ICANON|ECHO|ISIG;
+        (void)tcsetattr(0,TCSANOW,&child);
+    }
 }
 
 void shell_tty_resume(void) {
     if (g_console_session) embk_tty_mode(EMBK_TTY_RAW);
+    if (g_terminal_session) {
+        struct termios active=g_prompt_attr; active.c_lflag|=ISIG;
+        (void)tcsetattr(0,TCSANOW,&active);
+        shell_interrupt_route(EMBK_TERMINAL_SELF);
+    }
 }
 
 static void puts1(const char *s) { write(1, s, strlen(s)); }
@@ -139,20 +156,24 @@ static int run_program(const char *src, struct scope *top) {
     }
     if (prog->n == 0) { block_free(prog); return 0; }   /* blank input */
 
-    /* Claim ^C for the duration. Only when we own the console session: under
-     * the Terminal app or `-c`, the route belongs to whoever spawned us and
-     * taking it would interrupt the wrong thing. */
-    if (g_console_session) {
+    /* Catch our own command loops on the actual terminal session. A pipe
+     * does not imply ownership of the machine console's interrupt route. */
+    if (g_console_session || g_terminal_session) {
         (void)embk_intr_take();                 /* drop anything stale */
         (void)embk_intr_catch(1);
-        (void)embk_console_interrupt_route(EMBK_INTR_ROUTE_SELF);
+        shell_interrupt_route(EMBK_INTR_ROUTE_SELF);
+        if (g_terminal_session) {
+            struct termios active=g_prompt_attr; active.c_lflag|=ISIG;
+            (void)tcsetattr(0,TCSANOW,&active);
+        }
     }
 
     struct exec_out out = { FLOW_NORMAL, value_null(), false };
     int rc = block_exec(prog, top, print_sink, NULL, &out);
 
-    if (g_console_session) {
-        (void)embk_console_interrupt_route(-1); /* ^C is a byte again */
+    if (g_console_session || g_terminal_session) {
+        shell_interrupt_route(-1);
+        if (g_terminal_session) (void)tcsetattr(0,TCSANOW,&g_prompt_attr);
         (void)embk_intr_catch(0);
     }
 
@@ -342,7 +363,9 @@ int main(int argc, char **argv) {
     seed_default_env();
 
 
-    if (stdin_is_console()) {
+    if (tcgetattr(0,&g_prompt_attr)==0) {
+        g_terminal_session=1;
+    } else if (stdin_is_console()) {
         embk_tty_mode(EMBK_TTY_RAW);
         /* At OUR prompt, ^C is a LINE-EDIT key (kill the input line), NOT a
          * cancellation -- so route it to NOBODY, which makes it arrive as the
@@ -402,11 +425,20 @@ int main(int argc, char **argv) {
         } else {
             char cwd[192];
             if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
-            puts1("\x10"); puts1(cwd); puts1("\n");
+            const char *integration=getenv("EMBLINK_PROMPT");
+            if (integration && !strcmp(integration,"1")) {
+                /* OSC shell integration, distinct from ordinary C0 bytes and
+                 * terminated without adding a row to the terminal screen. */
+                for (char *p=cwd;*p;p++) if ((unsigned char)*p<32 || (unsigned char)*p==127) *p='?';
+                puts1("\033[?1049l\033[?1l\033[?2004l\033[?25h\033[0m");
+                puts1("\033]133;A;cwd="); puts1(cwd); puts1("\007");
+            } else puts1("embk> ");
         }
         int n = read_line(line, sizeof line);
         if (n < 0) break;                      /* console EOF/error: leave */
         if (strcmp(line, "exit") == 0) break;
+        const char *integration=getenv("EMBLINK_PROMPT");
+        if (integration && !strcmp(integration,"1")) puts1("\033]133;C\007");
         (void)run_line(line, &top);
     }
     if (g_console_session) embk_tty_mode(EMBK_TTY_COOKED);

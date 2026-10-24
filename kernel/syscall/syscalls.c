@@ -36,6 +36,7 @@
 #include "../../user/lib/embk_gpu.h"
 #include "block/partition.h"
 #define EMBK_DISK_IS_PARTITION 1u
+#include "../../user/lib/embk_child.h"
 #include "ipc/pipe.h"          /* sys_pipe: pipe_create */
 #include "drivers/timer/rtc.h"
 #include "drivers/timer/hpet.h"
@@ -50,6 +51,7 @@
 #include "process/futex.h"
 #include "process/debug.h"   /* sys_debug_* handlers for the table below */
 #include "tty/tty.h"
+#include "tty/pty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
 #include "ipc/clipboard.h"
@@ -280,19 +282,30 @@ static int64_t sys_close(const struct sysargs *a) {
  * a child at spawn. On a copy_to_user fault both handles are released via
  * the kind dispatch (which drops the pipe refs), so a bad pointer can't leak
  * a pipe. */
+static int64_t pipe_create_user(void *user_out,bool as_fds) {
+    int handles[2],fds[2]={-1,-1};
+    int rc=pipe_create(&handles[0],&handles[1]);
+    if(rc)return rc;
+    if(as_fds) {
+        for(int i=0;i<2;i++) {
+            struct pipe_end *pe=current_process->obj_handles[handles[i]].obj;
+            fds[i]=fd_install_pipe_any(current_process,pe->p,pe->side);
+            if(fds[i]<0){rc=fds[i];break;}
+        }
+    }
+    if(!rc && copy_to_user(user_out,as_fds?fds:handles,sizeof handles))rc=-EMBK_EFAULT;
+    if(as_fds || rc)for(int i=0;i<2;i++)obj_handle_free(current_process,handles[i]);
+    if(rc && as_fds)for(int i=0;i<2;i++)if(fds[i]>=0)vfs_close(fds[i]);
+    return rc;
+}
+
+/* Separate call IDs preserve the original single-argument pipe ABI: unused
+ * argument registers in existing binaries are not feature flags. */
 static int64_t sys_pipe(const struct sysargs *a) {
-    uint64_t user_out = a->arg[0];    /* int[2]: {read_handle, write_handle} */
-    int handles[2];
-    int rc = pipe_create(&handles[0], &handles[1]);
-    if (rc != EMBK_OK) {
-        return rc;
-    }
-    if (copy_to_user((void *)user_out, handles, sizeof handles) != EMBK_OK) {
-        obj_handle_free(current_process, handles[0]);   /* dispatch drops the refs */
-        obj_handle_free(current_process, handles[1]);
-        return -EMBK_EFAULT;
-    }
-    return 0;
+    return pipe_create_user((void *)(uintptr_t)a->arg[0],false);
+}
+static int64_t sys_pipe_fds(const struct sysargs *a) {
+    return pipe_create_user((void *)(uintptr_t)a->arg[0],true);
 }
 
 /* handle_close(h) -> 0, or -errno. Release ONE obj-handle through the
@@ -369,6 +382,13 @@ static int64_t sys_fcntl(const struct sysargs *a) {
     }
     case 2:
         return vfs_fd_set_nonblock(fd, arg != 0);
+    case 3: {
+        int fl=vfs_fd_get_flags(fd);
+        if(fl<0)return fl;
+        /* Stable wire flags: access mode in bits 0..1, nonblocking in bit 2.
+         * libc O_NONBLOCK has a different value from the native fd flag. */
+        return (fl&O_ACCMODE)|((fl&O_NONBLOCK)?4:0);
+    }
     default:
         return -EMBK_EINVAL;
     }
@@ -870,7 +890,9 @@ static int64_t sys_spawn(const struct sysargs *a) {
         return pid;   // -errno from process_create_env()
     }
     
-    int handle = process_handle_alloc(current_process, (uint32_t)pid);
+    bool retained=false;
+    for(int i=0;i<n_count;i++)if(actions_kernel[i].kind==SPAWN_ACTION_KEEP_STATUS)retained=true;
+    int handle = process_handle_alloc_retained(current_process,(uint32_t)pid,retained);
     if (handle < 0) {
         /* Table full -- almost always because the caller spawned children and
          * never wait()'d the dead ones, leaking a handle slot each. Reclaim any
@@ -878,14 +900,13 @@ static int64_t sys_spawn(const struct sysargs *a) {
          * then retry, so a leak-filled table doesn't force us to KILL the valid
          * child we just created. */
         if (process_handle_reap_dead(current_process) > 0) {
-            handle = process_handle_alloc(current_process, (uint32_t)pid);
+            handle = process_handle_alloc_retained(current_process,(uint32_t)pid,retained);
         }
     }
     if (handle < 0) {
-        /* Genuinely at capacity -- every handle names a still-LIVE child, so
-         * there's no slot to name this one and (with no init-reaper for
-         * orphans) leaving it unnamed would leak it. Kill it and report EMFILE. */
-        process_kill((uint32_t)pid);
+        /* All slots name live children or retained statuses. The unpublished
+         * child must be detached and terminated without leaving a zombie. */
+        process_abort_spawn((uint32_t)pid);
         return handle;   // -EMBK_EMFILE
     }
     return handle;
@@ -908,7 +929,7 @@ static int64_t sys_wait(const struct sysargs *a) {
     }
 
     int code = process_wait(pid);
-    process_handle_free(current_process, handle);
+    process_handle_free_pid(current_process,handle,pid);
     return code;
 }
 
@@ -1461,6 +1482,38 @@ static int64_t sys_win_restore(const struct sysargs *a) {
 }
 
 #include "../../user/lib/embk_desktop.h"
+/* terminal(fd, op, buffer, bytes): all device authority comes from the fd.
+ * OPEN allocates a private pair and rolls back both descriptors on copyout. */
+static int64_t sys_child(const struct sysargs *a) {
+    _Static_assert(sizeof(struct embk_child_result)==16,"child status wire layout");
+    unsigned op=(unsigned)a->arg[1],flags=(unsigned)a->arg[4];
+    void *user=(void *)(uintptr_t)a->arg[2];size_t bytes=(size_t)a->arg[3];
+    if(op>EMBK_CHILD_WAIT_STATUS || (flags&~EMBK_CHILD_NOHANG) || (op==EMBK_CHILD_INFO && flags))return -EMBK_EINVAL;
+    size_t expected=op==EMBK_CHILD_WAIT_STATUS?(user?sizeof(int):0):sizeof(struct embk_child_result);
+    if(bytes!=expected)return -EMBK_EINVAL;
+    return process_child_control((int)a->arg[0],op,flags,user);
+}
+
+static int64_t sys_terminal(const struct sysargs *a) {
+    int fd=(int)a->arg[0]; unsigned op=(unsigned)a->arg[1];
+    void *user=(void *)(uintptr_t)a->arg[2]; size_t bytes=(size_t)a->arg[3];
+    union { struct embk_terminal_attr attr; struct embk_terminal_size size; int pair[2]; int handle; } data;
+    size_t expected;
+    if (op==EMBK_TERMINAL_OPEN) expected=sizeof data.pair;
+    else if (op>=EMBK_TERMINAL_GET_ATTR && op<=EMBK_TERMINAL_SET_ATTR_FLUSH) expected=sizeof data.attr;
+    else if (op==EMBK_TERMINAL_GET_SIZE || op==EMBK_TERMINAL_SET_SIZE) expected=sizeof data.size;
+    else if (op==EMBK_TERMINAL_FOREGROUND) expected=sizeof data.handle;
+    else return -EMBK_EINVAL;
+    if (bytes!=expected) return -EMBK_EINVAL;
+    bool get=op==EMBK_TERMINAL_OPEN || op==EMBK_TERMINAL_GET_ATTR || op==EMBK_TERMINAL_GET_SIZE;
+    if (!get && copy_from_user(&data,user,expected)!=0) return -EMBK_EFAULT;
+    int rc=op==EMBK_TERMINAL_OPEN?fd_alloc_pty(data.pair):fd_terminal_control(fd,op,&data);
+    if (!rc && get && copy_to_user(user,&data,expected)!=0) {
+        if (op==EMBK_TERMINAL_OPEN) { vfs_close(data.pair[0]); vfs_close(data.pair[1]); }
+        return -EMBK_EFAULT;
+    }
+    return rc;
+}
 static int64_t sys_desktop_control(const struct sysargs *a) {
     int cg=cap_gate(EMBK_CAP_GPU);if(cg)return cg;
     if(a->arg[0]>EMBK_DESKTOP_MOVE_FRONT || a->arg[2]!=sizeof(struct embk_desktop))return -EMBK_EINVAL;
@@ -2869,6 +2922,9 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_close_ack] = sys_win_close_ack,
     [SYS_key_poll_input] = sys_key_poll_input,
     [SYS_desktop_control] = sys_desktop_control,
+    [SYS_terminal] = sys_terminal,
+    [SYS_child] = sys_child,
+    [SYS_pipe_fds] = sys_pipe_fds,
     [SYS_win_blur_rect]  = sys_win_blur_rect,
     [SYS_win_restore]    = sys_win_restore,
     [SYS_win_minimize]   = sys_win_minimize,

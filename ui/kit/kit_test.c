@@ -361,6 +361,13 @@ int main(void) {
     CHECK(!strcmp(clip_text(), "world"), "Shift+Left selects, and copy puts it on the clipboard");
     CHECK(!strcmp(A, "hello world"), "copying does not change the text");
 
+    clip_set("a\r\nb\tc",6);frame(SALL "\xFF");
+    CHECK(!strcmp(A,"a b c") && !subA,"field paste replaces selection and cannot submit or traverse");
+    frame("!");CHECK(!strcmp(A,"a b c!"),"field paste collapses selection at the new caret");
+    memset(g_clip,'x',100);g_clip_n=100;frame(SALL "\xFF");
+    CHECK(!strcmp(A,"a b c!"),"oversized field paste keeps the original text");
+    frame("hello world");frame(SLEFT SLEFT SLEFT SLEFT SLEFT);
+
     frame("W");
     CHECK(!strcmp(A, "hello W"), "typing REPLACES the selection");
 

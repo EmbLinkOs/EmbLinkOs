@@ -8,6 +8,7 @@
 #include "include/kstring.h"
 #include "process/process.h"
 #include "tty/tty.h"
+#include "tty/pty.h"
 #include "process/ksync.h"            /* per-process fd-table mutex (fdlock/fdunlock) */
 #include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
@@ -750,6 +751,24 @@ int vfs_fd_inherit(int fd, struct fd_entry *dst)
     return src->ops->inherit(dst, src);
 }
 
+/* Explicit descriptor transfer at spawn. No ambient descriptor inheritance
+ * beyond stdio; the source is resolved in the spawning process's own table. */
+int fd_inherit_into(struct process *target,int target_fd,int source_fd) {
+    if (!current_thread || !target || target==current_process) return -EMBK_EINVAL;
+    if (target_fd<0 || target_fd>=FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry copy;
+    fdlock(current_process);
+    int rc=vfs_fd_inherit(source_fd,&copy);
+    fdunlock(current_process);
+    if (rc) return rc;
+    fdlock(target);
+    struct fd_entry old=target->fds[target_fd];
+    target->fds[target_fd]=copy;
+    fdunlock(target);
+    if (old.used && old.ops && old.ops->close) old.ops->close(&old);
+    return 0;
+}
+
 int vfs_close(int fd)
 {
     if (fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN)
@@ -1309,11 +1328,11 @@ static const struct fd_ops nulldev_fd_ops = {
 static int pipe_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
     if (e->u.pipe.side != 0) return -EMBK_EBADF;    /* direction enforced at the
                                                       * op, per the one-kind design */
-    return pipe_read(e->u.pipe.p, buf, len, out);
+    return pipe_read_flags(e->u.pipe.p,buf,len,out,(e->flags&O_NONBLOCK)!=0);
 }
 static int pipe_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
     if (e->u.pipe.side != 1) return -EMBK_EBADF;
-    return pipe_write(e->u.pipe.p, buf, len, out);
+    return pipe_write_flags(e->u.pipe.p,buf,len,out,(e->flags&O_NONBLOCK)!=0,true);
 }
 static int pipe_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *out) {
     (void)e;(void)d;(void)w;(void)out; return -EMBK_ESPIPE;
@@ -1360,14 +1379,19 @@ static const struct fd_ops pipe_fd_ops = {
  * would be properly unref'd rather than leaked). Runs UNLOCKED (spawn's
  * file-actions loop, ordinary syscall context), hence ops->close, and the
  * self-contained sched_lock around the ref bump. */
-int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side)
+static int install_pipe(struct process *target, int target_fd, struct pipe *p, int side)
 {
     if (!target || !p || (side != 0 && side != 1))
         return -EMBK_EINVAL;
-    if (target_fd < FD_BASE || target_fd >= FD_BASE + FD_MAX_OPEN)
+    if (target_fd < -1 || target_fd >= FD_BASE + FD_MAX_OPEN)
         return -EMBK_EBADF;
 
     fdlock(target);             /* same rule as fd_open_into: target's table, atomic redirect */
+    if (target_fd==-1) {
+        for(target_fd=FD_BASE;target_fd<FD_BASE+FD_MAX_OPEN;target_fd++)
+            if(!target->fds[target_fd-FD_BASE].used)break;
+        if(target_fd==FD_BASE+FD_MAX_OPEN){fdunlock(target);return -EMBK_EMFILE;}
+    }
     struct fd_entry *e = &target->fds[target_fd - FD_BASE];
     if (e->used && e->ops && e->ops->close)
         e->ops->close(e);
@@ -1387,9 +1411,17 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
                                  * Fresh g_sched_lock, not nested under fd_lock. */
     sched_unlock();
     fdunlock(target);
-    return EMBK_OK;
+    return target_fd;
 }
 
+
+int fd_install_pipe(struct process *target,int fd,struct pipe *p,int side) {
+    if(fd<FD_BASE)return -EMBK_EBADF;
+    int rc=install_pipe(target,fd,p,side);return rc<0?rc:EMBK_OK;
+}
+int fd_install_pipe_any(struct process *target,struct pipe *p,int side) {
+    return install_pipe(target,-1,p,side);
+}
 
 /* ---- FD_BACKING_SOCKET: a TCP connection as a read/write fd (M4) --------- */
 static int sock_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
@@ -1793,4 +1825,84 @@ int vfs_fd_run_selftests(void)
 
     kprintf("FD: selftest: OK (incl. O_TRUNC + mtime + rmdir)\n");
     return EMBK_OK;
+}
+
+/* A PTY operation pins the object independently of descriptors. Closing the
+ * last peer fd therefore wakes a blocked operation immediately, while the pin
+ * keeps its storage alive until the operation unwinds. */
+static int pty_hold(struct fd_entry *e,struct fd_entry *copy) {
+    if (!current_thread) return -EMBK_ENOTTY;
+    fdlock(current_process);
+    if (!e || !e->used) { fdunlock(current_process); return -EMBK_EBADF; }
+    if (e->backing!=FD_BACKING_PTY) { fdunlock(current_process); return -EMBK_ENOTTY; }
+    *copy=*e;
+    sched_lock();
+    pty_pin_locked(copy->u.pty.p); current_thread->io_pty=copy->u.pty.p;
+    sched_unlock();
+    fdunlock(current_process); return 0;
+}
+static void pty_drop(struct fd_entry *e) {
+    sched_lock(); current_thread->io_pty=NULL; pty_unpin_locked(e->u.pty.p); sched_unlock();
+}
+static int pty_fd_read(struct fd_entry *e,void *buf,size_t len,size_t *out) {
+    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
+    rc=pty_read(held.u.pty.p,held.u.pty.side,buf,len,out,(held.flags&O_NONBLOCK)!=0);
+    pty_drop(&held); return rc;
+}
+static int pty_fd_write(struct fd_entry *e,const void *buf,size_t len,size_t *out) {
+    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
+    rc=pty_write(held.u.pty.p,held.u.pty.side,buf,len,out,(held.flags&O_NONBLOCK)!=0);
+    pty_drop(&held); return rc;
+}
+static int pty_fd_fstat(struct fd_entry *e,struct vfs_stat *out) {
+    (void)e; memset(out,0,sizeof *out); out->type=VFS_DT_CHAR; out->mode=0600; return 0;
+}
+static int pty_fd_inherit(struct fd_entry *dst,const struct fd_entry *src) {
+    sched_lock(); pty_ref_locked(src->u.pty.p,src->u.pty.side); sched_unlock();
+    *dst=*src; return 0;
+}
+static void pty_fd_close_locked(struct fd_entry *e) { pty_unref_locked(e->u.pty.p,e->u.pty.side); }
+static void pty_fd_close(struct fd_entry *e) { sched_lock(); pty_fd_close_locked(e); sched_unlock(); }
+static int64_t pty_fd_avail(struct fd_entry *e) {
+    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
+    int64_t n=pty_avail(held.u.pty.p,held.u.pty.side); pty_drop(&held); return n;
+}
+static int pty_fd_poll(struct fd_entry *e,int events) {
+    struct fd_entry held; int rc=pty_hold(e,&held); if (rc) return rc;
+    int n=pty_poll(held.u.pty.p,held.u.pty.side,events); pty_drop(&held); return n;
+}
+static const struct fd_ops pty_fd_ops={
+    .read=pty_fd_read,.write=pty_fd_write,.seek=pipe_fd_seek,.fstat=pty_fd_fstat,
+    .inherit=pty_fd_inherit,.close=pty_fd_close,.close_locked=pty_fd_close_locked,
+    .avail=pty_fd_avail,.poll=pty_fd_poll,
+};
+int fd_alloc_pty(int pair[2]) {
+    if (!current_thread) return -EMBK_EINVAL;
+    fdlock(current_process);
+    int fds[2],n=0;
+    for (int i=FD_STDIO_MAX;i<FD_MAX_OPEN && n<2;i++) if (!current_process->fds[i].used) fds[n++]=i;
+    if (n<2) { fdunlock(current_process); return -EMBK_EMFILE; }
+    struct pty *p; int rc=pty_create(&p);
+    if (!rc) for (int side=0;side<2;side++) {
+        struct fd_entry *e=&current_process->fds[fds[side]];
+        memset(e,0,sizeof *e); e->used=true; e->backing=FD_BACKING_PTY;
+        e->ops=&pty_fd_ops; e->flags=O_RDWR; e->u.pty.p=p; e->u.pty.side=side;
+        pair[side]=fds[side];
+    }
+    fdunlock(current_process); return rc;
+}
+int fd_terminal_control(int fd,unsigned op,void *data) {
+    if (!current_thread) return -EMBK_ENOTTY;
+    struct fd_entry held;
+    if (fd<0 || fd>=FD_MAX_OPEN) return -EMBK_EBADF;
+    int rc=pty_hold(&current_process->fds[fd],&held); if (rc) return rc;
+    uint32_t pid=0;
+    if (op==EMBK_TERMINAL_FOREGROUND) {
+        int handle=*(int *)data;
+        if (handle==EMBK_TERMINAL_SELF) pid=current_process->pid;
+        else if (handle!=EMBK_TERMINAL_NONE && process_handle_resolve(current_process,handle,&pid)!=0) rc=-EMBK_EINVAL;
+        data=&pid;
+    }
+    if (!rc) rc=pty_control(held.u.pty.p,held.u.pty.side,op,data);
+    pty_drop(&held); return rc;
 }

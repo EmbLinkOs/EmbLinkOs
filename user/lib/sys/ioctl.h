@@ -1,13 +1,13 @@
 /* sys/ioctl.h -- EmbLink override header (newlib ships none).
  *
- * One caller matters today: git asks TIOCGWINSZ for the terminal size to wrap
- * its output. ioctl() is defined in syscalls.c and REFUSES (ENOSYS) -- the
- * console has no winsize protocol yet, and a fabricated 80x24 would be a guess
- * dressed as a measurement. Callers fall back to their defaults honestly. */
+ * PTY dimensions are measured by Terminal and shared with child programs.
+ * The legacy machine console has no winsize protocol and refuses queries. */
+
 #ifndef _EMBK_SYS_IOCTL_H
 #define _EMBK_SYS_IOCTL_H
 
 #define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
 
 struct winsize {
     unsigned short ws_row;

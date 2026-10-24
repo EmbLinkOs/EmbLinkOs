@@ -184,6 +184,10 @@ void ui_clipboard_provider(int (*set)(const char *buf, unsigned len),
  * ask whether there is one. */
 int ui_clipboard_set(const char *buf, unsigned len);
 int ui_clipboard_get(char *buf, unsigned cap);
+/* Read bounded, NUL-terminated text. Single-line controls flatten line breaks
+ * and tabs; multiline controls retain them. Other C0/DEL bytes are discarded.
+ * An over-capacity clipboard returns -1, never a partial paste. */
+int ui_clipboard_text(char *buf, unsigned cap, bool multiline);
 
 /* A CLOCK, installed the same way and for the same reason.
  *

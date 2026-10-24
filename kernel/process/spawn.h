@@ -56,6 +56,8 @@
                                                // child receives it at its first free slot. The
                                                // bootstrap for two-process channel tests.
 #define SPAWN_ACTION_INSTALL_OBJ     4         // install a byte-stream obj-handle (a pipe end)
+#define SPAWN_ACTION_KEEP_STATUS    10        // preserve this child status under handle pressure
+#define SPAWN_ACTION_INHERIT_FD      9         // src_obj_handle is a PARENT fd; target_fd is child's
 #define SPAWN_ACTION_DEBUG           6         // born under debug, stopped before _start
                                                // (EMBDBG_Specification.md §6.2). Needs the
                                                // spawner to hold EMBK_CAP_DEBUG; the child is

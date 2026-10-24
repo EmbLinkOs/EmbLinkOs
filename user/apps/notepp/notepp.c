@@ -396,14 +396,16 @@ static int on_key(int ch) {
         return 1;
     }
 
-    /* PASTE, taken raw. The runtime would otherwise replay the clipboard
-     * through this hook with newlines flattened to spaces, which is the right
-     * rule for a terminal and turns a pasted function into one long line here.
-     * Taking 0x16 (Ctrl+V) and EMBK_KEY_PASTE (GUI+V) ourselves keeps the line
-     * breaks. */
+    /* This editor owns multiline paste. The kernel reports the full held
+     * length, even if a smaller destination was supplied. Cover the session's
+     * 64 KiB clipboard and validate before using that length as an index. */
     if (ch == 0x16 || ch == EMBK_KEY_PASTE) {
-        static char clip[8192];
+        static char clip[65537];
         int64_t n = embk_clip_get(clip, sizeof clip - 1);
+        if (n >= (int64_t)sizeof clip) {
+            snprintf(g_msg,sizeof g_msg,"Clipboard text is too large to paste.");
+            return 1;
+        }
         if (n > 0) {
             clip[n] = 0;
             ed_insert_text(&ED, clip, (int)n);

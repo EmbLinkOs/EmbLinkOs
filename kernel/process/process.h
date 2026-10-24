@@ -97,12 +97,13 @@ enum process_state {
  * spawn-and-forget parent (one that never wait()s its dead children) leaks a
  * slot per dead child; process_handle_reap_dead() reclaims those on pressure so
  * a full table self-heals instead of sys_spawn having to kill its new child --
- * this cap is therefore the limit on simultaneously-LIVE children, not a leak
- * ceiling. 32 gives a launcher comfortable headroom (256 B/process). */
+ * explicitly retained child statuses are excluded from reclamation and keep
+ * their slots until collected. The bound includes live and retained children. */
 #define PROC_HANDLE_MAX 32
 struct proc_handle {
     uint32_t pid;
     bool used;
+    bool retained; /* explicit spawn request: never discard an uncollected status */
 };
 
 /* Intrusive wait queue: blocked THREADS are linked through their own
@@ -411,6 +412,9 @@ struct thread {
                              * only given an environment when its parent passes
                              * one (see spawn.h). Guarded by has_argv, which is
                              * set on the same path. */
+    /* A blocking PTY syscall pins storage independently of descriptors.
+     * Reaping a hard-killed thread must release the pin its stack cannot. */
+    struct pty *io_pty;
 };
 
 /* The resource owner: address space, pid, parent/child tracking, fd/handle
@@ -647,6 +651,7 @@ struct process {
      * one process's own children. */
     struct wait_queue join_wait;
 
+    bool force_terminated;     /* distinguish a hard kill from exit(-1) */
     int exit_code;             /**< Exit code once every thread has exited (meaningful only then) */
 
     /* EmbDBG v2 lifetime history: lapic ticks when this process was created
@@ -876,6 +881,8 @@ void wait_queue_wake_all(struct wait_queue *wq);
  * @return EMBK_OK, or -EMBK_EINVAL if no such process.
  */
 int process_cancel(uint32_t pid);
+/* Same cancellation under an already-held scheduler lock (PTY hangup/reap). */
+int process_cancel_locked(uint32_t pid);
 
 /* Raise a counted interrupt on `pid` if it has opted in (intr_catch), waking
  * its blocked threads exactly as a cancellation does so a sleeper notices.
@@ -1587,5 +1594,13 @@ static inline struct process *current_process_atomic(void) {
  * thread's owner", never what any caller wanted. */
 #define current_thread  (current_thread_atomic())
 #define current_process (current_process_atomic())
+
+
+/* Explicit child-status control. Copies the result before reaping, so a bad
+ * userspace destination cannot consume a status. See embk_child.h for the ABI. */
+int process_child_control(int selector,unsigned op,unsigned flags,void *user);
+int process_handle_alloc_retained(struct process *owner,uint32_t pid,bool retained);
+void process_abort_spawn(uint32_t pid);
+void process_handle_free_pid(struct process *owner,int handle,uint32_t pid);
 
 #endif /* __PROCESS_H__ */
