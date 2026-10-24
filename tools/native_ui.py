@@ -81,12 +81,15 @@ for i in range(1,count):
     x,y,w,h=bounds(index);_,_,_,_,alpha,skip,_=world(index)
     if alpha<.1 or skip or w<=0 or h<=0 or x+w<=0 or y+h<=0 or x>={window['cw']} or y>={window['ch']}:continue
     parent=uint(a,offsets['i_parent']);ancestors=[];valid=True
+    visible=[max(0,x),max(0,y),min({window['cw']},x+w),min({window['ch']},y+h)]
     for step in range(10):
         if not parent or parent>=count:break
         p=instance(parent);ni=uint(p,offsets['i_scene']);r=bounds(ni);pn=node(ni)
-        if pn[offsets['n_clip']] and (x+w<=r[0] or y+h<=r[1] or x>=r[0]+r[2] or y>=r[1]+r[3]):valid=False;break
+        if pn[offsets['n_clip']]:
+            visible=[max(visible[0],r[0]),max(visible[1],r[1]),min(visible[2],r[0]+r[2]),min(visible[3],r[1]+r[3])]
+            if visible[2]<=visible[0] or visible[3]<=visible[1]:valid=False;break
         ancestors.append(r);parent=uint(p,offsets['i_parent'])
-    if valid:rows.append({{'text':a[offsets['i_text']:offsets['i_text']+256].split(b'\\0',1)[0].decode('utf-8','replace'),'rect':[x,y,w,h],'parents':ancestors}})
+    if valid:rows.append({{'text':a[offsets['i_text']:offsets['i_text']+256].split(b'\\0',1)[0].decode('utf-8','replace'),'rect':[x,y,w,h],'visible_rect':[visible[0],visible[1],visible[2]-visible[0],visible[3]-visible[1]],'parents':ancestors}})
 if {diagnostic!r}:
     states={{}}
     for key in ['g_hovered','g_clicked','g_active','g_focused']:
@@ -109,10 +112,10 @@ print('RESULT '+json.dumps(rows))''')
     def click_text(self,w,label,rightmost=False):
         rows=[r for r in self.labels(w) if r['text']==label]
         if not rows:raise AssertionError('visible label missing: '+label)
-        r=(max if rightmost else min)(rows,key=lambda r:r['rect'][0])['rect'];self.d.click(int(w['x']+r[0]+r[2]/2),int(w['y']+r[1]+r[3]/2))
+        r=(max if rightmost else min)(rows,key=lambda r:r['rect'][0])['visible_rect'];self.d.click(int(w['x']+r[0]+r[2]/2),int(w['y']+r[1]+r[3]/2))
     def reveal(self,w,label):
         for _ in range(20):
-            if any(r['text']==label for r in self.labels(w)):return
+            if any(r['text']==label and r['visible_rect'][3]>=r['rect'][3]-1 for r in self.labels(w)):return
             self.scroll(w,2)
         raise AssertionError('could not scroll to visible label: '+label)
     def select(self,w,title,label):

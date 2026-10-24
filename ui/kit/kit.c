@@ -276,6 +276,7 @@ float ui_slider(float value) {
     ui_set_align(ALIGN_CENTER);
     ui_set_border(0,t->border);
     ui_control_interact(self);
+    if(ui_has_focus(self))ui_focus_own_horizontal(self);
     out+=g_control_adjustment*.05f;if(out<0)out=0;if(out>1)out=1;
     value=out;
     ui_box_begin(0);                          /* filled leading portion */
@@ -854,6 +855,7 @@ bool ui_control_interact(struct instance_handle self) {
         }
     }
     if(focused) {
+        ui_focus_own_horizontal(INSTANCE_HANDLE_NULL);
         if(keys){n=g_carry_n;memcpy(in,g_carry,(size_t)n*sizeof *in);g_carry_n=0;}
         if(keys!=1)n+=ui_input_take_keys(in+n,(int)(sizeof in/sizeof in[0])-n);
         for(int i=0;i<n;i++) {
@@ -893,6 +895,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     bool eligible=trav_enter(self,&key_mode);keys=key_mode;
     if(eligible && autofocus && !ui_any_focus())ui_request_focus(self);
     bool focused = ui_has_focus(self);
+    if(focused)ui_focus_own_horizontal(self);
 
     /* THE CARET FOLLOWS FOCUS, and a click puts it where the pointer is.
      *

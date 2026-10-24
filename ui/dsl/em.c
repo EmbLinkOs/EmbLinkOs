@@ -3407,6 +3407,7 @@ int em_menu_key(int code) {
     if(code==UI_KEY_UP || code==UI_KEY_DOWN) {
         ui_focus_move(code==UI_KEY_UP?-1:1);em_request_frame();return 1;
     }
+    if((code==UI_KEY_LEFT || code==UI_KEY_RIGHT || code==UI_KEY_HOME || code==UI_KEY_END) && ui_focus_owns_horizontal())return 0;
     if(code==UI_KEY_HOME || code==UI_KEY_END) {
         ui_focus_edge(code==UI_KEY_END);em_request_frame();return 1;
     }

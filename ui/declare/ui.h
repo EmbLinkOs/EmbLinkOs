@@ -147,6 +147,8 @@ bool ui_has_focus(struct instance_handle h);
 bool ui_any_focus(void);       /* is ANY text field focused? (app key hooks) */
 bool ui_focus_register(struct instance_handle h);
 struct instance_handle ui_focus_previous(struct instance_handle h);
+void ui_focus_own_horizontal(struct instance_handle h);
+bool ui_focus_owns_horizontal(void);
 bool ui_focus_move(int direction);              /* cycle the active scope */
 bool ui_focus_edge(bool last);
 #define UI_FOCUS_MENU 1u

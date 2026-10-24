@@ -224,6 +224,7 @@ static void modal_frame(void) {
     em_flush();ui_frame_end();ui_run_layout(400,400);
 }
 static int menu_action;
+static float menu_level=.5f;
 static void menu_frame(void) {
     ui_frame_begin();em_new_frame();
     VStack(.key="menu-navigation") {
@@ -238,7 +239,7 @@ static void menu_frame(void) {
                 if(MenuItem("Copy"))menu_action=4;
                 if(MenuItem("Paste"))menu_action=5;
             }
-            Menu("Tools") {if(Button("Hidden action").clicked())menu_action=6;}
+            Menu("Tools") {if(Button("Hidden action").clicked())menu_action=6;Slider(&menu_level);}
         }
     }
     em_flush();ui_frame_end();ui_run_layout(500,500);
@@ -282,6 +283,13 @@ static void navigation_regressions(void) {
     ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
     CHECK(em_menu_key(27),"Escape dismisses a menu without reaching the application");menu_frame();menu_frame();
     CHECK(!em_menu_any_open(),"Escape leaves the menu closed");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    em_menu_key(UI_KEY_LEFT);menu_frame();menu_frame(); /* File -> Tools */
+    ui_input_char('\t');menu_frame();menu_frame();
+    CHECK(!em_menu_key(UI_KEY_RIGHT),"a focused menu slider retains its horizontal adjustment keys");
+    ui_input_char(UI_KEY_RIGHT);menu_frame();menu_frame();
+    CHECK(menu_level>.54f && menu_level<.56f,"Right adjusts a menu slider without switching menus");
+    em_menu_dismiss();menu_frame();menu_frame();
     ui_request_focus(INSTANCE_HANDLE_NULL);context_frame();context_frame();
     ui_input_char(UI_KEY_SEL_ALL);context_frame();
     em_feed_pointer(50,15,0,1,0,1);context_frame();

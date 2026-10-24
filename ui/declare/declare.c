@@ -94,7 +94,7 @@ static struct { struct instance_handle root,restore,first; uint64_t seen; unsign
 static unsigned g_focus_depth;
 static bool g_focus_redraw;
 static uint64_t g_focus_context,g_focus_sequence;
-static struct instance_handle g_deferred_focus;
+static struct instance_handle g_deferred_focus,g_horizontal_focus;
 static unsigned char g_deferred_key;
 static void focus_frame_end(void);
 
@@ -1197,6 +1197,10 @@ bool ui_focus_edge(bool last) {
         if(focus_allowed(h)){ui_request_focus(h);return true;}
     }
     return false;
+}
+void ui_focus_own_horizontal(struct instance_handle h) {g_horizontal_focus=h;}
+bool ui_focus_owns_horizontal(void) {
+    return ui_any_focus() && g_horizontal_focus.index==g_focused.index && g_horizontal_focus.generation==g_focused.generation;
 }
 bool ui_focus_move(int direction) {
     unsigned list=g_cursor_top<0?1:0,n=g_focus_counts[list];if(!n)return false;

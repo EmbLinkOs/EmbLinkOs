@@ -18,7 +18,9 @@ def main():
     def scalar(app,w,name):return int.from_bytes(d.read(app,w['pid'],name,1 if name=='g_reset_confirm' else 4),'little',signed=True)
     def doc(w):return d.read('edit',w['pid'],'g_doc',256).split(b'\0',1)[0].decode()
     def focus(w,label):
-        target=ui.text(w,label)['rect'];chain=ui.labels(w,True)['g_focused']
+        rows=[r for r in ui.labels(w) if r['text']==label]
+        if not rows:return False
+        target=rows[0]['rect'];chain=ui.labels(w,True)['g_focused']
         if not chain:return False
         x,y,width,height=chain[0]['rect']
         return x<=target[0]+1 and y<=target[1]+1 and x+width>=target[0]+target[2]-1 and y+height>=target[1]+target[3]-1
