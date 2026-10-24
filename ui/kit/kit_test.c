@@ -52,7 +52,7 @@ static const char *clip_text(void) {
 }
 static char A[32], B[32], C[32];
 static bool subA, subB, subC;
-static bool show_b = true, autofocus = true;
+static bool show_b = true, show_c=true, autofocus = true;
 static uint64_t page = 0x1111;            /* a keyed container: a new key is a new page */
 
 static void form(void) {
@@ -60,7 +60,7 @@ static void form(void) {
       if (autofocus) ui_text_field_autofocus();
       ui_text_field(A, sizeof A, "a");  subA = ui_text_field_submitted();
       if (show_b) { ui_text_field(B, sizeof B, "b");  subB = ui_text_field_submitted(); }
-      ui_password_field(C, sizeof C, "c"); subC = ui_text_field_submitted();
+      if(show_c){ui_password_field(C, sizeof C, "c"); subC = ui_text_field_submitted();}
     ui_end_stack();
 }
 static void frame(const char *keys) {
@@ -224,8 +224,8 @@ int main(void) {
     frame("x");
     CHECK(!strcmp(A, "testerx"), "Tab in the LAST field wraps to the first");
 
-    /* Hiding one field is NOT a new page: identity is positional, so the
-     * field after it inherits its instance -- and its focus. */
+    /* Removing a field preserves focus continuity within the same form,
+     * while keeping the surviving field's own identity. */
     frame("\t");                          /* focus to B */
     show_b = false;
     frame(NULL);
@@ -775,6 +775,19 @@ int main(void) {
     CHECK(nav_scroll==manual_scroll,"manual scrolling is not pinned to an unchanged focused control");
     for(unsigned i=0;i<8;i++){ui_input_key('\t',UI_MOD_SHIFT);scroll_controls();scroll_controls();}
     CHECK(nav_scroll<1,"reverse Tab reveals the first control again");
+
+    page=0xD15A;show_b=autofocus=true;A[0]=B[0]=C[0]=0;
+    frame(NULL);frame(NULL);frame("\t\t");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_char('x');frame(NULL);
+    show_b=false;frame(NULL);
+    CHECK(!ui_keyboard_pending(),"removing a deferred traversal target stops pending builds");
+    frame(NULL);CHECK(!A[0] && !C[0],"keys for a removed target do not replay into another field");
+
+    page=0xD15B;show_b=show_c=autofocus=true;
+    frame(NULL);frame(NULL);frame("\t\t");
+    ui_input_key('\t',UI_MOD_SHIFT);frame(NULL);
+    show_b=show_c=false;frame(NULL);
+    CHECK(!ui_keyboard_pending(),"a destroyed transfer target cannot leave an idle application rebuilding forever");
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

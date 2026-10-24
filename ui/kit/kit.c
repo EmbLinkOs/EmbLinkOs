@@ -411,7 +411,13 @@ static struct instance_handle g_carry_target;
 static uint64_t g_carry_frame,g_trav_scope;
 static int g_control_navigation;
 int ui_control_navigation(void){return g_control_navigation;}
-bool ui_keyboard_pending(void){return g_tab_pending || g_focus_first || g_carry_target.index;}
+bool ui_keyboard_pending(void) {
+    if((g_carry_target.index && !instance_resolve(g_carry_target)) ||
+       (!ui_any_focus() && (g_tab_pending || g_focus_first || g_carry_target.index))) {
+        g_tab_pending=g_focus_first=false;g_carry_target=INSTANCE_HANDLE_NULL;g_carry_n=0;
+    }
+    return g_tab_pending || g_focus_first || g_carry_target.index;
+}
 static float g_field_next_width,g_field_next_height;
 void ui_text_field_next_size(float width,float height) {g_field_next_width=width;g_field_next_height=height;}
 static bool     g_autofocus_next;         /* see ui_text_field_autofocus */
@@ -880,7 +886,8 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     g_emph_on = false;                    /* consumed, whether or not it is used */
     bool autofocus = g_autofocus_next;
     g_autofocus_next = false;             /* one-shot, like the emphasis */
-    ui_box_begin(0);
+    /* The edited buffer is the field identity, including after rows reorder. */
+    ui_box_begin((uint64_t)(uintptr_t)buf);
     struct instance_handle self = ui_open();
     bool clicked = ui_consume_click(self);
     if (clicked) ui_request_focus(self);

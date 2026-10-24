@@ -75,7 +75,8 @@ static struct instance_handle g_clicked;   /* deepest instance a press landed on
  * is the only way an app can tell, and nothing else in the stack remembers. */
 static int g_press_edges;
 static struct instance_handle g_active;    /* instance that owns the current drag (pointer capture) */
-static struct instance_handle g_focused;   /* instance with keyboard focus (text field) */
+static struct instance_handle g_focused;
+static struct instance_handle g_focus_parent;   /* instance with keyboard focus (text field) */
 static bool g_focus_seen;                   /* the focused widget asked this frame */
 static float g_ptr_x, g_ptr_y;
 static bool  g_ptr_down;
@@ -97,6 +98,7 @@ static uint64_t g_focus_context,g_focus_sequence;
 static struct instance_handle g_deferred_focus,g_horizontal_focus;
 static unsigned char g_deferred_key;
 static void focus_frame_end(void);
+static void focus_recover_missing(struct instance_handle parent);
 
 static float g_wheel;                       /* per-frame scroll-wheel delta, consumed by the hovered scroll view */
 static uint32_t g_font;
@@ -950,8 +952,9 @@ void ui_frame_begin(void) {
     g_cursor[++g_cursor_top] = (struct reconcile_cursor){ g_root, INSTANCE_HANDLE_NULL };
 }
 void ui_frame_end(void) {
+    struct instance_handle focus_parent=g_focus_parent;
     sweep_unvisited_children(g_root);
-    focus_frame_end();
+    focus_frame_end();focus_recover_missing(focus_parent);
     g_cursor_top = -1;
     /* a press that landed on no focusable widget clears keyboard focus */
     if (g_press_edge && !g_focus_claimed) g_focused = INSTANCE_HANDLE_NULL;
@@ -1157,6 +1160,7 @@ void ui_request_focus(struct instance_handle h) {
     if(h.index && !focus_allowed(h))return;
     if(h.index!=g_focused.index || h.generation!=g_focused.generation){g_focus_redraw=true;g_focus_sequence++;}
     g_focused=h;g_focus_claimed=true;
+    struct instance *focused=instance_resolve(h);g_focus_parent=focused?focused->parent:INSTANCE_HANDLE_NULL;
 }
 bool ui_any_focus(void) {return focus_allowed(g_focused);}
 bool ui_has_focus(struct instance_handle h) {
@@ -1256,6 +1260,21 @@ bool ui_focus_reveal(float *offset) {
     *offset+=delta;if(*offset<0)*offset=0;g_focus_redraw=true;return true;
 }
 bool ui_focus_needs_frame(void) {bool changed=g_focus_redraw;g_focus_redraw=false;return changed;}
+/* A removed field can hand focus to the next surviving sibling without
+ * handing over its identity or its queued text. A replaced page cannot. */
+static void focus_recover_missing(struct instance_handle parent) {
+    if(!g_focused.index || instance_resolve(g_focused) || !instance_resolve(parent))return;
+    unsigned n=g_focus_counts[0];int old=-1;
+    for(unsigned i=0;i<n;i++)if(g_focus_nodes[0][i].index==g_focused.index &&
+        g_focus_nodes[0][i].generation==g_focused.generation)old=(int)i;
+    if(old<0)return;
+    for(unsigned step=1;step<=n;step++) {
+        struct instance_handle next=g_focus_nodes[0][((unsigned)old+step)%n];
+        if(!focus_allowed(next) || !focus_descendant(parent,next))continue;
+        for(unsigned j=0;j<g_focus_counts[1];j++)if(next.index==g_focus_nodes[1][j].index &&
+            next.generation==g_focus_nodes[1][j].generation){ui_request_focus(next);return;}
+    }
+}
 static void focus_frame_end(void) {
     while(g_focus_depth && (g_focus_scopes[g_focus_depth-1].seen!=g_frame_serial ||
         !instance_resolve(g_focus_scopes[g_focus_depth-1].root))) {
