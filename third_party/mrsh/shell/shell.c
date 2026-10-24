@@ -25,6 +25,7 @@ struct mrsh_state *mrsh_state_create(void) {
 	}
 
 	priv->term_fd = STDIN_FILENO;
+	priv->shell_pid=getpid();
 
 	struct mrsh_state *state = &priv->pub;
 	state->exit = -1;
@@ -157,7 +158,7 @@ void push_frame(struct mrsh_state *state, int argc, const char *argv[]) {
 	next->pub.argc = argc;
 	next->pub.argv = calloc(argc + 1, sizeof(char *));
 	for (int i = 0; i < argc; ++i) {
-		next->pub.argv[i] = strdup(argv[i]);
+		next->pub.argv[i] = strdup(i==0 && state->frame->argc?state->frame->argv[0]:argv[i]);
 	}
 	next->pub.prev = state->frame;
 	state->frame = &next->pub;

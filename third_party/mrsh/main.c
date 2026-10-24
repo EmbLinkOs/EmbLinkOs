@@ -13,10 +13,22 @@
 #include <string.h>
 #include <unistd.h>
 #include "frontend.h"
+#include "native.h"
 
 extern char **environ;
 
 int main(int argc, char *argv[]) {
+    sh_interrupt_init();
+    static char self[512];
+    if(strchr(argv[0],'/')) {
+        if(argv[0][0]=='/')sh_executable=argv[0];
+        else {char cwd[256];if(!getcwd(cwd,sizeof cwd))return 126;snprintf(self,sizeof self,"%s/%s",cwd,argv[0]);sh_executable=self;}
+    }
+    if(argc==3 && !strcmp(argv[1],"--emblink-worker")) {
+        char *end;long fd=strtol(argv[2],&end,10);
+        if(!*argv[2] || *end || fd<3 || fd>=64)return 126;
+        return sh_worker_main((int)fd);
+    }
 	struct mrsh_state *state = mrsh_state_create();
 
 	struct mrsh_init_args init_args = {0};
@@ -29,6 +41,7 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+    if(!mrsh_env_get(state,"PATH",NULL))mrsh_env_set(state,"PATH","/system/bin:/bin",MRSH_VAR_ATTRIB_EXPORT);
 	struct mrsh_buffer parser_buffer = {0};
 	struct mrsh_parser *parser;
 	int fd = -1;
@@ -113,7 +126,7 @@ int main(int argc, char *argv[]) {
 				if (state->interactive) {
 					continue;
 				} else {
-					state->exit = 1;
+					state->exit = 2;
 					break;
 				}
 			} else if (mrsh_parser_eof(parser)) {
@@ -126,9 +139,10 @@ int main(int argc, char *argv[]) {
 			}
 		} else {
 			if ((state->options & MRSH_OPT_NOEXEC)) {
-				mrsh_program_print(prog);
+				/* syntax-only mode: do not execute or print an AST */
 			} else {
-				mrsh_run_program(state, prog);
+                int status=mrsh_run_program(state,prog);
+                if(status<0 && state->exit<0){state->last_status=status==TASK_STATUS_INTERRUPTED?130:1;if(!state->interactive)state->exit=state->last_status;}
 				mrsh_destroy_terminated_jobs(state);
 			}
 			mrsh_buffer_finish(&read_buffer);

@@ -11,46 +11,12 @@
 #include "shell/shell.h"
 #include "shell/task.h"
 #include "shell/trap.h"
+#include "native.h"
 
-static int run_subshell(struct mrsh_context *ctx, struct mrsh_array *array) {
-	struct mrsh_state_priv *priv = state_get_priv(ctx->state);
-
-	pid_t pid = fork();
-	if (pid < 0) {
-		perror("fork");
-		return TASK_STATUS_ERROR;
-	} else if (pid == 0) {
-		priv->child = true;
-
-		reset_caught_traps(ctx->state);
-
-		if (!(ctx->state->options & MRSH_OPT_MONITOR)) {
-			// If job control is disabled, stdin is /dev/null
-			int fd = open("/dev/null", O_CLOEXEC | O_RDONLY);
-			if (fd < 0) {
-				fprintf(stderr, "failed to open /dev/null: %s\n",
-					strerror(errno));
-				exit(1);
-			}
-			if (fd != STDIN_FILENO) {
-				dup2(fd, STDIN_FILENO);
-				close(fd);
-			}
-		}
-
-		int ret = run_command_list_array(ctx, array);
-		if (ret < 0) {
-			exit(127);
-		}
-
-		if (ctx->state->exit >= 0) {
-			exit(ctx->state->exit);
-		}
-		exit(ret);
-	}
-
-	struct mrsh_process *proc = process_create(ctx->state, pid);
-	return job_wait_process(proc);
+static int run_subshell(struct mrsh_context *ctx,struct mrsh_array *array) {
+    struct mrsh_program program={.node.type=MRSH_NODE_PROGRAM,.body=*array};
+    pid_t pid=sh_spawn_worker(ctx->state,&program.node,-1,-1,false);
+    return pid<0?TASK_STATUS_ERROR:sh_wait(pid);
 }
 
 static int run_if_clause(struct mrsh_context *ctx, struct mrsh_if_clause *ic) {
@@ -83,7 +49,7 @@ static int run_loop_clause(struct mrsh_context *ctx, struct mrsh_loop_clause *lc
 			return ret;
 		}
 
-		bool break_loop;
+		bool break_loop=false;
 		switch (lc->type) {
 		case MRSH_LOOP_WHILE:
 			break_loop = ret > 0;
@@ -311,70 +277,19 @@ int run_and_or_list(struct mrsh_context *ctx, struct mrsh_and_or_list *and_or_li
 	abort();
 }
 
-/**
- * Put the process into its job's process group. This has to be done both in the
- * parent and the child because of potential race conditions.
- */
-static struct mrsh_process *init_async_child(struct mrsh_context *ctx, pid_t pid) {
-	struct mrsh_process *proc = process_create(ctx->state, pid);
-
-	if (ctx->state->options & MRSH_OPT_MONITOR) {
-		job_add_process(ctx->job, proc);
-	}
-
-	return proc;
-}
-
 int run_command_list_array(struct mrsh_context *ctx, struct mrsh_array *array) {
 	struct mrsh_state *state = ctx->state;
 	struct mrsh_state_priv *priv = state_get_priv(state);
 
 	int ret = 0;
 	for (size_t i = 0; i < array->len; ++i) {
+        if(sh_interrupted())return TASK_STATUS_INTERRUPTED;
 		struct mrsh_command_list *list = array->data[i];
-		if (list->ampersand) {
-			struct mrsh_context child_ctx = *ctx;
-			child_ctx.background = true;
-			if (child_ctx.job == NULL) {
-				child_ctx.job = job_create(state, &list->node);
-			}
-
-			pid_t pid = fork();
-			if (pid < 0) {
-				perror("fork");
-				return TASK_STATUS_ERROR;
-			} else if (pid == 0) {
-				ctx = NULL; // Use child_ctx instead
-				priv->child = true;
-
-				init_async_child(&child_ctx, getpid());
-				if (state->options & MRSH_OPT_MONITOR) {
-					init_job_child_process(state);
-				}
-
-				if (!(state->options & MRSH_OPT_MONITOR)) {
-					// If job control is disabled, stdin is /dev/null
-					int fd = open("/dev/null", O_CLOEXEC | O_RDONLY);
-					if (fd < 0) {
-						fprintf(stderr, "failed to open /dev/null: %s\n",
-							strerror(errno));
-						exit(1);
-					}
-					if (fd != STDIN_FILENO) {
-						dup2(fd, STDIN_FILENO);
-						close(fd);
-					}
-				}
-
-				int ret = run_and_or_list(&child_ctx, list->and_or_list);
-				if (ret < 0) {
-					exit(127);
-				}
-				exit(ret);
-			}
-
-			ret = 0;
-			init_async_child(&child_ctx, pid);
+        if(list->ampersand) {
+            if(priv->processes.len>=32){fprintf(stderr,"sh: collect background statuses with wait (limit 32)\n");return 2;}
+            pid_t pid=sh_spawn_worker(state,&list->and_or_list->node,-1,-1,true);
+            if(pid<0)return TASK_STATUS_ERROR;
+            process_create(state,pid);priv->last_bg_pid=pid;ret=0;
 		} else {
 			ret = run_and_or_list(ctx, list->and_or_list);
 			if (ret < 0) {
@@ -410,6 +325,7 @@ void mrsh_destroy_terminated_jobs(struct mrsh_state *state) {
 		*previous = job_by_id(state, "%-", false);
 	bool r = rand() % 2 == 0;
 
+	sh_poll_background(state);
 	refresh_jobs_status(state);
 
 	for (size_t i = 0; i < priv->jobs.len; ++i) {

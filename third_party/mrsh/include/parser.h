@@ -58,6 +58,7 @@ struct mrsh_parser {
 
 	struct mrsh_array here_documents;
 	bool continuation_line;
+	size_t here_document_line_end;
 
 	mrsh_parser_alias_func alias;
 	void *alias_user_data;

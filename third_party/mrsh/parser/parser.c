@@ -284,7 +284,7 @@ static void next_symbol(struct mrsh_parser *parser) {
 		}
 	}
 
-	if (isblank(c)) {
+	if (isblank((unsigned char)(c))) {
 		parser_read_char(parser);
 		next_symbol(parser);
 		return;

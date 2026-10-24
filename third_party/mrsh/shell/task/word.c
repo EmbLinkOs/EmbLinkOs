@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <mrsh/buffer.h>
 #include <mrsh/parser.h>
@@ -12,6 +13,7 @@
 #include "builtin.h"
 #include "shell/process.h"
 #include "shell/task.h"
+#include "native.h"
 #include "shell/word.h"
 
 #define READ_SIZE 1024
@@ -36,50 +38,6 @@ static bool buffer_read_from(struct mrsh_buffer *buf, int fd) {
 	return true;
 }
 
-static bool naive_word_streq(struct mrsh_word *word, const char *str) {
-	while (word->type == MRSH_WORD_LIST) {
-		struct mrsh_word_list *wl = mrsh_word_get_list(word);
-		if (wl->children.len != 1) {
-			return false;
-		}
-		word = wl->children.data[0];
-	}
-	if (word->type != MRSH_WORD_STRING) {
-		return false;
-	}
-	struct mrsh_word_string *ws = mrsh_word_get_string(word);
-	return strcmp(ws->str, "trap") == 0;
-}
-
-static bool is_print_traps(struct mrsh_program *program) {
-	if (program->body.len != 1) {
-		return false;
-	}
-	struct mrsh_command_list *cl = program->body.data[0];
-	if (cl->ampersand || cl->and_or_list->type != MRSH_AND_OR_LIST_PIPELINE) {
-		return false;
-	}
-	struct mrsh_pipeline *pipeline =
-		mrsh_and_or_list_get_pipeline(cl->and_or_list);
-	if (pipeline->bang || pipeline->commands.len != 1) {
-		return false;
-	}
-	struct mrsh_command *cmd = pipeline->commands.data[0];
-	if (cmd->type != MRSH_SIMPLE_COMMAND) {
-		return false;
-	}
-	struct mrsh_simple_command *sc = mrsh_command_get_simple_command(cmd);
-	if (sc->name == NULL || !naive_word_streq(sc->name, "trap")) {
-		return false;
-	}
-	if (sc->arguments.len == 1) {
-		struct mrsh_word *arg = sc->arguments.data[0];
-		return naive_word_streq(arg, "--");
-	} else {
-		return sc->arguments.len == 0;
-	}
-}
-
 static void swap_words(struct mrsh_word **word_ptr, struct mrsh_word *new_word) {
 	mrsh_word_destroy(*word_ptr);
 	*word_ptr = new_word;
@@ -94,38 +52,10 @@ static int run_word_command(struct mrsh_context *ctx, struct mrsh_word **word_pt
 		return TASK_STATUS_ERROR;
 	}
 
-	pid_t pid = fork();
-	if (pid < 0) {
-		perror("fork");
-		close(fds[0]);
-		close(fds[1]);
-		return TASK_STATUS_ERROR;
-	} else if (pid == 0) {
-		close(fds[0]);
-
-		if (fds[1] != STDOUT_FILENO) {
-			dup2(fds[1], STDOUT_FILENO);
-			close(fds[1]);
-		}
-
-		init_job_child_process(ctx->state);
-
-		// When a subshell is entered, traps that are not being ignored shall
-		// be set to the default actions, except in the case of a command
-		// substitution containing only a single trap command, when the traps
-		// need not be altered.
-		if (!wc->program || !is_print_traps(wc->program)) {
-			reset_caught_traps(ctx->state);
-		}
-
-		if (wc->program != NULL) {
-			mrsh_run_program(ctx->state, wc->program);
-		}
-
-		exit(ctx->state->exit >= 0 ? ctx->state->exit : 0);
-	}
-
-	struct mrsh_process *process = process_create(ctx->state, pid);
+    fcntl(fds[0],F_SETFD,FD_CLOEXEC);fcntl(fds[1],F_SETFD,FD_CLOEXEC);
+    struct mrsh_program empty={.node.type=MRSH_NODE_PROGRAM};
+    pid_t pid=sh_spawn_worker(ctx->state,wc->program?&wc->program->node:&empty.node,-1,fds[1],false);
+    if(pid<0){close(fds[0]);close(fds[1]);return TASK_STATUS_ERROR;}
 
 	close(fds[1]);
 	int child_fd = fds[0];
@@ -150,7 +80,10 @@ static int run_word_command(struct mrsh_context *ctx, struct mrsh_word **word_pt
 		mrsh_word_string_create(mrsh_buffer_steal(&buf), false);
 	ws->split_fields = true;
 	swap_words(word_ptr, &ws->word);
-	return job_wait_process(process);
+    int status=sh_wait(pid);
+    struct mrsh_state_priv *priv=state_get_priv(ctx->state);
+    priv->did_substitute=true;priv->substitution_status=status;
+    return status;
 }
 
 static const char *parameter_get_value(struct mrsh_state *state,
@@ -174,23 +107,13 @@ static const char *parameter_get_value(struct mrsh_state *state,
 	} else if (strcmp(name, "-") == 0) {
 		return state_get_options(state);
 	} else if (strcmp(name, "$") == 0) {
-		sprintf(value, "%d", (int)getpid());
+		sprintf(value, "%d", (int)priv->shell_pid);
 		return value;
-	} else if (strcmp(name, "!") == 0) {
-		for (ssize_t i = priv->jobs.len - 1; i >= 0; i--) {
-			struct mrsh_job *job = priv->jobs.data[i];
-			if (job->processes.len == 0) {
-				continue;
-			}
-			struct mrsh_process *process =
-				job->processes.data[job->processes.len - 1];
-			sprintf(value, "%d", process->pid);
-			return value;
-		}
-		/* Standard is unclear on what to do in this case, mimic dash */
-		return "";
+    } else if(strcmp(name,"!")==0) {
+        if(!priv->last_bg_pid)return NULL;
+        snprintf(value,sizeof value,"%d",(int)priv->last_bg_pid);return value;
 	} else if (end[0] == '\0' && end != name) {
-		if (lvalue >= state->frame->argc) {
+		if (lvalue < 0 || lvalue >= state->frame->argc) {
 			return NULL;
 		}
 		return state->frame->argv[lvalue];

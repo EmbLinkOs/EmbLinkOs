@@ -4,12 +4,21 @@
 #include <mrsh/shell.h>
 #include <shell/word.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include "builtin.h"
 #include "mrsh_getopt.h"
 
 static const char read_usage[] = "usage: read [-r] var...\n";
+
+/* Read exactly one byte without carrying stdio's prefetched bytes across a
+ * temporary stdin redirection. A later read must see its own descriptor. */
+static int read_byte(void) {
+    unsigned char c;ssize_t n;
+    do{n=read(STDIN_FILENO,&c,1);}while(n<0 && errno==EINTR);
+    return n==1?c:EOF;
+}
 
 int builtin_read(struct mrsh_state *state, int argc, char *argv[]) {
 	bool raw = false;
@@ -35,7 +44,7 @@ int builtin_read(struct mrsh_state *state, int argc, char *argv[]) {
 	struct mrsh_buffer buf = {0};
 	bool escaped = false;
 	int c;
-	while ((c = fgetc(stdin)) != EOF) {
+	while ((c = read_byte()) != EOF) {
 		if (!raw && !escaped && c == '\\') {
 			escaped = true;
 			continue;

@@ -10,6 +10,7 @@
 #include "shell/path.h"
 #include "shell/process.h"
 #include "shell/shell.h"
+#include "native.h"
 
 static const char command_usage[] = "usage: command [-v|-V|-p] "
 	"command_name [argument...]\n";
@@ -57,7 +58,7 @@ static int verify_command(struct mrsh_state *state, const char *command_name,
 	return 1;
 }
 
-static int run_command(struct mrsh_state *state, int argc, char *argv[],
+static int run_command_utility(struct mrsh_state *state, int argc, char *argv[],
 		bool default_path) {
 	if (mrsh_has_builtin(argv[0])) {
 		return mrsh_run_builtin(state, argc - _mrsh_optind, &argv[_mrsh_optind]);
@@ -69,23 +70,7 @@ static int run_command(struct mrsh_state *state, int argc, char *argv[],
 		return 127;
 	}
 
-	// TODO: job control support
-	pid_t pid = fork();
-	if (pid < 0) {
-		perror("fork");
-		return 126;
-	} else if (pid == 0) {
-		execv(path, argv);
-
-		// Something went wrong
-		perror(argv[0]);
-		exit(126);
-	}
-
-	free(path);
-
-	struct mrsh_process *proc = process_create(state, pid);
-	return job_wait_process(proc);
+    int ret=sh_spawn_command(state,path,argv,NULL);free(path);return ret;
 }
 
 int builtin_command(struct mrsh_state *state, int argc, char *argv[]) {
@@ -125,6 +110,6 @@ int builtin_command(struct mrsh_state *state, int argc, char *argv[]) {
 		return verify_command(state, argv[_mrsh_optind], default_path);
 	}
 
-	return run_command(state, argc - _mrsh_optind, &argv[_mrsh_optind],
+	return run_command_utility(state, argc - _mrsh_optind, &argv[_mrsh_optind],
 		default_path);
 }

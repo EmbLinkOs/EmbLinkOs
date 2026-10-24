@@ -788,7 +788,7 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # test binaries). Fonts and the format fixtures are NOT *.elf and are placed
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
-_SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
+_SYSTEM_BIN = {"sh.elf", "init.elf", "primtest.elf", "shell.elf", "home.elf",
                "setup.elf", "login.elf",
                # A SERVICE, not an application: nothing launches filepanel from
                # the dock, apps reach it through /run/emlink.files, and it is
@@ -862,6 +862,8 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf" or name in NOT_AUTO_STAGED:
             continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+        if name == "sh.elf":
+            objects.append((b"system/bin/sh", L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
         # declared namespace as <progdir>/<name>.ns, packed beside its .elf as
         # /data/apps/<name>/<name>.ns. The session (home) reads it and grants

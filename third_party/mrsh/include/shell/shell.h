@@ -55,6 +55,9 @@ struct mrsh_state_priv {
 
 	// TODO: move this to context
 	bool child; // true if we're not the main shell process
+	bool did_substitute;
+	int substitution_status;
+	pid_t shell_pid, last_bg_pid; /* explicit worker identity, not authority */
 };
 
 /**

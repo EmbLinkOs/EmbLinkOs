@@ -15,7 +15,7 @@ static bool parse_char(struct mrsh_parser *parser, char c) {
 }
 
 static bool parse_whitespace(struct mrsh_parser *parser) {
-	if (!isspace(parser_peek_char(parser))) {
+	if (!isspace((unsigned char)parser_peek_char(parser))) {
 		return false;
 	}
 	parser_read_char(parser);
@@ -60,7 +60,7 @@ static size_t peek_literal(struct mrsh_parser *parser) {
 
 		char c = parser->buf.data[i];
 		// TODO: 0x, 0b prefixes
-		if (!isdigit(c)) {
+		if (!isdigit((unsigned char)(c))) {
 			break;
 		}
 

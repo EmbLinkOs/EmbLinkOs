@@ -14,53 +14,9 @@
 #include "shell/task.h"
 
 bool mrsh_set_job_control(struct mrsh_state *state, bool enabled) {
-	struct mrsh_state_priv *priv = state_get_priv(state);
-
-	assert(priv->term_fd >= 0);
-
-	if (priv->job_control == enabled) {
-		return true;
-	}
-
-	if (enabled) {
-		// Loop until we are in the foreground
-		while (true) {
-			pid_t pgid = getpgrp();
-			if (tcgetpgrp(priv->term_fd) == pgid) {
-				break;
-			}
-			kill(-pgid, SIGTTIN);
-		}
-
-		// Ignore interactive and job-control signals
-		set_job_control_traps(state, true);
-
-		// Put ourselves in our own process group, if we aren't the session
-		// leader
-		priv->pgid = getpid();
-		if (getsid(0) != priv->pgid) {
-			if (setpgid(priv->pgid, priv->pgid) != 0) {
-				perror("setpgid");
-				return false;
-			}
-		}
-
-		// Grab control of the terminal
-		if (tcsetpgrp(priv->term_fd, priv->pgid) != 0) {
-			perror("tcsetpgrp");
-			return false;
-		}
-		// Save default terminal attributes for the shell
-		if (tcgetattr(priv->term_fd, &priv->term_modes) != 0) {
-			perror("tcgetattr");
-			return false;
-		}
-	} else {
-		set_job_control_traps(state, false);
-	}
-
-	priv->job_control = enabled;
-	return true;
+    (void)state;
+    if(enabled){fprintf(stderr,"sh: process-group job control is not supported\n");return false;}
+    return true;
 }
 
 static void array_remove(struct mrsh_array *array, size_t i) {
@@ -122,10 +78,12 @@ void job_add_process(struct mrsh_job *job, struct mrsh_process *proc) {
 		job->pgid = proc->pid;
 	}
 	// This can fail because we do it both in the parent and the child
+#ifndef EMBLINK_TARGET
 	if (setpgid(proc->pid, job->pgid) != 0 && errno != EPERM) {
 		perror("setpgid");
 		return;
 	}
+#endif
 	mrsh_array_add(&job->processes, proc);
 }
 
@@ -140,58 +98,8 @@ static void job_queue_notification(struct mrsh_job *job) {
 	job->last_status = status;
 }
 
-bool job_set_foreground(struct mrsh_job *job, bool foreground, bool cont) {
-	struct mrsh_state *state = job->state;
-	struct mrsh_state_priv *priv = state_get_priv(state);
-
-	assert(job->pgid > 0);
-
-	if (!priv->job_control) {
-		return false;
-	}
-
-	// Don't try to continue the job if it's not stopped
-	if (job_poll(job) != TASK_STATUS_STOPPED) {
-		cont = false;
-	}
-
-	if (foreground && priv->foreground_job != job) {
-		assert(priv->foreground_job == NULL);
-		// Put the job in the foreground
-		tcsetpgrp(priv->term_fd, job->pgid);
-		if (cont) {
-			// Restore the job's terminal modes
-			tcsetattr(priv->term_fd, TCSADRAIN, &job->term_modes);
-		}
-		priv->foreground_job = job;
-	}
-
-	if (!foreground && priv->foreground_job == job) {
-		// Put the shell back in the foreground
-		tcsetpgrp(priv->term_fd, priv->pgid);
-		// Save the job's terminal modes, to restore them if it's put in the
-		// foreground again
-		tcgetattr(priv->term_fd, &job->term_modes);
-		// Restore the shell’s terminal modes
-		tcsetattr(priv->term_fd, TCSADRAIN, &priv->term_modes);
-		priv->foreground_job = NULL;
-	}
-
-	if (cont) {
-		if (kill(-job->pgid, SIGCONT) != 0) {
-			perror("kill");
-			return false;
-		}
-
-		for (size_t j = 0; j < job->processes.len; ++j) {
-			struct mrsh_process *proc = job->processes.data[j];
-			proc->stopped = false;
-		}
-	}
-
-	job_queue_notification(job);
-
-	return true;
+bool job_set_foreground(struct mrsh_job *job,bool foreground,bool cont) {
+ (void)job;(void)foreground;(void)cont;return false;
 }
 
 int job_poll(struct mrsh_job *job) {
@@ -225,7 +133,7 @@ static bool _job_wait(struct mrsh_state *state, pid_t pid, int options) {
 	// We only want to be notified about stopped processes in the main
 	// shell. Child processes want to block until their own children have
 	// terminated.
-	if (!priv->child) {
+	if (priv->job_control && !priv->child) {
 		options |= WUNTRACED;
 	}
 

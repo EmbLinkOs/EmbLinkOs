@@ -67,7 +67,7 @@ static size_t peek_alias(struct mrsh_parser *parser) {
 		case '@':
 			break;
 		default:
-			if (!isalnum(c)) {
+			if (!isalnum((unsigned char)(c))) {
 				return 0;
 			}
 		}
@@ -181,24 +181,12 @@ static bool io_file(struct mrsh_parser *parser,
 }
 
 static int io_number(struct mrsh_parser *parser) {
-	if (!symbol(parser, TOKEN)) {
-		return -1;
-	}
-
-	char c = parser_peek_char(parser);
-	if (!isdigit(c)) {
-		return -1;
-	}
-
-	char buf[2];
-	parser_peek(parser, buf, sizeof(buf));
-	if (buf[1] != '<' && buf[1] != '>') {
-		return -1;
-	}
-
-	parser_read_char(parser);
-	consume_symbol(parser);
-	return strtol(buf, NULL, 10);
+    if(!symbol(parser,TOKEN))return -1;
+    size_t n=0;unsigned value=0;char c;
+    for(;;){parser_peek(parser,NULL,n+1);c=parser->buf.data[n];if(!isdigit((unsigned char)c))break;if(value<64)value=value*10+(unsigned)(c-'0');n++;}
+    if(!n || (c!='<' && c!='>'))return -1;
+    if(value>=64){parser_set_error(parser,"descriptor must be in 0..63");return -1;}
+    parser_read(parser,NULL,n);consume_symbol(parser);return (int)value;
 }
 
 static struct mrsh_io_redirect *io_redirect(struct mrsh_parser *parser) {
@@ -829,7 +817,7 @@ static struct mrsh_function_definition *function_definition(
 		char c = parser->buf.data[i];
 		if (c == '(') {
 			break;
-		} else if (!isblank(c)) {
+		} else if (!isblank((unsigned char)(c))) {
 			return NULL;
 		}
 
@@ -1202,6 +1190,7 @@ static bool expect_here_document(struct mrsh_parser *parser,
 		if (strcmp(line, delim) == 0) {
 			if (parser_peek_char(parser) == '\n') {
 				parser_read_char(parser);
+                parser->here_document_line_end=parser->pos.offset;
 			}
 			break;
 		}
@@ -1297,7 +1286,8 @@ static struct mrsh_program *program(struct mrsh_parser *parser) {
 		return NULL;
 	}
 
-	while (newline_list(parser)) {
+	while ((parser->here_document_line_end && parser->pos.offset==parser->here_document_line_end) || newline_list(parser)) {
+        parser->here_document_line_end=0;
 		if (eof(parser)) {
 			return prog;
 		}
@@ -1330,7 +1320,7 @@ struct mrsh_program *mrsh_parse_line(struct mrsh_parser *parser) {
 	if (!expect_complete_command(parser, &prog->body)) {
 		goto error;
 	}
-	if (!eof(parser) && !newline(parser)) {
+	if (!(parser->here_document_line_end && parser->pos.offset==parser->here_document_line_end) && !eof(parser) && !newline(parser)) {
 		parser_set_error(parser, "expected a newline");
 		goto error;
 	}

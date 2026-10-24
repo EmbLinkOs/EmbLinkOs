@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include "builtin.h"
 #include "shell/shell.h"
+#include "native.h"
 
 struct builtin {
 	const char *name;
@@ -92,7 +93,7 @@ static const struct builtin *get_builtin(const char *name) {
 }
 
 bool mrsh_has_builtin(const char *name) {
-	return get_builtin(name) != NULL;
+	return get_builtin(name) != NULL || sh_has_extra_builtin(name);
 }
 
 bool mrsh_has_special_builtin(const char *name) {
@@ -101,6 +102,7 @@ bool mrsh_has_special_builtin(const char *name) {
 }
 
 int mrsh_run_builtin(struct mrsh_state *state, int argc, char *argv[]) {
+    if(sh_has_extra_builtin(argv[0]))return sh_extra_builtin(state,argc,argv);
 	assert(argc > 0);
 
 	const char *name = argv[0];
@@ -116,7 +118,7 @@ void print_escaped(const char *value) {
 	const char safe[] = "@%+=:,./-";
 	size_t i;
 	for (i = 0; value[i] != '\0'; ++i) {
-		if (!isalnum(value[i]) && !strchr(safe, value[i])) {
+		if (!isalnum((unsigned char)(value[i])) && !strchr(safe, value[i])) {
 			break;
 		}
 	}

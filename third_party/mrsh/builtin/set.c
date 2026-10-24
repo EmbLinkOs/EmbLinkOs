@@ -157,6 +157,7 @@ static int set(struct mrsh_state *state, int argc, char *argv[],
 				fprintf(stderr, set_usage);
 				return 1;
 			}
+			if(i+1>=argc){fprintf(stderr,set_usage);return 2;}
 			init_args->command_str = argv[i + 1];
 			++i;
 			break;
@@ -214,8 +215,10 @@ out:
 }
 
 int builtin_set(struct mrsh_state *state, int argc, char *argv[]) {
+    uint32_t previous=state->options;
 	uint32_t populated_opts = 0;
 	int ret = set(state, argc, argv, NULL, &populated_opts);
+    if(state->options&~(MRSH_OPT_ALLEXPORT|MRSH_OPT_NOGLOB|MRSH_OPT_NOEXEC|MRSH_OPT_NOUNSET|MRSH_OPT_XTRACE)){state->options=previous;fprintf(stderr,"set: requested option is not supported by this shell port\n");return 1;}
 	if (ret != 0) {
 		return ret;
 	}
@@ -241,9 +244,8 @@ int mrsh_process_args(struct mrsh_state *state, struct mrsh_init_args *init_args
 
 	state->interactive = isatty(priv->term_fd) &&
 		init_args->command_str == NULL && init_args->command_file == NULL;
-	if (state->interactive && !(populated_opts & MRSH_OPT_MONITOR)) {
-		state->options |= MRSH_OPT_MONITOR;
-	}
+    /* Native child handles do not provide POSIX process-group job control. */
+    if(state->options&~(MRSH_OPT_ALLEXPORT|MRSH_OPT_NOGLOB|MRSH_OPT_NOEXEC|MRSH_OPT_NOUNSET|MRSH_OPT_XTRACE)){fprintf(stderr,"sh: requested option is not supported by this shell port\n");return 1;}
 
 	return 0;
 }

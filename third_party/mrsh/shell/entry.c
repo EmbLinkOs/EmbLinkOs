@@ -81,6 +81,7 @@ char *mrsh_get_ps4(struct mrsh_state *state) {
 bool mrsh_populate_env(struct mrsh_state *state, char **environ) {
 	for (size_t i = 0; environ[i] != NULL; ++i) {
 		char *eql = strchr(environ[i], '=');
+		if(!eql || eql==environ[i])continue;
 		size_t klen = eql - environ[i];
 		char *key = strndup(environ[i], klen);
 		char *val = &eql[1];
@@ -149,7 +150,11 @@ void mrsh_source_env(struct mrsh_state *state) {
 	if (path == NULL) {
 		return;
 	}
+	#ifdef EMBLINK_TARGET
+    if(getuid()!=geteuid()) {
+#else
 	if (getuid() != geteuid() || getgid() != getegid()) {
+#endif
 		return;
 	}
 	path = expand_str(state, path);

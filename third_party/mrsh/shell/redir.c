@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/param.h>
 #include "shell/redir.h"
+#include "native.h"
 
 static ssize_t write_here_document_line(int fd, struct mrsh_word *line,
 		ssize_t max_size) {
@@ -38,59 +39,9 @@ err_write:
 }
 
 static int create_here_document_fd(const struct mrsh_array *lines) {
-	int fds[2];
-	if (pipe(fds) != 0) {
-		perror("pipe");
-		return -1;
-	}
-
-	// We can write at most PIPE_BUF bytes without blocking. If we want to write
-	// more, we need to fork and continue writing in another process.
-	size_t remaining = PIPE_BUF;
-	bool more = false;
-	size_t i;
-	for (i = 0; i < lines->len; ++i) {
-		struct mrsh_word *line = lines->data[i];
-		ssize_t n = write_here_document_line(fds[1], line, remaining);
-		if (n < 0) {
-			close(fds[0]);
-			close(fds[1]);
-			return -1;
-		} else if (n == 0) {
-			more = true;
-			break;
-		}
-	}
-
-	if (!more) {
-		// We could write everything into the pipe buffer
-		close(fds[1]);
-		return fds[0];
-	}
-
-	pid_t pid = fork();
-	if (pid < 0) {
-		perror("fork");
-		close(fds[0]);
-		close(fds[1]);
-		return -1;
-	} else if (pid == 0) {
-		close(fds[0]);
-
-		for (; i < lines->len; ++i) {
-			struct mrsh_word *line = lines->data[i];
-			ssize_t n = write_here_document_line(fds[1], line, -1);
-			if (n < 0) {
-				close(fds[1]);
-				exit(1);
-			}
-		}
-		close(fds[1]);
-		exit(0);
-	}
-
-	close(fds[1]);
-	return fds[0];
+    int fd=sh_anonymous_file();if(fd<0)return -1;
+    for(size_t i=0;i<lines->len;i++)if(write_here_document_line(fd,lines->data[i],-1)<0){close(fd);return -1;}
+    if(lseek(fd,0,SEEK_SET)<0){close(fd);return -1;}return fd;
 }
 
 static int parse_fd(const char *str) {
@@ -153,6 +104,7 @@ int process_redir(const struct mrsh_io_redirect *redir, int *redir_fd) {
 	if (fd < 0) {
 		fprintf(stderr, "cannot open %s: %s\n", filename,
 			strerror(errno));
+        free(filename);
 		return -1;
 	}
 

@@ -226,7 +226,7 @@ void split_fields(struct mrsh_array *fields, const struct mrsh_word *word,
 	char *ifs_non_space = calloc(ifs_len, sizeof(char));
 	size_t ifs_non_space_len = 0;
 	for (size_t i = 0; i < ifs_len; ++i) {
-		if (!isspace(ifs[i])) {
+		if (!isspace((unsigned char)(ifs[i]))) {
 			ifs_non_space[ifs_non_space_len++] = ifs[i];
 		}
 	}
@@ -346,9 +346,9 @@ bool expand_pathnames(struct mrsh_array *expanded,
 		}
 
 		glob_t glob_buf;
-		int ret = glob(pattern, GLOB_NOSORT, NULL, &glob_buf);
+		int ret = glob(pattern, 0, NULL, &glob_buf);
 		if (ret == 0) {
-			for (size_t i = 0; i < glob_buf.gl_pathc; ++i) {
+			for (size_t i = 0; i < (size_t)glob_buf.gl_pathc; ++i) {
 				mrsh_array_add(expanded, strdup(glob_buf.gl_pathv[i]));
 			}
 			globfree(&glob_buf);

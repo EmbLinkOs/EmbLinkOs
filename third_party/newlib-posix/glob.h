@@ -37,6 +37,8 @@
 #define	_GLOB_H_
 
 #include <sys/cdefs.h>
+#define glob sh_glob
+#define globfree sh_globfree
 
 struct stat;
 typedef struct {

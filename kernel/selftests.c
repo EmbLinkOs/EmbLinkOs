@@ -609,6 +609,7 @@ static void selftests_print_commands(void)
     kprintf("  test tty\n");
     kprintf("  test process-compat\n");
     kprintf("  test spawn-compat\n");
+    kprintf("  test posix-shell\n");
     kprintf("  test dirtree\n");
     kprintf("  test layout\n");
 }
@@ -10686,6 +10687,16 @@ int selftests_handle_command(const char *cmd)
                 fail == 0 ? "OK" : "FAIL", pass, pass + fail);
         #undef DCHK
         return 1;
+    }
+
+    if(strcmp(cmd,"test posix-shell")==0) {
+        unsigned before=pipe_live_count();
+        char *argv[]={"/data/apps/shprobe/shprobe.elf",NULL};
+        int pid=process_create(argv[0],argv,1,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pipe_live_count();
+        kprintf("\n[cmd] test posix-shell: exit=%d, pipes=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");return 1;
     }
 
     if(strcmp(cmd,"test spawn-compat")==0) {

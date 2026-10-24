@@ -17,17 +17,6 @@ int builtin_exec(struct mrsh_state *state, int argc, char *argv[]) {
 		return 0;
 	}
 
-	char *path = expand_path(state, argv[_mrsh_optind], false, false);
-	if (path == NULL) {
-		fprintf(stderr, "exec: %s: command not found\n", argv[_mrsh_optind]);
-		return 127;
-	}
-	if (access(path, X_OK) != 0) {
-		fprintf(stderr, "exec: %s: not executable\n", path);
-		return 126;
-	}
-
-	execv(path, &argv[_mrsh_optind]);
-	perror("exec");
-	return 1;
+    fprintf(stderr,"exec: in-place image replacement is not supported\n");
+    return 126;
 }

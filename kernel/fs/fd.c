@@ -926,6 +926,11 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
  * unused here - process_alloc() never populates it, and spawn() POSIX
  * addopen running against a fork()'d tables that might already have entries. */
  int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode){
+    /* A spawn action opens a new object on the parent's authority, just like
+     * sys_open. It must not bypass the filesystem class gate. The parent may
+     * still explicitly transfer an already-held descriptor to a weaker child. */
+    if(current_thread && !(current_process->cap_set&EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM)))
+        return -EMBK_EPERM;
 
     if (!target || !path)
         return -EMBK_EINVAL;

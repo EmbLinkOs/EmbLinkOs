@@ -34,6 +34,7 @@
 #define	_FNMATCH_H_
 
 #include <sys/cdefs.h>
+#define fnmatch sh_fnmatch
 
 #define	FNM_NOMATCH	1	/* Match failed. */
 
@@ -53,3 +54,11 @@ int	 fnmatch(const char *, const char *, int);
 __END_DECLS
 
 #endif /* !_FNMATCH_H_ */
+
+/* GNU extension bits used by the imported matcher. */
+#ifndef FNM_LEADING_DIR
+#define FNM_LEADING_DIR 0x08
+#endif
+#ifndef FNM_CASEFOLD
+#define FNM_CASEFOLD 0x10
+#endif

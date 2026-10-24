@@ -348,85 +348,12 @@ globexp2(ptr, pattern, pglob, rv, limit)
  * expand tilde from the passwd file.
  */
 static const Char *
-globtilde(pattern, patbuf, patbuf_len, pglob)
-	const Char *pattern;
-	Char *patbuf;
-	size_t patbuf_len;
-	glob_t *pglob;
-{
-	struct passwd *pwd;
-	char *h;
-	const Char *p;
-	Char *b, *eb;
-
-	if (*pattern != TILDE || !(pglob->gl_flags & GLOB_TILDE))
-		return pattern;
-
-	/* 
-	 * Copy up to the end of the string or / 
-	 */
-	eb = &patbuf[patbuf_len - 1];
-	for (p = pattern + 1, h = (char *) patbuf;
-	    h < (char *)eb && *p && *p != SLASH; *h++ = *p++)
-		continue;
-
-	*h = EOS;
-
-	if (((char *) patbuf)[0] == EOS) {
-		/*
-		 * handle a plain ~ or ~/ by expanding $HOME first (iff
-		 * we're not running setuid or setgid) and then trying
-		 * the password file
-		 */
-		if (
-#ifndef	__NETBSD_SYSCALLS
-		    issetugid() != 0 ||
-#endif
-		    (h = getenv("HOME")) == NULL) {
-/* If we are not EL/IX level 4, we cannot use getpwxxx interfaces */
-#if !defined(_ELIX_LEVEL) || _ELIX_LEVEL >= 4
-			if (((h = getlogin()) != NULL &&
-			     (pwd = getpwnam(h)) != NULL) ||
-			    (pwd = getpwuid(getuid())) != NULL)
-				h = pwd->pw_dir;
-			else
-#endif /* !_ELIX_LEVEL || _ELIX_LEVEL >= 4 */
-				return pattern;
-		}
-	}
-	else {
-		/*
-		 * Expand a ~user
-		 */
-
-#if !defined(_ELIX_LEVEL) || _ELIX_LEVEL >= 4
-		if ((pwd = getpwnam((char*) patbuf)) != NULL)
-			h = pwd->pw_dir;
-		else
-#endif /* !_ELIX_LEVEL || _ELIX_LEVEL >= 4 */
-			return pattern;
-	}
-
-	/* Copy the home directory */
-	for (b = patbuf; b < eb && *h; *b++ = *h++)
-		continue;
-
-	/* Append the rest of the pattern */
-	while (b < eb && (*b++ = *p++) != EOS)
-		continue;
-	*b = EOS;
-
-	return patbuf;
+globtilde(const Char *pattern,Char *patbuf,size_t size,glob_t *pglob) {
+    /* The shell expands HOME-based tildes before pathname matching. No user
+     * database or set-id identity API is available in this private port. */
+    (void)patbuf;(void)size;(void)pglob;return pattern;
 }
 
-
-/*
- * The main glob() routine: compiles the pattern (optionally processing
- * quotes), calls glob1() to do the real pattern matching, and finally
- * sorts the list (unless unsorted operation is requested).  Returns 0
- * if things went well, nonzero if errors occurred.  It is not an error
- * to find no matches.
- */
 static int
 glob0(pattern, pglob, limit)
 	const Char *pattern;

@@ -61,9 +61,9 @@ size_t peek_name(struct mrsh_parser *parser, bool in_braces) {
 		parser_peek(parser, NULL, i + 1);
 
 		char c = parser->buf.data[i];
-		if (c != '_' && !isalnum(c)) {
+		if (c != '_' && !isalnum((unsigned char)(c))) {
 			break;
-		} else if (i == 0 && isdigit(c) && !in_braces) {
+		} else if (i == 0 && isdigit((unsigned char)(c)) && !in_braces) {
 			break;
 		}
 
@@ -97,7 +97,7 @@ size_t peek_word(struct mrsh_parser *parser, char end) {
 			return 0;
 		}
 
-		if (is_operator_start(c) || isblank(c) || c == end) {
+		if (is_operator_start(c) || isblank((unsigned char)(c)) || c == end) {
 			return i;
 		}
 
@@ -116,7 +116,7 @@ bool token(struct mrsh_parser *parser, const char *str,
 	size_t len = strlen(str);
 	assert(len > 0);
 
-	if (len == 1 && !isalpha(str[0])) {
+	if (len == 1 && !isalpha((unsigned char)str[0])) {
 		if (parser_peek_char(parser) != str[0]) {
 			return false;
 		}
@@ -126,7 +126,7 @@ bool token(struct mrsh_parser *parser, const char *str,
 		if (len != word_len || strncmp(parser->buf.data, str, word_len) != 0) {
 			return false;
 		}
-		// assert(isalpha(str[i]));
+		// assert(isalpha((unsigned char)(str[i])));
 
 		parser_read(parser, NULL, len);
 	}
@@ -191,7 +191,7 @@ static struct mrsh_word *word_list(struct mrsh_parser *parser, char end,
 		struct mrsh_buffer buf = {0};
 		while (true) {
 			char c = parser_peek_char(parser);
-			if (!isblank(c)) {
+			if (!isblank((unsigned char)(c))) {
 				break;
 			}
 			mrsh_buffer_append_char(&buf, parser_read_char(parser));
@@ -218,6 +218,22 @@ static struct mrsh_word *word_list(struct mrsh_parser *parser, char end,
 		struct mrsh_word_list *wl = mrsh_word_list_create(&children, false);
 		return &wl->word;
 	}
+}
+
+/* Parameter names occur inside words, where '#' is a parameter rather than
+ * the beginning of a shell comment. Do not run top-level token classification. */
+static size_t parameter_name_length(struct mrsh_parser *parser,bool braces) {
+    char c=parser_peek_char(parser);if(!c)return 0;
+    if(strchr("@*#?-$!",c))return 1;
+    if(isdigit((unsigned char)c) && !braces)return 1;
+    bool positional=isdigit((unsigned char)c);size_t n=0;
+    while(true){parser_peek(parser,NULL,n+1);c=parser->buf.data[n];if(positional?!isdigit((unsigned char)c):(c!='_' && !isalnum((unsigned char)c)))break;n++;}
+    return n;
+}
+static char *read_parameter_name(struct mrsh_parser *parser,size_t n,struct mrsh_range *range) {
+    char *name=malloc(n+1);if(!name)return NULL;
+    range->begin=parser->pos;parser_read(parser,name,n);name[n]=0;
+    range->end=parser->pos;consume_symbol(parser);return name;
 }
 
 static enum mrsh_word_parameter_op char_to_parameter_op_val(char c) {
@@ -285,21 +301,22 @@ static struct mrsh_word_parameter *expect_parameter_expression(
 
 	enum mrsh_word_parameter_op op = MRSH_PARAM_NONE;
 	struct mrsh_range op_range = {0};
-	if (parser_peek_char(parser) == '#') {
+	char prefix[2]={0};parser_peek(parser,prefix,2);
+	if (prefix[0] == '#' && prefix[1]!='}') {
 		op_range.begin = parser->pos;
 		parser_read_char(parser);
 		op_range.end = parser->pos;
 		op = MRSH_PARAM_LEADING_HASH;
 	}
 
-	size_t name_len = peek_name(parser, true);
+	size_t name_len = parameter_name_length(parser, true);
 	if (name_len == 0) {
 		parser_set_error(parser, "expected a parameter");
 		return NULL;
 	}
 
 	struct mrsh_range name_range;
-	char *name = read_token(parser, name_len, &name_range);
+	char *name = read_parameter_name(parser, name_len, &name_range);
 	if (name == NULL) {
 		return NULL;
 	}
@@ -425,7 +442,7 @@ struct mrsh_word *expect_dollar(struct mrsh_parser *parser) {
 			return &wc->word;
 		}
 	default:; // Parameter expansion in the form `$parameter`
-		size_t name_len = peek_name(parser, false);
+		size_t name_len = parameter_name_length(parser, false);
 		if (name_len == 0) {
 			bool ok = false;
 			switch (c) {
@@ -439,7 +456,7 @@ struct mrsh_word *expect_dollar(struct mrsh_parser *parser) {
 				ok = true;
 				break;
 			default:
-				ok = isdigit(c);
+				ok = isdigit((unsigned char)(c));
 			}
 			if (ok) {
 				name_len = 1;
@@ -452,7 +469,7 @@ struct mrsh_word *expect_dollar(struct mrsh_parser *parser) {
 		}
 
 		struct mrsh_range name_range;
-		char *name = read_token(parser, name_len, &name_range);
+		char *name = read_parameter_name(parser, name_len, &name_range);
 		if (name == NULL) {
 			return NULL;
 		}
@@ -709,7 +726,7 @@ struct mrsh_word *word(struct mrsh_parser *parser, char end) {
 				read_continuation_line(parser);
 				continue;
 			}
-		} else if (is_operator_start(c) || isblank(c)) {
+		} else if (is_operator_start(c) || isblank((unsigned char)(c))) {
 			break;
 		}
 
@@ -758,7 +775,7 @@ struct mrsh_word *arithmetic_word(struct mrsh_parser *parser, char end) {
 		parser_peek(parser, next, sizeof(*next) * 2);
 		c = next[0];
 		if (c == '\0' || c == '\n' || c == ';'
-				|| isblank(c)
+				|| isblank((unsigned char)(c))
 				|| (strcmp(next, "))") == 0 && parser->arith_nested_parens == 0)) {
 			break;
 		}
