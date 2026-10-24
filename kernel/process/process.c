@@ -2277,13 +2277,21 @@ int process_handle_alloc_retained(struct process *owner,uint32_t pid,bool retain
     }
     spin_unlock(&g_sched_lock);return -EMBK_EMFILE;
 }
+int process_handle_publish(struct process *owner,int handle,uint32_t pid,bool retained) {
+    spin_lock(&g_sched_lock);
+    int rc=-EMBK_EINVAL;
+    if(handle>=0 && handle<PROC_HANDLE_MAX && owner->handles[handle].used && !owner->handles[handle].pid) {
+        owner->handles[handle].pid=pid;owner->handles[handle].retained=retained;rc=0;
+    }
+    spin_unlock(&g_sched_lock);return rc;
+}
 int process_handle_alloc(struct process *owner,uint32_t pid) {
     return process_handle_alloc_retained(owner,pid,false);
 }
 int process_handle_resolve(struct process *owner,int handle,uint32_t *out_pid) {
     spin_lock(&g_sched_lock);
     int rc=-EMBK_EINVAL;
-    if(handle>=0 && handle<PROC_HANDLE_MAX && owner->handles[handle].used) {
+    if(handle>=0 && handle<PROC_HANDLE_MAX && owner->handles[handle].used && owner->handles[handle].pid) {
         *out_pid=owner->handles[handle].pid;rc=0;
     }
     spin_unlock(&g_sched_lock);return rc;
@@ -2424,6 +2432,19 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count,
                        uint64_t requested_caps) {
+    if(n_count<0 || n_count>SPAWN_ACTIONS_MAX || (n_count && !actions))return -EMBK_E2BIG;
+    bool compat_fds=false;
+    for(int i=0;i<n_count;i++) {
+        if(actions[i].kind==SPAWN_ACTION_FD_SNAPSHOT) {
+            if(i!=0)return -EMBK_EINVAL;
+            compat_fds=true;
+        }
+        if(actions[i].kind==SPAWN_ACTION_OPEN || actions[i].kind==SPAWN_ACTION_CWD) {
+            size_t n=0;while(n<sizeof actions[i].path && actions[i].path[n])n++;
+            if(n==sizeof actions[i].path)return -EMBK_ENAMETOOLONG;
+            if(actions[i].path[0]!='/')return -EMBK_EINVAL;
+        }
+    }
     /* Count + budget-check envp BEFORE any allocation, so an over-budget request
      * costs nothing and, more importantly, is REJECTED rather than truncated:
      * a child silently missing half its environment is a bug that surfaces far
@@ -2575,6 +2596,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             break;
         }
     }
+    proc->startup_cwd[0]=0;
     proc->zombie_next = NULL;
     proc->vma_list = 0;   /* no mappings until mmap() makes one */
     proc->zombie_head = NULL;
@@ -2596,13 +2618,6 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     memset(proc->handles, 0, sizeof(proc->handles));
     memset(proc->obj_handles, 0, sizeof(proc->obj_handles));
     proc->shared_next_va = proc->layout.shared_base;   /* surface-mapping VA window, its OWN now */
-
-    /* Register ourselves on our parent's live-children list (ps tree view
-     * only -- see child_list's comment in process.h). */
-    if (current_thread) {
-        proc->child_next = current_process->child_list;
-        current_process->child_list = proc;
-    }
 
     // 1. Its own address space (PML4) with the kernel half mapped
     uint64_t pml4 = vmm_create_address_space();
@@ -2641,11 +2656,11 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         return rc;  // image load failed (ELF/EMBX, incl. -EMBK_EPERM for a cap denial)
     }
 
-    fds_init_stdio(proc);
+    if(!compat_fds)fds_init_stdio(proc);
 
-    /* 2.5. Apply file_actions -- give the child its fds before it ever runs.
-     * proc->fds[] is guaranteed empty here (see fd_open_into()'s comment),
-     * so there's nothing to close/overwrite first. */
+    /* 2.5. Ordered actions before user code. Compatibility starts from an
+     * empty table and snapshots under the parent's fd lock; native launchers
+     * retain their inherited/default stdio policy. */
     int want_debug = 0;   /* SPAWN_ACTION_DEBUG seen -> born stopped (below) */
     for (int i = 0; i < n_count; i++) {
         const struct spawn_file_action *act = &actions[i];
@@ -2657,6 +2672,18 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                 proc->pid = 0;
                 return fd;  // fd_open_into failed
             }
+        } else if(act->kind==SPAWN_ACTION_FD_SNAPSHOT || act->kind==SPAWN_ACTION_DUP2 ||
+                  act->kind==SPAWN_ACTION_CLOSE || act->kind==SPAWN_ACTION_CWD) {
+            int rc=0;
+            if(act->kind==SPAWN_ACTION_FD_SNAPSHOT)rc=fd_snapshot_into(proc);
+            else if(act->kind==SPAWN_ACTION_DUP2)rc=fd_dup_into(proc,act->src_obj_handle,act->target_fd);
+            else if(act->kind==SPAWN_ACTION_CLOSE)rc=fd_close_into(proc,act->target_fd);
+            else {
+                struct vnode vn;rc=vfs_resolve(act->path,&vn);
+                if(!rc && vn.type!=VFS_DT_DIR)rc=-EMBK_ENOTDIR;
+                if(!rc)memcpy(proc->startup_cwd,act->path,strlen(act->path)+1);
+            }
+            if(rc<0){vmm_destroy_address_space(pml4);spawn_discard_fds(proc);proc->pid=0;return rc;}
         } else if (act->kind == SPAWN_ACTION_INHERIT_SURFACE) {
             /* Minimal handle_transfer (EmbLink UI Piece 1): dup+map the
              * PARENT's surface (act->target_fd reused as the parent's surface
@@ -2780,6 +2807,8 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             return -EMBK_EINVAL;  // unknown spawn action kind
         }
     }
+
+    if(compat_fds)fd_close_exec(proc);
 
     // 3. The main stack: USER_STACK_PAGES ending with the top page, as ONE
     // anonymous mapping. Demand-paged and zero on first touch -- the eager
@@ -2932,9 +2961,16 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
         proc->debug_session = s;
         /* t->state was left BLOCKED by debug_session_spawn's wait_queue_block. */
-    } else {
-        sched_set_ready(t);
     }
+    /* Failed constructions never enter this list. Link only a complete child,
+     * under the same lock used by exit, tree readers and concurrent spawners. */
+    spin_lock(&g_sched_lock);
+    if(current_thread) {
+        proc->child_next=current_process->child_list;
+        current_process->child_list=proc;
+    }
+    spin_unlock(&g_sched_lock);
+    if(!want_debug)sched_set_ready(t);
     return (int)proc->pid;
 }
 

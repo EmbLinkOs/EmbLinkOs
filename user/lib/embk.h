@@ -71,8 +71,15 @@
  * struct spawn_file_action (kernel/process/spawn.h) FIELD-FOR-FIELD: the
  * kernel copies this struct raw, so the two must grow together (and every
  * action-passing app rebuilt when they do). */
+#define EMBK_SPAWN_ACTIONS_MAX       64
 #define EMBK_SPAWN_ACTION_OPEN        1
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
+/* Explicit compatibility policy: snapshot first, actions in order, then
+ * close descriptors still marked CLOEXEC. Legacy native launches are unchanged. */
+#define EMBK_SPAWN_ACTION_FD_SNAPSHOT 11
+#define EMBK_SPAWN_ACTION_DUP2        12
+#define EMBK_SPAWN_ACTION_CLOSE       13
+#define EMBK_SPAWN_ACTION_CWD         14
 #define EMBK_SPAWN_ACTION_KEEP_STATUS 10
 #define EMBK_SPAWN_ACTION_INHERIT_FD 9    /* src_obj_handle names a parent fd */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */

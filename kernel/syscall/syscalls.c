@@ -368,8 +368,8 @@ static int64_t sys_fd_avail(const struct sysargs *a) {
 /* fcntl(fd, cmd, arg) -- the sliver of POSIX fcntl the kernel actually owns:
  * the O_NONBLOCK fd flag. cmd 1 = get (returns 1 if non-blocking, else 0);
  * cmd 2 = set non-blocking to `arg`. F_DUPFD is served by SYS_dup, which the
- * libc's fcntl() routes to; everything else about fcntl (F_GETFD, ...) stays a
- * libc concern. */
+ * libc's fcntl() routes to. cmd 3 returns access/nonblock wire flags;
+ * cmd 4/5 read/write the per-descriptor close-on-exec bit. */
 static int64_t sys_fcntl(const struct sysargs *a) {
     int fd  = (int)a->arg[0];
     int cmd = (int)a->arg[1];
@@ -382,6 +382,8 @@ static int64_t sys_fcntl(const struct sysargs *a) {
     }
     case 2:
         return vfs_fd_set_nonblock(fd, arg != 0);
+    case 4: return vfs_fd_get_cloexec(fd);
+    case 5: return vfs_fd_set_cloexec(fd,arg!=0);
     case 3: {
         int fl=vfs_fd_get_flags(fd);
         if(fl<0)return fl;
@@ -754,9 +756,9 @@ static int64_t sys_readdir(const struct sysargs *a) {
  * to) can ever name this child via sys_wait/sys_kill, closing the
  * confused-deputy gap a bare pid argument would leave open at this
  * boundary (any ring-3 process could otherwise wait()/kill() any pid it
- * could guess). If the handle table is full, the orphaned child is killed
- * immediately rather than leaked unreferenced. */
-static int64_t sys_spawn(const struct sysargs *a) {
+ * could guess). Reserve a handle before creating the child, so a full table
+ * cannot run an unowned program. */
+static int64_t sys_spawn_impl(const struct sysargs *a,bool actual_pid) {
     const char *user_path = (const char *)a->arg[0];
     const uint64_t *user_argv = (const uint64_t *)a->arg[1];
     int argc = (int)a->arg[2];
@@ -815,13 +817,6 @@ static int64_t sys_spawn(const struct sysargs *a) {
 
     }
 
-    struct spawn_file_action actions_kernel[SPAWN_ACTIONS_MAX];
-    if (n_count > 0 && copy_from_user(actions_kernel, user_actions,
-         n_count * sizeof(struct spawn_file_action)) != EMBK_OK) {
-        kfree(argv_buf);
-        return -EMBK_EFAULT;
-    }
-
     /* envp. NULL-terminated in USER space, so its length is discovered by
      * walking it -- one pointer at a time, since we cannot know how far it is
      * safe to read ahead. Bounded by SPAWN_ENVP_MAX.
@@ -832,7 +827,7 @@ static int64_t sys_spawn(const struct sysargs *a) {
      * process_create_env() and elf_load() add their own frames on top. This
      * codebase has already been bitten once by a big syscall buffer on that
      * stack (see SYSCALL_IO_CHUNK's history in sys_read). The alloc/free window
-     * below is deliberately narrow -- two returns, both handled. */
+     * below is deliberately narrow and every allocation has a cleanup path. */
     uint64_t user_envp_ptrs[SPAWN_ENVP_MAX];
     char *envp_kernel[SPAWN_ENVP_MAX];
     char *envp_buf = NULL;
@@ -864,6 +859,22 @@ static int64_t sys_spawn(const struct sysargs *a) {
         envp_kernel[envc] = NULL;
     }
 
+    struct spawn_file_action *actions_kernel=NULL;
+    int handle=-1, result;
+    if(n_count) {
+        actions_kernel=kmalloc((size_t)n_count*sizeof *actions_kernel);
+        if(!actions_kernel){result=-EMBK_ENOMEM;goto spawn_done;}
+        if(copy_from_user(actions_kernel,user_actions,(size_t)n_count*sizeof *actions_kernel)!=EMBK_OK) {
+            result=-EMBK_EFAULT;goto spawn_done;
+        }
+    }
+    /* Reserve before opening files or creating a runnable child. A reservation
+     * is retained with pid 0 and cannot be resolved, waited or pressure-reaped. */
+    handle=process_handle_alloc_retained(current_process,0,true);
+    if(handle<0 && process_handle_reap_dead(current_process)>0)
+        handle=process_handle_alloc_retained(current_process,0,true);
+    if(handle<0){result=handle;goto spawn_done;}
+
     /* A SPAWN_ACTION_SET_CAPS action, if present, carries the child's requested
      * capability set in `flags`. Absent => EMBK_CAP_INHERIT (the child gets the
      * parent's whole set, the default every existing spawn already gets).
@@ -882,36 +893,32 @@ static int64_t sys_spawn(const struct sysargs *a) {
     int pid = process_create_caps(path, argv_kernel, argc,
                                  user_envp ? envp_kernel : NULL,
                                  actions_kernel, n_count, requested_caps);
-    /* Safe already: process_create_env() COPIES every string into the child's
-     * own stack before returning -- that is its documented contract. */
-    if (envp_buf) kfree(envp_buf);
-    kfree(argv_buf);
-    if (pid < 0) {
-        return pid;   // -errno from process_create_env()
-    }
-    
-    bool retained=false;
+    if(pid<0){result=pid;process_handle_free_pid(current_process,handle,0);goto spawn_done;}
+    bool retained=actual_pid;
     for(int i=0;i<n_count;i++)if(actions_kernel[i].kind==SPAWN_ACTION_KEEP_STATUS)retained=true;
-    int handle = process_handle_alloc_retained(current_process,(uint32_t)pid,retained);
-    if (handle < 0) {
-        /* Table full -- almost always because the caller spawned children and
-         * never wait()'d the dead ones, leaking a handle slot each. Reclaim any
-         * handles that name already-exited children (and reap those zombies),
-         * then retry, so a leak-filled table doesn't force us to KILL the valid
-         * child we just created. */
-        if (process_handle_reap_dead(current_process) > 0) {
-            handle = process_handle_alloc_retained(current_process,(uint32_t)pid,retained);
-        }
-    }
-    if (handle < 0) {
-        /* All slots name live children or retained statuses. The unpublished
-         * child must be detached and terminated without leaving a zombie. */
-        process_abort_spawn((uint32_t)pid);
-        return handle;   // -EMBK_EMFILE
-    }
-    return handle;
+    result=process_handle_publish(current_process,handle,(uint32_t)pid,retained);
+    if(result<0)process_abort_spawn((uint32_t)pid);
+    else result=actual_pid?pid:handle;
+spawn_done:
+    if(actions_kernel)kfree(actions_kernel);
+    if(envp_buf)kfree(envp_buf);
+    kfree(argv_buf);
+    return result;
 }
 
+
+static int64_t sys_spawn(const struct sysargs *a){return sys_spawn_impl(a,false);}
+/* Separate entry retains status and returns the actual PID atomically with
+ * handle publication. No libc INFO round trip that another waiter can race. */
+static int64_t sys_spawn_pid(const struct sysargs *a){return sys_spawn_impl(a,true);}
+static int64_t sys_spawn_cwd(const struct sysargs *a) {
+    const char *cwd=current_process->startup_cwd;
+    if(!cwd[0])return 0;
+    size_t n=strlen(cwd)+1;
+    if(a->arg[1]<n)return -EMBK_ERANGE;
+    if(copy_to_user((void *)a->arg[0],cwd,n)!=EMBK_OK)return -EMBK_EFAULT;
+    return (int64_t)n;
+}
 /* wait(handle) -> exit_code, or -errno (-EMBK_EINVAL for a bad/unknown
  * handle, -EMBK_ECHILD if it doesn't/no-longer names one of our children).
  * Resolves the handle to a pid, then blocks on process_wait() (process.c)
@@ -2925,6 +2932,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_terminal] = sys_terminal,
     [SYS_child] = sys_child,
     [SYS_pipe_fds] = sys_pipe_fds,
+    [SYS_spawn_cwd] = sys_spawn_cwd,
+    [SYS_spawn_pid] = sys_spawn_pid,
     [SYS_win_blur_rect]  = sys_win_blur_rect,
     [SYS_win_restore]    = sys_win_restore,
     [SYS_win_minimize]   = sys_win_minimize,

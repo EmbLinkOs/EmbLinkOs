@@ -38,17 +38,15 @@ struct process;
                               * transaction). Needs writable access; a fs
                               * without the op fails -ENOSYS, never silently
                               * keeps stale bytes. */
+#define O_CLOEXEC    0x100000 /* descriptor inheritance flag, not file status */
 #define O_APPEND     0x0400  /* reserved  (write is cursor-driven for now)*/
 
-/* Fds 0/1/2 are reserved for stdin, stdout, stderr, so returned fds start at
- * FD_BASE and map to slot (fd - FD_BASE). Public (not fd.c-local) because
+/* Fds 0/1/2 conventionally hold stdin/stdout/stderr. Allocation uses the
+ * lowest free slot, so closed standard descriptors can be reused. Public (not fd.c-local) because
  * struct process (process.h) embeds a table of these -- each process gets
  * its own fd namespace rather than sharing one global table. */
 #define FD_BASE 0        /* was 3. Fds 0/1/2 are now REAL table slots. */
-#define FD_STDIO_MAX 3   /* slots 0,1,2 are reserved for stdin/stdout/stderr;
-                          * vfs_open's free-slot scan starts ABOVE them, so a
-                          * fresh open() can never be handed fd 0 and later
-                          * collide with a stdio write. */
+#define FD_STDIO_MAX 3   /* initial stdin/stdout/stderr slots */
 #define FD_MAX_OPEN 64
 
 /* What backs an open fd. The per-backing behaviour is a struct fd_ops table
@@ -159,6 +157,7 @@ struct open_file {
 
 struct fd_entry {
     bool used;
+    bool cloexec;
     enum fd_backing backing;    /**< selects which fd_ops table applies */
     const struct fd_ops *ops;   /**< per-backing dispatch (NULL when unused) */
     int flags;
@@ -174,7 +173,7 @@ struct fd_entry {
 
 void vfs_fd_init(void);
 
-/* The Unix-shared fd surfaces, by path. returns an fd >= 3 on success, or a
+/* The Unix-shared fd surfaces, by path. returns an fd >= 0 on success, or a
  * negative error code on failure. */
 
 int vfs_open(const char *path, int flags, uint32_t mode);
@@ -220,6 +219,13 @@ int fd_open_into(struct process *target, int target_fd, const char *path, int fl
  * Both descriptors share ONE open file description: the same cursor, the same
  * vnode reference. Closing either leaves the other fully working. */
 int vfs_fd_dup(int oldfd, int newfd, int min_fd);
+int vfs_fd_get_cloexec(int fd);
+int vfs_fd_set_cloexec(int fd, bool on);
+/* Ordered actions operate on a child table, never temporary parent redirects. */
+int fd_dup_into(struct process *target, int oldfd, int newfd);
+int fd_close_into(struct process *target, int fd);
+int fd_snapshot_into(struct process *target);
+void fd_close_exec(struct process *target);
 
 /* Install one end of a pipe onto target_fd in `target` -- the fd-layer half
  * of the INSTALL_OBJ spawn action (pipe_fd_ops is private to fd.c, so the

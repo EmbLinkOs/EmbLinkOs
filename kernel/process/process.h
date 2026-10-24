@@ -592,6 +592,7 @@ struct process {
      * convenience, and no spawn should fail over one. */
 #define EXEC_NAME_MAX 23
     char     exec_name[EXEC_NAME_MAX + 1];
+    char     startup_cwd[256]; /* explicit spawn context; empty = legacy PWD fallback */
 
     /* Per-process NAMESPACE -- the OTHER grant a process is born with (the
      * "authority IS the namespace" model, docs/USERSPACE_v2.md UP2). Maps path
@@ -1601,6 +1602,7 @@ static inline struct process *current_process_atomic(void) {
 int process_child_control(int selector,unsigned op,unsigned flags,void *user);
 int process_handle_alloc_retained(struct process *owner,uint32_t pid,bool retained);
 void process_abort_spawn(uint32_t pid);
+int process_handle_publish(struct process *owner,int handle,uint32_t pid,bool retained);
 void process_handle_free_pid(struct process *owner,int handle,uint32_t pid);
 
 #endif /* __PROCESS_H__ */

@@ -99,6 +99,8 @@ struct embk_vfs_dirent {
 #define EMBK_O_EXCL    0x0080
 #define EMBK_O_TRUNC   0x0200
 #define EMBK_O_APPEND  0x0400
+#define EMBK_O_NONBLOCK 0x0800
+#define EMBK_O_CLOEXEC 0x100000
 
 /* The environment. newlib requires `environ`; getenv() walks it.
  *
@@ -294,7 +296,7 @@ static char g_cwd[EMBK_PATH_MAX] = "/";
  * untouched, so "/a/../b" reached the kernel verbatim and failed at a ".."
  * component the VFS has no rule for. git walks UP to find a repo root -- ".." is
  * its normal idiom, not an edge case. */
-static int path_abs(const char *in, char *out, size_t out_sz) {
+static int path_abs_from(const char *cwd,const char *in, char *out, size_t out_sz) {
     if (!in) {
         errno = EFAULT;
         return -1;
@@ -313,9 +315,9 @@ static int path_abs(const char *in, char *out, size_t out_sz) {
         if (strlen(in) >= sizeof raw) { errno = ENAMETOOLONG; return -1; }
         strcpy(raw, in);
     } else {
-        size_t cl = strlen(g_cwd);
+        size_t cl = strlen(cwd);
         if (cl + 1 + strlen(in) >= sizeof raw) { errno = ENAMETOOLONG; return -1; }
-        strcpy(raw, g_cwd);
+        strcpy(raw, cwd);
         if (cl > 0 && raw[cl - 1] != '/') strcat(raw, "/");
         strcat(raw, in);
     }
@@ -351,6 +353,20 @@ static int path_abs(const char *in, char *out, size_t out_sz) {
     return 0;
 }
 
+static int path_abs(const char *in,char *out,size_t size) {
+    return path_abs_from(g_cwd,in,out,size);
+}
+static int open_native_flags(int flags) {
+    int out=flags&O_ACCMODE;
+    if(flags&O_CREAT)out|=EMBK_O_CREAT;
+    if(flags&O_EXCL)out|=EMBK_O_EXCL;
+    if(flags&O_TRUNC)out|=EMBK_O_TRUNC;
+    if(flags&O_APPEND)out|=EMBK_O_APPEND;
+    if(flags&O_NONBLOCK)out|=EMBK_O_NONBLOCK;
+    if(flags&O_CLOEXEC)out|=EMBK_O_CLOEXEC;
+    return out;
+}
+
 int open(const char *name, int flags, ...) {
     /* Only consume the variadic mode argument when O_CREAT is set -- reading
      * it unconditionally would be UB for the common open(path, O_RDONLY). */
@@ -363,11 +379,7 @@ int open(const char *name, int flags, ...) {
     }
 
     /* Translate newlib's O_* bit layout to the kernel's (see EMBK_O_* above). */
-    int kflags = flags & 0x3;   /* access mode: identical on both sides */
-    if (flags & O_CREAT)  kflags |= EMBK_O_CREAT;
-    if (flags & O_EXCL)   kflags |= EMBK_O_EXCL;
-    if (flags & O_TRUNC)  kflags |= EMBK_O_TRUNC;
-    if (flags & O_APPEND) kflags |= EMBK_O_APPEND;
+    int kflags = open_native_flags(flags);
 
     char abs[EMBK_PATH_MAX];
     if (path_abs(name, abs, sizeof abs) != 0) return -1;   /* errno set */
@@ -701,7 +713,7 @@ int access(const char *path, int mode) {
 
 /* getcwd/chdir are REAL now: see g_cwd + path_abs above. The cwd is this
  * process's own libc state -- per-process by construction, never shared, never
- * inherited unless a parent names PWD at spawn. */
+ * initialized by explicit spawn context, or legacy PWD startup. */
 char *getcwd(char *buf, size_t size) {
     if (!buf) {
         /* The GNU "allocate it for me" extension is deliberately not offered;
@@ -734,13 +746,17 @@ int chdir(const char *path) {
 
 /* Called by crt0 BEFORE ctors and main, once environ is installed.
  *
- * PWD is how a parent HANDS OVER a starting directory -- the same explicit
+ * Legacy PWD is how a native parent HANDS OVER a starting directory -- the same explicit
  * naming as envp and file-actions, using the mechanism that already exists. No
  * PWD means no inheritance, and we stay at "/", which is the honest default.
  *
  * Best-effort on purpose: a PWD naming somewhere gone must not kill startup, it
  * must leave us at the root. chdir() does the verifying. */
 void embk_cwd_init_from_env(void) {
+    /* An explicit spawn context wins over PWD without mutating environ. */
+    char initial[EMBK_PATH_MAX];
+    int64_t n=embk_syscall2(EMBK_SYS_spawn_cwd,(int64_t)(uintptr_t)initial,sizeof initial);
+    if(n>0){memcpy(g_cwd,initial,(size_t)n);return;}
     const char *pwd = getenv("PWD");
     if (pwd && pwd[0] == '/') (void)chdir(pwd);
 }
@@ -847,14 +863,10 @@ int dup(int fd) {
  * because getpath.py swallows the OSError, leaving only "No module named
  * 'encodings'" as the symptom.
  *
- * F_GETFD/F_SETFD (FD_CLOEXEC) -- ANSWERED, and honestly. FD_CLOEXEC promises
- * "this descriptor will not survive into an exec'd image". EmbLink HAS NO EXEC:
- * the model is spawn() + explicit file-actions, so a child only ever receives
- * descriptors the parent names deliberately, and nothing is implicitly
- * inherited. That promise therefore already holds for every fd, unconditionally
- * -- reporting FD_CLOEXEC set is a true statement about this OS, not a
- * convenient stub. (Should exec ever exist -- it will not, by design -- this
- * must become real state.)
+ * F_GETFD/F_SETFD track real per-descriptor state. The compatibility spawn
+ * policy inherits open descriptors and closes those still marked CLOEXEC
+ * after applying ordered actions. Native explicit-transfer launches retain
+ * their existing policy.
  *
  * F_GETFL translates the actual access mode and nonblocking state from the
  * kernel. F_SETFL changes nonblocking state; other mutable file flags remain
@@ -887,14 +899,16 @@ int fcntl(int fd, int cmd, ...) {
     }
 
     switch (cmd) {
-    case F_GETFD:
-        /* Every fd is effectively close-on-exec here -- see above. */
-        return FD_CLOEXEC;
-    case F_SETFD:
-        /* Accept whatever is asked: with no exec, both "close on exec" and
-         * "stay open across exec" describe the same (unobservable) reality, so
-         * there is nothing to store and nothing that could later disagree. */
-        return 0;
+    case F_GETFD: {
+        int64_t r=embk_syscall3(EMBK_SYS_fcntl,fd,4,0);
+        return r<0?embk_fail(r):(r?FD_CLOEXEC:0);
+    }
+    case F_SETFD: {
+        va_list ap;va_start(ap,cmd);int flags=va_arg(ap,int);va_end(ap);
+        if(flags&~FD_CLOEXEC){errno=EINVAL;return -1;}
+        int64_t r=embk_syscall3(EMBK_SYS_fcntl,fd,5,(flags&FD_CLOEXEC)!=0);
+        return r<0?embk_fail(r):0;
+    }
     case F_GETFL: {
         int64_t fl=embk_syscall3(EMBK_SYS_fcntl,fd,3,0);
         if(fl<0)return embk_fail(fl);
@@ -1881,3 +1895,6 @@ void __malloc_unlock(struct _reent *r) {
     g_depth = 0;
     embk_mutex_unlock(&g_malloc_mtx);
 }
+
+/* Kept in this retargeting object so installed SDK links need no extra object. */
+#include "spawn_compat.inc"

@@ -643,8 +643,7 @@ static void test_sysparams(void) {
 /* fcntl's descriptor flags. This is the call that silently broke CPython: it
  * opens every file via _Py_wfopen, which calls make_non_inheritable ->
  * fcntl(fd, F_GETFD) right after fopen() succeeds, and closed the file again
- * when our ENOSYS came back. FD_CLOEXEC is answerable here because EmbLink has
- * no exec -- see the long comment on fcntl() in syscalls.c. */
+ * when our ENOSYS came back. Descriptor flags are now real state used by the spawn adapter. */
 static void test_fcntl(void) {
     printf("fcntl descriptor flags:\n");
 
@@ -655,12 +654,12 @@ static void test_fcntl(void) {
     int flags = fcntl(fd, F_GETFD);
     printf("       (F_GETFD -> 0x%X)\n", flags);
     ck("F_GETFD succeeds", flags != -1);
-    /* Every fd is effectively close-on-exec: there is no exec to survive. */
-    ck("F_GETFD reports FD_CLOEXEC", flags != -1 && (flags & FD_CLOEXEC));
+    ck("new descriptors start inheritable", flags == 0);
 
     ck("F_SETFD(FD_CLOEXEC) accepted", fcntl(fd, F_SETFD, FD_CLOEXEC) == 0);
-    ck("F_SETFD(0) accepted too (no exec => unobservable either way)",
-       fcntl(fd, F_SETFD, 0) == 0);
+    ck("F_GETFD observes FD_CLOEXEC", fcntl(fd,F_GETFD)==FD_CLOEXEC);
+    ck("F_SETFD(0) clears descriptor flags",
+       fcntl(fd, F_SETFD, 0) == 0 && fcntl(fd,F_GETFD)==0);
 
     ck("F_GETFL reports the actual read-only access mode",
        fcntl(fd, F_GETFL) == O_RDONLY);

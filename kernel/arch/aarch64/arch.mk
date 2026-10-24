@@ -323,7 +323,7 @@ ARM_PIE_SYSCALLS := $(ARM_USER)/syscalls_pic.o
 # and it builds; nothing else needs editing.
 # Static newlib console programs (-T newlib.ld, no libembk.so).
 ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn lockdemo jitter \
-                    crasher ioracer processprobe sockdemo udptest nbsock httpget \
+                    crasher ioracer processprobe spawnprobe sockdemo udptest nbsock httpget \
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \
                     $(if $(HAVE_QJS),js,) \
@@ -556,7 +556,7 @@ $(ARM_USER):
 # The retargeting layer, once.
 $(ARM_USER)/crt0.o: user/lib/crt0.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-$(ARM_USER)/syscalls.o: user/lib/syscalls.c user/lib/embk_child.h | $(ARM_USER)
+$(ARM_USER)/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_child.h | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
 # EXPLICIT rules, generated per program, NOT pattern rules -- and that is a
@@ -608,7 +608,7 @@ $(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
 ifneq ($(PIE_OK),)
 $(ARM_USER)/crt0_pic.o: user/lib/crt0.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
-$(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h user/lib/embk_child.h | $(ARM_USER)
+$(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 $(ARM_USER)/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@

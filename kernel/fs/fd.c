@@ -104,6 +104,7 @@ void vfs_fd_init(void)
     struct fd_entry *fds = fd_table();
     for (int i = 0; i < FD_MAX_OPEN; i++) {
         fds[i].used = false;
+        fds[i].cloexec = false;
         fds[i].backing = FD_BACKING_NONE;
         fds[i].ops = NULL;
         fds[i].flags = 0;
@@ -547,7 +548,7 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         return -EMBK_EINVAL;
     if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
         return -EMBK_EINVAL;
-    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_NONBLOCK | O_CLOEXEC))
         return -EMBK_EINVAL;
 
     /* /dev/null: the one special name (see nulldev_fd_ops above). Checked
@@ -568,7 +569,8 @@ int vfs_open(const char *path, int flags, uint32_t mode)
                 e->used = true;
                 e->backing = FD_BACKING_NULLDEV;
                 e->ops = &nulldev_fd_ops;
-                e->flags = flags;
+                e->flags = flags & ~O_CLOEXEC;
+    e->cloexec = (flags & O_CLOEXEC) != 0;
                 rfd = i + FD_BASE;
                 break;
             }
@@ -675,7 +677,8 @@ int vfs_open(const char *path, int flags, uint32_t mode)
     fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
     fds[fd - FD_BASE].ops = &vnode_fd_ops;
     fds[fd - FD_BASE].u.file.of = of;
-    fds[fd - FD_BASE].flags = flags;
+    fds[fd - FD_BASE].flags = flags & ~O_CLOEXEC;
+    fds[fd - FD_BASE].cloexec = (flags&O_CLOEXEC)!=0;
     fdunlock(p);
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
@@ -857,6 +860,7 @@ int vfs_fd_dup(int oldfd, int newfd, int min_fd) {
         return rc;
     }
     dst->used = true;
+    dst->cloexec = false;
     fdunlock(p);
 
     if (had) snap.ops->close(&snap);
@@ -931,9 +935,18 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     int acc = flags & O_ACCMODE;
     if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
         return -EMBK_EINVAL;
-    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_NONBLOCK | O_CLOEXEC))
         return -EMBK_EINVAL;
 
+    if(strcmp(path,"/dev/null")==0) {
+        struct fd_entry entry={0};entry.used=true;entry.backing=FD_BACKING_NULLDEV;
+        entry.ops=&nulldev_fd_ops;entry.flags=flags & ~O_CLOEXEC;
+        entry.cloexec=(flags&O_CLOEXEC)!=0;
+        (void)fd_close_into(target,target_fd);target->fds[target_fd]=entry;return target_fd;
+    }
+    if(fd_writable(flags) || (flags&(O_CREAT|O_TRUNC))) {
+        int rc=ns_check_writable(path);if(rc)return rc;
+    }
     struct vnode vn;
     int err = vfs_resolve(path, &vn);
     if (err == EMBK_OK) {
@@ -972,6 +985,12 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         vmo_file_truncated(vn, 0);
     }
 
+    /* This new open-file description owns one vnode reference, just as a
+     * normal open does. Dup/inherit only bump the description's own count. */
+    if(vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_get) {
+        err=vn.mnt->ops->obj_get(vn.mnt,vn.ino);if(err)return err;
+    }
+
     /* Lock the TARGET's table, not current's. At spawn time target is the child,
      * not yet running, so this is uncontended -- but it makes the redirect atomic
      * for the dup2-into-self case, and keeps every fds[] mutation under one rule.
@@ -996,7 +1015,8 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     e->backing = FD_BACKING_VNODE;
     e->ops = &vnode_fd_ops;
     e->u.file.of = of;
-    e->flags = flags;
+    e->flags = flags & ~O_CLOEXEC;
+    e->cloexec = (flags & O_CLOEXEC) != 0;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
@@ -1905,4 +1925,62 @@ int fd_terminal_control(int fd,unsigned op,void *data) {
     }
     if (!rc) rc=pty_control(held.u.pty.p,held.u.pty.side,op,data);
     pty_drop(&held); return rc;
+}
+
+/* Descriptor flags are per descriptor. Duplication clears close-on-exec;
+ * status flags retain the existing per-entry contract. */
+int vfs_fd_get_cloexec(int fd) {
+    struct process *p=current_process;fdlock(p);
+    struct fd_entry *e=fd_lookup(fd);
+    int rc=e?(e->cloexec?1:0):-EMBK_EBADF;
+    fdunlock(p);return rc;
+}
+int vfs_fd_set_cloexec(int fd,bool on) {
+    struct process *p=current_process;fdlock(p);
+    struct fd_entry *e=fd_lookup(fd);
+    if(e)e->cloexec=on;
+    fdunlock(p);return e?0:-EMBK_EBADF;
+}
+int fd_close_into(struct process *target,int fd) {
+    if(!target || fd<0 || fd>=FD_MAX_OPEN)return -EMBK_EBADF;
+    struct fd_entry *e=&target->fds[fd];
+    if(!e->used)return -EMBK_EBADF;
+    struct fd_entry old=*e;memset(e,0,sizeof *e);
+    if(old.ops && old.ops->close)old.ops->close(&old);
+    return 0;
+}
+int fd_dup_into(struct process *target,int oldfd,int newfd) {
+    if(!target || oldfd<0 || oldfd>=FD_MAX_OPEN || newfd<0 || newfd>=FD_MAX_OPEN)return -EMBK_EBADF;
+    struct fd_entry *src=&target->fds[oldfd];
+    if(!src->used || !src->ops || !src->ops->inherit)return -EMBK_EBADF;
+    /* Unlike ordinary dup2(fd,fd), a spawn dup2 action clears CLOEXEC. */
+    if(oldfd==newfd){src->cloexec=false;return 0;}
+    struct fd_entry copy={0};int rc=src->ops->inherit(&copy,src);
+    if(rc)return rc;
+    (void)fd_close_into(target,newfd);copy.cloexec=false;
+    target->fds[newfd]=copy;return 0;
+}
+int fd_snapshot_into(struct process *target) {
+    if(!current_thread || !target || target==current_process)return -EMBK_EINVAL;
+    for(int i=0;i<FD_MAX_OPEN;i++)(void)fd_close_into(target,i);
+    fdlock(current_process);
+    int rc=0;
+    for(int i=0;i<FD_MAX_OPEN;i++) {
+        const struct fd_entry *src=&current_process->fds[i];
+        if(!src->used)continue;
+        /* Network backings have no shared lifetime yet. Never copy a socket
+         * whose close in the child would tear down the parent's connection. */
+        if(src->backing==FD_BACKING_SOCKET || src->backing==FD_BACKING_UDP) {
+            if(src->cloexec)continue;
+            rc=-EMBK_ENOSYS;break;
+        }
+        if(!src->ops || !src->ops->inherit){rc=-EMBK_ENOSYS;break;}
+        rc=src->ops->inherit(&target->fds[i],src);
+        if(rc)break;
+    }
+    fdunlock(current_process);return rc;
+}
+void fd_close_exec(struct process *target) {
+    for(int i=0;i<FD_MAX_OPEN;i++)
+        if(target->fds[i].used && target->fds[i].cloexec)(void)fd_close_into(target,i);
 }

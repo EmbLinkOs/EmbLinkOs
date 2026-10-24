@@ -345,6 +345,8 @@
 #define SYS_terminal 148
 #define SYS_child 149
 #define SYS_pipe_fds 150
+#define SYS_spawn_cwd 151
+#define SYS_spawn_pid 152
 
 
 
