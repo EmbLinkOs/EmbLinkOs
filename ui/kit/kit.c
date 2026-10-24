@@ -396,24 +396,21 @@ void ui_text_field_emphasis(unsigned start, unsigned len) {
     g_emph_start = start; g_emph_len = len; g_emph_on = (len > 0);
 }
 
-/* KEYBOARD FOCUS TRAVERSAL -- Tab moves to the next field.
- *
- * A form you can only fill by clicking each field is not usable from the
- * keyboard, and the login screen is exactly such a form. Immediate mode has no
- * list of focusable widgets to walk, so traversal is built from what it does
- * have: the order fields are emitted in, which IS the reading order.
- *
- *   Tab in the focused field  -> the NEXT field emitted this frame takes focus,
- *                                and whatever was typed after the Tab goes to it
- *   Tab in the LAST field     -> next frame, the FIRST field takes focus (wrap)
- *
- * Per-frame state, reset when ui_frame_serial() moves. */
+/* Keyboard traversal follows the current reading order. Forward transfers can
+ * continue within this build; a reverse transfer to an already-built control
+ * retains its remaining key/modifier events for the next build. Modal scopes
+ * filter the retained order and discard carry when ownership changes. */
 static uint64_t g_trav_frame;
 static bool     g_tab_pending;            /* hand focus to the next field emitted */
 static bool     g_focus_first;            /* wrapped: the first field of this frame takes it */
 static bool     g_seen_field;             /* a field has been emitted this frame */
-static char     g_carry[32];              /* keys typed after the Tab, for the next field */
+static struct ui_key_input g_carry[32];              /* keys typed after the Tab, for the next field */
 static int      g_carry_n;
+static struct instance_handle g_carry_target;
+static uint64_t g_carry_frame,g_trav_scope;
+static int g_control_navigation;
+int ui_control_navigation(void){return g_control_navigation;}
+bool ui_keyboard_pending(void){return g_tab_pending || g_focus_first || g_carry_target.index;}
 static float g_field_next_width,g_field_next_height;
 void ui_text_field_next_size(float width,float height) {g_field_next_width=width;g_field_next_height=height;}
 static bool     g_autofocus_next;         /* see ui_text_field_autofocus */
@@ -802,9 +799,15 @@ static unsigned caret_from_x(const char *s, unsigned len, uint32_t font,
 }
 
 static void trav_new_frame(void) {
+    uint64_t scope=ui_focus_scope_serial();
+    if(scope!=g_trav_scope) {
+        g_trav_scope=scope;g_carry_n=0;g_tab_pending=g_focus_first=g_seen_field=false;
+        g_carry_target=INSTANCE_HANDLE_NULL;
+    }
     uint64_t f = ui_frame_serial();
     if (f == g_trav_frame) return;
     g_trav_frame = f;
+    if(g_focus_first && !g_seen_field){g_focus_first=false;g_carry_n=0;}
     if (g_tab_pending) {                  /* Tab in the last field last frame: wrap */
         g_tab_pending = false;
         g_focus_first = true;
@@ -812,37 +815,54 @@ static void trav_new_frame(void) {
     g_seen_field = false;
 }
 
-/* Shared focus traversal for non-text controls. It uses the same carry stream
- * as fields, so Tab followed by Return in one queued batch activates exactly
- * the next control. Enter/Space never leak into a later text field. */
+static bool trav_enter(struct instance_handle self,int *keys) {
+    trav_new_frame();if(!ui_focus_register(self))return false;
+    bool first=!g_seen_field;g_seen_field=true;
+    if(g_carry_target.index==self.index && g_carry_target.generation==self.generation) {
+        g_carry_target=INSTANCE_HANDLE_NULL;ui_request_focus(self);
+        *keys=g_carry_frame==ui_frame_serial()?1:2;
+    } else if(g_tab_pending){g_tab_pending=false;ui_request_focus(self);*keys=1;}
+    else if(first && g_focus_first){g_focus_first=false;ui_request_focus(self);*keys=2;}
+    return true;
+}
+static void trav_tab(struct instance_handle self,const struct ui_key_input *in,int remaining,unsigned mods) {
+    g_carry_n=remaining<(int)(sizeof g_carry/sizeof g_carry[0])?remaining:(int)(sizeof g_carry/sizeof g_carry[0]);
+    memcpy(g_carry,in,(size_t)g_carry_n*sizeof *in);g_carry_frame=ui_frame_serial();
+    if(mods&UI_MOD_SHIFT) {
+        g_carry_target=ui_focus_previous(self);ui_request_focus(g_carry_target);
+    } else {g_carry_target=INSTANCE_HANDLE_NULL;g_tab_pending=true;}
+}
+/* Carry retains each key's modifier snapshot as it crosses control boundaries. */
 bool ui_control_interact(struct instance_handle self) {
-    g_control_adjustment=0;
-    trav_new_frame();bool first=!g_seen_field;g_seen_field=true;
-    int keys=0; /* own queue, carry only, carry then queue */
-    bool clicked=ui_consume_click(self);
-    if(clicked)ui_request_focus(self);
-    if(g_tab_pending){g_tab_pending=false;ui_request_focus(self);keys=1;}
-    else if(first && g_focus_first){g_focus_first=false;ui_request_focus(self);keys=2;}
+    g_control_adjustment=0;g_control_navigation=0;int keys=0;
+    if(!trav_enter(self,&keys))return false;
+    bool clicked=ui_consume_click(self);if(clicked)ui_request_focus(self);
     bool focused=ui_has_focus(self);
-    char in[64];int n=0;
+    struct ui_key_input in[64];int n=0;
     if(!ui_any_focus()) {
-        char queued[32];int count=ui_input_take(queued,sizeof queued);
-        for(int i=0;i<count;i++)if(queued[i]=='\t') {
-            ui_request_focus(self);focused=true;keys=1;
-            g_carry_n=count-i-1;memcpy(g_carry,queued+i+1,(size_t)g_carry_n);break;
+        struct ui_key_input queued[32];int count=ui_input_take_keys(queued,32);
+        for(int i=0;i<count;i++)if(queued[i].code=='\t') {
+            if(queued[i].modifiers&UI_MOD_SHIFT) {
+                trav_tab(self,queued+i+1,count-i-1,queued[i].modifiers);
+                focused=ui_has_focus(self);keys=1;
+                if(focused)g_carry_target=INSTANCE_HANDLE_NULL;
+            } else {
+                ui_request_focus(self);focused=true;keys=1;
+                g_carry_n=count-i-1;memcpy(g_carry,queued+i+1,(size_t)g_carry_n*sizeof *queued);
+            }
+            break;
         }
     }
     if(focused) {
-        if(keys){n=g_carry_n;memcpy(in,g_carry,(size_t)n);g_carry_n=0;}
-        if(keys!=1)n+=ui_input_take(in+n,(int)sizeof in-n);
+        if(keys){n=g_carry_n;memcpy(in,g_carry,(size_t)n*sizeof *in);g_carry_n=0;}
+        if(keys!=1)n+=ui_input_take_keys(in+n,(int)(sizeof in/sizeof in[0])-n);
         for(int i=0;i<n;i++) {
-            if(in[i]=='\t') {
-                g_carry_n=0;for(int j=i+1;j<n && g_carry_n<(int)sizeof g_carry;j++)g_carry[g_carry_n++]=in[j];
-                g_tab_pending=true;break;
-            }
-            if(in[i]==UI_KEY_LEFT || in[i]==UI_KEY_DOWN)g_control_adjustment--;
-            if(in[i]==UI_KEY_RIGHT || in[i]==UI_KEY_UP)g_control_adjustment++;
-            if(in[i]=='\n' || in[i]=='\r' || in[i]==' ')clicked=true;
+            int c=in[i].code;
+            if(c=='\t') {trav_tab(self,in+i+1,n-i-1,in[i].modifiers);break;}
+            if(c==UI_KEY_LEFT || c==UI_KEY_DOWN)g_control_adjustment--;
+            if(c==UI_KEY_RIGHT || c==UI_KEY_UP)g_control_adjustment++;
+            if(c==UI_KEY_LEFT || c==UI_KEY_RIGHT || c==UI_KEY_UP || c==UI_KEY_DOWN)g_control_navigation=c;
+            if(c=='\n' || c=='\r' || c==' ')clicked=true;
         }
         ui_set_border(1.5f,TH->accent);
     }
@@ -858,10 +878,6 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     g_emph_on = false;                    /* consumed, whether or not it is used */
     bool autofocus = g_autofocus_next;
     g_autofocus_next = false;             /* one-shot, like the emphasis */
-    trav_new_frame();
-    bool first = !g_seen_field;
-    g_seen_field = true;
-
     ui_box_begin(0);
     struct instance_handle self = ui_open();
     bool clicked = ui_consume_click(self);
@@ -873,17 +889,9 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
      * down the whole form. A field wrapped into on the NEXT frame takes the
      * carry and then that frame's queue, which is new. */
     enum { OWN_QUEUE, CARRY_ONLY, CARRY_THEN_QUEUE } keys = OWN_QUEUE;
-    if (g_tab_pending) {                  /* the previous field was Tabbed out of */
-        g_tab_pending = false;
-        ui_request_focus(self);
-        keys = CARRY_ONLY;
-    } else if (first && g_focus_first) {  /* wrapped around from the last field */
-        g_focus_first = false;
-        ui_request_focus(self);
-        keys = CARRY_THEN_QUEUE;
-    } else if (autofocus && !ui_any_focus()) {
-        ui_request_focus(self);           /* a form that opens ready to type */
-    }
+    int key_mode=keys;
+    bool eligible=trav_enter(self,&key_mode);keys=key_mode;
+    if(eligible && autofocus && !ui_any_focus())ui_request_focus(self);
     bool focused = ui_has_focus(self);
 
     /* THE CARET FOLLOWS FOCUS, and a click puts it where the pointer is.
@@ -996,15 +1004,15 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     /* while focused, apply this frame's typed characters in place -- first
      * whatever the field before this one saw typed after a Tab */
     if (focused) {
-        char in[64];
+        struct ui_key_input in[64];
         int n = 0;
         if (keys != OWN_QUEUE) {
-            memcpy(in, g_carry, (size_t)g_carry_n);
+            memcpy(in, g_carry, (size_t)g_carry_n*sizeof *in);
             n = g_carry_n;
             g_carry_n = 0;
         }
         if (keys != CARRY_ONLY)
-            n += ui_input_take(in + n, (int)sizeof in - n);
+            n += ui_input_take_keys(in + n, (int)(sizeof in/sizeof in[0]) - n);
 
         /* THE TEXT AS IT WAS, for the undo log to diff against once this
          * frame's keys have been applied. 512 bytes covers every field in the
@@ -1028,7 +1036,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         } while (0)
 
         for (int i = 0; i < n; i++) {
-            unsigned char c = (unsigned char)in[i];
+            unsigned char c = in[i].code;
             if (c == UI_KEY_SEL_LEFT)  { g_caret = utf8_back(buf, g_caret); }
             else if (c == UI_KEY_SEL_RIGHT) { g_caret = utf8_fwd(buf, len, g_caret); }
             else if (c == UI_KEY_SEL_HOME)  { g_caret = 0; }
@@ -1096,11 +1104,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             }
             else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
             else if (c == '\t') {
-                /* The rest of this frame's keys belong to the next field. */
-                g_carry_n = 0;
-                for (int k = i + 1; k < n && g_carry_n < (int)sizeof g_carry; k++)
-                    g_carry[g_carry_n++] = in[k];
-                g_tab_pending = true;
+                trav_tab(self,in+i+1,n-i-1,in[i].modifiers);
                 break;
             }
             else if (c == UI_KEY_UNDO || c == UI_KEY_REDO) {
@@ -1286,7 +1290,8 @@ bool ui_password_field(char *buf, unsigned long cap, const char *placeholder) {
 
 /* --- scroll view -------------------------------------------------------- */
 
-static float *g_scroll_ptr;
+static float *g_scroll_ptrs[16];
+static unsigned g_scroll_depth;
 
 /* THE SCROLLBAR'S GUTTER, always reserved.
  *
@@ -1313,7 +1318,8 @@ void ui_scroll_begin(uint64_t key, float viewport_h, float *scroll_y) {
     ui_set_size(sz_grow(), sz_fixed(viewport_h));
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
-    g_scroll_ptr = scroll_y;
+    if(g_scroll_depth<16)g_scroll_ptrs[g_scroll_depth]=scroll_y;
+    g_scroll_depth++;
 
     ui_begin_vstack(0);                 /* the clipped, offset content column */
     ui_set_size(sz_grow(), sz_grow());
@@ -1325,6 +1331,9 @@ void ui_scroll_begin(uint64_t key, float viewport_h, float *scroll_y) {
 
 void ui_scroll_end(void) {
     const struct ui_theme *t = TH;
+    float *g_scroll_ptr=g_scroll_depth && --g_scroll_depth<16?g_scroll_ptrs[g_scroll_depth]:NULL;
+    if(!g_scroll_ptr){ui_end_stack();ui_end_stack();return;}
+    if(ui_focus_reveal(g_scroll_ptr))ui_set_scroll_offset(*g_scroll_ptr);
     /* clamp to content using last frame's measured extents (one-frame lag is ok) */
     float content = 0, viewport = 0;
     int measured = ui_open_content_extent(&content, &viewport);
@@ -1388,12 +1397,16 @@ void ui_scroll_end(void) {
 
 /* --- overlay / modal ---------------------------------------------------- */
 
-static struct instance_handle g_overlay_h, g_dialog_h;
+static struct instance_handle g_overlay_h[16],g_dialog_h[16];
+static unsigned g_overlay_depth,g_dialog_depth;
 
 void ui_overlay_begin(uint64_t key) {
     ui_begin_hstack(key);
-    g_overlay_h = ui_open();
+    struct instance_handle h=ui_open();
+    if(g_overlay_depth<16)g_overlay_h[g_overlay_depth]=h;
+    g_overlay_depth++;
     struct color scrim = { 0.0f, 0.0f, 0.0f, 0.55f };   /* dim the content behind */
+    ui_focus_scope_begin(h,INSTANCE_HANDLE_NULL,0);
     ui_set_overlay(true);                 /* fill the screen, out of flow (paints on top) */
     ui_set_layer(1);                      /* elevated: paints above + hits above the flow */
     ui_set_paint(solid(scrim));
@@ -1402,16 +1415,20 @@ void ui_overlay_begin(uint64_t key) {
     ui_set_justify(JUSTIFY_CENTER);
 }
 bool ui_overlay_end(void) {
+    struct instance_handle h=g_overlay_depth && --g_overlay_depth<16?g_overlay_h[g_overlay_depth]:INSTANCE_HANDLE_NULL;
+    ui_focus_scope_end(h);
     ui_end_stack();
-    return ui_consume_click(g_overlay_h);   /* true only if the bare scrim was clicked */
+    return ui_consume_click(h);   /* true only if the bare scrim was clicked */
 }
 void ui_dialog_begin(uint64_t key) {
     ui_card_begin(key);
-    g_dialog_h = ui_open();
+    if(g_dialog_depth<16)g_dialog_h[g_dialog_depth]=ui_open();
+    g_dialog_depth++;
     const struct ui_theme *t=TH;ui_set_shadow(true,t->shadow_lg.dx,t->shadow_lg.dy,t->shadow_lg.blur,t->shadow_lg.color);
 }
 void ui_dialog_end(void) {
-    ui_consume_click(g_dialog_h);           /* absorb clicks on the dialog so they don't dismiss */
+    struct instance_handle h=g_dialog_depth && --g_dialog_depth<16?g_dialog_h[g_dialog_depth]:INSTANCE_HANDLE_NULL;
+    ui_consume_click(h);           /* absorb clicks on the dialog so they don't dismiss */
     ui_card_end();
 }
 

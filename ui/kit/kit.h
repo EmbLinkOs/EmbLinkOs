@@ -40,6 +40,8 @@ void ui_caption(const char *fmt, ...);
 
 /* --- controls (return true on the frame they were clicked) --- */
 bool ui_control_interact(struct instance_handle control);
+int ui_control_navigation(void);
+bool ui_keyboard_pending(void);
 
 bool ui_button_primary(const char *label);
 bool ui_button_secondary(const char *label);

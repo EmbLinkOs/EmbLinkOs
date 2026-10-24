@@ -440,7 +440,12 @@ int  em_take_frame_request(void) { int r = g_frame_req; g_frame_req = 0; return 
 
 static uint64_t (*g_clock)(void);
 static uint64_t g_now_ms, g_prev_ms;
+static struct {const char *label;struct instance_handle button;} g_menu_buttons[24];
+static unsigned g_menu_button_count;
+static int g_menu_start_last,g_menu_preserve_input;
+static struct instance_handle g_menu_restore;
 static int g_dt_ms;
+static int g_ov_escape;
 static int g_ov_now, g_ov_prev, g_ov_dismissed, g_ov_frames;   /* modal-overlay tracking */
 
 void em_set_clock(uint64_t (*fn)(void)) { g_clock = fn; }
@@ -504,7 +509,8 @@ float em_animate(const char *id, float target, float rate) {
 }
 
 void em_new_frame(void) {
-    g_tip_seen=0;
+    if(!g_ov_now)g_ov_escape=0;
+    g_tip_seen=0;g_menu_button_count=0;
     g_now_ms = em_now_ms();
     g_dt_ms = g_prev_ms ? (int)(g_now_ms - g_prev_ms) : 0;
     if (g_dt_ms < 0) g_dt_ms = 0;
@@ -539,10 +545,15 @@ void em_overlay_end_(void)  {
      * mid-session tree rebuild can register one more spurious click -- either
      * would open-and-instantly-dismiss the modal. Only honour a real scrim click
      * once the overlay has been stably up for a few frames. */
-    g_ov_dismissed = (ui_overlay_end() && g_ov_frames >= 3) ? 1 : 0;
+    int scrim=ui_overlay_end();
+    g_ov_dismissed=g_ov_escape || (scrim && g_ov_frames>=3);g_ov_escape=0;
 }
 int  em_overlay_dismissed(void) { return g_ov_dismissed; }
 int  em_overlay_active(void)    { return g_ov_now || g_ov_prev; }
+int em_overlay_escape(void) {
+    if(!em_overlay_active() || !ui_focus_scope_active())return 0;
+    g_ov_escape=1;g_em_epoch++;em_request_frame();return 1;
+}
 void em_dialog_(EmProps p)  {
     em_flush();ui_dialog_begin(0);
     /* em_apply_box deliberately clears omitted fills on retained containers.
@@ -984,15 +995,16 @@ static void em_stepper_impl(const char *label, int *bind, int lo, int hi, EmProp
  * Only the FOCUSED field draws it, which is also the only field whose rect the
  * kit knows -- so a window of ten fields emits one menu, not ten. */
 static bool g_fieldmenu_open;
+static const char *g_fieldmenu_owner;
 static float g_fieldmenu_x, g_fieldmenu_y;
 
-static void em_text_menu(void) {
+static void em_text_menu(const char *owner) {
     float rx, ry, rw, rh, cx, cy;
     if (!g_fieldmenu_open && ui_focused_field_rect(&rx, &ry, &rw, &rh) &&
         em_right_peek(&cx, &cy) &&
         cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh) {
         em_right_take();
-        g_fieldmenu_open = true;
+        g_fieldmenu_open = true;g_fieldmenu_owner=owner;
         g_fieldmenu_x = cx; g_fieldmenu_y = cy;
     }
     if (!g_fieldmenu_open) return;
@@ -1004,14 +1016,14 @@ static void em_text_menu(void) {
          * A, while "\xE2\x8C\x98A" is one escape too wide and does not compile. */
         #define CMD_  "\xE2\x8C\x98"
         #define SHFT_ "\xE2\x87\xA7"
-        if (MenuItemK("Undo",       CMD_ "Z"))        ui_input_char(UI_KEY_UNDO);
-        if (MenuItemK("Redo",       SHFT_ CMD_ "Z"))  ui_input_char(UI_KEY_REDO);
+        if (MenuItemK("Undo",       CMD_ "Z"))        ui_focus_defer_key(UI_KEY_UNDO);
+        if (MenuItemK("Redo",       SHFT_ CMD_ "Z"))  ui_focus_defer_key(UI_KEY_REDO);
         MenuSeparator();
-        if (MenuItemK("Cut",        CMD_ "X"))        ui_input_char(UI_KEY_CUT);
-        if (MenuItemK("Copy",       CMD_ "C"))        ui_input_char(UI_KEY_COPY);
-        if (MenuItemK("Paste",      CMD_ "V"))        ui_input_char(UI_KEY_PASTE);
+        if (MenuItemK("Cut",        CMD_ "X"))        ui_focus_defer_key(UI_KEY_CUT);
+        if (MenuItemK("Copy",       CMD_ "C"))        ui_focus_defer_key(UI_KEY_COPY);
+        if (MenuItemK("Paste",      CMD_ "V"))        ui_focus_defer_key(UI_KEY_PASTE);
         MenuSeparator();
-        if (MenuItemK("Select All", CMD_ "A"))        ui_input_char(UI_KEY_SEL_ALL);
+        if (MenuItemK("Select All", CMD_ "A"))        ui_focus_defer_key(UI_KEY_SEL_ALL);
         #undef CMD_
         #undef SHFT_
     }
@@ -1021,7 +1033,7 @@ static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool
     if (out_hov) *out_hov = false;
     ui_text_field_next_size(p.width,p.height);
     bool f = ui_text_field(buf, cap, ph);
-    if (f) em_text_menu();
+    if(f || (g_fieldmenu_open && g_fieldmenu_owner==buf))em_text_menu(buf);
     return f;
 }
 static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
@@ -1591,7 +1603,7 @@ static bool em_zoom_tile(const char *label, int cols, int rows, int on, int inse
 /* The menu machinery, declared early: the board is built on the SAME overlay
  * the menus use. See em_zoom_board for why. */
 static int g_controls_hidden;
-static void em_menu_panel_open(uint64_t key, float ax, float ay);
+static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal);
 static struct instance_handle em_menu_overlay_handle(void);
 static int  em_menu_panel_close(void);
 
@@ -1612,7 +1624,7 @@ static void em_zoom_board(void) {
      * inherits that, and means a future fix to overlay positioning fixes both
      * rather than one of them. */
     em_flush();
-    em_menu_panel_open(0x2004B, g_zoom_anchor_x - 8.0f, g_zoom_anchor_y + 6.0f);
+    em_menu_panel_open(0x2004B, g_zoom_anchor_x - 8.0f, g_zoom_anchor_y + 6.0f,0);
     g_zoom_overlay=em_menu_overlay_handle();
 
     EmWinLayout pick = EmWinNormal;
@@ -3134,11 +3146,13 @@ void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
  * branches, so a state flip can never inherit the other state's leftovers. */
 static float g_menu_panel_w = 200.0f;   /* what the NEXT panel should be wide */
 
-static void em_menu_panel_open(uint64_t key, float ax, float ay) {
+static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal) {
     g_controls_hidden=0;
     const struct ui_theme *t = TH;
     ui_begin_vstack(key);                 /* the out-of-flow overlay layer */
-    g_menu_scrim = ui_open();ui_set_hit_passthrough(false);
+    g_menu_scrim = ui_open();ui_set_hit_passthrough(false);ui_set_focus_excluded(false);
+    if(modal)ui_focus_scope_begin(g_menu_scrim,g_menu_restore,UI_FOCUS_MENU|(g_menu_preserve_input?UI_FOCUS_KEEP_INPUT:0));
+    g_menu_restore=INSTANCE_HANDLE_NULL;g_menu_preserve_input=0;
     ui_set_overlay(true);
     ui_set_layer(1);                      /* elevated: paints above + hits above the flow */
     ui_set_clip_children(false);
@@ -3208,7 +3222,8 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
 }
 /* returns 1 if the transparent scrim (outside the panel) was clicked */
 static int em_menu_panel_close(void) {
-    ui_end_stack();                       /* panel */
+    ui_end_stack();
+    ui_focus_scope_end(g_menu_scrim);                       /* panel */
     int scrim_hit = ui_consume_click(g_menu_scrim);
     ui_end_stack();                       /* overlay */
     return scrim_hit;
@@ -3218,7 +3233,7 @@ static int em_menu_panel_close(void) {
  * every open-state prop explicitly reversed (overlay, layer, paint, offset). */
 static void em_menu_hidden_open(uint64_t key) {
     g_controls_hidden=1;
-    ui_begin_vstack(key);
+    ui_begin_vstack(key);ui_set_focus_excluded(true);
     ui_set_overlay(false);
     ui_set_layer(0);
     ui_set_paint(solid((Color){0,0,0,0}));
@@ -3239,6 +3254,7 @@ void em_menu_(const char *label, EmProps p) {
     int is_open = (g_menu_open == (const void *)label);
     ui_begin_hstack(0);                   /* the menu button in the bar */
     struct instance_handle btn = ui_open();
+    if(g_menu_button_count<24){g_menu_buttons[g_menu_button_count].label=label;g_menu_buttons[g_menu_button_count++].button=btn;}
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     ui_set_paint(solid(is_open ? t->accent_soft : pressed ? shade(t->surface_alt, 0.94f)
                                 : hov ? t->surface_alt : t->surface_alt));
@@ -3257,6 +3273,8 @@ void em_menu_(const char *label, EmProps p) {
       if(p.icon)em_icon_impl(p.icon,lp);else em_text_impl(label,lp); }
     if(p.icon && !is_open)em_tooltip(label);
     bool activated=ui_control_interact(btn);
+    int navigation=ui_control_navigation();
+    if(!is_open && (navigation==UI_KEY_DOWN || navigation==UI_KEY_UP)){activated=true;g_menu_start_last=navigation==UI_KEY_UP;}
     ui_end_stack();
     if(activated) {
         if (is_open) g_menu_open = 0;
@@ -3281,7 +3299,7 @@ void em_menu_(const char *label, EmProps p) {
         float x,y,w,h;
         if(ui_rect_of(btn,&x,&y,&w,&h)) {g_menu_ax=x;float anchor=p.menu_above>1?em_viewport_height()-p.menu_above+(p.menu_above-h)*.5f:y;
             g_menu_ay=p.menu_above?-(anchor+1):y+h+2;}
-        em_menu_panel_open((uint64_t)(uintptr_t)label,g_menu_ax,g_menu_ay);
+        g_menu_restore=btn;em_menu_panel_open((uint64_t)(uintptr_t)label,g_menu_ax,g_menu_ay,1);
     }
     else         em_menu_hidden_open((uint64_t)(uintptr_t)label);
 }
@@ -3289,6 +3307,7 @@ void em_menu_end_(void) {
     em_flush();
     if (g_menu_cur_open) {
         if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; }
+        else if(g_menu_start_last){ui_focus_edge(true);g_menu_start_last=0;}
     }
     else {
         ui_end_stack();                       /* inner mirror */
@@ -3318,7 +3337,7 @@ bool em_menu_item(const char *label, const char *shortcut) {
     const struct ui_theme *t = TH;
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
-    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    bool hov = ui_is_hovered() || ui_has_focus(self), pressed = ui_is_pressed();
     /* One panel material, with a highlight only on the current row. Reset the
      * border explicitly: reconciled instances may have been glass containers. */
     ui_set_paint(solid(pressed ? shade(t->accent_soft, 0.94f) : hov ? t->accent_soft : (Color){0,0,0,0}));
@@ -3360,7 +3379,7 @@ void em_context_menu_(bool *open, float x, float y, EmProps p) {
     g_ctx_cur_open = (open && *open) ? 1 : 0;
     g_ctx_open_flag = open;
     g_menu_item_chosen = 0;               /* fresh: only THIS frame's item clicks count */
-    if (g_ctx_cur_open) em_menu_panel_open((uint64_t)(uintptr_t)open, x, y);
+    if (g_ctx_cur_open) em_menu_panel_open((uint64_t)(uintptr_t)open, x, y,1);
     else                em_menu_hidden_open((uint64_t)(uintptr_t)open);
 }
 void em_context_menu_end_(void) {
@@ -3374,6 +3393,32 @@ void em_context_menu_end_(void) {
     } else {
         ui_end_stack(); ui_end_stack();   /* inner mirror + hidden box */
     }
+}
+
+/* Called before app hooks: an open menu owns navigation and cancellation. */
+int em_menu_key(int code) {
+    int context=g_ctx_cur_open && g_ctx_open_flag && *g_ctx_open_flag;
+    if(!g_menu_open && !context)return 0;
+    if(code==27) {
+        if(context){*g_ctx_open_flag=false;g_ctx_cur_open=0;g_em_epoch++;}
+        else em_menu_dismiss();
+        return 1;
+    }
+    if(code==UI_KEY_UP || code==UI_KEY_DOWN) {
+        ui_focus_move(code==UI_KEY_UP?-1:1);em_request_frame();return 1;
+    }
+    if(code==UI_KEY_HOME || code==UI_KEY_END) {
+        ui_focus_edge(code==UI_KEY_END);em_request_frame();return 1;
+    }
+    if(g_menu_open && (code==UI_KEY_LEFT || code==UI_KEY_RIGHT)) {
+        unsigned n=g_menu_button_count;
+        for(unsigned i=0;i<n;i++)if(g_menu_buttons[i].label==g_menu_open) {
+            unsigned next=(i+n+(code==UI_KEY_LEFT?-1:1))%n;
+            g_menu_open=g_menu_buttons[next].label;g_menu_preserve_input=1;g_em_epoch++;return 1;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* ======================================================================= */

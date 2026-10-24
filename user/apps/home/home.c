@@ -1803,17 +1803,18 @@ int main(int argc, char **argv, char **envp) {
          * password field -- there is nothing else on the screen to type into,
          * and nothing behind it may have them either. */
         if (g_locked) {
-            for (int c; (c = embk_key_poll()) > 0; )
-                if (!g_lock_checking) ui_input_char(c);
+            for (int input; (input=embk_key_poll_input())>0; )
+                if(!g_lock_checking)ui_input_key(input&255,(unsigned)(input>>8)&255);
         } else if (g_apps_open) {
-            for (int c; (c = embk_key_poll()) > 0; ) {
+            for (int input; (input=embk_key_poll_input())>0; ) {
+                int c=input&255;
                 if (c == 27) { apps_set_open(0); break; }   /* Esc dismisses */
                 /* Everything else goes to the search field. The desktop has no
                  * other text to type into, so there is nothing to arbitrate
                  * between -- and typing straight into the search box, without
                  * clicking it first, is most of why searching a launcher is
                  * faster than looking through it. */
-                ui_input_char(c);
+                ui_input_key(c,(unsigned)(input>>8)&255);
             }
         } else {
             /* The kernel focus gate permits only desktop-owned input here.

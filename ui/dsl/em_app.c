@@ -620,7 +620,8 @@ int em_app_run(const EmApp *app) {
             int c=input&255;g_key_modifiers=(input>>8)&255;
             /* Escape first dismisses a menu; it must not quit the application
              * (especially the system bar) that owns an open dropdown. */
-            if (c == 27 && em_menu_dismiss()) { had_key = 1; continue; }
+            if (em_menu_key(c)) {had_key=1;continue;}
+            int captured=ui_focus_scope_active();
             /* THE HOOK GETS FIRST REFUSAL ON PASTE TOO. The replay below turns
              * newlines and tabs into spaces, which is right for a terminal --
              * a paste must never execute anything -- and wrong for an editor,
@@ -634,7 +635,7 @@ int em_app_run(const EmApp *app) {
              * console interrupt. Keeping both means nothing that worked stops
              * working. */
             if ((c == 0x16 || c == EMBK_KEY_PASTE) &&
-                g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
+                g_em_key_hook && (!captured || c==27) && g_em_key_hook(c)) { had_key = 1; continue; }
             if (c == 0x16 || c == EMBK_KEY_PASTE) {   /* paste, app-wide */
                 /* The runtime replays the clipboard through the SAME delivery
                  * path as typing -- key hook first, else the focused field --
@@ -656,15 +657,16 @@ int em_app_run(const EmApp *app) {
                      * real character; the bytes of one arrive consecutively and
                      * the caret advances one at a time, so it lands intact. */
                     if (ch < 0x20 || ch == 0x7F) continue;
-                    if (g_em_key_hook && g_em_key_hook(ch)) continue;
+                    if (!captured && g_em_key_hook && g_em_key_hook(ch)) continue;
                     ui_input_char(ch);
                 }
                 had_key = 1;
                 continue;
             }
-            if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
+            if (g_em_key_hook && (!captured || c==27) && g_em_key_hook(c)) { had_key = 1; continue; }
+            if (c==27 && em_overlay_escape()){had_key=1;continue;}
             if (c == 27) { em_app_request_exit(0); had_key = 1; continue; }
-            ui_input_char(c);
+            ui_input_key(c,(unsigned)g_key_modifiers);
             had_key = 1;
         }
         int input_edge = had_key ||
@@ -700,7 +702,7 @@ int em_app_run(const EmApp *app) {
         if (app_tick) last_app_tick = em_now_ms();
         int build = first || input_edge || em_take_frame_request() || app_tick ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
-                    em_overlay_active() || win_moved;
+                    em_overlay_active() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
         if (!build) {
             cad_idle_tick(&cad);
             /* SAMPLE THE POINTER WHILE IDLING, in slices, rather than sleeping

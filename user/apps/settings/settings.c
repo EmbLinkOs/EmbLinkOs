@@ -725,7 +725,8 @@ static void app(void) {
                 }
             }
         }
-        if(g_reset_confirm)Overlay() {
+        if(g_reset_confirm) {
+          Overlay() {
             Dialog(.width=400,.padding=22,.spacing=14) {
                 Text("Reset appearance?").title();
                 Text("Restore the Contour palette, layout, typography and effects. Other system preferences are kept.").body().secondary();
@@ -734,6 +735,8 @@ static void app(void) {
                     if(Button("Reset").primary().clicked()){apply_preset(0);g_reset_confirm=false;}
                 }
             }
+          }
+          if(OverlayDismissed())g_reset_confirm=false;
         }
     }
 }

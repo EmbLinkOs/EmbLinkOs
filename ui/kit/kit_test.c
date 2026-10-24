@@ -179,6 +179,15 @@ static void scroll_wrapped(float *sc) {
     ui_end_stack();ui_scroll_end();ui_frame_end();ui_run_layout(140,80);
 }
 
+static float nav_scroll;
+static void scroll_controls(void) {
+    ui_frame_begin();ui_scroll_begin(0xACC355,80,&nav_scroll);
+    for(unsigned i=0;i<10;i++) {
+        ui_begin_vstack(i+1);ui_button_primary("Reachable");ui_end_stack();
+    }
+    ui_scroll_end();ui_frame_end();ui_run_layout(400,100);
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -733,6 +742,20 @@ int main(void) {
     CHECK(!strcmp(A,"x") && !strcmp(B,"y"),"Tab carries subsequent text through buttons into the next field");
     CHECK(control_pressed && control_toggled,"Return activates a button and Space toggles without pointer input");
 
+    page=0xBACC;show_b=autofocus=true;A[0]=B[0]=C[0]=0;
+    frame(NULL);frame(NULL);frame("a\tb\tc");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('B',0);g_mods=0;
+    frame(NULL);frame(NULL);
+    CHECK(!strcmp(A,"a") && !strcmp(B,"bB") && !strcmp(C,"c"),
+          "Shift+Tab uses its queued modifiers and carries text to the previous field");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('C',0);
+    for(int i=0;i<4;i++)frame(NULL);
+    CHECK(!strcmp(A,"a") && !strcmp(B,"bB") && !strcmp(C,"cC"),
+          "multiple queued reverse Tabs wrap without replay or lost text");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('\t',0);ui_input_key('!',0);
+    for(int i=0;i<4;i++)frame(NULL);
+    CHECK(!strcmp(C,"cC!") && !strcmp(B,"bB"),"mixed forward/reverse traversal preserves key order");
+
     /* A segmented control replacing a fixed-width row must not inherit it. */
     struct instance_handle old_row;
     ui_frame_begin();ui_begin_vstack(0x51e63);ui_begin_hstack(0);old_row=ui_open();
@@ -744,6 +767,14 @@ int main(void) {
     }
     float oldx,oldy,neww,newh;
     CHECK(ui_rect_of(old_row,&oldx,&oldy,&neww,&newh) && neww>180,"a reused segmented root releases an old fixed width");
+
+    ui_request_focus(INSTANCE_HANDLE_NULL);nav_scroll=0;scroll_controls();scroll_controls();
+    for(unsigned i=0;i<9;i++){ui_input_char('\t');scroll_controls();scroll_controls();}
+    CHECK(nav_scroll>100,"Tab reveals a focused control below a scroll viewport");
+    float manual_scroll=nav_scroll-20;nav_scroll=manual_scroll;scroll_controls();scroll_controls();
+    CHECK(nav_scroll==manual_scroll,"manual scrolling is not pinned to an unchanged focused control");
+    for(unsigned i=0;i<8;i++){ui_input_key('\t',UI_MOD_SHIFT);scroll_controls();scroll_controls();}
+    CHECK(nav_scroll<1,"reverse Tab reveals the first control again");
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

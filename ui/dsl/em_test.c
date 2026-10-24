@@ -196,6 +196,103 @@ static void chrome_frame(void) {
     ui_frame_end();ui_run_layout(400,300);
 }
 
+static char modal_text[32];
+static bool modal_open,nested_open;
+static int accepted;
+static struct instance_handle outside_button;
+static void modal_frame(void) {
+    ui_frame_begin();em_new_frame();
+    VStack(.key="focus-regression") {
+        em_field_autofocus();TextField(modal_text,sizeof modal_text,"Outside");
+        if(Button("Show decision").clicked())modal_open=true;
+        em_flush();
+        outside_button=ui_next_sibling(ui_first_child(ui_first_child(ui_root())));
+        if(modal_open)Overlay() {
+            Dialog(.width=300) {
+                if(Button("Cancel").clicked())modal_open=false;
+                if(Button("More options").clicked())nested_open=true;
+                if(Button("Proceed").clicked()){accepted++;modal_open=false;}
+                if(nested_open)Overlay() {
+                    Dialog(.width=200) {
+                        if(Button("Back").clicked())nested_open=false;
+                        if(Button("Done").clicked())nested_open=false;
+                    }
+                }
+            }
+        }
+    }
+    em_flush();ui_frame_end();ui_run_layout(400,400);
+}
+static int menu_action;
+static void menu_frame(void) {
+    ui_frame_begin();em_new_frame();
+    VStack(.key="menu-navigation") {
+        MenuBar() {
+            Menu("File") {
+                if(MenuItem("New"))menu_action=1;
+                MenuSeparator();
+                if(MenuItem("Open"))menu_action=2;
+                if(MenuItem("Close"))menu_action=3;
+            }
+            Menu("Edit") {
+                if(MenuItem("Copy"))menu_action=4;
+                if(MenuItem("Paste"))menu_action=5;
+            }
+            Menu("Tools") {if(Button("Hidden action").clicked())menu_action=6;}
+        }
+    }
+    em_flush();ui_frame_end();ui_run_layout(500,500);
+}
+static char context_text[48]="Clipboard survives focus.";
+static void context_frame(void) {
+    ui_frame_begin();em_new_frame();
+    VStack(.key="context-focus") {em_field_autofocus();TextField(context_text,sizeof context_text,"Context");}
+    em_flush();ui_frame_end();ui_run_layout(500,400);
+}
+static void navigation_regressions(void) {
+    ui_request_focus(INSTANCE_HANDLE_NULL);modal_text[0]=0;modal_open=nested_open=false;accepted=0;
+    modal_frame();modal_frame();ui_input_char('x');ui_input_char('\t');ui_input_char('\n');ui_input_char('!');modal_frame();modal_frame();
+    CHECK(modal_open && !strcmp(modal_text,"x") && accepted==0,"opening a dialog consumes its activation without typing into the background");
+    for(int i=0;i<8;i++){ui_input_char('\t');modal_frame();modal_frame();}
+    ui_input_key('\t',UI_MOD_SHIFT);modal_frame();modal_frame();
+    ui_input_char('q');modal_frame();
+    CHECK(!strcmp(modal_text,"x") && modal_open,"forward and reverse Tab stay inside the dialog");
+    /* Return to the first dialog control, then open its nested decision. */
+    ui_focus_edge(false);modal_frame();ui_input_char('\t');ui_input_char('\n');modal_frame();modal_frame();
+    CHECK(nested_open,"a nested dialog opens from the focused control");
+    ui_input_char('\n');modal_frame();modal_frame();modal_frame();
+    CHECK(!nested_open && modal_open,"Return in a nested dialog activates only its own default control");
+    ui_input_key('\t',UI_MOD_SHIFT);modal_frame();modal_frame();ui_input_char('\n');modal_frame();modal_frame();modal_frame();
+    CHECK(!modal_open && ui_has_focus(outside_button),"closing nested and outer dialogs restores their initiating controls");
+    ui_request_focus(INSTANCE_HANDLE_NULL);menu_action=0;menu_frame();menu_frame();
+    ui_input_char('\t');menu_frame();ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    CHECK(em_menu_any_open(),"Down opens a focused menu from the keyboard");
+    CHECK(em_menu_key(UI_KEY_DOWN),"an open menu consumes Down before app hooks");menu_frame();
+    ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==2 && !em_menu_any_open(),"Down skips separators and Return activates the focused item once");
+    ui_input_char(UI_KEY_UP);menu_frame();menu_frame();ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==3,"Up opens a menu at its final item");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    CHECK(em_menu_key(UI_KEY_RIGHT),"Right walks adjacent menus");menu_frame();menu_frame();
+    ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==4,"switching menus focuses the new menu's first item");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    em_menu_key(UI_KEY_LEFT);ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==1 && !em_menu_any_open(),"queued menu switching and Return activate only the new menu");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    CHECK(em_menu_key(27),"Escape dismisses a menu without reaching the application");menu_frame();menu_frame();
+    CHECK(!em_menu_any_open(),"Escape leaves the menu closed");
+    ui_request_focus(INSTANCE_HANDLE_NULL);context_frame();context_frame();
+    ui_input_char(UI_KEY_SEL_ALL);context_frame();
+    em_feed_pointer(50,15,0,1,0,1);context_frame();
+    em_feed_pointer(50,15,0,0,0,1);context_frame();context_frame();
+    CHECK(em_menu_key(UI_KEY_HOME),"a text context menu retains keyboard ownership after field focus moves");context_frame();
+    for(int i=0;i<3;i++){em_menu_key(UI_KEY_DOWN);context_frame();}
+    ui_input_char('\n');context_frame();context_frame();context_frame();context_frame();
+    CHECK(!strcmp(clip_text(),context_text),"context Copy waits for the original field's focus and selection to return");
+
+}
+
 int main(void) {
     printf("=== em-test: the multi-line editor ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -513,6 +610,8 @@ int main(void) {
     em_flush();ui_frame_end();ui_run_layout(400,100);
     struct scene_node *toast=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
     CHECK(toast && toast->opacity==1,"reduced motion presents a toast without a fade or slide");
+
+    navigation_regressions();
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

@@ -138,10 +138,27 @@ bool ui_open_rect(float *x, float *y, float *w, float *ht);
 
 /* --- keyboard focus + typed input (text fields) --- */
 void ui_input_char(int c);                        /* loop feeds each key byte here */
+struct ui_key_input { unsigned char code, modifiers; };
+void ui_input_key(int c, unsigned modifiers);     /* modifiers captured with this key */
+int  ui_input_take_keys(struct ui_key_input *dst, int max);
 int  ui_input_take(char *dst, int max);           /* focused field drains queued chars */
 void ui_request_focus(struct instance_handle h);
 bool ui_has_focus(struct instance_handle h);
 bool ui_any_focus(void);       /* is ANY text field focused? (app key hooks) */
+bool ui_focus_register(struct instance_handle h);
+struct instance_handle ui_focus_previous(struct instance_handle h);
+bool ui_focus_move(int direction);              /* cycle the active scope */
+bool ui_focus_edge(bool last);
+#define UI_FOCUS_MENU 1u
+#define UI_FOCUS_KEEP_INPUT 2u
+void ui_focus_scope_begin(struct instance_handle root, struct instance_handle restore,unsigned policy);
+void ui_focus_scope_end(struct instance_handle root);
+bool ui_focus_scope_active(void);
+void ui_focus_defer_key(int code);               /* deliver to restored scope owner */
+uint64_t ui_focus_scope_serial(void);
+void ui_set_focus_excluded(bool excluded);       /* current subtree, e.g. hidden menus */
+bool ui_focus_reveal(float *scroll_offset);      /* reveal new focus in current viewport */
+bool ui_focus_needs_frame(void);                 /* read-and-clear redraw request */
 uint64_t ui_frame_serial(void); /* changes every frame; for per-frame widget state */
 
 /* --- scroll --- */
