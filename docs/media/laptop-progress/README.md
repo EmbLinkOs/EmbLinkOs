@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-145 actual EmbLinkOS captures document the original laptop work, its
+150 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration and several monitors. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors and GPU composition. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,41 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: several monitors
+## Latest: GPU composition
+
+The desktop is composed on the GPU where the adapter can do it: through virgl on QEMU's virtio-vga-gl -- the host's OpenGL, here Mesa's llvmpipe -- and with the Gen9 blitter on Intel laptops. These are captures of the virgl path; a GL scanout has no surface for QEMU's screendump, so they were read over VNC from an egl-headless display, unmodified. The same guest run with composition kept on the CPU gave the comparison frames; the Intel blitter has only met a model of its engine. See [DISPLAYS.md](../../DISPLAYS.md#gpu-composition).
+
+### The desktop composed on the host's GPU
+
+After setup and login the compositor draws through virgl: the wallpaper window, the translucent menu bar, the frosted dock and the pointer are draws in a 3D context, straight into the scanout resource. It matches the CPU-composed desktop pixel for pixel.
+
+![The desktop composed on the host's GPU in EmbLinkOS](146-gpu-desktop.png)
+
+### Kernel title bars, rings and shadows on the GPU
+
+The Windows demo, started from the Terminal: two windows with kernel title bars over a third. Rounded corners, the 1px border ring and the focus shadow are fragment shaders; the title bars are drawn by the CPU on a canvas the GPU shows.
+
+![Kernel title bars, rings and shadows on the GPU in EmbLinkOS](147-gpu-windows.png)
+
+### Settings names what composes
+
+Settings > Displays > Rendering reports host GPU (virgl) once the compositor's probe frame came back right.
+
+![Settings names what composes in EmbLinkOS](148-gpu-settings.png)
+
+### The same scene composed on the CPU
+
+The same guest and the same input with composition kept on the CPU: Rendering says Software. The smoke test compares every GPU frame with its CPU twin.
+
+![The same scene composed on the CPU in EmbLinkOS](149-cpu-settings.png)
+
+### A resolution trial under the GPU
+
+Apply Resolution at 1024 × 768: a new surface and scanout resource, attached to the 3D context, the canvas made again over the new backbuffer. Revert brings 1280 × 800 back, still composed on the GPU.
+
+![A resolution trial under the GPU in EmbLinkOS](150-gpu-resolution-trial.png)
+
+## Several monitors
 
 The desktop spans every monitor in use. Each monitor shows its own rectangle of one surface and its own wallpaper, and the primary carries the menu bar and the dock. A monitor plugged in extends the desktop. Settings arranges the displays through the same keep-or-revert trial as a resolution change, and a kept arrangement returns for the same monitors after login. These are QEMU captures of a two-head virtio-vga (each head captured separately); native Intel external monitors have only met a register model. See [DISPLAYS.md](../../DISPLAYS.md).
 
