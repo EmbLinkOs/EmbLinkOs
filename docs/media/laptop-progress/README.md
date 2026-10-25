@@ -1,6 +1,6 @@
 # Laptop progress captures
 
-156 actual EmbLinkOS captures document the original laptop work, its
+160 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
 interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and the start of a real Terminal. PNG exports preserve
@@ -23,6 +23,32 @@ The Terminal is being rebuilt into a real one -- then a Powerlevel10k-style prom
 Up and Ctrl+S are the same byte, and F5 has none; the kernel queue now records which key made each byte. ttyprobe --identity shows what the Terminal sent for keys pressed over QMP: F-keys, modified arrows, Alt as Meta, Backspace against Ctrl+Backspace, and the keypad in application mode -- each as xterm sends it.
 
 ![Keys with identity in EmbLinkOS](156-terminal-key-identity.png)
+
+The shell then took its line back from the terminal: it draws its prompt, edits, completes and recalls history itself, as readline is bash's ([SHELL.md](../../SHELL.md#10-the-line--the-shell-edits-its-own)).
+
+### Completion from what the shell knows
+
+Tab on a word many commands share opens a menu of the shell's builtins, its keywords and the programs in /system/bin and /data/apps; Tab again chooses. The shell completes, not the terminal.
+
+![Completion from what the shell knows in EmbLinkOS](157-shell-edit-completion.png)
+
+### Searching history as you type
+
+Ctrl+R and three letters find the earlier command containing them; the search line sits under the prompt, Enter runs the match and Escape puts the line back.
+
+![Searching history as you type in EmbLinkOS](158-shell-edit-search.png)
+
+### A block typed the way it is written
+
+Enter on an open brace adds a line under a '...' prompt instead of reporting an error; the closed block runs as one program.
+
+![A block typed the way it is written in EmbLinkOS](159-shell-edit-multiline.png)
+
+### History that outlives the window
+
+The Terminal was closed and a new one opened: its shell lists what the first one ran from ~/.local/share/shell/history, and Up recalls the multi-line program whole.
+
+![History that outlives the window in EmbLinkOS](160-shell-edit-history.png)
 
 ## The native shell runs any program
 
