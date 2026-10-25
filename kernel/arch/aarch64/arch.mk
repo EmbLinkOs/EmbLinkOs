@@ -138,6 +138,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/module/module.c \
                   kernel/module/exports.c \
                   kernel/fs/fd.c \
+                  kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c \
                   kernel/fs/namespace.c \
                   kernel/fs/epfs.c \
                   kernel/fs/embkfs/embkfs.c \
@@ -153,7 +154,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/gfx/surface.c \
                   kernel/gfx/compositor.c \
                   kernel/kworker/kworker.c \
-                  kernel/tty/tty.c \
+                  kernel/tty/tty.c kernel/tty/pty.c \
                   kernel/acpi/acpi.c \
                   kernel/acpi/aml.c \
                   kernel/acpi/acpi_dev.c \
@@ -323,7 +324,7 @@ ARM_PIE_SYSCALLS := $(ARM_USER)/syscalls_pic.o
 # and it builds; nothing else needs editing.
 # Static newlib console programs (-T newlib.ld, no libembk.so).
 ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn lockdemo jitter \
-                    crasher ioracer sockdemo udptest nbsock httpget \
+                    crasher ioracer processprobe spawnprobe shprobe fdprobe sh sockdemo udptest nbsock httpget \
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \
                     $(if $(HAVE_QJS),js,) \
@@ -425,6 +426,9 @@ ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
                  $(wildcard user/audio/mp3/*.c)) \
                user/audio/resample.c
 
+ARM_XSRC_term     := user/terminal/vt.c
+$(ARM_USER)/term.o: user/terminal/vt.h
+
 ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \
                      user/photos/album.c user/web/png.c user/web/jpeg.c \
                      user/lib/inflate.c
@@ -459,6 +463,19 @@ ARM_INC_js        := $(QJS_CFLAGS)
 
 # shell/ programs: their sources are outside the program directories, so each names its own
 # main and its own extra objects.
+ARM_MAIN_sh := third_party/mrsh/main.c
+ARM_SH_SRCS := $(filter-out third_party/mrsh/main.c,$(MRSH_SRCS))
+ARM_INC_sh := $(MRSH_INC) -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096
+ARM_SH_OBJS := $(patsubst %.c,$(ARM_USER)/mrsh/%.o,$(ARM_SH_SRCS))
+ARM_EXTRAOBJ_sh := $(ARM_SH_OBJS)
+define ARM_SH_OBJECT
+$(ARM_USER)/mrsh/$(patsubst %.c,%.o,$(1)): $(1)
+	@mkdir -p $$(dir $$@)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(ARM_INC_sh) -c $$< -o $$@
+endef
+$(foreach source,$(ARM_SH_SRCS),$(eval $(call ARM_SH_OBJECT,$(source))))
+-include $(addsuffix .d,$(ARM_SH_OBJS))
+
 ARM_XSRC_shell    := $(ARM_SHELL_SRC)
 ARM_XSRC_sysinfo  := $(ARM_SHELL_SDK)
 ARM_XSRC_tally    := $(ARM_SHELL_SDK)
@@ -553,7 +570,7 @@ $(ARM_USER):
 # The retargeting layer, once.
 $(ARM_USER)/crt0.o: user/lib/crt0.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-$(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
+$(ARM_USER)/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_child.h | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
 # EXPLICIT rules, generated per program, NOT pattern rules -- and that is a
@@ -605,7 +622,7 @@ $(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
 ifneq ($(PIE_OK),)
 $(ARM_USER)/crt0_pic.o: user/lib/crt0.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
-$(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(ARM_USER)
+$(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 $(ARM_USER)/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@

@@ -1,0 +1,29 @@
+image: archlinux
+packages:
+  - gcc
+  - meson
+  - readline
+sources:
+  - https://git.sr.ht/~emersion/mrsh
+tasks:
+  - setup: |
+      cd mrsh
+      meson build -Db_sanitize=address,undefined -Dauto_features=enabled
+  - build: |
+      cd mrsh
+      ninja -C build
+  - test: |
+      cd mrsh
+      ninja -C build test
+  - build-release: |
+      cd mrsh
+      meson configure build --buildtype release
+      ninja -C build
+  - build-minimal: |
+      cd mrsh
+      meson configure build -Dauto_features=disabled
+      ninja -C build
+triggers:
+  - action: email
+    condition: failure
+    to: "<contact@emersion.fr>"

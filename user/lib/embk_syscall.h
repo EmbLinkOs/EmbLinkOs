@@ -202,6 +202,12 @@
 #define EMBK_SYS_win_close_ack 145
 #define EMBK_SYS_key_poll_input 146
 #define EMBK_SYS_desktop_control 147
+#define EMBK_SYS_terminal 148
+#define EMBK_SYS_child 149
+#define EMBK_SYS_pipe_fds 150
+#define EMBK_SYS_spawn_cwd 151
+#define EMBK_SYS_spawn_pid 152
+#define EMBK_SYS_update 153
 
 
 

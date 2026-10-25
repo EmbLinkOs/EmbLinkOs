@@ -13,20 +13,24 @@
 #include "theme.h"
 #include "system_status.h"
 
-enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_WINDOWS, PANE_ACCESS, PANE_WIFI, PANE_SOUND, PANE_DISPLAY, PANE_POWER, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_ABOUT, PANE_N };
+enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_WINDOWS, PANE_ACCESS, PANE_WIFI, PANE_SOUND, PANE_DISPLAY, PANE_POWER, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_UPDATE, PANE_ABOUT, PANE_N };
 
-static const char *g_pane_name[PANE_N]={"Appearance","Desktop & Dock","Windows & Workspaces","Accessibility","Wi-Fi","Sound","Displays","Battery & Power","Keyboard","Date & Time","System","About"};
-static const int g_pane_icon[PANE_N]={IconPalette,IconGrid,IconWindow,IconUser,IconNetwork,IconVolume,IconDisplay,IconBattery,IconKeyboard,IconClock,IconBolt,IconInfo};
+static const char *g_pane_name[PANE_N]={"Appearance","Desktop & Dock","Windows & Workspaces","Accessibility","Wi-Fi","Sound","Displays","Battery & Power","Keyboard","Date & Time","System","Software Update","About"};
+static const int g_pane_icon[PANE_N]={IconPalette,IconGrid,IconWindow,IconUser,IconNetwork,IconVolume,IconDisplay,IconBattery,IconKeyboard,IconClock,IconBolt,IconBolt,IconInfo};
 static const char *g_pane_description[PANE_N]={
     "A coordinated workspace, with room for your own taste.","Arrange the command strip, dock and desktop.",
     "Choose how windows look, move and share the display.","Make the desktop easier to read and calmer to use.",
     "Connect and manage your saved networks.","Choose the level for your audio output.",
     "Your screen and its available controls.","Battery readings and energy preferences.",
     "Layout and the shortcuts used across the desktop.","The clock and your local time zone.",
-    "Live information about this computer.","EmbLink OS and its system preferences."};
+    "Live information about this computer.","Keep your system and applications current.","EmbLink OS and its system preferences."};
 static char g_search[64],g_surface_hex[8],g_accent_hex[8];
 static bool g_reset_confirm;
 static int   g_pane = PANE_APPEARANCE;
+static struct embk_update_info g_update;
+static int g_update_rc;
+static int g_update_confirm;
+static char g_update_action_error[96];
 static struct embk_audio_info g_audio;
 static struct embk_display_info g_display;
 static struct embk_gpu_info g_graphics;
@@ -70,6 +74,7 @@ static void sample_system(void) {
     if(ms>=g_sample_next) {
         g_sample_next=ms+1000;
         g_wifi_rc=embk_wifi_get(&g_wifi);
+        g_update_rc=embk_update(EMBK_UPDATE_STATUS,&g_update,sizeof g_update);
         g_audio_rc=embk_audio_get(&g_audio);g_display_rc=embk_display_get(&g_display);
         g_power_rc=embk_power_get(&g_power);embk_gpu_get(&g_graphics);embk_policy_get(&g_policy);
         if(!g_wifi_rc && g_wifi_pending && g_wifi.completed_id &&
@@ -655,6 +660,59 @@ static void pane_system(void) {
     }
 }
 
+static void request_update(unsigned action) {
+    int rc=embk_update(action,NULL,0);
+    if(rc)snprintf(g_update_action_error,sizeof g_update_action_error,
+        rc==-1?"An administrator account is required.":"Update request failed (%d).",rc);
+    else g_update_action_error[0]=0;
+}
+static void pane_update(void) {
+    int managed=!g_update_rc && (g_update.flags&EMBK_UPDATE_MANAGED);
+    int admin=!g_update_rc && (g_update.flags&EMBK_UPDATE_ADMIN);
+    int busy=g_update.job || (g_update.phase>=EMBK_UPDATE_DOWNLOADING && g_update.phase<=EMBK_UPDATE_WRITING);
+    Section("EmbLink OS") {
+        Text(managed?g_update.current:"Current installation").title();
+        Text(g_update_rc?"The update service is unavailable.":g_update.message).body().secondary();
+        if(g_update_action_error[0])Text(g_update_action_error).caption().secondary();
+        if(g_update.flags&EMBK_UPDATE_TRIAL)Text("Verifying this startup. A failed boot restores the previous system automatically.").caption().secondary();
+        if(g_update.flags&EMBK_UPDATE_REVERTED)Text("The previous update did not complete. Your confirmed system was restored.").caption().secondary();
+        if(busy) {
+            ProgressBar(g_update.total?(float)g_update.done/(float)g_update.total:0.0f);
+            if(g_update.total) {
+                char progress[96];snprintf(progress,sizeof progress,"%u%% · %llu / %llu MiB",g_update.progress,
+                    (unsigned long long)(g_update.done>>20),(unsigned long long)(g_update.total>>20));
+                Text(progress).caption().tertiary();
+            }
+        }
+        if(g_update.candidate[0] && g_update.candidate_release>g_update.release) {
+            ListRow(IconInfo,"Available release",g_update.candidate);
+            if(g_update.notes[0])Text(g_update.notes).body().secondary();
+        }
+        if(managed && admin && !busy && !(g_update.flags&EMBK_UPDATE_TRIAL)) {
+            HStack(.spacing=10) {
+                if(g_update.phase==EMBK_UPDATE_RESTART) {
+                    if(Button("Restart to finish…").primary().clicked())g_update_confirm=1;
+                } else {
+                    if(Button("Check for Updates").secondary().clicked())request_update(EMBK_UPDATE_CHECK);
+                    if(g_update.phase==EMBK_UPDATE_AVAILABLE && Button("Install Update…").primary().clicked())g_update_confirm=2;
+                }
+            }
+        } else if(managed && !admin)Text("Sign in to an administrator account to install updates.").caption().tertiary();
+    }
+    Section("Your data stays yours") {
+        Text("System upgrades include the kernel, drivers, desktop, built-in applications and shared components. Personal files, accounts and preferences live separately from the system.").body().secondary();
+        if(managed && admin && (g_update.flags&EMBK_UPDATE_PREVIOUS) && !busy && g_update.phase!=EMBK_UPDATE_RESTART) {
+            if(Button("Restore Previous System…").secondary().clicked())g_update_confirm=3;
+        }
+    }
+    Section("Application packages") {
+        Text("Built-in applications are upgraded with the system. Independently installed packages use signed bundles and their own retained versions.").body().secondary();
+        if(managed && admin && !busy && g_update.phase!=EMBK_UPDATE_RESTART && (g_update.flags&EMBK_UPDATE_APPS_CHANNEL)) {
+            if(Button("Update Applications").secondary().clicked())request_update(EMBK_UPDATE_APPLICATIONS);
+        } else if(!(g_update.flags&EMBK_UPDATE_APPS_CHANNEL))Text("No application update registry is configured for this build.").caption().tertiary();
+    }
+}
+
 static void pane_about(void) {
     VStack(.spacing = 8, .align = Leading, .py = 6) {
         Text("EmbLink OS").title();
@@ -719,11 +777,31 @@ static void app(void) {
                         case PANE_KEYBOARD:pane_keyboard();break;
                         case PANE_TIME:pane_time();break;
                         case PANE_SYSTEM:pane_system();break;
+                        case PANE_UPDATE:pane_update();break;
                         default:pane_about();break;
                         }
                     }
                 }
             }
+        }
+        if(g_update_confirm) {
+          Overlay() {
+            Dialog(.width=430,.padding=22,.spacing=14) {
+                Text(g_update_confirm==1?"Restart to finish?":g_update_confirm==2?"Install system update?":"Restore previous system?").title();
+                Text(g_update_confirm==1?"Save open documents first. The computer will restart into the prepared system.":
+                    g_update_confirm==2?"The verified release will install in the spare system slot. You can keep working and restart when it is ready.":
+                    "The retained system will be selected for the next restart. Your personal files and settings stay in place.").body().secondary();
+                HStack(.spacing=10) {
+                    Spacer();if(Button("Cancel").secondary().clicked())g_update_confirm=0;
+                    if(Button(g_update_confirm==1?"Restart":g_update_confirm==2?"Install":"Select Previous System").primary().clicked()) {
+                        if(g_update_confirm==1) {int rc=embk_power_request(EMBK_POWER_REBOOT);if(rc)snprintf(g_update_action_error,sizeof g_update_action_error,"Restart failed (%d).",rc);}
+                        else request_update(g_update_confirm==2?EMBK_UPDATE_INSTALL:EMBK_UPDATE_ROLLBACK);
+                        g_update_confirm=0;
+                    }
+                }
+            }
+          }
+          if(OverlayDismissed())g_update_confirm=0;
         }
         if(g_reset_confirm) {
           Overlay() {

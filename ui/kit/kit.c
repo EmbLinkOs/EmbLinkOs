@@ -491,6 +491,21 @@ int ui_clipboard_get(char *buf, unsigned cap) {
     return g_clip_get ? g_clip_get(buf, cap) : 0;
 }
 
+int ui_clipboard_text(char *buf, unsigned cap, bool multiline) {
+    if (!cap) return -1;
+    int got=ui_clipboard_get(buf,cap);
+    if (got<0 || (unsigned)got>=cap) {buf[0]=0;return -1;}
+    unsigned n=0;
+    for (int i=0;i<got;i++) {
+        unsigned char c=(unsigned char)buf[i];
+        if (c=='\r') {if (i+1<got && buf[i+1]=='\n')i++;c='\n';}
+        if (c=='\n' || c=='\t') {if (!multiline)c=' ';}
+        else if (c<32 || c==127)continue;
+        buf[n++]=(char)c;
+    }
+    buf[n]=0;return (int)n;
+}
+
 static unsigned (*g_mods_fn)(void);
 void     ui_mods_provider(unsigned (*fn)(void)) { g_mods_fn = fn; }
 unsigned ui_mods(void) { return g_mods_fn ? g_mods_fn() : 0u; }
@@ -1139,14 +1154,15 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                 }
             }
             else if (c == UI_KEY_PASTE) {
-                /* The paste itself is the runtime's (ui/dsl/em_app.c): it holds
-                 * the clipboard and replays it through this same queue, so that
-                 * an app with a key hook -- a terminal, which must never let a
-                 * pasted newline execute anything -- gets a say. What arrives
-                 * here is the replayed text, one character at a time, and the
-                 * first of them replaces the selection like any other typing.
-                 * Swallowed rather than fallen through so the command byte
-                 * itself is never mistaken for text. */
+                static char clip[65537];
+                int got=ui_clipboard_text(clip,sizeof clip,false);
+                unsigned removed=has_sel()?sel_hi()-sel_lo():0;
+                if (got>0 && (unsigned)got<cap-(len-removed)) {
+                    DROP_SEL();
+                    memmove(buf+g_caret+got,buf+g_caret,len-g_caret+1);
+                    memcpy(buf+g_caret,clip,(unsigned)got);
+                    len+=(unsigned)got;g_caret+=(unsigned)got;g_anchor=g_caret;
+                }
             }
             else if ((c >= 32 && c < 127) || c >= 0x80) {
                 /* >= 0x80 is a UTF-8 byte of a real character -- é, €, a
@@ -1249,7 +1265,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             }                                                                   \
             run[n_] = 0;                                                        \
             if (run[0]) {                                                       \
-                if (selected) ui_set_text_bg(CP(selection, t->selection));      \
+                ui_set_text_bg((selected)?CP(selection, t->selection):(struct color){0});      \
                 text_role_line(t->font_regular, t->text_body, fg, run);              \
             }                                                                   \
         } while (0)

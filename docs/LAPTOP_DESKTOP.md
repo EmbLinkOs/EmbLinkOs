@@ -107,8 +107,12 @@ Physical AX200, laptop HDA routing, panel brightness, EC/battery and I2C touchpa
 acceptance remain outstanding. [DAILY_USE.md](DAILY_USE.md) covers the initial
 recovery installer, authenticated default boot, session lock/logout, file
 operations and power policies added subsequently. Broader drivers, suspend/resume,
-OS-image updates/rollback and general service supervision remain open; package
-signing/update/rollback already cover applications.
+Managed UEFI system updates now stage an inactive OS slot, verify disk readback,
+confirm a healthy desktop boot and retain a local rollback system. Accounts and
+files live on shared Data. Settings uses a supervised signed-release worker;
+independent applications use atomic version publication and retained bundles.
+Production release hosting, legacy migration and broader service supervision
+remain open. See [UPDATES.md](UPDATES.md) for scope and validation.
 
 For a real UI interaction check (QEMU plus GDB on PATH):
 

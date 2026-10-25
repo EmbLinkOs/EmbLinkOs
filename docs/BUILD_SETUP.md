@@ -514,6 +514,25 @@ for the concrete Makefile + `mkfs_embkfs.py` steps — mechanically it's "copy
 an existing app's three registration points and rename," not something that
 needs new loader code.
 
+## Shared descriptor acceptance
+
+`make fd-sharing-test` runs production descriptor lifetime/status code under
+ASan/UBSan with a deterministic threaded network shim (GCC-compatible HOSTCC).
+After building images, `python3 tools/fd_shared_smoke.py` boots a disposable
+UEFI/NVMe guest, runs concurrent file tests and uses local TCP/UDP echo fixtures.
+The script binds loopback ports 39381/39382 and attaches an emulated e1000e;
+it does not use a public echo service. See
+[FILE_DESCRIPTIONS.md](FILE_DESCRIPTIONS.md) for guarantees and bounds.
+
+## Spawn-based sh
+
+The default image build includes the pinned mrsh-based port and its native
+probe; no network download or configure step is needed. Use `sh`, `sh file.sh`
+or `sh -c 'command'` from Terminal. Host checks are
+`make posixsh-test posixsh-sanitize-test`; native acceptance is
+`python3 tools/posixsh_smoke.py` after building fresh images.
+See [POSIX_SHELL.md](POSIX_SHELL.md) for supported behavior and limitations.
+
 ## Optional ports: C++, CPython, git, TCC
 
 The core OS builds with just the cross toolchain above. Four bigger programs are

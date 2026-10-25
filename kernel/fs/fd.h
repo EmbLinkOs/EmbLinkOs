@@ -20,9 +20,7 @@ struct vm_object;   /* mm/vm_object.h -- the file's resident pages */
  * process.h is actually included. */
 struct process;
 
-/* open() flags. bit values are our own; only O_CREAT/O_EXCL act in v1.
- * O_TRUNC and O_APPEND are reserved - declared so callers can compile against
- * the final ABI, but the open/write path don't use them yet*/
+/* Native open/status bits; libc translates its own ABI values. */
 
 #define O_RDONLY     0x0000
 #define O_WRONLY     0x0001
@@ -32,23 +30,21 @@ struct process;
 #define O_EXCL       0x0080
 #define O_NONBLOCK   0x0800  /* fd is non-blocking: read/recv return -EAGAIN and
                               * connect() returns -EINPROGRESS instead of waiting.
-                              * Stored in fd_entry.flags; set via sys_fcntl. */
+                              * Shared across dup/spawn copies. */
 #define O_TRUNC      0x0200  /* LIVE: open() shrinks the file to 0 via the
                               * per-fs truncate op (EMBKFS: a real COW
                               * transaction). Needs writable access; a fs
                               * without the op fails -ENOSYS, never silently
                               * keeps stale bytes. */
-#define O_APPEND     0x0400  /* reserved  (write is cursor-driven for now)*/
+#define O_CLOEXEC    0x100000 /* descriptor inheritance flag, not file status */
+#define O_APPEND     0x0400  /* select EOF atomically on every cached-file write */
 
-/* Fds 0/1/2 are reserved for stdin, stdout, stderr, so returned fds start at
- * FD_BASE and map to slot (fd - FD_BASE). Public (not fd.c-local) because
+/* Fds 0/1/2 conventionally hold stdin/stdout/stderr. Allocation uses the
+ * lowest free slot, so closed standard descriptors can be reused. Public (not fd.c-local) because
  * struct process (process.h) embeds a table of these -- each process gets
  * its own fd namespace rather than sharing one global table. */
 #define FD_BASE 0        /* was 3. Fds 0/1/2 are now REAL table slots. */
-#define FD_STDIO_MAX 3   /* slots 0,1,2 are reserved for stdin/stdout/stderr;
-                          * vfs_open's free-slot scan starts ABOVE them, so a
-                          * fresh open() can never be handed fd 0 and later
-                          * collide with a stdio write. */
+#define FD_STDIO_MAX 3   /* initial stdin/stdout/stderr slots */
 #define FD_MAX_OPEN 64
 
 /* What backs an open fd. The per-backing behaviour is a struct fd_ops table
@@ -61,10 +57,12 @@ enum fd_backing {
     FD_BACKING_NULLDEV,       /**< /dev/null: EOF source / discard sink (stateless) */
     FD_BACKING_SOCKET,        /**< a TCP connection (kernel/net/tcp) -- M4 network fd */
     FD_BACKING_UDP,           /**< a UDP datagram socket (kernel/net/udp) -- M5 */
+    FD_BACKING_PTY,           /**< isolated master/slave terminal session */
 };
 
 struct pipe;   /* opaque -- defined in kernel/ipc/pipe.c; the fd layer only
                 * stores the pointer + side and dispatches through pipe_fd_ops. */
+struct pty;
 
 /* Per-backing dispatch, sme pattern as struct vfs_ops and struct gpu_driver.
  * Adding a fourth backing later touches this table, not four switch statements. 
@@ -139,12 +137,12 @@ struct fd_ops {
  * fresh open -- it is an accidental third thing that corrupts silently, which
  * is precisely why vnode_fd_inherit() used to refuse rather than approximate.
  *
- * `refs` counts descriptors, across every process. The vnode's own reference
- * is released once, when the last of them goes. */
+ * `refs` counts descriptors and in-flight I/O loans across every process.
+ * The vnode's own reference is released once, when the last of them goes. */
 struct open_file {
     struct vnode vn;
     uint64_t pos;
-    int refs;                   /**< descriptors pointing here; atomic */
+    int refs;                   /**< descriptors and I/O loans; atomic */
 
     /* The file's PAGES. Not "a cache this fd keeps" -- the one object every
      * descriptor onto this file shares, so a write through one is visible to a
@@ -155,34 +153,45 @@ struct open_file {
     struct vm_object *obj;
 };
 
+struct fd_shared;
 struct fd_entry {
     bool used;
+    bool cloexec;
     enum fd_backing backing;    /**< selects which fd_ops table applies */
     const struct fd_ops *ops;   /**< per-backing dispatch (NULL when unused) */
-    int flags;
+    struct fd_shared *shared;  /* status flags, socket identity and cursor lock */
     union {
         struct { struct open_file *of; } file;           /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
-        struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
-        struct { int us; } udp;                          /**< FD_BACKING_UDP (UDP socket index) */
+        struct { struct pty *p; int side; } pty;
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
 };
 
 void vfs_fd_init(void);
 
-/* The Unix-shared fd surfaces, by path. returns an fd >= 3 on success, or a
+/* The Unix-shared fd surfaces, by path. returns an fd >= 0 on success, or a
  * negative error code on failure. */
 
 int vfs_open(const char *path, int flags, uint32_t mode);
 int vfs_close(int fd);
 int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read);
 int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
+/* Keep one resolved backing across a whole syscall, including bounce chunks.
+ * Return on every exit. A PTY loan pins storage without extending endpoint life. */
+int fd_borrow(int fd,struct fd_entry *copy);
+void fd_return(struct fd_entry *copy);
+int fd_read_entry(struct fd_entry *,void *,size_t,size_t *);
+int fd_write_entry(struct fd_entry *,const void *,size_t,size_t *);
+int fd_sync_entry(struct fd_entry *); /* caller owns backing; no fd lookup */
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */
 int vfs_fd_poll(int fd, int events);          /* ready POLL* bits for one fd */
-int vfs_fd_get_flags(int fd);                 /* O_ACCMODE | O_NONBLOCK, or -errno */
+int fd_entry_flags(const struct fd_entry *e); /* caller owns entry or table lock */
+unsigned fd_shared_live_count(void);
+int vfs_fd_get_flags(int fd);                 /* access + supported status bits */
+int vfs_fd_set_status(int fd, int flags);     /* mutable O_NONBLOCK / O_APPEND */
 int vfs_fd_set_nonblock(int fd, bool on);     /* set/clear O_NONBLOCK; 0 or -errno */
 int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
 int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */
@@ -195,7 +204,7 @@ int vfs_fd_fsync(int fd);    /* push this file's dirty pages to the device NOW *
 /* The page object behind an open fd, with a NEW reference taken for the
  * caller (mmap holds one for the life of the mapping). NULL if the fd is not
  * a cached file -- a pipe, a socket, the console. */
-struct vm_object *vfs_fd_object(int fd);
+int vfs_fd_object(int fd,struct vm_object **out,bool *may_write);
 
 /* Symbolic links, by path. `target` is stored verbatim and never validated --
  * a link may name something that does not exist, which is the normal case in
@@ -217,6 +226,13 @@ int fd_open_into(struct process *target, int target_fd, const char *path, int fl
  * Both descriptors share ONE open file description: the same cursor, the same
  * vnode reference. Closing either leaves the other fully working. */
 int vfs_fd_dup(int oldfd, int newfd, int min_fd);
+int vfs_fd_get_cloexec(int fd);
+int vfs_fd_set_cloexec(int fd, bool on);
+/* Ordered actions operate on a child table, never temporary parent redirects. */
+int fd_dup_into(struct process *target, int oldfd, int newfd);
+int fd_close_into(struct process *target, int fd);
+int fd_snapshot_into(struct process *target);
+void fd_close_exec(struct process *target);
 
 /* Install one end of a pipe onto target_fd in `target` -- the fd-layer half
  * of the INSTALL_OBJ spawn action (pipe_fd_ops is private to fd.c, so the
@@ -224,6 +240,10 @@ int vfs_fd_dup(int oldfd, int newfd, int min_fd);
  * reference (ref bumped under the lock); the parent's obj-handle stays alive
  * and must be released separately for EOF. side: 0=read, 1=write. */
 int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side);
+int fd_install_pipe_any(struct process *target,struct pipe *p,int side);
+int fd_alloc_pty(int pair[2]);
+int fd_terminal_control(int fd, unsigned op, void *data);
+int fd_inherit_into(struct process *target, int target_fd, int source_fd);
 
 /* Network sockets (M4). fd_alloc_socket() claims a free fd backed by an
  * unconnected TCP socket (conn = -1) in `p`; fd_socket_connect() runs the

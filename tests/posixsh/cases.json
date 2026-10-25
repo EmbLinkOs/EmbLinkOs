@@ -1,0 +1,584 @@
+[
+  {
+    "name": "echo",
+    "script": "echo ready",
+    "stdout": "ready\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "quoted words",
+    "script": "x='a b'; printf '<%s>\\n' \"$x\"",
+    "stdout": "<a b>\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "quoted dollar",
+    "script": "printf '%s\\n' '$x $(false) `false`'",
+    "stdout": "$x $(false) `false`\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "escaped quote",
+    "script": "printf '%s\\n' \"a\\\"b\\\\c\"",
+    "stdout": "a\"b\\c\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "unicode worker",
+    "script": "printf '%s\\n' 'café Ω' | cat",
+    "stdout": "café Ω\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "arithmetic",
+    "script": "x=6; printf \"%d\\n\" \"$((x*7))\"",
+    "stdout": "42\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "for",
+    "script": "for x in a b c; do printf \"%s\\n\" \"$x\"; done",
+    "stdout": "a\nb\nc\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "while",
+    "script": "i=0; while [ \"$i\" -lt 3 ]; do echo \"$i\"; i=$((i+1)); done",
+    "stdout": "0\n1\n2\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "until",
+    "script": "i=0; until [ \"$i\" -eq 2 ]; do i=$((i+1)); done; echo \"$i\"",
+    "stdout": "2\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "loop break",
+    "script": "for i in a b c; do echo \"$i\"; break; done; echo done",
+    "stdout": "a\ndone\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "loop continue",
+    "script": "for i in a b c; do [ \"$i\" = b ] && continue; echo \"$i\"; done",
+    "stdout": "a\nc\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "if else",
+    "script": "if false; then echo bad; elif [ 2 -gt 1 ]; then echo good; else echo bad; fi",
+    "stdout": "good\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "and or",
+    "script": "false && echo bad; true || echo bad; false || echo good",
+    "stdout": "good\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "case glob",
+    "script": "case sensor.txt in *.txt) echo matched;; *) echo wrong;; esac",
+    "stdout": "matched\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "parameter default",
+    "script": "unset x; echo \"${x:-fallback}\"; echo \"${x:=saved}\"; echo \"$x\"",
+    "stdout": "fallback\nsaved\nsaved\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "parameter pattern",
+    "script": "x=alpha.beta.txt; echo \"${x%.txt}\"; echo \"${x##*.}\"; echo \"${#x}\"",
+    "stdout": "alpha.beta\ntxt\n14\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "function arguments",
+    "script": "f() { printf \"%s:%s\\n\" \"$1\" \"$x\"; }; x=keep; f arg",
+    "stdout": "arg:keep\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "function worker",
+    "script": "f() { printf \"%s:%s\\n\" \"$1\" \"$x\"; }; x=keep; f arg | cat",
+    "stdout": "arg:keep\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "function return",
+    "script": "f() { echo before; return 7; echo bad; }; f; echo \"status:$?\"",
+    "stdout": "before\nstatus:7\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "function positional zero",
+    "script": "f() { echo \"$0:$#:$1\"; }; f arg",
+    "stdout": "case-sh:1:arg\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "subshell isolation",
+    "script": "x=parent; (x=child; echo \"$x\"); echo \"$x\"",
+    "stdout": "child\nparent\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "subshell input",
+    "script": "printf \"%s\\n\" inherited | (read x; echo \"$x\")",
+    "stdout": "inherited\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "brace pipeline",
+    "script": "{ echo first; echo second; } | cat",
+    "stdout": "first\nsecond\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "loop in worker",
+    "script": "for x in first second; do echo \"$x\"; done | cat",
+    "stdout": "first\nsecond\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "case in worker",
+    "script": "case alpha in a*) echo good;; esac | cat",
+    "stdout": "good\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "command substitution",
+    "script": "x=\"$(printf \"a\\nb\\n\\n\")\"; printf \"<%s>\\n\" \"$x\"",
+    "stdout": "<a\nb>\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "substitution function",
+    "script": "f() { echo \"$1:$x\"; }; x=keep; echo \"$(f arg)\"",
+    "stdout": "arg:keep\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "nested substitution",
+    "script": "echo \"outer:$(echo \"inner:$(echo value)\")\"",
+    "stdout": "outer:inner:value\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "shell pid preservation",
+    "script": "p=$$; q=$(echo $$); [ \"$p\" = \"$q\" ] && echo same",
+    "stdout": "same\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "positional quoting",
+    "script": "set -- \"\" \"a b\" c; printf \"<%s>\\n\" \"$@\"",
+    "stdout": "<>\n<a b>\n<c>\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "shift",
+    "script": "set -- a b c; shift; echo \"$#:$1:$2\"",
+    "stdout": "2:b:c\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "builtin redirection",
+    "script": "printf \"%s\\n\" file > redir.txt; cat redir.txt; echo restored",
+    "stdout": "file\nrestored\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "append",
+    "script": "printf A > append.txt; printf B >> append.txt; cat append.txt",
+    "stdout": "AB",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "ordered builtin redirect",
+    "script": "printf output 3>&1 1>swap.txt 1>&3; cat swap.txt; echo restored",
+    "stdout": "outputrestored\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "closed redirect",
+    "script": "echo hidden 1>&-; echo visible",
+    "stdout": "visible\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "redirect failure recovery",
+    "script": "echo bad > missing-directory/out; echo survived",
+    "stdout": "survived\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "read here document",
+    "script": "read -r x <<EOF\nhello world\nEOF\necho \"$x\"",
+    "stdout": "hello world\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "heredoc expansion",
+    "script": "x=expanded; cat <<EOF\n$x\nEOF",
+    "stdout": "expanded\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "quoted heredoc",
+    "script": "x=expanded; cat <<'EOF'\n$x\nEOF",
+    "stdout": "$x\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "large heredoc",
+    "script": "cat <<EOF\nabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij\nEOF",
+    "stdout": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "glob sorted",
+    "script": "printf \"%s\\n\" [ab][le]*.txt",
+    "stdout": "alpha.txt\nbeta.txt\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "glob unmatched",
+    "script": "echo *.absent",
+    "stdout": "*.absent\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "glob quoted",
+    "script": "printf \"%s\\n\" \"*.txt\"",
+    "stdout": "*.txt\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "noglob",
+    "script": "set -f; echo [ab][le]*.txt",
+    "stdout": "[ab][le]*.txt\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "external status",
+    "script": "@PROBE@ --status 23; echo \"$?\"",
+    "stdout": "23\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "external environment",
+    "script": "MARK=prefix @PROBE@ --mark",
+    "stdout": "prefix\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "export environment",
+    "script": "MARK=exported; export MARK; @PROBE@ --mark",
+    "stdout": "exported\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "unexported variable",
+    "script": "MARK=private; @PROBE@ --mark",
+    "stdout": "unset\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "external redirect order",
+    "script": "@PROBE@ --streams 2>&1 > streams.txt; cat streams.txt",
+    "stdout": "err\nout\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "external pipeline",
+    "script": "@PROBE@ --emit | @PROBE@ --upper | @PROBE@ --count",
+    "stdout": "66049\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "builtin pipeline long",
+    "script": "@PROBE@ --emit | cat | @PROBE@ --count-lower",
+    "stdout": "66049\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "pipeline last status",
+    "script": "false | true; echo \"$?\"; true | false; echo \"$?\"",
+    "stdout": "0\n1\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "pipeline negation",
+    "script": "! true | true; echo \"$?\"; ! false | false; echo \"$?\"",
+    "stdout": "1\n0\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "background wait",
+    "script": "sleep 0.02 & p=$!; wait \"$p\"; echo \"done:$?\"",
+    "stdout": "done:0\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "background retained status",
+    "script": "@PROBE@ --status 17 & p=$!; sleep 0.05; wait \"$p\"; echo \"$?\"",
+    "stdout": "17\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "wait all",
+    "script": "sleep 0.02 & sleep 0.01 & wait; echo done",
+    "stdout": "done\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "wait unknown",
+    "script": "wait 999999; echo \"$?\"",
+    "stdout": "127\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "directory context",
+    "script": "cd nested; pwd; echo \"$(pwd)\"",
+    "stdout": "@ROOT@/nested\n@ROOT@/nested\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "eval",
+    "script": "x=one; eval 'echo \"$x\"'",
+    "stdout": "one\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "source file",
+    "script": ". ./source.sh; echo \"$sourced\"",
+    "stdout": "sourced-value\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "alias",
+    "script": "alias greet=echo\ngreet hello",
+    "stdout": "hello\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "printf formats",
+    "script": "printf '%04d:%s:%x\\n' 7 value 255",
+    "stdout": "0007:value:ff\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "printf repeat",
+    "script": "printf '<%s>\\n' a b",
+    "stdout": "<a>\n<b>\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "printf b stop",
+    "script": "printf '%bX\\n' 'a\\nb\\cignored'",
+    "stdout": "a\nb",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "test status",
+    "script": "test a = a; echo \"$?\"; test 2 -lt 1; echo \"$?\"",
+    "stdout": "0\n1\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "test invalid integer",
+    "script": "test nope -eq 3; echo \"$?\"",
+    "stdout": "2\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "descriptor stability",
+    "script": "b=$(@PROBE@ --fds); i=0; while [ \"$i\" -lt 40 ]; do echo x > stable.txt; i=$((i+1)); done; a=$(@PROBE@ --fds); [ \"$a\" = \"$b\" ] && echo stable",
+    "stdout": "stable\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "child handle reuse",
+    "script": "i=0; while [ \"$i\" -lt 40 ]; do @PROBE@ --status 0; i=$((i+1)); done; echo \"$i\"",
+    "stdout": "40\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "not found status",
+    "script": "missing-command; echo \"$?\"",
+    "stdout": "127\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "explicit exit",
+    "script": "echo before; exit 19; echo bad",
+    "stdout": "before\n",
+    "status": 19,
+    "option": null
+  },
+  {
+    "name": "syntax error",
+    "script": "if then",
+    "stdout": "",
+    "status": 2,
+    "option": null
+  },
+  {
+    "name": "syntax only",
+    "script": "echo not-executed > syntax-only.txt",
+    "stdout": "",
+    "status": 0,
+    "option": "-n"
+  },
+  {
+    "name": "unsupported errexit",
+    "script": "set -e; echo \"refused:$?\"",
+    "stdout": "refused:1\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "unsupported monitor",
+    "script": "set -m; echo \"refused:$?\"",
+    "stdout": "refused:1\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "unsupported exec",
+    "script": "exec @PROBE@ --status 0; echo \"refused:$?\"",
+    "stdout": "refused:126\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "highest descriptor",
+    "script": "echo highest 63>&1 1>&63",
+    "stdout": "highest\n",
+    "status": 0,
+    "option": null,
+    "reference": false
+  },
+  {
+    "name": "redirection only",
+    "script": "> only.txt; [ -f only.txt ] && echo created",
+    "stdout": "created\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "substitution status",
+    "script": "x=$(false); echo \"$?\"; x=$(false) y=literal; echo \"$?\"",
+    "stdout": "1\n1\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "parameter special braces",
+    "script": "set -- arg; echo \"${#}:${1}:${?}\"",
+    "stdout": "1:arg:0\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "script file input",
+    "script": "./file-script.sh",
+    "stdout": "file:argument\n",
+    "status": 0,
+    "option": "--file"
+  },
+  {
+    "name": "read redirection isolation",
+    "script": "read a <<EOF\none\ntwo\nEOF\nread b <<EOF\nthree\nEOF\nprintf \"%s:%s\\n\" \"$a\" \"$b\"",
+    "stdout": "one:three\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "shift two",
+    "script": "set -- a b c d; shift 2; echo \"$#:$1:$2\"",
+    "stdout": "2:c:d\n",
+    "status": 0,
+    "option": null
+  },
+  {
+    "name": "shift all",
+    "script": "set -- a b; shift 2; echo \"$#\"",
+    "stdout": "0\n",
+    "status": 0,
+    "option": null
+  }
+]

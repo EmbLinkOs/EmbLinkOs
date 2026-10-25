@@ -9,13 +9,14 @@
  *
  * The one hard constraint we inherit from the kernel: KP2V hardwires the
  * higher-half window (0xFFFFFFFF80000000) to physical 0, so the kernel image
- * MUST live at its linked physical address (0x100000) and the page tables must
+ * MUST live at its linked physical address (currently 32 MiB) and the page tables must
  * map higher-half -> phys 0, exactly like stage2 does.
  */
 #include "uefi.h"
 #include "crypto/sha256.h"
 #include "console.h"
 #include "menu.h"
+#include "update_boot.h"
 #include "display_mode.h"
 
 /* A BYTE ON COM1. See crt0.S: the firmware's console may not be ours yet, and
@@ -497,7 +498,7 @@ static void boot_emblinkos(EFI_HANDLE image,unsigned mode) {
     bp->boot_disk_sig = 0;      /* not resolved yet (kernel probes all disks) */
     bp->boot_drive    = 0xFF;   /* n/a under UEFI */
     bp->acpi_rsdp     = find_acpi_rsdp();
-    bp->boot_mode=mode;fill_boot_device(image,bp);
+    bp->boot_mode=mode;fill_boot_device(image,bp);update_boot_fill(bp);
 
     /* WHAT WAS TRUSTED, recorded before boot services go away and the
      * question becomes unanswerable. */
@@ -543,6 +544,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     mark('3');
     con_init(st);
     mark('4');
+    unsigned selected_mode=0;
+    if(update_boot_child(image,&selected_mode))boot_emblinkos(image,(uint8_t)selected_mode);
 
     for (;;) {
         int choice = menu_run();          /* draws the menu, returns an entry id */
@@ -551,6 +554,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         case MENU_RECOVERY:
         case MENU_DIAGNOSTICS:
         case MENU_LIVE_DESKTOP:
+            update_boot_dispatch(image,choice==MENU_RECOVERY?BOOT_MODE_RECOVERY:
+                choice==MENU_DIAGNOSTICS?BOOT_MODE_DIAGNOSTICS:
+                choice==MENU_LIVE_DESKTOP?BOOT_MODE_LIVE:BOOT_MODE_NORMAL);
             boot_emblinkos(image,choice==MENU_RECOVERY?BOOT_MODE_RECOVERY:
                 choice==MENU_DIAGNOSTICS?BOOT_MODE_DIAGNOSTICS:
                 choice==MENU_LIVE_DESKTOP?BOOT_MODE_LIVE:BOOT_MODE_NORMAL);        /* never returns */

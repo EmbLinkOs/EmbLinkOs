@@ -62,7 +62,8 @@ int install_command(const char *line) {
     snprintf(confirm,sizeof confirm,"ERASE-%s-%08x",target->name,p->fingerprint);
     kprintf("install: source %s -> target %s (%llu MiB)\n",source->name,target->name,target->block_count/2048);
     kprintf("install: target's existing partitions and files will be overwritten\n");
-    kprintf("install: EFI %llu MiB + EMBKFS %llu MiB; root grows to use target capacity\n",p->esp_sectors/2048,p->target_root_sectors/2048);
+    if(p->managed)kprintf("install: managed OS-A + OS-B + EFI; personal data grows to %llu MiB\n",p->target_root_sectors/2048);
+    else kprintf("install: EFI %llu MiB + EMBKFS %llu MiB; root grows to use target capacity\n",p->esp_sectors/2048,p->target_root_sectors/2048);
     if(strcmp(args[1],"erase") || n!=4 || strcmp(args[3],confirm)) {
         kprintf("install: reviewed plan: install erase %s %s\n",target->name,confirm);
         kfree(p);return 1;

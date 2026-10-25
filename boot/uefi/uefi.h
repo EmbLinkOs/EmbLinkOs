@@ -41,7 +41,57 @@ typedef struct {
     void *SystemTable;
     EFI_HANDLE DeviceHandle;
 } EFI_LOADED_IMAGE_PREFIX;
+typedef struct {
+    uint32_t Revision;
+    EFI_HANDLE ParentHandle;
+    void *SystemTable;
+    EFI_HANDLE DeviceHandle;
+    void *FilePath,*Reserved;
+    uint32_t LoadOptionsSize;
+    void *LoadOptions,*ImageBase;
+    uint64_t ImageSize;
+    uint32_t ImageCodeType,ImageDataType;
+    void *Unload;
+} EFI_LOADED_IMAGE_PROTOCOL;
 typedef EFI_STATUS (EFIAPI *EFI_HANDLE_PROTOCOL)(EFI_HANDLE, EFI_GUID *, void **);
+
+#define EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID \
+    {0x964e5b22,0x6459,0x11d2,{0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}}
+typedef struct EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
+struct EFI_FILE_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *Open)(EFI_FILE_PROTOCOL *,EFI_FILE_PROTOCOL **,CHAR16 *,uint64_t,uint64_t);
+    EFI_STATUS (EFIAPI *Close)(EFI_FILE_PROTOCOL *);
+    void *Delete;
+    EFI_STATUS (EFIAPI *Read)(EFI_FILE_PROTOCOL *,UINTN *,void *);
+    EFI_STATUS (EFIAPI *Write)(EFI_FILE_PROTOCOL *,UINTN *,void *);
+    void *GetPosition;
+    EFI_STATUS (EFIAPI *SetPosition)(EFI_FILE_PROTOCOL *,uint64_t);
+    void *GetInfo,*SetInfo;
+    EFI_STATUS (EFIAPI *Flush)(EFI_FILE_PROTOCOL *);
+};
+typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *OpenVolume)(EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *,EFI_FILE_PROTOCOL **);
+};
+#define EFI_BLOCK_IO_PROTOCOL_GUID \
+    {0x964e5b21,0x6459,0x11d2,{0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}}
+typedef struct {
+    uint32_t MediaId;
+    BOOLEAN RemovableMedia,MediaPresent,LogicalPartition,ReadOnly,WriteCaching;
+    uint32_t BlockSize,IoAlign;
+    uint64_t LastBlock;
+} EFI_BLOCK_IO_MEDIA;
+typedef struct EFI_BLOCK_IO_PROTOCOL EFI_BLOCK_IO_PROTOCOL;
+struct EFI_BLOCK_IO_PROTOCOL {
+    uint64_t Revision;
+    EFI_BLOCK_IO_MEDIA *Media;
+    void *Reset;
+    EFI_STATUS (EFIAPI *ReadBlocks)(EFI_BLOCK_IO_PROTOCOL *,uint32_t,uint64_t,UINTN,void *);
+    EFI_STATUS (EFIAPI *WriteBlocks)(EFI_BLOCK_IO_PROTOCOL *,uint32_t,uint64_t,UINTN,void *);
+    EFI_STATUS (EFIAPI *FlushBlocks)(EFI_BLOCK_IO_PROTOCOL *);
+};
 
 /* Graphics Output Protocol GUID {9042A9DE-23DC-4A38-96FB-7ADED080516A} */
 #define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
@@ -211,8 +261,8 @@ typedef struct {
     void              *LocateHandle;
     void              *LocateDevicePath;
     void              *InstallConfigurationTable;
-    void              *LoadImage;
-    void              *StartImage;
+    EFI_STATUS (EFIAPI *LoadImage)(BOOLEAN,EFI_HANDLE,void *,void *,UINTN,EFI_HANDLE *);
+    EFI_STATUS (EFIAPI *StartImage)(EFI_HANDLE,UINTN *,CHAR16 **);
     void              *Exit;
     void              *UnloadImage;
     EFI_EXIT_BOOT_SERVICES ExitBootServices;

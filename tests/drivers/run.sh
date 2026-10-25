@@ -29,7 +29,7 @@ compile_and_run hda tests/drivers/hda_transport_test.c
 compile_and_run wifi-service tests/drivers/wifi_service_test.c kernel/net/wifi/control.c kernel/net/wifi/profile.c kernel/net/wifi/station.c kernel/net/wifi/wpa2.c kernel/net/wifi/ccmp.c kernel/net/wifi/wpa2_crypto.c kernel/crypto/sha1.c kernel/crypto/aes.c
 compile_and_run console-argv tests/drivers/console_argv_test.c
 
-compile_and_run installer tests/drivers/install_test.c kernel/block/install_protocol.c -lz
+compile_and_run installer tests/drivers/install_test.c kernel/block/install_protocol.c kernel/update/protocol.c -lz
 compile_and_run session tests/drivers/session_test.c
 compile_and_run authentication tests/drivers/auth_test.c
 compile_and_run fileops -DEMBK_FILEOPS_HOST tests/drivers/fileops_test.c user/lib/fileops.c -Wl,--wrap=read,--wrap=write,--wrap=fsync

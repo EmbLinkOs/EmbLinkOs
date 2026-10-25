@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-99 actual EmbLinkOS captures document the original laptop work, its
+127 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
-recoverable document workspaces, the Contour desktop redesign, and keyboard
-interaction. PNG exports preserve
+recoverable document workspaces, the Contour desktop redesign, keyboard
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O and managed system upgrades. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -13,6 +13,216 @@ Captures 01–20 are historical (`c90c478`, 800 × 600). Captures 21–40 show t
 merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
+
+## Latest: managed system and application updates
+
+Software Update now checks a signed release, streams an OS and paired EFI to
+the inactive system slot, verifies disk readback, and offers an explicit restart.
+A real administrator logged in before and after upgrade and rollback. The
+account, appearance preferences and a pre-existing document survived the cold
+boots. The paired kernel's update authority and mapping checks pass natively;
+package installation publishes synced immutable versions through CURRENT.
+
+These are original-pixel QMP captures using a temporary local signing key and
+release server. The versions are acceptance fixtures, not a public release feed.
+No production signing key or public OS/application registry is configured by
+default. See [the update contract](../../UPDATES.md) for supported layouts and
+remaining work. Captures 01–116 and their metadata are preserved.
+
+### Software Update in Settings
+
+A real administrator account opens Software Update on managed UEFI/NVMe. The pane reports release 1.0.0 from the boot journal; the independent application registry is explicitly unconfigured.
+
+![Software Update in Settings in EmbLinkOS](117-software-update-settings.png)
+
+### A verified release is available
+
+The native worker checked an ECDSA-P256 signed release from a local acceptance fixture. Version and release notes come from the verified descriptor. These are test releases, not a configured public update channel.
+
+![A verified release is available in EmbLinkOS](118-signed-release-available.png)
+
+### Installing the next system
+
+The running desktop remains in the confirmed system while the native worker streams the signed OS and paired EFI into the inactive deployment. The progress is read from the actual update engine.
+
+![Installing the next system in EmbLinkOS](119-background-system-install.png)
+
+### Verifying the installed bytes
+
+The kernel reads the inactive deployment back from NVMe and verifies both image digests before publishing a trial boot. Settings navigation was exercised during this bounded verification phase.
+
+![Verifying the installed bytes in EmbLinkOS](120-system-readback-verification.png)
+
+### Restart when ready
+
+Both payloads passed readback verification and the trial journal was flushed. Restart is an explicit user action, with a save-your-work confirmation.
+
+![Restart when ready in EmbLinkOS](121-system-update-ready.png)
+
+### The upgraded system is confirmed
+
+After a cold boot into OS-B, the actual desktop/top-bar frames and live supervised service remained healthy for five seconds. The engine confirmed release 1.1.0 and retained OS-A for rollback. The account and saved appearance preferences survived.
+
+![The upgraded system is confirmed in EmbLinkOS](122-upgraded-desktop.png)
+
+### Choose the previous system
+
+Settings selected the retained local deployment for the next restart. The test then cold-booted OS-A and confirmed it through the same real desktop health path.
+
+![Choose the previous system in EmbLinkOS](123-previous-system-selected.png)
+
+### Personal files survive upgrade and rollback
+
+Terminal reads the document created before installation, after upgrade to OS-B and rollback to OS-A. A real administrator authenticated across all three boots; saved appearance preferences also matched. No host filesystem or physical laptop was used.
+
+![Personal files survive upgrade and rollback in EmbLinkOS](124-files-survive-system-rollback.png)
+
+## Managed recovery and installation acceptance
+
+### The confirmed desktop is restored
+
+The real firmware rejected a signed but unloadable trial EFI and booted confirmed OS-A instead. This is the restored live desktop; the boot journal and serial acceptance log establish the failure and fallback. The confirmed OS hash stayed unchanged across rejected catalogs, short/altered payloads, hard interruption and firmware fallback.
+
+![The confirmed desktop is restored in EmbLinkOS](125-failed-update-restored.png)
+
+### Installing the managed system
+
+The recovery console copied and read back a managed ESP, OS-A, OS-B and shared Data onto a separate disposable NVMe disk. It rewrote boot identities and expanded Data while preserving the source hash. This operation never selected a host disk.
+
+![Installing the managed system in EmbLinkOS](126-managed-recovery-install.png)
+
+### The installed system boots alone
+
+The newly installed NVMe disk booted without the source media. The selected OS mounted read-only, shared Data mounted writable, the update engine recognized its rewritten identities, and real first-account setup presented its frame.
+
+![The installed system boots alone in EmbLinkOS](127-installed-managed-first-boot.png)
+
+## Earlier: shared descriptions and socket I/O
+
+The native witness passes 223 checks in Terminal, including concurrent file
+records, append, shared status and socket ownership. Through sh, 83 network
+checks verify actual TCP/UDP echo traffic after child exit/termination, pending
+reads across close/reuse, empty datagrams and oversized-packet refusal. The
+[contract](../../FILE_DESCRIPTIONS.md) records bounds and remaining work.
+
+These original-pixel QMP captures use a disposable UEFI/NVMe live session with
+an emulated e1000e and local echo servers, without a synthetic ACPI fixture.
+Captures 01–114 and their metadata are unchanged.
+
+![Shared descriptors and concurrent file I/O](115-shared-descriptors-and-append.png)
+
+![Socket ownership through the development shell](116-shared-socket-traffic.png)
+
+## Earlier: spawn-based sh
+
+The image now includes an initial mrsh-based shell alongside the native prompt.
+The shared 83-case script corpus passes 338 checks in Terminal and twice through
+the serial wrapper. Interactive input runs loops, arithmetic, command substitution
+and a verified 66,049-byte three-stage pipeline. This is a bounded development
+shell; see [the contract](../../POSIX_SHELL.md) for supported options and gaps.
+
+These original-pixel QMP captures use a disposable UEFI/NVMe live session without
+a synthetic ACPI fixture. Captures 01–112 and their metadata are unchanged.
+
+![Shell scripts in the native Terminal](113-posix-shell-script-checks.png)
+
+![Interactive sh, expansion and a three-stage pipeline](114-posix-shell-interactive.png)
+
+## Earlier: POSIX spawn
+
+The spawn adapter passes 357 checks in the normal logged-in Terminal namespace,
+including ordered file actions, close-on-exec, PATH lookup, exact child
+environments and directory setup before constructors run. Two children
+transform 66,049 bytes through pipes, and a following shell command succeeds.
+The same checks pass twice through the serial wrapper. This is a bounded
+adapter on native child handles; the later sh milestone above builds on it.
+
+This original-pixel QMP capture uses a disposable UEFI/NVMe live session without
+a synthetic ACPI fixture. Captures 01–111 and their metadata are unchanged.
+
+![Ordered spawn actions and a POSIX pipeline](112-posix-spawn-pipeline.png)
+
+## Latest: process compatibility
+
+The native process witness passes 203 checks inside Terminal, retaining 32 child statuses and transforming 66,049 bytes through two child processes. It verifies EOF, nonblocking writes, actual PIDs, copyout retry and competing waiters; a following shell command succeeds. This is the spawn-based compatibility foundation, not a ported Unix shell.
+
+This original-pixel QMP capture uses a disposable UEFI/NVMe live session without a synthetic ACPI fixture.
+
+![Pipes and child waits in the native terminal](111-process-pipeline-waits.png)
+
+## Latest: full-screen terminal
+
+Seven real QMP captures show the native screen witness, cross-application clipboard and restored shell. They use a disposable UEFI/NVMe session without a synthetic ACPI fixture. The witness exercises the emulator; it does not establish Vim, zsh or xterm compatibility.
+
+### A screen with independent regions
+
+The native raw-mode terminal witness keeps its heading and footer fixed while twelve log entries scroll inside its margins. Application-cursor Down selects the second row; colours and Unicode cells are rendered by the actual emulator.
+
+![A screen with independent regions](104-terminal-screen-region.png)
+
+### Cursor position, round trip
+
+The native application positions its cursor, requests a report and verifies the terminal reply through its own standard input. This is a screen-emulation witness, not an upstream application compatibility claim.
+
+![Cursor position, round trip](105-terminal-cursor-reply.png)
+
+### One screen, a larger workspace
+
+The real window control expands Terminal. The application queries updated PTY dimensions and redraws its screen at the new size; restoring the window is verified in the same run.
+
+![One screen, a larger workspace](106-terminal-live-resize.png)
+
+### Multiline paste reaches the program
+
+Text copied from Editor reaches the running raw-mode application inside bracketed-paste delimiters. The program verifies 22 bytes and one newline without treating that newline as an ordinary command.
+
+![Multiline paste reaches the program](107-terminal-bracketed-paste.png)
+
+### Screen text back in Editor
+
+Copy screen exports plain UTF-8 text without terminal escape sequences. Editor receives the complete multiline grid through a single paste command, replaces its selection and clears the retained highlight.
+
+![Screen text back in Editor](108-terminal-screen-editor.png)
+
+### Return to the native shell
+
+Leaving the alternate screen restores the previous native command and its result. The witness confirms its exit; alternate-screen content does not enter the primary output.
+
+![Return to the native shell](109-terminal-primary-restored.png)
+
+### A large clipboard in the code editor
+
+The guest doubles text using Editor selection/copy/paste commands, then copies more than 8 KiB into Note++. Its separate application paste hook receives the full multiline text without indexing beyond its clipboard buffer.
+
+![A large clipboard in the code editor](110-terminal-long-editor-paste.png)
+
+## Latest: interactive terminal sessions
+
+Four real QMP captures accompany the terminal-device milestone. They come from a disposable UEFI/NVMe live session with no synthetic ACPI fixture. They show the native shell and terminal witness, not a ported Unix shell or a full VT screen emulator.
+
+### The native prompt, preserved
+
+Terminal runs its native shell on a private pseudo-terminal while retaining local caret editing and command history. The guest verifies edited commands and their separate result lines.
+
+![The native prompt, preserved](100-terminal-prompt.png)
+
+### A program takes keyboard input
+
+The child reports measured terminal dimensions, receives an edited canonical line and switches to raw input. It is waiting for one key without Enter.
+
+![A program takes keyboard input](101-terminal-raw-input.png)
+
+### One key, delivered immediately
+
+The native program receives z as byte 0x7a without Enter, then restores canonical input. Ctrl+D returns control to the shell; the same guest also verifies Ctrl-letter bytes and ANSI arrow input.
+
+![One key, delivered immediately](102-terminal-direct-input.png)
+
+### Interrupt a command and keep working
+
+Ctrl+C stops a foreground child and interrupts a native shell loop. Subsequent commands produce their expected results in the same Terminal session.
+
+![Interrupt a command and keep working](103-terminal-interrupt.png)
 
 ## Latest: keyboard interaction
 

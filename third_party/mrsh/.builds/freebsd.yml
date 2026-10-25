@@ -1,0 +1,21 @@
+image: freebsd/latest
+packages:
+  - meson
+  - libedit
+  - pkgconf
+sources:
+  - https://git.sr.ht/~emersion/mrsh
+tasks:
+  - setup: |
+      cd mrsh
+      meson build -Dauto_features=enabled -Dreadline-provider=editline
+  - build: |
+      cd mrsh
+      ninja -C build
+  - test: |
+      cd mrsh
+      ninja -C build test
+triggers:
+  - action: email
+    condition: failure
+    to: "<contact@emersion.fr>"

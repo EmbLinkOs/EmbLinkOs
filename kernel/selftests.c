@@ -26,6 +26,7 @@
 #include "mm/pmm.h"
 #include "lib/ksym.h"         /* test debugsym: the panic symbolizer */
 #include "tty/tty.h"
+#include "tty/pty.h"
 #include "drivers/input/keyboard.h"
 #include "ipc/clipboard.h"                   /* test session: whose the clipboard is */
 #include "process/ksync.h"
@@ -606,6 +607,9 @@ static void selftests_print_commands(void)
     kprintf("  test usb\n");
     kprintf("  test gpu\n");
     kprintf("  test tty\n");
+    kprintf("  test process-compat\n");
+    kprintf("  test spawn-compat\n");
+    kprintf("  test posix-shell\n");
     kprintf("  test dirtree\n");
     kprintf("  test layout\n");
 }
@@ -704,25 +708,14 @@ static int document_sync_test(void) {
     if(obj->dirty_pages!=0 || dirty!=1)fails++;
     vmo_put(obj);
 
-    /* Install only in this monitor thread's own unused descriptor slot. The
-     * automatic fixture objects outlive the call and are removed before return. */
-    struct fd_entry *table=current_process?current_process->fds:NULL;
-    int fd=-1;
-    if(table) {
-        mutex_lock(&current_process->fd_lock);
-        for(int i=3;i<FD_MAX_OPEN;i++)if(!table[i].used){fd=i;break;}
-    }
-    if(fd<0) {
-        if(table)mutex_unlock(&current_process->fd_lock);
-        kprintf("[cmd] test document sync: fixture fd unavailable -> FAIL\n");return fails+1;
-    }
+    /* Exercise the owned-entry sync backend directly. A stack fixture is not
+     * a published descriptor: it has no inheritable lifetime or table lock. */
     struct open_file file={.vn=vn,.refs=1,.obj=NULL};
-    table[fd]=(struct fd_entry){.used=true,.backing=FD_BACKING_VNODE};
-    table[fd].u.file.of=&file;sync_test_calls=0;sync_test_error=0;
-    if(vfs_fd_fsync(fd)!=EMBK_OK || sync_test_calls!=1)fails++;
+    struct fd_entry entry={.used=true,.backing=FD_BACKING_VNODE};
+    entry.u.file.of=&file;sync_test_calls=0;sync_test_error=0;
+    if(fd_sync_entry(&entry)!=EMBK_OK || sync_test_calls!=1)fails++;
     file.vn.type=VFS_DT_DIR;sync_test_error=-EMBK_EIO;
-    if(vfs_fd_fsync(fd)!=-EMBK_EIO || sync_test_calls!=2)fails++;
-    memset(&table[fd],0,sizeof table[fd]);mutex_unlock(&current_process->fd_lock);
+    if(fd_sync_entry(&entry)!=-EMBK_EIO || sync_test_calls!=2)fails++;
     kprintf("[cmd] test document sync: short writes remain dirty; clean-file and directory barriers/errors: %s\n",fails?"FAIL":"OK");
     return fails;
 }
@@ -10682,6 +10675,59 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[cmd] test dirtree: %s (%d/%d)\n",
                 fail == 0 ? "OK" : "FAIL", pass, pass + fail);
         #undef DCHK
+        return 1;
+    }
+
+    if(strcmp(cmd,"test fd-sharing")==0 || strcmp(cmd,"test fd-network")==0) {
+        unsigned before=fd_shared_live_count(),pipes=pipe_live_count(),ptys=pty_live_count();
+        char *argv[]={"/data/apps/fdprobe/fdprobe.elf",NULL,NULL};
+        int argc=1;if(strcmp(cmd,"test fd-network")==0){argv[1]="--network";argc=2;}
+        int pid=process_create(argv[0],argv,argc,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=fd_shared_live_count();
+        kprintf("\n[cmd] %s: exit=%d, descriptions=%u->%u -> %s\n",cmd,code,before,after,
+            pid>=0 && code==0 && before==after && pipes==pipe_live_count() && ptys==pty_live_count()?"OK":"FAIL");return 1;
+    }
+
+    if(strcmp(cmd,"test posix-shell")==0) {
+        unsigned before=pipe_live_count();
+        char *argv[]={"/data/apps/shprobe/shprobe.elf",NULL};
+        int pid=process_create(argv[0],argv,1,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pipe_live_count();
+        kprintf("\n[cmd] test posix-shell: exit=%d, pipes=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");return 1;
+    }
+
+    if(strcmp(cmd,"test spawn-compat")==0) {
+        unsigned before=pipe_live_count();
+        char *argv[]={"/data/apps/spawnprobe/spawnprobe.elf",NULL};
+        int pid=process_create(argv[0],argv,1,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pipe_live_count();
+        kprintf("\n[cmd] test spawn-compat: exit=%d, pipes=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");return 1;
+    }
+
+    if (strcmp(cmd,"test process-compat")==0) {
+        unsigned before=pipe_live_count();
+        char *argv[]={"/data/apps/processprobe/processprobe.elf",NULL};
+        int pid=process_create(argv[0],argv,1,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pipe_live_count();
+        kprintf("\n[cmd] test process-compat: exit=%d, pipes=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd,"test terminal")==0) {
+        unsigned before=pty_live_count();
+        char *argv[]={"/data/apps/ttyprobe/ttyprobe.elf","--selftest",NULL};
+        int pid=process_create(argv[0],argv,2,NULL,0);
+        int code=pid>=0?process_wait((uint32_t)pid):-1;
+        unsigned after=pty_live_count();
+        kprintf("\n[cmd] test terminal: exit=%d, live=%u->%u -> %s\n",code,before,after,
+                pid>=0 && code==0 && before==after?"OK":"FAIL");
         return 1;
     }
 

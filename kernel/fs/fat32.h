@@ -110,6 +110,7 @@ struct fat_dir_entry {
 // Mount a FAT32 volume from a block device: read sectors 0, parse the
 // BPB, and compute the region locations, validate.  Returns 0 on success.
 // negative EMBK_* error on failure. Fills *vol.
+int fat32_fixed_map(struct fat32_volume *,const char *,uint64_t,uint64_t **,uint32_t *);
 int fat32_mount(struct embk_block_device *dev, struct fat32_volume *vol);
 
 // List the root directory entries on a mounted FAT32 volume.

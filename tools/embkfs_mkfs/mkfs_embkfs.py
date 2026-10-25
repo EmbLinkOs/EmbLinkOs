@@ -788,7 +788,7 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # test binaries). Fonts and the format fixtures are NOT *.elf and are placed
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
-_SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
+_SYSTEM_BIN = {"sh.elf", "init.elf", "primtest.elf", "shell.elf", "home.elf",
                "setup.elf", "login.elf",
                # A SERVICE, not an application: nothing launches filepanel from
                # the dock, apps reach it through /run/emlink.files, and it is
@@ -798,7 +798,7 @@ _SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
                # never by a user: it is the only program in reach of a session
                # that can read /etc/shadow, so it belongs with the system's
                # own, not among the applications.
-               "authd.elf"}   # -> /system/bin/
+               "authd.elf", "updateworker.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -862,6 +862,10 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf" or name in NOT_AUTO_STAGED:
             continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+        if name in ("pkg.elf", "gitclone.elf", "wget.elf"):
+            objects.append((b"system/bin/" + name.encode(), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+        if name == "sh.elf":
+            objects.append((b"system/bin/sh", L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
         # declared namespace as <progdir>/<name>.ns, packed beside its .elf as
         # /data/apps/<name>/<name>.ns. The session (home) reads it and grants
@@ -1073,6 +1077,15 @@ def discover_userland_objects(build_dir="build"):
     # header-free toys. ~140 files, ~1.1 MB.
     objects.extend(_tree_objects(NEWLIB_INC, b"system/abi/include/", ".h"))
     objects.extend(_tree_objects(TCC_INC, b"data/apps/tcc/include/", ".h"))
+    # The installed SDK must use the same terminal declarations as the host
+    # build. Replace newlib's forwarding termios header (its target header is
+    # absent here), rather than packing two files with the same name.
+    for relative in ("termios.h", "sys/ioctl.h"):
+        header = _read_file("user/lib/" + relative)
+        if header is not None:
+            path = b"system/abi/include/" + relative.encode()
+            objects = [obj for obj in objects if obj[0] != path]
+            objects.append((path, L.DT_REG, L.S_IFREG | L.PERM_FILE, header))
 
     # EmbCC self-hosting fixed point (EmbCC M3, `test embcc self`): its OWN
     # source tree (preserving src/ subdirs so the relative quote-includes
@@ -1102,6 +1115,15 @@ def discover_userland_objects(build_dir="build"):
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".c"))
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".h"))
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".asm"))
+    # Shared wire declarations keep their relative location beside kernel/.
+    # In particular tty/pty.h includes ../../user/lib/embk_terminal.h. This
+    # also preserves the existing power/session/desktop header dependencies.
+    for filename in sorted(os.listdir("user/lib")):
+        if filename.startswith("embk_") and filename.endswith(".h"):
+            header = _read_file("user/lib/" + filename)
+            if header is not None:
+                objects.append((b"data/src/user/lib/" + filename.encode(),
+                                L.DT_REG, L.S_IFREG | L.PERM_FILE, header))
     kld = _read_file("kernel/linker.ld")
     if kld is not None:
         objects.append((b"data/src/kernel/linker.ld",
@@ -1288,6 +1310,8 @@ def discover_userland_objects(build_dir="build"):
                         # declaring the ABI joins the ABI (BUILD.md's rule).
                         ("user/lib/document.h",            b"system/abi/include/document.h"),
                         ("user/lib/embk_desktop.h",        b"system/abi/include/embk_desktop.h"),
+                        ("user/lib/embk_terminal.h",       b"system/abi/include/embk_terminal.h"),
+                        ("user/lib/embk_child.h",          b"system/abi/include/embk_child.h"),
                         ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
                         ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
                         ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),
@@ -1341,6 +1365,28 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink.\n\nThis is your home directory.\n"))
+    # OS update trust is an explicit publisher input, never the public dev key.
+    objects.append((b"system/update", L.DT_DIR, L.S_IFDIR | 0o755, None))
+    update_key = os.environ.get("EMBK_UPDATE_KEY")
+    update_source = os.environ.get("EMBK_UPDATE_SOURCE")
+    if bool(update_key) != bool(update_source):
+        raise SystemExit("mkfs: EMBK_UPDATE_KEY and EMBK_UPDATE_SOURCE must be configured together")
+    if update_key:
+        public = open(update_key, "rb").read()
+        if len(public) != 64:
+            raise SystemExit("mkfs: update public key must be raw P-256 X||Y (64 bytes)")
+        source = update_source.encode("ascii")
+        if len(source) > 254 or any(c <= 32 or c >= 127 for c in source):
+            raise SystemExit("mkfs: invalid update source")
+        objects.append((b"system/update/key", L.DT_REG, L.S_IFREG | 0o644, public))
+        objects.append((b"system/update/source", L.DT_REG, L.S_IFREG | 0o644, source + b"\n"))
+        apps_source = os.environ.get("EMBK_UPDATE_APPS_SOURCE")
+        if apps_source:
+            app_url = apps_source.encode("ascii")
+            if not app_url.startswith(b"https://") or len(app_url)>254 or any(c<=32 or c>=127 for c in app_url):
+                raise SystemExit("mkfs: application registry must be a bounded HTTPS URL")
+            objects.append((b"system/update/apps-source", L.DT_REG, L.S_IFREG | 0o644, app_url + b"\n"))
+
     objects.append((b"etc",      L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
     objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))

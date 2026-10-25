@@ -1,17 +1,20 @@
-# Ports: C++, CPython, git, and a C compiler on the OS
+# Ports: sh, C++, CPython, git, and a C compiler on the OS
 
-EmbLinkOS runs four substantial pieces of third-party software. This doc says
+EmbLinkOS runs the ports below. This doc says
 what each one actually does here, what it honestly cannot do, and why the OS
 grew the way it did to host them. For *how to build* them, see
 [BUILD_SETUP.md](BUILD_SETUP.md#optional-ports-c-cpython-git-tcc); this doc is
 the *what and why*.
 
-None of them is a fork. CPython needed **one** patch and git **zero**; TCC
+The sh port has target-specific execution changes documented in
+[POSIX_SHELL.md](POSIX_SHELL.md), with a separately committed pristine import.
+For the earlier ports, CPython needed **one** patch and git **zero**; TCC
 needed **four**, and each of the four is a fact about this target rather than a
 disagreement with tcc — see the section below.
 
 | Port | Status | Proof it works | Needs |
 |---|---|---|---|
+| mrsh-based sh | initial bounded port | `test posix-shell`; 83 shared cases | writable home/temp; see [contract](POSIX_SHELL.md) |
 | C++ / libstdc++ | runs | `test cxx` → 13/13 | — |
 | CPython 3.14 | runs | `test python` → "hello from CPython on EmbLink" | `-cpu max` |
 | git 2.49 | runs | `test git repo` → a real root commit | `-cpu max` |
@@ -51,11 +54,11 @@ EmbLink is **not** POSIX. It has `spawn` + file-actions, and no `fork`/`exec`,
 by design — see [ARCHITECTURE.md](ARCHITECTURE.md). Every port collides with
 that somewhere, and the collision is where the interesting work is.
 
-**This is why the compiler is TCC and not GCC.** GCC is not "harder" here; it is
-*structurally impossible*. The `gcc` you type is a **driver** that fork/execs
-`cc1`, then `as`, then `ld` as separate programs. Its first act on this OS would
-be a spawn it cannot make. TCC is compiler + assembler + linker **in one 368 KB
-binary**: `tcc a.c -o a` is a single process from start to finish. Its only
+TCC avoided adapting a multi-process driver: it is compiler + assembler +
+linker **in one 368 KB binary**. GCC's driver normally launches `cc1`, `as`
+and `ld` separately; a future port could use the bounded spawn adapter, but
+that driver and its dependencies have not been ported. `tcc a.c -o a` is a
+single process from start to finish. Its only
 `exec` is the `-m32/-m64` dispatcher, which an x86_64-only build never compiles
 in. That was the decisive check before a line of work was done.
 
@@ -67,11 +70,12 @@ The same shape recurs: git's pager is an exec, so `GIT_PAGER=` is required for
 > A refusal is only honest if the capability is genuinely **absent**.
 > Ask: is this *missing*, or *trivially true here*?
 
-This is not philosophy, it is a bug class. `FD_CLOEXEC` was refused with
-`ENOSYS` because "we have no exec" — but with no exec, "close this fd on exec"
-is **vacuously satisfied**, and accepting it costs nothing. Refusing it broke
-*every file open in CPython*. Contrast `fsync`, which returns `ENOSYS` and
-should: we cannot prove durability, so promising it would be a lie.
+Earlier adapters accepted `FD_CLOEXEC` without using it at a process boundary.
+The current spawn adapter stores and enforces it when transferring descriptors;
+`dup` clears it and `dup2(fd, fd)` preserves it. `fsync` also has a current
+writeback/flush path rather than the historical `ENOSYS` stub. These contracts
+still depend on actual filesystem/device error reporting; physical durability
+and power-loss acceptance are separate work.
 
 Applied elsewhere: `SA_RESTART=0` for git is honest (we never interrupt a
 syscall with a signal at all, so "restart it" is vacuous); `SIGPIPE` being
@@ -96,8 +100,9 @@ needed them, not because a checklist said so:
   close) and a real kernel bug (the IF=0 voluntary-block wake leak, ledger
   Bug 26).
 - **All of them** → the environment (`getenv`) and per-process **cwd**, both
-  passed *explicitly at spawn*: nothing is inherited here, a parent names `PWD`
-  and the child's crt0 seeds from it.
+  passed explicitly at spawn. The current adapter supplies a separate starting
+  directory before constructors without rewriting `PWD` or the environment;
+  older native callers can retain their documented startup convention.
 
 ## TCC: the OS compiles C, on itself
 
@@ -375,7 +380,7 @@ When in doubt, check mkfs's `src fingerprint` line for the packed binary.
   timestamp staleness structurally false-fresh here). make arrives later as
   opt-in compat when a foreign tree (rebuilding git/CPython on-OS) demands it,
   alongside the sh/sed dragnet that story implies.
-- **clang / clangd** — unlike GCC, *not* structurally impossible: modern clang
+- **clang / clangd** — not ported: modern clang
   runs cc1 in-process (`-fintegrated-cc1`) and lld links as a library, and
   clangd's core is in-process too. What defers them is cost vs. value: an
   LLVM cross-build against newlib with no mmap and a single-threaded

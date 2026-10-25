@@ -163,6 +163,9 @@ int vmo_read(struct vm_object *o, uint64_t off, void *buf, uint64_t len,
              uint64_t *out_done);
 int vmo_write(struct vm_object *o, uint64_t off, const void *buf, uint64_t len,
               uint64_t *out_done);
+/* Choose EOF and write while holding the same cache lock as normal writes. */
+int vmo_append(struct vm_object *o,const void *buf,uint64_t len,
+               uint64_t *out_offset,uint64_t *out_done);
 
 /* Push every dirty page of this object to the device. What fsync() is. */
 int vmo_flush(struct vm_object *o);
@@ -223,6 +226,7 @@ uint64_t vmo_reclaim(uint64_t want);
  * `vmo_page_phys` answers "which frame backs this index, if any" WITHOUT
  * faulting or pinning -- what munmap uses to tell a pinned cache page from a
  * private copy-on-write copy it has to free itself. */
+int vmo_check_write(struct vm_object *o);
 uint64_t vmo_wire_page(struct vm_object *o, uint64_t index);
 void     vmo_unwire_page(struct vm_object *o, uint64_t index);
 uint64_t vmo_page_phys(struct vm_object *o, uint64_t index);

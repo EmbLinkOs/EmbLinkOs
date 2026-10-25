@@ -19,6 +19,8 @@ struct install_plan {
     uint64_t target_root_sectors,filesystem_blocks,filesystem_free;
     uint32_t filesystem_block_size;
     uint32_t fingerprint;
+    uint32_t managed;
+    uint8_t update_record[512];
 };
 int install_prepare(const struct install_io *, const struct install_io *, struct install_plan *);
 int install_copy(const struct install_io *, const struct install_io *, struct install_plan *,

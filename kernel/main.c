@@ -4,6 +4,8 @@
 #include "include/io.h"
 #include "include/errno.h"
 #include "include/kstring.h"
+#include "update/storage.h"
+#include "update/service.h"
 
 #include "drivers/char/serial.h"
 #include "drivers/video/framebuffer.h"
@@ -2158,6 +2160,14 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     selftests_set_vfs_ready(vfs_ready);
     if (vfs_ready)
         vfs_fd_init();
+    if(vfs_ready) {
+        int update_mount=update_storage_mount();
+        const struct boot_protocol *record=boot_protocol_get();
+        if(update_mount && record && record->size>=BOOT_PROTOCOL_SIZE_V4 && (record->update_flags&1)) {
+            kprintf("update: managed storage unavailable (%d); recovery only\n",update_mount);
+            boot_protocol_force_recovery();
+        }
+    }
 
     /* Load the kernel's own .embdbg so a panic's isr_handler dump names
      * func:line instead of a bare hex RIP (EMBDBG_Specification.md §7). The
@@ -2238,6 +2248,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
     if(!boot_recovery_mode())net_init();
+    {int rc=update_service_init();if(rc)kprintf("update: service unavailable (%d)\n",rc);}
 
     // Enter userspace through INIT: the kernel spawns exactly ONE user process,
     // /system/bin/init.elf, the root of userspace authority (docs/USERSPACE_v2.md
@@ -2326,6 +2337,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         }
         // Advance any window open/minimize motion. Same reasoning as above: it
         // repaints, so it must run in schedulable context, not an IRQ.
+        update_service_health(compositor_desktop_healthy());
         session_refresh_screen();
         compositor_anim_tick();
         if(boot_recovery_mode())fb_present();

@@ -2,11 +2,13 @@ ENTRY(_start)
 
 
 KERNEL_VIRTUAL_BASE = 0XFFFFFFFF80000000;
-KERNEL_PHYSICAL_BASE = 0X100000;
+/* Keep the linked image clear of firmware ACPI reservations near 8 MiB and
+ * the BIOS ELF staging buffer at 16 MiB. Both loaders map the first GiB. */
+KERNEL_PHYSICAL_BASE = 0X2000000;
 
 
 SECTIONS {
-    . = KERNEL_VIRTUAL_BASE + KERNEL_PHYSICAL_BASE; /* Start of the kernel in memory at 1MB */
+    . = KERNEL_VIRTUAL_BASE + KERNEL_PHYSICAL_BASE; /* Physical 32 MiB */
 
     .text ALIGN(4096) : AT(ADDR(.text) - KERNEL_VIRTUAL_BASE) {
         *(.text) /* All .text sections from input files */

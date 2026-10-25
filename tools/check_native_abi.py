@@ -14,4 +14,9 @@ sdk=numbers('user/lib/embk.h','EMBK_CAP_')
 ids.pop('MAX_ID')
 assert ids==sdk, f'Capability SDK mismatch: {set(ids.items()) ^ set(sdk.items())}'
 assert len(set(ids.values()))==len(ids),'Capability ID reused'
+actions=numbers('kernel/process/spawn.h','SPAWN_ACTION_')
+public=numbers('user/lib/embk.h','EMBK_SPAWN_ACTION_')
+assert all(actions.get(k)==v for k,v in public.items()),'Spawn action SDK mismatch'
+limit=numbers('kernel/process/spawn.h','SPAWN_')['ACTIONS_MAX']
+assert limit==numbers('user/lib/embk.h','EMBK_SPAWN_')['ACTIONS_MAX'],'Spawn action limit mismatch'
 print(f'Native ABI: {len(kernel)} unique syscalls and {len(ids)} matching capability IDs')

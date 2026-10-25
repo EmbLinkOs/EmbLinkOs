@@ -550,7 +550,12 @@ static int embkfs_vfs_sync(struct vnode *vn)
     return rc;
 }
 
+static int embkfs_vfs_check_write(struct vnode *vn) {
+    return vol_of(vn)->read_only ? -EMBK_EROFS : 0;
+}
+
 static const struct vfs_ops embkfs_vfs_ops = {
+    .check_write = embkfs_vfs_check_write,
     .lookup = embkfs_vfs_lookup,
     .readdir = embkfs_vfs_readdir,
     .read = embkfs_vfs_read,

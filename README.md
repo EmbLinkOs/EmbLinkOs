@@ -87,6 +87,16 @@ executable format (EMBX) — which it uses to rebuild its userland on itself.
   linked** userland binaries — see [BUILD_SETUP.md](docs/BUILD_SETUP.md#dynamic-linking-how-libembkso-actually-works).
 - IPC: handles, channels, and endpoints for cross-process communication.
 
+**System and application updates**
+- Settings checks signed releases, stages a complete OS and paired EFI loader
+  in an inactive slot, verifies disk readback, and offers a restart. A healthy
+  desktop confirms the new boot; an unconfirmed trial falls back automatically.
+- Accounts, files and preferences live on shared Data. Signed app bundles use
+  atomic current/previous version publication and retained-version rollback.
+- `make managed-image` builds the paired x86-64 UEFI layout. Release hosting and
+  production signing must be configured explicitly; existing legacy disks are
+  not silently repartitioned. See [UPDATES.md](docs/UPDATES.md).
+
 **Storage**
 - **EMBKFS**, a from-scratch filesystem (B-tree-backed, checksummed,
   AES-256-XTS encryption, compression, snapshots, self-heal, provenance,

@@ -1550,7 +1550,7 @@ static bool embkfs_unlock_volume(struct embk_block_device *dev, struct embkfs_vo
  * device through a scratch descriptor (self-heal, verify-boot), which must
  * not sweep or allocate on that device's behalf. Everything else calls
  * embkfs_mount(). */
-int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume *vol)
+static int probe_superblock_mode(struct embk_block_device *dev, struct embkfs_volume *vol,bool force_readonly)
 {
     if (!dev || !vol) {
         return -EMBK_EINVAL;
@@ -1662,7 +1662,7 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
             ((const struct embk_superblock *)sb_backup)->generation == sb->generation;
         bool other_ok = sb_is_primary ? backup_matches : primary_matches;
 
-        if (!boot_recovery_mode() && !other_ok && good_spb > 0 && good_spb <= 128) {
+        if (!force_readonly && !boot_recovery_mode() && !other_ok && good_spb > 0 && good_spb <= 128) {
             uint8_t *goodblk = kmalloc(good_spb * dev->block_size);
             if (goodblk && embk_block_read(dev, good_lba, good_spb, goodblk) == EMBK_OK) {
                 int wrc = embk_block_write(dev, bad_lba, good_spb, goodblk);
@@ -1686,7 +1686,7 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
                 dev->name, sb->feature_incompat);
         return -EMBK_EINVAL;
     }
-    bool read_only = boot_recovery_mode() || (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
+    bool read_only = force_readonly || boot_recovery_mode() || (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
 
     /* Version backstop: a newer major could mean anything. */
     if (sb->version_major > EMBKFS_MAX_KNOWN_MAJOR) {
@@ -1820,6 +1820,10 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
  * On success, `buf` is a valid, parent-vouched node block.
  */
 /* See struct embkfs_stat (embkfs.h). Attributes EMBKFS's block reads by cause. */
+int embkfs_probe_superblock(struct embk_block_device *dev,struct embkfs_volume *vol) {
+    return probe_superblock_mode(dev,vol,false);
+}
+
 static struct embkfs_stat g_efs_stat;
 void embkfs_stat_reset(void) { memset(&g_efs_stat, 0, sizeof g_efs_stat); }
 void embkfs_stat_get(struct embkfs_stat *out)
@@ -7718,6 +7722,12 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     return EMBK_OK;
 }
 
+int embkfs_mount_readonly(struct embk_block_device *dev,struct embkfs_volume *vol) {
+    int rc=probe_superblock_mode(dev,vol,true);
+    if(rc)return rc;
+    return embkfs_finish_mount(vol)?EMBK_OK:-EMBK_EIO;
+}
+
 void embkfs_init(void)
 {
     kprintf("\n=== EMBKFS init ===\n");
@@ -7728,6 +7738,20 @@ void embkfs_init(void)
 
     /* Build the CRC32C table before anything verifies a checksum. */
     embk_crc32c_init();
+
+    const struct boot_protocol *bp=boot_protocol_get();
+    bool managed=bp && bp->size>=BOOT_PROTOCOL_SIZE_V4 && (bp->update_flags&1);
+    struct embk_block_device *managed_root=NULL,*managed_data=NULL;
+    if(managed) {
+        managed_root=embk_partition_by_guid(bp->update_root_guid,boot_disk);
+        managed_data=embk_partition_by_guid(bp->update_data_guid,boot_disk);
+        if(!boot_disk || !managed_root || !managed_data || managed_root==managed_data ||
+           embkfs_mount_readonly(managed_root,&g_embkfs_volumes[0])) {
+            kprintf("EMBKFS: selected managed OS/data partition unavailable; refusing unrelated root\n");return;
+        }
+        g_embkfs_volume_count=1;
+        kprintf("EMBKFS: managed OS slot %u mounted read-only from %s\n",bp->update_slot,managed_root->name);
+    }
 
     /* Probe EVERY block device for an EMBKFS superblock; mount EVERY one
      * that validates, up to EMBKFS_MAX_VOLUMES (v2.2 Phase 1 -- previously
@@ -7748,6 +7772,7 @@ void embkfs_init(void)
          * bogus "primary superblock" by WRITING over the MBR / boot code. */
         if (embk_block_is_partitioned(d))
             continue;
+        if(managed && (d==managed_root || (embk_partition_parent(d)==boot_disk && d!=managed_data)))continue;
         if(boot_recovery_mode() && ((boot_disk && embk_partition_parent(d)!=boot_disk) || g_embkfs_volume_count))continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
@@ -7771,7 +7796,7 @@ void embkfs_init(void)
      * rather than repointing, so main.c's per-volume /sdX registration (which
      * treats index 0 as embk_live) needs no change. */
     uint32_t boot_sig;
-    if (g_embkfs_volume_count > 1 && (boot_disk || bootinfo_boot_disk_sig(&boot_sig))) {
+    if (!managed && g_embkfs_volume_count > 1 && (boot_disk || bootinfo_boot_disk_sig(&boot_sig))) {
         for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
             struct embk_block_device *disk =
                 embk_partition_parent(g_embkfs_volumes[i].dev);

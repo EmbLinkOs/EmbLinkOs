@@ -643,8 +643,7 @@ static void test_sysparams(void) {
 /* fcntl's descriptor flags. This is the call that silently broke CPython: it
  * opens every file via _Py_wfopen, which calls make_non_inheritable ->
  * fcntl(fd, F_GETFD) right after fopen() succeeds, and closed the file again
- * when our ENOSYS came back. FD_CLOEXEC is answerable here because EmbLink has
- * no exec -- see the long comment on fcntl() in syscalls.c. */
+ * when our ENOSYS came back. Descriptor flags are now real state used by the spawn adapter. */
 static void test_fcntl(void) {
     printf("fcntl descriptor flags:\n");
 
@@ -655,21 +654,15 @@ static void test_fcntl(void) {
     int flags = fcntl(fd, F_GETFD);
     printf("       (F_GETFD -> 0x%X)\n", flags);
     ck("F_GETFD succeeds", flags != -1);
-    /* Every fd is effectively close-on-exec: there is no exec to survive. */
-    ck("F_GETFD reports FD_CLOEXEC", flags != -1 && (flags & FD_CLOEXEC));
+    ck("new descriptors start inheritable", flags == 0);
 
     ck("F_SETFD(FD_CLOEXEC) accepted", fcntl(fd, F_SETFD, FD_CLOEXEC) == 0);
-    ck("F_SETFD(0) accepted too (no exec => unobservable either way)",
-       fcntl(fd, F_SETFD, 0) == 0);
+    ck("F_GETFD observes FD_CLOEXEC", fcntl(fd,F_GETFD)==FD_CLOEXEC);
+    ck("F_SETFD(0) clears descriptor flags",
+       fcntl(fd, F_SETFD, 0) == 0 && fcntl(fd,F_GETFD)==0);
 
-    /* F_GETFL REPORTS THE TRUTH rather than refusing. It used to return
-     * ENOSYS, on the reasoning that a false success would make a caller
-     * believe it had non-blocking I/O and then hang in a blocking read -- but
-     * that confuses "cannot SET O_NONBLOCK" with "cannot say what the flags
-     * are". Every fd here is O_RDWR and blocking, which is a complete and
-     * accurate answer; F_SETFL is still the one that refuses. */
-    ck("F_GETFL reports the true state (O_RDWR, blocking)",
-       fcntl(fd, F_GETFL) == O_RDWR);
+    ck("F_GETFL reports the actual read-only access mode",
+       fcntl(fd, F_GETFL) == O_RDONLY);
 
     close(fd);
 
@@ -742,11 +735,11 @@ static void test_mmap(void) {
     ck("MAP_SHARED is refused, not silently made private",
        sh == MAP_FAILED && errno == ENOTSUP);
 
-    /* ANY fd is refused -- fd 1 rather than a file we open, so this assertion
-     * cannot be skipped by a missing fixture the way a stat() guard would. */
+    /* A console has no file pages. Keep ENODEV distinct from a regular
+     * file descriptor whose access mode does not permit the mapping. */
     errno = 0;
     void *fm = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 1, 0);
-    ck("a file-backed mapping is refused, not faked with zeroes",
+    ck("a console mapping is refused, not faked with zeroes",
        fm == MAP_FAILED && errno == ENODEV);
 
     /* A range that is KNOWN to be unmapped, found by asking rather than by

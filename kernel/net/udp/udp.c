@@ -135,14 +135,15 @@ int net_udp_sendto(int us, uint32_t dst_ip, uint16_t dst_port, const void *data,
     return rc;
 }
 
-int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port) {
+static int recvfrom_flags(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port,bool nonblock) {
     if (us < 0 || us >= UDP_SOCKS) return -1;
     net_lock();
     if (!udp_socks[us].in_use) { net_unlock(); return -1; }
     struct udp_sock *s = &udp_socks[us];
     int got = -1;
     uint64_t deadline = net_ticks() + NET_TMO_TICKS;
-    while (net_ticks() < deadline) {
+    for (;;) {
+        if (!s->in_use)break;
         if (s->q_n > 0) {
             struct udp_dgram *d = &s->q[s->q_head];
             uint32_t k = d->len < cap ? d->len : cap;
@@ -154,10 +155,23 @@ int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t
             got = (int)k;
             break;
         }
+        if(nonblock){got=-2;break;}
+        if(net_ticks()>=deadline)break;
         net_wait();
     }
     net_unlock();
     return got;
+}
+int net_udp_recvfrom(int us,void *buf,uint32_t cap,uint32_t *ip,uint16_t *port) {
+    return recvfrom_flags(us,buf,cap,ip,port,false);
+}
+int net_udp_recvfrom_nb(int us,void *buf,uint32_t cap,uint32_t *ip,uint16_t *port) {
+    return recvfrom_flags(us,buf,cap,ip,port,true);
+}
+int net_udp_ready(int us) {
+    if(us<0 || us>=UDP_SOCKS)return -1;
+    net_lock();int n=udp_socks[us].in_use?(udp_socks[us].q_n>0):-1;
+    net_unlock();return n;
 }
 
 void net_udp_close(int us) {

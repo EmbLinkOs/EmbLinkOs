@@ -122,3 +122,4 @@ void boot_protocol_dump(void)
             (unsigned long)g_bp.acpi_rsdp);
 }
 bool boot_recovery_mode(void) {return g_valid && (g_bp.boot_mode==BOOT_MODE_RECOVERY || g_bp.boot_mode==BOOT_MODE_DIAGNOSTICS);}
+void boot_protocol_force_recovery(void) {if(g_valid)g_bp.boot_mode=BOOT_MODE_RECOVERY;}

@@ -1,0 +1,11 @@
+{
+  "mrsh_revision": "4c81598721bc5eeb28f9faa818b3102d0471b7f6",
+  "mrsh_archive_sha256": "6d542dd5d26c97a5e63575c883ce84c716074e41e5d24c813840a6e93f62ee03",
+  "newlib_version": "4.5.0.20241231",
+  "newlib_files": {
+    "fnmatch.c": "fa8c433459d07c247d1bd6452767b50faeafd2bf2fb292d3644fe67881a5f5c3",
+    "glob.c": "9ac69d95c86829d3b0aafca02efc9db5c9025f535655da645b68b93c21ec7fc7",
+    "fnmatch.h": "3a6ca8bce057d57213e430ebff2ebb478d55edcc2fe844eebf13326f2e272f9a",
+    "glob.h": "5187486085ba34960d9e95cc00507ab11c0075c11c2eca974987c172317c49b0"
+  }
+}

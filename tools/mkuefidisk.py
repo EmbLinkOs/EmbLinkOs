@@ -73,10 +73,10 @@ def _dirent(name: str, attr: int, cluster: int, size: int) -> bytes:
             struct.pack("<HI", cluster & 0xFFFF, size))
 
 
-def fat32(size_sectors: int, efi_blob: bytes, label: str = "EMBLINKEFI") -> bytes:
+def fat32(size_sectors: int, efi_blob: bytes, label: str = "EMBLINKEFI", *, reserved_sectors=32) -> bytes:
     """A FAT32 filesystem of `size_sectors` holding /EFI/BOOT/BOOTX64.EFI."""
     spc = 1                                   # sectors per cluster
-    reserved = 32
+    reserved = reserved_sectors
     nfats = 2
 
     # sectors_per_fat has to describe a FAT big enough for the clusters that
@@ -186,8 +186,10 @@ def gpt_disk(parts, total_sectors: int, payloads) -> bytes:
     img[0:SECTOR] = mbr
 
     entries = bytearray(GPT_ENTRIES * GPT_ENTRY_SZ)
-    for i, (first, last, tguid, name) in enumerate(parts):
-        e = (_guid(tguid) + _guid(uuid.uuid4()) +
+    for i, part in enumerate(parts):
+        first,last,tguid,name=part[:4]
+        identity=part[4] if len(part)>4 else uuid.uuid4()
+        e = (_guid(tguid) + _guid(identity) +
              struct.pack("<QQQ", first, last, 0) +
              name.encode("utf-16-le").ljust(72, b"\0")[:72])
         entries[i * GPT_ENTRY_SZ:(i + 1) * GPT_ENTRY_SZ] = e
