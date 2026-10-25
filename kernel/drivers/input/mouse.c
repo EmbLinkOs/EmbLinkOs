@@ -21,8 +21,10 @@ static spinlock_t pointer_state_lock=SPINLOCK_INIT;
 #if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"
 #include "include/io.h"
+#include "drivers/input/i8042.h"
 #endif
 #include "drivers/char/serial.h"
+#include "include/kprintf.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: a press knows its own time */
 
 #define PS2_DATA   0x60
@@ -137,17 +139,10 @@ int32_t mouse_take_wheel(void) {
 }
 
 
-/* controller handshake helpers (bounded spins so a wedged 8042 can't hang) */
 #if defined(__x86_64__)
-static void ps2_wait_write(void) { for (int i = 0; i < 100000; i++) if (!(inb(PS2_STATUS) & PS2_ST_INPUT_FULL)) return; }
-static void ps2_wait_read(void)  { for (int i = 0; i < 100000; i++) if (  inb(PS2_STATUS) & PS2_ST_OUTPUT_FULL) return; }
-
-/* send a command byte to the MOUSE (aux) device (0xD4 prefix), read its ACK. */
-static void mouse_command(uint8_t cmd) {
-    ps2_wait_write(); outb(PS2_CMD, 0xD4);
-    ps2_wait_write(); outb(PS2_DATA, cmd);
-    ps2_wait_read();  (void)inb(PS2_DATA);   /* consume the 0xFA ACK */
-}
+/* One byte to the device on port 2, ACK consumed. The 0xD4 prefix, the bounded
+ * waits and the RESEND retry live in i8042.c, which owns the controller. */
+static bool mouse_command(uint8_t cmd) { return i8042_aux_write(cmd); }
 
 /* Apply the accumulated packet's motion + buttons (bytes 0..2, common to both
  * the 3- and 4-byte formats). */
@@ -262,37 +257,53 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     return;
 #else
 
-    /* enable the auxiliary (mouse) device */
-    ps2_wait_write(); outb(PS2_CMD, 0xA8);
-
-    /* turn on IRQ12 (bit 1) and the mouse clock (clear bit 5) in the config byte */
-    ps2_wait_write(); outb(PS2_CMD, 0x20);
-    ps2_wait_read();  uint8_t cfg = inb(PS2_DATA);
-    cfg |=  0x02;
-    cfg &= ~0x20;
-    ps2_wait_write(); outb(PS2_CMD, 0x60);
-    ps2_wait_write(); outb(PS2_DATA, cfg);
+    /* THE CONTROLLER FIRST, and it decides whether there is anything here at
+     * all. A laptop touchpad that speaks PS/2 is on port 2 and this drives it;
+     * one on an I2C bus is not, and the honest thing is to say so and leave
+     * the cursor to whatever else can move it, rather than spending four
+     * unanswered commands finding out the hard way on every boot. */
+    if (!i8042_init() || !i8042_have_aux()) {
+        kprintf("Mouse: no PS/2 pointing device; a USB or virtio pointer moves "
+                "the cursor instead\n");
+        return;
+    }
 
     mouse_command(0xF6);   /* set defaults */
 
     /* IntelliMouse magic knock: sample rates 200,100,80 then GET_DEVICE_ID; a
-     * reply of 0x03 means the mouse now emits a 4th byte carrying the wheel. */
+     * reply of 0x03 means the mouse now emits a 4th byte carrying the wheel.
+     * A laptop touchpad in its default PS/2 mode answers this too -- most of
+     * them report 0x00 and send plain 3-byte packets, which is exactly what
+     * the parser below expects, and is why a touchpad works here at all. */
     mouse_command(0xF3); mouse_command(200);
     mouse_command(0xF3); mouse_command(100);
     mouse_command(0xF3); mouse_command(80);
-    ps2_wait_write(); outb(PS2_CMD, 0xD4);
-    ps2_wait_write(); outb(PS2_DATA, 0xF2);          /* GET_DEVICE_ID */
-    ps2_wait_read();  (void)inb(PS2_DATA);           /* ACK */
-    ps2_wait_read();  uint8_t id = inb(PS2_DATA);
-    if (id == 0x03) { g_pkt_len = 4; serial_write_string("Mouse: IntelliMouse wheel enabled\n"); }
+    int id = -1;
+    if (mouse_command(0xF2)) { id = i8042_read(100000); }
+    if (id == 0x03) { g_pkt_len = 4; kprintf("Mouse: IntelliMouse wheel enabled\n"); }
+
+    /* A touchpad reports far more often than a mouse needs to, and every
+     * report is an interrupt. 100/s is the usual compromise and is what the
+     * cursor code can consume; the default is 100 already on most devices,
+     * but a device left at 200 by the firmware halves the interrupt load for
+     * one command. */
+    mouse_command(0xF3); mouse_command(100);
 
     mouse_command(0xF4);   /* enable data reporting */
 
     irq_register(12, mouse_handler);
-    serial_write_string("Mouse registered on IRQ 12\n");
+    i8042_irq_enable(false, true);          /* IRQ12 on, handler now in place */
+    kprintf("Mouse: PS/2 pointing device ready on IRQ 12 (%u-byte packets)\n",
+            (unsigned)g_pkt_len);
 #endif /* __x86_64__ */
 }
 
+void mouse_warp(int32_t x,int32_t y) {
+    spin_lock(&pointer_state_lock);
+    if(x<0)x=0;if(y<0)y=0;if(x>=g_w)x=g_w-1;if(y>=g_h)y=g_h-1;
+    g_x=x;g_y=y;
+    spin_unlock(&pointer_state_lock);
+}
 void mouse_set_bounds(uint32_t w,uint32_t h) {
     if(!w || !h)return;
     spin_lock(&pointer_state_lock);

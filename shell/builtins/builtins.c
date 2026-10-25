@@ -5,6 +5,7 @@
  * ========================================================================== */
 #include "builtins/builtins.h"
 #include "hist/hist.h"
+#include "sval/sval.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -221,6 +222,42 @@ static struct value bi_first(const struct command *cmd, struct value input,
     }
     value_free(&input);
     return err_args(cmd, "expected a table or list from the previous stage");
+}
+
+/* -------------------------------------------------------------------------
+ * assert <condition> [message] -- stop here unless the condition holds.
+ *
+ * What a script checks its own work with: `assert ($n == 3) "three lines"`
+ * fails the program -- exit status 1 under -c or as a script -- with the
+ * message, and passes its input through when it holds, so it can sit in the
+ * middle of a pipeline. The condition is strict, like `if`'s: something that
+ * is not true or false is itself an error, not a silent pass.
+ * ------------------------------------------------------------------------- */
+static struct value bi_assert(const struct command *cmd, struct value input,
+                              struct scope *env) {
+    if (cmd->nargs < 1 || cmd->nargs > 2) {
+        value_free(&input);
+        return value_error("assert: assert <condition> [message]");
+    }
+    struct value c = expr_eval(cmd->args[0], env);
+    if (c.type == VAL_ERROR) { value_free(&input); return c; }
+    int t = value_truthy(&c);
+    value_free(&c);
+    if (t == 1) return input;
+    value_free(&input);
+    if (t < 0) return value_error("assert: the condition is neither true nor false");
+    char msg[200];
+    if (cmd->nargs == 2) {
+        struct value m = expr_eval(cmd->args[1], env);
+        if (m.type == VAL_ERROR) return m;
+        char text[160];
+        sval_format_scalar(&m, text, sizeof text);
+        value_free(&m);
+        snprintf(msg, sizeof msg, "assertion failed: %s", text);
+    } else {
+        snprintf(msg, sizeof msg, "assertion failed (line %zu)", cmd->line);
+    }
+    return value_error(msg);
 }
 
 /* -------------------------------------------------------------------------
@@ -872,6 +909,11 @@ static struct value bi_help(const struct command *cmd, struct value input,
         { "uptime / date",    "system uptime / wall-clock date" },
         { "clear",            "clear the terminal" },
         { "let x = <expr>",   "bind a variable ($x)" },
+        { "assert <cond> [msg]", "stop the program unless the condition is true" },
+        { "source <file>",    "run a file's program here: its lets and defs stay" },
+        { "cmd out> f / out>> f", "a command's output to a file (replace / append)" },
+        { "cmd err> f / out+err> f", "its errors, or both, to a file" },
+        { "cmd in< f",        "a file as the command's input" },
         { "exit",             "leave the shell" },
     };
     struct value out = value_table();
@@ -891,6 +933,7 @@ static struct value bi_help(const struct command *cmd, struct value input,
 builtin_fn builtin_lookup(const char *name) {
     static const struct { const char *name; builtin_fn fn; } tab[] = {
         { "echo",    bi_echo    },
+        { "assert",  bi_assert  },
         { "where",   bi_where   },
         { "select",  bi_select  },
         { "sort-by", bi_sort_by },

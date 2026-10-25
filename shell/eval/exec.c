@@ -33,6 +33,7 @@
  * ========================================================================== */
 #include "eval/exec.h"
 #include "eval/eval.h"
+#include "lex/lex.h"
 #include "builtins/builtins.h"
 #include "value/value.h"
 #include <stdlib.h>
@@ -216,6 +217,43 @@ void exec_init(struct scope *top, value_sink sink, void *sink_ctx) {
     eval_user_command_call   = userfn_call;
 }
 
+/* --- `source`: a file's program in the CALLER's scope --------------------
+ * What separates `source defs.esh` from running the script: its `let`s and
+ * `def`s are left behind in the scope it ran in, so a file can be a library
+ * of commands a session or another script loads. Its statements print as
+ * the caller's would. A file that defines commands keeps its AST for the
+ * session, as a typed line that defines one does (exec_retain_program). */
+struct value exec_source_text(const char *src, struct scope *env) {
+    size_t ntoks = 0;
+    struct token *toks = lex(src, &ntoks);
+    if (!toks) return value_error("source: out of memory");
+    char err[160];
+    struct block *prog = parse_program(toks, ntoks, err, sizeof err);
+    lex_free_tokens(toks, ntoks);
+    if (!prog) {
+        char msg[200];
+        snprintf(msg, sizeof msg, "source: %s", err);
+        return value_error(msg);
+    }
+    struct exec_out out = { FLOW_NORMAL, value_null(), false };
+    int rc = block_exec(prog, env, g_sink, g_sink_ctx, &out);
+    bool keep = false;
+    for (size_t i = 0; i < prog->n && !keep; i++)
+        keep = prog->stmts[i]->kind == STMT_DEF || prog->stmts[i]->kind == STMT_IF ||
+               prog->stmts[i]->kind == STMT_WHILE || prog->stmts[i]->kind == STMT_FOR;
+    if (keep && !exec_retain_program(prog)) {
+        value_free(&out.value);
+        block_free(prog);
+        return value_error("source: too many definitions in this session");
+    }
+    if (!keep) block_free(prog);
+    if (rc != 0) return out.value.type == VAL_ERROR ? out.value : value_error("source: the file failed");
+    /* Its statements were shown as they ran; what it leaves in the pipeline
+     * is nothing, so the last one is not shown twice. */
+    value_free(&out.value);
+    return value_null();
+}
+
 /* --- iterating whatever `for` was handed --------------------------------- */
 
 /* How many items a value offers a `for` loop, and how to fetch one.
@@ -334,7 +372,7 @@ static int stmt_exec(const struct stmt *st, struct scope *env,
             return 0;
         }
 
-        struct value v = pipeline_run(st->u.pipe, env);
+        struct value v = pipeline_run(st->u.pipe, env, true);
         if (v.type == VAL_ERROR) {
             value_free(&out->value);
             out->value = v;

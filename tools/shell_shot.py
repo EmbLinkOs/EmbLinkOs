@@ -22,6 +22,7 @@ import json, os, socket, subprocess, sys, threading, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
+import qemu_guard
 
 SCREEN_W, SCREEN_H = 1024, 768
 DOCK_SIZE = 38                      # oscfg default; home.c's DOCK_BASE
@@ -156,8 +157,7 @@ def main():
     # a real debugging session: every tool here refused to start, reporting
     # "another qemu-system is running", while nothing was running but the
     # waiters themselves. -x matches the program, which is the question.
-    if any(subprocess.run(["pgrep", "-x", exe], capture_output=True).returncode == 0
-           for exe in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("shell_shot: another qemu-system is running; refusing to start a second one")
         return 2
     p, ser, qmp = A.boot(name, os.path.join(A.BUILD, "shot-%s.img" % name))

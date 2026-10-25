@@ -9,6 +9,7 @@ KERNEL_PHYSICAL_BASE = 0X2000000;
 
 SECTIONS {
     . = KERNEL_VIRTUAL_BASE + KERNEL_PHYSICAL_BASE; /* Physical 32 MiB */
+    kernel_start = .;
 
     .text ALIGN(4096) : AT(ADDR(.text) - KERNEL_VIRTUAL_BASE) {
         *(.text) /* All .text sections from input files */

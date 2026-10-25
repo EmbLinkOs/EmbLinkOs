@@ -1,5 +1,5 @@
 #include "edid.h"
-#include <string.h>
+#include "include/kstring.h"
 #include "../../user/lib/embk_monitor.h"
 static void text(char *out,size_t cap,const uint8_t *p,unsigned n) {
     size_t at=0;for(unsigned i=0;i<n && at+1<cap;i++) {

@@ -264,6 +264,66 @@ static void appearance_start(const struct oscfg *initial) {
     if(!g_appearance_worker_started && embk_thread_create(appearance_worker,0)>=0)g_appearance_worker_started=1;
 }
 static int g_shell_bottom,g_shell_height=34,g_follow_display_width;
+
+/* THE MONITORS. The desktop is one surface over every monitor
+ * (embk_monitor.h); an app places, maximizes and tiles on the monitor its
+ * window is on, and the top bar and dock band only shrink the primary's work
+ * area. Without the layout (one monitor, or no GPU capability) the whole
+ * screen is the one output. */
+struct em_out { int x, y, w, h, primary; };
+static struct embk_display_layout g_dl;
+static int g_dl_ok;
+static uint32_t g_dl_seen;
+static void outputs_refresh(void) {
+    g_dl.version=EMBK_DISPLAY_LAYOUT_VERSION;
+    g_dl_ok=!embk_display_layout(&g_dl) && g_dl.count;
+}
+static struct em_out out_primary(uint32_t sw,uint32_t sh) {
+    struct em_out o={0,0,(int)sw,(int)sh,1};
+    if(!g_dl_ok)return o;
+    for(unsigned i=0;i<g_dl.count && i<EMBK_DISPLAY_MAX_OUTPUTS;i++) {
+        const struct embk_output *d=&g_dl.outputs[i];
+        if((d->flags&EMBK_OUTPUT_ENABLED) && (d->flags&EMBK_OUTPUT_PRIMARY) && d->width && d->height)
+            return (struct em_out){d->x,d->y,(int)d->width,(int)d->height,1};
+    }
+    return o;
+}
+static struct em_out out_at(int px,int py,uint32_t sw,uint32_t sh) {
+    struct em_out best=out_primary(sw,sh);
+    if(!g_dl_ok)return best;
+    long long bestd=-1;
+    for(unsigned i=0;i<g_dl.count && i<EMBK_DISPLAY_MAX_OUTPUTS;i++) {
+        const struct embk_output *d=&g_dl.outputs[i];
+        if(!(d->flags&EMBK_OUTPUT_ENABLED) || !d->width || !d->height)continue;
+        long long cx=px<d->x?d->x:px>=d->x+(int)d->width?d->x+(int)d->width-1:px;
+        long long cy=py<d->y?d->y:py>=d->y+(int)d->height?d->y+(int)d->height-1:py;
+        long long dd=(cx-px)*(cx-px)+(cy-py)*(cy-py);
+        if(bestd<0 || dd<bestd) {
+            bestd=dd;
+            best=(struct em_out){d->x,d->y,(int)d->width,(int)d->height,(d->flags&EMBK_OUTPUT_PRIMARY)!=0};
+        }
+    }
+    return best;
+}
+void em_primary_output(int *x,int *y,int *w,int *h) {
+    uint32_t sw=0,sh=0;embk_screen_size(&sw,&sh);
+    if(!g_dl_ok)outputs_refresh();
+    struct em_out o=out_primary(sw,sh);
+    if(x)*x=o.x;
+    if(y)*y=o.y;
+    if(w)*w=o.w;
+    if(h)*h=o.h;
+}
+int em_output_at(int px,int py,int *x,int *y,int *w,int *h) {
+    uint32_t sw=0,sh=0;embk_screen_size(&sw,&sh);
+    if(!g_dl_ok)outputs_refresh();
+    struct em_out o=out_at(px,py,sw,sh);
+    if(x)*x=o.x;
+    if(y)*y=o.y;
+    if(w)*w=o.w;
+    if(h)*h=o.h;
+    return o.primary;
+}
 void em_app_follow_display_width(int enabled){g_follow_display_width=!!enabled;}
 void em_shell_band(int bottom,int height){g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
 static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
@@ -307,18 +367,20 @@ int em_app_run(const EmApp *app) {
     /* the window: requested content size, clamped + centred on the screen */
     uint32_t sw = 0, sh = 0;
     embk_screen_size(&sw, &sh);
+    outputs_refresh();g_dl_seen=g_dl.generation;
+    struct em_out P=out_primary(sw,sh);   /* new windows open on the primary monitor */
     int minw=app->min_size.w>0?app->min_size.w:200;
     int minh=app->min_size.h>0?app->min_size.h:160;
-    if(sw && minw>(int)sw-inset_l-inset_r)minw=(int)sw-inset_l-inset_r;
-    if(sh && minh>(int)sh-inset_t-inset_b-34)minh=(int)sh-inset_t-inset_b-34;
-    int winw = app->fullscreen && sw ? (int)sw : (app->size.w > 0 ? app->size.w : 640);
-    int winh = app->fullscreen && sh ? (int)sh : (app->size.h > 0 ? app->size.h : 480);
+    if(P.w && minw>P.w-inset_l-inset_r)minw=P.w-inset_l-inset_r;
+    if(P.h && minh>P.h-inset_t-inset_b-34)minh=P.h-inset_t-inset_b-34;
+    int winw = app->fullscreen && P.w ? P.w : (app->size.w > 0 ? app->size.w : 640);
+    int winh = app->fullscreen && P.h ? P.h : (app->size.h > 0 ? app->size.h : 480);
     int glass = (app->material == Acrylic);      /* frosted window (implies chromeless) */
     int translucent = (app->material == Translucent);  /* per-pixel transparent, no blur */
     int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass || translucent;
     int bar = chromeless ? 0 : 34;
-    if (!app->fullscreen && sw) {
-        int maxw = translucent ? (int)sw : (int)sw - inset_l - inset_r - 8;
+    if (!app->fullscreen && P.w) {
+        int maxw = translucent ? P.w : P.w - inset_l - inset_r - 8;
         if (winw > maxw) winw = maxw;
     }
     /* 64 was hard-coded here and it was WRONG at every dock size: the pill is
@@ -329,15 +391,16 @@ int em_app_run(const EmApp *app) {
      * clicks went to the app instead. From the outside: the dock needs several
      * clicks to launch anything, and once one app is open it stops working
      * altogether. Ask the preference instead of guessing. */
-    if (!app->fullscreen && sh && winh > (int)sh - inset_t - inset_b - bar)
-        winh = (int)sh - inset_t - inset_b - bar;
+    if (!app->fullscreen && P.h && winh > P.h - inset_t - inset_b - bar)
+        winh = P.h - inset_t - inset_b - bar;
     if(winw<minw)winw=minw;
     /* chromeless strips (menu bars, docks) are legitimately short; normal
      * titled windows keep a usable floor. */
     if(winh<(translucent?24:minh))winh=translucent?24:minh;
-    int wx = app->fullscreen ? 0 : inset_l+((int)sw-inset_l-inset_r-winw)/2;        if (wx < 0) wx = 0;
-    int wy = app->fullscreen ? 0 : inset_t+((int)sh-inset_t-inset_b-winh-bar)/2;
-    if (wy < inset_t && !app->fullscreen) wy = inset_t;
+    int wx = app->fullscreen ? P.x : P.x+inset_l+(P.w-inset_l-inset_r-winw)/2;        if (wx < P.x) wx = P.x;
+    int wy = app->fullscreen ? P.y : P.y+inset_t+(P.h-inset_t-inset_b-winh-bar)/2;
+    if (wy < P.y+inset_t && !app->fullscreen) wy = P.y+inset_t;
+    if (g_follow_display_width) { wx = P.x; wy = P.y; }
     /* Publish AFTER both are assigned. This line used to pass g_viewport_h to
      * em_set_viewport one statement BEFORE that variable was given a value, so
      * every application started life telling the toolkit its window was zero
@@ -460,23 +523,53 @@ int em_app_run(const EmApp *app) {
 
         if(em_now_ms()>=screen_next) {
             screen_next=em_now_ms()+200;uint32_t nsw=0,nsh=0;embk_screen_size(&nsw,&nsh);
-            if(nsw && nsh && (display_pending || nsw!=sw || nsh!=sh)) {
-                display_pending=0;
+            struct embk_display_layout was=g_dl;int was_ok=g_dl_ok;
+            outputs_refresh();
+            int layout_moved=g_dl_ok && g_dl.generation!=g_dl_seen;
+            int display_changed=nsw && nsh && (nsw!=sw || nsh!=sh || layout_moved);
+            if(!app->fullscreen && !g_follow_display_width) {
+                /* WHERE THE PERSON PUT IT. A window moved since the runtime
+                 * last placed it -- by its own title bar (chromeless), or the
+                 * kernel's -- has a new normal place. The kernel's answer is
+                 * only asked between display changes: right after one, the
+                 * compositor's own clamping is in it. */
+                int32_t x=wx_now,y=wy_now;
+                if(chromeless)em_window_pos(&x,&y);
+                else if(!display_changed){struct embk_win_geometry geo;if(!embk_win_where(win,&geo)){x=geo.x;y=geo.y;}}
+                if(x!=wx_now || y!=wy_now) {
+                    if(layout_now==EmWinNormal){normal_x=x;normal_y=y;}
+                    wx_now=x;wy_now=y;
+                }
+                /* THE MONITOR MOVED: the compositor has carried the window
+                 * with it, and the normal place goes the same distance. Only
+                 * the monitor's move -- never the clamping a smaller mode
+                 * forces -- so a resolution trial reverted puts every window
+                 * back exactly where it was. */
+                int32_t dx=0,dy=0;
+                if(display_changed && was_ok && g_dl_ok &&
+                   arrange_follow(&was,&g_dl,wx_now+winw/2,wy_now+winh/2,&dx,&dy) && (dx || dy)) {
+                    normal_x+=dx;normal_y+=dy;wx_now+=dx;wy_now+=dy;
+                    if(chromeless)em_window_bind(win,wx_now,wy_now);
+                }
+            }
+            if(nsw && nsh && (display_pending || nsw!=sw || nsh!=sh || layout_moved)) {
+                display_pending=0;g_dl_seen=g_dl.generation;
                 sw=nsw;sh=nsh;
+                P=out_primary(sw,sh);
                 minw=app->min_size.w>0?app->min_size.w:200;
                 minh=app->min_size.h>0?app->min_size.h:160;
-                if(minw>(int)sw-inset_l-inset_r)minw=(int)sw-inset_l-inset_r;
-                if(minh>(int)sh-inset_t-inset_b-bar)minh=(int)sh-inset_t-inset_b-bar;
+                if(minw>P.w-inset_l-inset_r)minw=P.w-inset_l-inset_r;
+                if(minh>P.h-inset_t-inset_b-bar)minh=P.h-inset_t-inset_b-bar;
                 if(app->fullscreen || g_follow_display_width) {
-                    int nw=(int)sw,nh=app->fullscreen?(int)sh:menu_expanded==2?(int)sh:winh;
-                    if(nh>(int)sh)nh=(int)sh;
+                    int nw=P.w,nh=app->fullscreen?P.h:menu_expanded==2?P.h:winh;
+                    if(nh>P.h)nh=P.h;
                     uint32_t *npx=NULL;
                     if(embk_win_resize(win,nw,nh,(void **)&npx)>=0 && npx) {
                         px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);
                         rt.pixels=back?back:px;rt.width=nw;rt.height=nh;rt.stride=nw*4;
                         g_viewport_w=nw;g_viewport_h=nh;em_set_viewport(nw,nh);
-                        int ny=g_follow_display_width && g_shell_bottom && !menu_expanded?(int)sh-nh:0;
-                        embk_win_place(win,0,ny);if(chromeless)em_window_bind(win,0,ny);
+                        int ny=P.y+(g_follow_display_width && g_shell_bottom && !menu_expanded?P.h-nh:0);
+                        embk_win_place(win,P.x,ny);if(chromeless)em_window_bind(win,P.x,ny);
                         scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());em_structure_changed();em_request_frame();
                     }else display_pending=1;
                 }else geometry_pending=1;
@@ -498,9 +591,11 @@ int em_app_run(const EmApp *app) {
             drag_pending=0;
             if(appearance.snap && app->resize==Resizable && chromeless && !have_want) {
                 int32_t x,y;em_window_pos(&x,&y);wx_now=x;wy_now=y;
-                if(x<=inset_l+4) {want=EmWinLeft;have_want=1;}
-                else if(x+winw>=(int)sw-inset_r-4){want=EmWinRight;have_want=1;}
-                else if(y<=inset_t+4){want=EmWinFill;have_want=1;}
+                struct em_out O=out_at(x+winw/2,y+winh/2,sw,sh);
+                int il=O.primary?inset_l:0,ir=O.primary?inset_r:0,it=O.primary?inset_t:0;
+                if(x<=O.x+il+4) {want=EmWinLeft;have_want=1;}
+                else if(x+winw>=O.x+O.w-ir-4){want=EmWinRight;have_want=1;}
+                else if(y<=O.y+it+4){want=EmWinFill;have_want=1;}
             }
         }
         if (!have_want && em_window_take_maximize()) { want = layout_now==EmWinFill?EmWinNormal:EmWinFill; have_want = 1; }
@@ -561,18 +656,24 @@ int em_app_run(const EmApp *app) {
              * band. Every placement but Full is measured inside it, which is
              * what makes "Fill" different from "Full" and why both are offered
              * -- one leaves the shell reachable, the other does not. */
-            int ax = inset_l, ay = inset_t;
-            int aw = (int)sw-inset_l-inset_r, ah = (int)sh-inset_t-inset_b;
+            /* ...of the monitor the window is on: the bars are only on the primary. */
+            struct em_out O=want==EmWinNormal?out_at(normal_x+normal_w/2,normal_y+normal_h/2,sw,sh)
+                                             :out_at(wx_now+winw/2,wy_now+winh/2,sw,sh);
+            int ax = O.x+(O.primary?inset_l:0), ay = O.y+(O.primary?inset_t:0);
+            int aw = O.w-(O.primary?inset_l+inset_r:0), ah = O.h-(O.primary?inset_t+inset_b:0);
             int nx = normal_x, ny = normal_y, nw = normal_w, nh = normal_h;
 
             switch (want) {
             case EmWinNormal:
-                if(nw>aw)nw=aw;if(nh>ah-bar)nh=ah-bar;
-                if(nx<ax)nx=ax;if(nx>ax+aw-nw)nx=ax+aw-nw;
-                if(ny<ay)ny=ay;if(ny>ay+ah-bar-nh)ny=ay+ah-bar-nh;
+                if(nw>aw)nw=aw;
+                if(nh>ah-bar)nh=ah-bar;
+                if(nx<ax)nx=ax;
+                if(nx>ax+aw-nw)nx=ax+aw-nw;
+                if(ny<ay)ny=ay;
+                if(ny>ay+ah-bar-nh)ny=ay+ah-bar-nh;
                 break;
             case EmWinFill:   nx = ax; ny = ay; nw = aw; nh = ah - bar;    break;
-            case EmWinFull:   nx = 0;  ny = 0;  nw = (int)sw; nh = (int)sh; break;
+            case EmWinFull:   nx = O.x; ny = O.y; nw = O.w; nh = O.h; break;
             case EmWinLeft:   nx = ax; ny = ay; nw = aw / 2; nh = ah - bar; break;
             case EmWinRight:  nx = ax + aw / 2; ny = ay; nw = aw - aw / 2; nh = ah - bar; break;
             case EmWinTop:    nx = ax; ny = ay; nw = aw; nh = (ah - bar) / 2; break;
@@ -626,7 +727,7 @@ int em_app_run(const EmApp *app) {
                 int32_t wyc = 0; em_window_pos(0, &wyc);
                 /* The transparent dismiss surface reaches the dock and screen
                  * edges too; a 340px canvas silently missed clicks below it. */
-                int nh=want?(int)sh:expanded?thin_h+48:thin_h;
+                int nh=want?P.h:expanded?thin_h+48:thin_h;
                 if (nh < thin_h) nh = thin_h;
                 uint32_t *npx = 0;
                 if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
@@ -641,7 +742,7 @@ int em_app_run(const EmApp *app) {
                     scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                     em_request_frame();
                     menu_expanded = expanded;
-                    em_window_move_to(0,g_shell_bottom && !want?(int)sh-nh:0);
+                    em_window_move_to(P.x,P.y+(g_shell_bottom && !want?P.h-nh:0));
                 }
             }
         }
@@ -843,11 +944,13 @@ int em_app_run(const EmApp *app) {
             int nw = winw + dw, nh = winh + dh;
             if(nw<minw)nw=minw;
             if(nh<minh)nh=minh;
-            if (sw && nw > (int)sw) nw = (int)sw;
-            if (sh && nh > (int)sh) nh = (int)sh;
+            struct em_out O=out_at(wx_now+winw/2,wy_now+winh/2,sw,sh);   /* no bigger than its monitor */
+            if (O.w && nw > O.w) nw = O.w;
+            if (O.h && nh > O.h) nh = O.h;
             uint32_t *npx = 0;
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
+                if (layout_now == EmWinNormal) { normal_w = nw; normal_h = nh; }   /* the size the person chose */
                 g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
                 if (back) {
                     uint32_t *nb = (uint32_t *)realloc(back, (size_t)winw * (size_t)winh * 4);

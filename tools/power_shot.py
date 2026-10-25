@@ -20,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
 import shell_shot as S
+import qemu_guard
 
 # The EmbLink menu title in the top bar, and Shut Down's position MEASURED off
 # a screendump of the menu once open -- the first version guessed a row pitch
@@ -30,8 +31,7 @@ SHUTDOWN   = (135, 138)
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("power_shot: another qemu-system is running; refusing to start a second one")
         return 2
 

@@ -39,4 +39,10 @@ builtin_fn builtin_lookup(const char *name);
  * the host tests only exercise the pure set). */
 builtin_fn builtin_lookup_os(const char *name);
 
+/* Target-only helpers the external runner shares with the builtins
+ * (builtins_os.c): a path made absolute against the shell's cwd and
+ * normalised, and a whole file read as a string (errors name `who`). */
+void shell_path_resolve(const char *in, char *out, size_t cap);
+struct value shell_read_file(const char *path, const char *who);
+
 #endif /* __EMBK_BUILTINS_H__ */

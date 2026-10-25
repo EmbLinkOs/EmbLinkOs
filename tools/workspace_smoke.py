@@ -7,6 +7,7 @@ Keep the kernel/app binaries unchanged while the guest runs.
 """
 from pathlib import Path
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -17,8 +18,8 @@ from lock_test import keyname
 import shell_shot as S
 
 class Desktop:
-    def __init__(self,out,disk,graphics="virtio"):
-        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics)
+    def __init__(self,out,disk,graphics="virtio",cpu_compose=False):
+        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics,cpu_compose=cpu_compose)
         self.sock=out/'gdb.sock';self.symbols={}
     def login(self,setup=False):
         g=self.g
@@ -38,7 +39,8 @@ class Desktop:
     def debug(self,body):
         script=self.out/'inspect.gdb'
         script.write_text('set pagination off\ntarget remote '+str(self.sock)+'\npython\n'+body+'\nend\ndetach\nquit\n')
-        p=subprocess.run(['gdb','-q','-nx','-batch',str(ROOT/'kernel/kernel.elf'),'-x',str(script)],capture_output=True,text=True,timeout=20,check=True)
+        # EMBLINK_GDB: a gdb that speaks x86-64 where the host's does not (gdb-multiarch on an ARM host)
+        p=subprocess.run([os.environ.get('EMBLINK_GDB','gdb'),'-q','-nx','-batch',str(ROOT/'kernel/kernel.elf'),'-x',str(script)],capture_output=True,text=True,timeout=20,check=True)
         match=re.search(r'RESULT (.*)',p.stdout)
         if not match:raise RuntimeError(p.stdout+p.stderr)
         return json.loads(match.group(1))
@@ -67,7 +69,7 @@ print('RESULT '+json.dumps({'windows':rows,'mouse':[x,y]}))''')
         raise TimeoutError(title)
     def read(self,app,pid,symbol,length,offset=0):
         if app not in self.symbols:
-            p=subprocess.run(['x86_64-elf-nm','-S','--defined-only',str(ROOT/f'build/{app}.elf')],capture_output=True,text=True,check=True)
+            p=subprocess.run([os.environ.get('EMBLINK_NM','x86_64-elf-nm'),'-S','--defined-only',str(ROOT/f'build/{app}.elf')],capture_output=True,text=True,check=True)
             # nm has address, size, type, name; retain local app symbols too.
             self.symbols[app]={line.split()[3]:int(line.split()[0],16) for line in p.stdout.splitlines() if len(line.split())==4}
         address=self.symbols[app][symbol]+offset

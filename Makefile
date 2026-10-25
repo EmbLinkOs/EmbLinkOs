@@ -197,12 +197,19 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
              kernel/drivers/video/intel_display.c \
+             kernel/drivers/video/intel_mmio.c kernel/drivers/video/intel_dpaux.c \
+             kernel/drivers/video/intel_gmbus.c kernel/drivers/video/intel_capture.c \
+             kernel/drivers/video/intel_vbt.c kernel/drivers/video/intel_config.c \
+             kernel/drivers/video/intel_hw.c kernel/drivers/video/intel_native.c kernel/display/edid_modes.c \
+             kernel/drivers/video/intel_blt.c kernel/drivers/video/intel_compose.c kernel/gfx/soft_compose.c \
+             kernel/display/layout.c \
              kernel/acpi/display.c kernel/acpi/power.c \
              kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
              kernel/drivers/i2c/designware.c kernel/drivers/i2c/designware_protocol.c \
              kernel/drivers/i2c/hid_i2c.c kernel/drivers/i2c/hid_protocol.c kernel/drivers/input/hid_report.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
+             kernel/drivers/video/virgl.c kernel/drivers/video/virgl_compose.c \
              kernel/drivers/audio/ac97.c \
              kernel/drivers/audio/hda.c \
              kernel/drivers/audio/audio.c \
@@ -216,6 +223,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
+             kernel/drivers/input/i8042.c \
              kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \
              kernel/drivers/bus/virtio_pci.c \
@@ -316,6 +324,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/loader/pietest.c \
              kernel/lib/ksym.c \
              kernel/lib/klog.c \
+             kernel/lib/bootlog.c \
              kernel/lib/crashlog.c \
              kernel/lib/kprintf.c
 
@@ -534,7 +543,11 @@ NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/$(USER_TRIPLE)/lib,)
 # the host harness does not link jsdom at all. Nothing about that symptom
 # points at a Makefile.
 ifeq ($(ARCH),aarch64)
-NEWLIB_CFLAGS = -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+# -mno-outline-atomics, as the ARM kernel has (arch.mk says why): GCC's
+# outline atomic helpers are hidden symbols in libgcc.a, so libembk.so cannot
+# reference them and every app linking it fails ("hidden symbol
+# __aarch64_swp4_acq ... referenced by DSO").
+NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 else
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 endif
@@ -1318,7 +1331,7 @@ EMLIBC_INC    := -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include -Iuse
 # do heavy FP), and x86-64 passes float/double in XMM, so FP is impossible with
 # it. crt0 already realigns the stack (and $-16) for SSE. emlibc's non-FP code
 # is unaffected; math.c needs this.
-EMLIBC_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
+EMLIBC_CFLAGS  = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
                  -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
 
 # emlibc's math = a thin glue (emlibc_math.o) over LIFTED fdlibm (Sun's freely-
@@ -1328,7 +1341,7 @@ EMLIBC_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red
 EMLIBC_FD_DIR  := $(EMLIBC_DIR)/math/fdlibm
 EMLIBC_FD_SRCS := $(wildcard $(EMLIBC_FD_DIR)/*.c)
 EMLIBC_FD_OBJS := $(patsubst $(EMLIBC_FD_DIR)/%.c,build/emlibc_fd_%.o,$(EMLIBC_FD_SRCS))
-EMLIBC_FD_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+EMLIBC_FD_CFLAGS  = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
                     -O2 -w -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include \
                     -Iuser/lib -I$(EMLIBC_FD_DIR)
 
@@ -1604,7 +1617,15 @@ $(BUILD)/picobj_document.o: user/lib/document.c user/lib/document.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_workspace.o: user/lib/workspace.c user/lib/workspace.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-LIBEMBK_OBJS = $(BUILD)/picobj_workspace.o  $(BUILD)/picobj_document.o  $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+# Arranging several monitors (Settings, the desktop) runs the kernel's own
+# layout rules, so an arrangement is refused in userland for the reasons the
+# kernel would refuse it. -iquote: kernel/ names only "display/layout.h", it
+# never shadows a libc header.
+$(BUILD)/picobj_display_arrange.o: user/lib/display_arrange.c user/lib/display_arrange.h user/lib/embk_monitor.h kernel/display/layout.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC -iquote kernel -c $< -o $@
+$(BUILD)/picobj_display_layout.o: kernel/display/layout.c kernel/display/layout.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC -iquote kernel -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_display_arrange.o $(BUILD)/picobj_display_layout.o $(BUILD)/picobj_workspace.o  $(BUILD)/picobj_document.o  $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
@@ -1934,6 +1955,11 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 KERNEL_HDRS := $(shell find kernel -name '*.h')
 $(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
 	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
+	@# AND DOES IT STILL FIT WHERE IT IS LOADED? The kernel is placed at a
+	@# fixed physical address by both boot paths, and firmware reserves low
+	@# memory wherever it likes. A kernel that has grown past that is a
+	@# machine that stops before its first instruction. See tools/kernel_fits.py.
+	@python3 tools/kernel_fits.py $@
 
 # Boot image carries the stripped kernel (see KERNEL_BIN note above).
 $(KERNEL_BIN): $(KERNEL_ELF)
@@ -2198,10 +2224,11 @@ run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
 
 
 run-embkfs: $(IMG) $(DISK) embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	qemu-system-x86_64 \
 	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown $(NET)
 
 # --- run-ui: boot to a window, then the live EmbLink UI app ------------------
@@ -2214,10 +2241,11 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 # -vga std incurs (fb_front is vmm_map_mmio'd VMM_NOCACHE) -- ~2x FPS on the
 # toolkit demos. Use `make run-vga-std` for the plain uncached-LFB path.
 run-ui: $(IMG) embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	@echo "At the shell prompt, type:  run /uidemo.elf"
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
 	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
@@ -2226,10 +2254,11 @@ run-ui: $(IMG) embkfs.img
 # hosting the EmUI toolkit, one drawn directly) over a desktop with title-bar
 # chrome + z-order. At the shell prompt, type:  run /wmdemo.elf   (ESC quits).
 run-wm: $(IMG) embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	@echo "At the shell prompt, type:  run /wmdemo.elf   (ESC quits)"
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
 	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
@@ -2382,9 +2411,10 @@ dirtree.img: tools/embkfs_mkfs/mkfs_embkfs.py
 # Boot the default volume at "/" (index 1) PLUS the nested fixture (index 2 ->
 # embkfs_volume_at(1)), so `test dirtree` can resolve nested paths on it.
 run-dirtree: $(IMG) $(DISK) embkfs.img dirtree.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -drive format=raw,file=dirtree.img,if=ide,index=2 \
 	    -serial stdio -no-reboot -no-shutdown
 
@@ -2543,12 +2573,13 @@ uefi.img: $(BOOTX64) tools/mkuefidisk.py
 # Boot under OVMF. VARS must be a writable per-run copy. The kernel's EMBKFS root
 # rides a second drive for the MVP (kernel probes every block device for it).
 run-uefi: uefi.img embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
 	qemu-system-x86_64 \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 	    -drive format=raw,file=uefi.img,if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
 # SINGLE self-contained UEFI device: one GPT disk = [ESP: loader+kernel] +
@@ -2557,6 +2588,20 @@ run-uefi: uefi.img embkfs.img
 # second drive). `make run-uefi-usb` proves single-device boot under OVMF.
 uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.py
 	python3 tools/mkuefidisk.py $(BOOTX64) $@ embkfs.img
+
+# BUILD THE STICK -- the one command for the image that goes to a laptop.
+# The master root filesystem is regenerated from mkfs (several things can
+# have written it: see docs/TODO.md on master drift), the stick image is
+# rebuilt from it (the default target does not), and the result is CHECKED
+# before its checksum is printed: the embedded filesystem must be mkfs's
+# (generation 1), its root mirror intact, the loader on the ESP. A stick
+# image that fails the check is not one to hand over.
+.PHONY: stick
+stick:
+	rm -f embkfs.img
+	$(MAKE) embkfs.img
+	$(MAKE) uefi-usb.img
+	@python3 tools/stick_check.py uefi-usb.img
 
 run-uefi-usb: uefi-usb.img
 	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
@@ -2590,9 +2635,10 @@ run-uefi-cow: uefi.img $(EMBKFS_MASTER)
 # both on plain IDE -- exercises embkfs_init()'s multi-volume mount table
 # without needing USB. Pair with `test embkfs multivol` at the shell.
 run-multivol: $(IMG) $(DISK) embkfs.img usbdisk_embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -drive format=raw,file=usbdisk_embkfs.img,if=ide,index=2 \
 	    -serial stdio -no-reboot -no-shutdown
 
@@ -2906,6 +2952,55 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 #
 # The empty controller matters: a device present at boot would prove only that
 # the boot-time scan still works, which was never the missing part.
+# DOES A USB KEYBOARD STILL TYPE WHEN THE CONTROLLER'S INTERRUPT NEVER COMES?
+# A laptop's interrupt routing is the kind of thing that is wrong on a machine
+# nobody has booted before; the kernel falls back to polling and says so.
+# Proven here by masking the interrupt on purpose and typing.
+# DOES THE ROOT FILESYSTEM SURVIVE LOSING ITS ROOT NODE? One marginal flash
+# block under the tree's root made a ProBook's freshly written root volume
+# unreadable. The root has a mirror now (EMBKFS spec v2.3 section 6); three
+# boots prove it: healthy (mirror unused), root overwritten with garbage, and
+# an I/O error injected by blkdebug on the root's own sectors.
+.PHONY: test-root-mirror
+test-root-mirror: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/root_mirror_test.py || exit 1
+
+# A disk that fails every write (QEMU blkdebug): the first failed write makes
+# the volume read-only, later writes fail at once with EROFS, and the boot
+# still lists the root -- against a control boot of the same image
+# (EMBKFS spec v2.3 section 7).
+.PHONY: test-ro-fallback
+test-ro-fallback: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/ro_fallback_test.py || exit 1
+
+# The native shell on the OS (docs/SHELL.md): the original pipeline checks,
+# external structured tools, and test shellio -- text programs in pipelines,
+# redirections, arguments and their limits, #! scripts, source, which.
+.PHONY: test-shell-os
+test-shell-os: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py "test shell" "test extern" "test shellio" || exit 1
+
+# GPU composition (docs/DISPLAYS.md, "GPU composition"). test-virgl-compose
+# runs the compositor's virgl streams on the host's libvirglrenderer and checks
+# every operation in pixels; test-virgl-smoke boots uefi-usb.img on QEMU's
+# virtio-vga-gl twice, GPU- and CPU-composed, and compares the frames. Both
+# need Linux with virglrenderer and a DRM render node; the smoke test also
+# vncdotool (VIRGL_PYTHON: a Python that has it). The Intel blitter's test
+# runs anywhere, in tests/drivers/run.sh.
+VIRGL_PYTHON ?= python3
+.PHONY: test-virgl-compose test-virgl-smoke
+test-virgl-compose: | $(BUILD)
+	$(HOSTCC) -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE -D_TYPES_H -include stdint.h \
+	    -include stdbool.h -include stddef.h -Ikernel -Itests/drivers tests/drivers/virgl_compose_test.c \
+	    kernel/drivers/video/virgl.c kernel/drivers/video/virgl_compose.c -lvirglrenderer -o $(BUILD)/virgl_compose_test
+	LIBGL_ALWAYS_SOFTWARE=$${LIBGL_ALWAYS_SOFTWARE:-1} $(BUILD)/virgl_compose_test
+test-virgl-smoke: uefi-usb.img
+	@$(VIRGL_PYTHON) tools/virgl_smoke.py || exit 1
+
+.PHONY: test-xhci-nointr
+test-xhci-nointr: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/xhci_nointr_test.py || exit 1
+
 .PHONY: test-usb-hotplug
 test-usb-hotplug: $(IMG) $(EMBKFS_MASTER)
 	@echo "=== UHCI (the shared core) ==="
@@ -3558,6 +3653,12 @@ service-test:
 doc-model-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/note user/note/doc.c user/note/syntax.c user/note/doc_test.c -o $(BUILD)/doc_model_test
 	$(BUILD)/doc_model_test
+
+.PHONY: display-arrange-test
+display-arrange-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/lib -iquote kernel user/lib/display_arrange.c kernel/display/layout.c \
+	    tests/desktop/display_arrange_test.c -o $(BUILD)/display_arrange_test
+	$(BUILD)/display_arrange_test
 
 .PHONY: contour-test
 contour-test:

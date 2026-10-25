@@ -116,6 +116,7 @@ int fat32_mount(struct embk_block_device *dev, struct fat32_volume *vol);
 // List the root directory entries on a mounted FAT32 volume.
 void fat32_list_root(struct fat32_volume *vol);
 
+bool fat32_exists(struct fat32_volume *vol, const char *path);
 int fat32_read(struct fat32_volume *vol, const char *name, uint8_t *buffer, uint32_t max_size);
 int fat32_write(struct fat32_volume *vol, const char *name, const uint8_t *buffer, uint32_t size);
 int fat32_mkdir(struct fat32_volume *vol, const char *path);

@@ -186,6 +186,12 @@ int  compositor_desktop_front(int pid, int on);
  * the screen lock) is covering everything. The kernel's own key shortcuts stop
  * working then; see compositor.c. */
 int  compositor_shell_modal(void);
+/* Repaint the whole screen from the window stack -- after something outside
+ * the compositor (the kernel log view) has been drawing on it. */
+void compositor_repaint_all(void);
+/* What composes the desktop, for Settings: 1 and its name ("host GPU
+ * (virgl)") when a GPU does, else 0 and "Software". */
+int compositor_renderer(char *name, unsigned len);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */
@@ -219,6 +225,9 @@ int64_t compositor_win_damage(int pid, uint32_t id,
 int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y);
 /* Automatic placement preserves z-order and keyboard focus. */
 int64_t compositor_win_place(int pid,uint32_t id,int32_t x,int32_t y);
+/* Where a process's window is: frame origin and content size (embk_win_geometry). */
+struct comp_win_geometry { int32_t x, y; uint32_t width, height; };
+int64_t compositor_win_where(int pid,uint32_t id,struct comp_win_geometry *out);
 
 /* Destroy a window: free its buffer, erase it (repaint the exposed region). */
 int64_t compositor_win_destroy(int pid, uint32_t id);
@@ -239,6 +248,14 @@ void compositor_session_changed(void);
 int compositor_desktop_healthy(void);
 struct fb_surface;
 struct fb_surface *compositor_select_display(struct fb_surface *);
+struct gpu_layout;
+struct layout_rect;
+/* The surface spread over several outputs; rects are the enabled outputs,
+ * primary first (display/layout.h). n == 0: one output, the whole surface. */
+struct fb_surface *compositor_select_layout(struct fb_surface *, const struct gpu_layout *,
+                                            const struct layout_rect *rects, unsigned n);
+/* The outputs the compositor is placing windows on, primary first. */
+unsigned compositor_outputs(struct layout_rect *out, unsigned max);
 void compositor_display_lock(void);
 void compositor_display_unlock(void);
 #endif /* __GFX_COMPOSITOR_H__ */

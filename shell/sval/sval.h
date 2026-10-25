@@ -93,6 +93,14 @@ int  sval_read_blocking(struct sval_reader *r, int fd, struct value *out);
  * ------------------------------------------------------------------------- */
 int sval_print(const struct value *v, int fd);
 
+/* The same text, appended to `out` (no colour): what a text program reads on
+ * stdin when a value is piped into it. 0, or <0 out of memory. */
+int sval_render(const struct value *v, struct wire_buf *out);
+
+/* The section a program that links this SDK carries (sval.c): the shell
+ * looks for it to know that a program speaks the wire on fds 0 and 3. */
+#define SVAL_WIRE_SECTION ".embk_sval"
+
 /* Presentation colour (ANSI SGR), for terminals that declare support
  * (TERM=emlink*). OFF by default so pipes, saves and the serial console
  * never see escape bytes -- colour is a property of the DISPLAY, which is

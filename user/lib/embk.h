@@ -525,6 +525,12 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
 #ifndef EMBK_EEXIST
 #define EMBK_EEXIST  17
 #endif
+#ifndef EMBK_EAGAIN
+#define EMBK_EAGAIN  11
+#endif
+#ifndef EMBK_EBUSY
+#define EMBK_EBUSY   16
+#endif
 #ifndef EMBK_EINVAL
 #define EMBK_EINVAL  22
 #endif
@@ -1164,6 +1170,15 @@ static inline int embk_win_move(int id, int32_t x, int32_t y) {
 /* Place a window after display/work-area changes without raising or focusing it. */
 static inline int embk_win_place(int id,int32_t x,int32_t y) {
     return (int)embk_syscall3(EMBK_SYS_win_place,id,x,y);
+}
+
+/* Where the compositor has your window now. It moves windows itself -- with
+ * their monitor when the displays are rearranged, or by the title bar it
+ * draws -- so a toolkit placing a window again starts from here, not from
+ * where it last put it. 0 or -errno. */
+struct embk_win_geometry { int32_t x, y; uint32_t width, height; };
+static inline int embk_win_where(int id, struct embk_win_geometry *out) {
+    return (int)embk_syscall2(EMBK_SYS_win_where, id, (int64_t)(intptr_t)out);
 }
 
 /* Destroy a window and erase it from the desktop. */
@@ -1900,5 +1915,9 @@ static inline int embk_update(unsigned op,void *data,uint64_t bytes) {
 #include "embk_monitor.h"
 static inline int embk_monitor(unsigned op,void *data,unsigned bytes) {
     return (int)embk_syscall3(EMBK_SYS_monitor,op,(uint64_t)(uintptr_t)data,bytes);
+}
+/* Where every monitor sits on the desktop (embk_monitor.h). 0 or -errno. */
+static inline int embk_display_layout(struct embk_display_layout *out) {
+    return embk_monitor(EMBK_MONITOR_LAYOUT_GET,out,sizeof *out);
 }
 #endif /* __EMBK_H__ */

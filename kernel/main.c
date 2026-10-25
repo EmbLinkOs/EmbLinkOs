@@ -13,6 +13,8 @@
 #include "drivers/video/gpu.h"
 #include "drivers/video/console.h"
 #include "drivers/video/rawcon.h"
+#include "lib/klog.h"
+#include "lib/bootlog.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
@@ -2251,6 +2253,13 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     if(!boot_recovery_mode())net_init();
     {int rc=update_service_init();if(rc)kprintf("update: service unavailable (%d)\n",rc);}
 
+    /* AND LEAVE THE LOG SOMEWHERE A PERSON CAN GET AT IT. The next line hands
+     * the screen to the desktop; from here on a machine with no serial port
+     * says nothing. If it has a FAT partition -- and a machine booted from our
+     * stick does -- the log goes there on a timer, and the stick can be read
+     * on any other computer. */
+    bootlog_init();
+
     // Enter userspace through INIT: the kernel spawns exactly ONE user process,
     // /system/bin/init.elf, the root of userspace authority (docs/USERSPACE_v2.md
     // "authority IS the namespace", UP1). init in turn brings up the graphical
@@ -2265,15 +2274,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         kprintf("recovery: ready\n");
     } else {
         char *iargv[] = { (char *)"/system/bin/init.elf", NULL };
-        /* The desktop is about to own the framebuffer -- disable the text
-         * console's on-screen half BEFORE userspace becomes schedulable.
-         * Ordering matters: process_create() makes init RUNNABLE, and userspace
-         * stdout/stderr (fd 1/2) now route through console_putchar. If the fb
-         * were still enabled here, a timer preemption in the gap between spawn
-         * and this call could let the desktop's first write() paint over the
-         * boot screen. Disabling first closes that window. All kernel logging +
-         * the serial debug console below stay on COM1 and never touch the fb. */
-        console_set_fb_enabled(false);
+        /* The framebuffer is NOT handed over here -- the compositor does it
+         * when the first window is actually created (compositor.c). A machine
+         * that never gets that far keeps its screen, which is the only way it
+         * can say why. */
+        kprintf("\ninit: loading /system/bin/init.elf ...\n");
         int ipid = process_create("/system/bin/init.elf", iargv, 1, NULL, 0);
         if (ipid < 0)
             kprintf("\ninit: failed to launch /system/bin/init.elf: %s\n", embk_strerror(ipid));
@@ -2325,6 +2330,53 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                 kprintf("compositor: system shortcut %d ignored -- a full-screen "
                         "shell surface is up\n", sk);
                 sk = 0;
+            }
+            /* GUI+K: THE KERNEL LOG, ON SCREEN, AND BACK AGAIN. Handled
+             * before the modal check below on purpose -- the whole point of it
+             * is to work on a machine where nothing else does. */
+            if (sk == SYSKEY_KERNEL_LOG) {
+                sk = 0;
+                /* EACH PRESS GOES FURTHER BACK. One screenful is never the
+                 * screenful anyone wants -- USB enumeration happens hundreds
+                 * of lines before the desktop -- so the first press shows the
+                 * end of the log and every press after it shows the page
+                 * before it, until the log runs out and the desktop returns.
+                 *
+                 * Read straight out of the ring, backwards, with no copy: see
+                 * klog_peek_back(). */
+                static uint32_t page;
+                if (!rawcon_holding()) page = 0; else page++;
+
+                uint32_t live = klog_live();
+                uint32_t rows = rawcon_rows();
+                uint32_t per_page = rows > 3 ? rows - 3 : 1;
+
+                /* Walk back (page+1) pages of lines from the newest byte. */
+                uint32_t want = per_page * (page + 1), lines = 0, back = 0;
+                while (back < live && lines < want) {
+                    back++;
+                    if (klog_peek_back(back) == '\n') lines++;
+                }
+                bool nothing_left = (lines < want);
+
+                if (page > 0 && nothing_left) {
+                    rawcon_hold_end();
+                    compositor_repaint_all();       /* give the desktop back */
+                } else if (rawcon_hold_begin()) {
+                    char line[128];
+                    snprintf(line, sizeof line,
+                             "EmbLinkOS kernel log -- page %u back of %u bytes kept. "
+                             "GUI+K: older; again at the oldest: the desktop.\n\n",
+                             (unsigned)page, (unsigned)live);
+                    rawcon_puts(line);
+                    /* Forward from where the walk stopped, one page of lines. */
+                    uint32_t shown = 0;
+                    while (back > 0 && shown <= per_page) {
+                        char c = klog_peek_back(back--);
+                        if (c == '\n') { shown++; if (shown > per_page) break; }
+                        rawcon_putc(c);
+                    }
+                }
             }
             if(sk==SYSKEY_LAUNCHER)compositor_request_launcher();
             else if(sk>=SYSKEY_SPACE_1 && sk<SYSKEY_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_SPACE_1,0);

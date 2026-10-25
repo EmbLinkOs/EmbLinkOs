@@ -27,6 +27,7 @@ import socket
 import subprocess
 import sys
 import time
+import qemu_guard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -74,8 +75,7 @@ def mtt(kind, slot, tid, axis, value):
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("touch: another qemu-system is running; refusing to start a second one")
         return 2
 

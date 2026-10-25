@@ -314,6 +314,27 @@ struct embk_verify_header {
 } __attribute__((packed));
 _Static_assert(sizeof(struct embk_verify_header) == 48, "verify header must be 48 bytes");
 
+/* ---- Root mirror header (v2.3.1, spec §6) -------------------------------
+ * A byte-identical copy of the tree's root node, kept at a second block and
+ * named here, so that the one block every lookup passes through is not the
+ * whole volume. Past the crypto (200..252) and verify (260..308) headers, in
+ * the same first sector of the superblock block; self-described by magic and
+ * its own CRC32C over the 40 bytes before the checksum, NOT covered by the
+ * superblock's checksum, announced by no feature bit: a kernel without this
+ * ignores the bytes, one with it treats absent-or-invalid as "no mirror".
+ *
+ * The pointer carries the ROOT's checksum and generation, because the bytes
+ * are the root's; the copy's own header says "block <root's block>", and that
+ * is what a reader checks it against. */
+#define EMBKFS_MIRROR_HEADER_OFFSET 320
+#define EMBKFS_MIRROR_HEADER_MAGIC  0x3152494D4B424D45ULL /* "EMBKMIR1" */
+struct embk_mirror_header {
+    uint64_t              magic;        /*  0  EMBKFS_MIRROR_HEADER_MAGIC          */
+    struct embk_block_ptr root_mirror;  /*  8  block = the copy; csum/gen = the root's */
+    uint64_t              checksum;     /* 40  CRC32C over bytes [0..40)            */
+} __attribute__((packed));
+_Static_assert(sizeof(struct embk_mirror_header) == 48, "mirror header must be 48 bytes");
+
 /* ---- Snapshots (v2.2 Phase 5b) --------------------------------------
  * A snapshot is nothing but a FROZEN root block_ptr: taking one is O(1)
  * (the tree it points at is already immutable, CoW guarantees no future
@@ -415,7 +436,13 @@ struct embkfs_volume {
                                       * once the commit is durable (NULL outside a transaction) */
 
     struct embk_block_ptr root;      /* pointer into the metadata tree */
-    bool     read_only;              /* forced RO by an ro_compat bit  */
+    struct embk_block_ptr root_mirror; /* a second copy of the root's bytes; block 0 = none (spec §6) */
+    bool     root_mirror_said;       /* the "using its mirror" line, once per mount */
+    uint64_t root_primary_bad;       /* root block whose primary failed: reads go straight to the
+                                        mirror until a commit moves the root (0 = none) */
+    bool     read_only;              /* forced RO by an ro_compat bit, or by a failed device write */
+    bool     device_failed;          /* read_only because the device failed a write (spec §7) */
+    bool     refusal_said;           /* the first write refused after that, logged once */
     bool     mounted;                /* true once the SB validated     */
     uint64_t feature_incompat;       /* mirrors the on-disk field; only ever
                                        * gains bits (e.g. COMPRESSION the
@@ -719,6 +746,12 @@ int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
  * Never hold it across a wait on another thread that does fs I/O. */
 void embkfs_lock(void);
 void embkfs_unlock(void);
+
+/* Read every metadata block back immediately after writing it and report any
+ * difference. Off by default (it doubles metadata write I/O); switched on by
+ * `test embkfs verify-writes` to hunt the intermittent bad-checksum fault in
+ * docs/TODO.md. */
+void embkfs_set_verify_writes(bool on);
 
 /* How hard is that one lock actually being leaned on? Answering this is the
  * prerequisite for making it finer-grained: per-volume or per-object locking

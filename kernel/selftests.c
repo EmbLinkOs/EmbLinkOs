@@ -31,6 +31,7 @@
 #include "ipc/clipboard.h"                   /* test session: whose the clipboard is */
 #include "process/ksync.h"
 #include "mm/kheap.h"
+#include "lib/bootlog.h"                    /* test bootlog attach */
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "mm/swap.h"                         /* test swap store */
@@ -1053,6 +1054,46 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("\n[cmd] test usbdevs: OK\n");
+        return 1;
+    }
+
+    /* test bootlog attach -- the road the Intel display capture takes to the
+     * stick (bootlog_attach), driven where there is no Intel GPU to take it.
+     * Queued and left: the bootlog thread writes it within one period, and
+     * tools/laptop_test.py reads the bytes back off the stick image itself,
+     * which is the only proof that they reached the disk. */
+    if (strcmp(cmd, "test bootlog attach") == 0) {
+        const uint32_t n = 70000;              /* more than one FAT cluster */
+        uint8_t *data = (uint8_t *)kmalloc(n); /* owned by the bootlog from here */
+        if (!data) {
+            kprintf("[cmd] test bootlog attach: FAIL (no memory)\n");
+            return 1;
+        }
+        for (uint32_t i = 0; i < n; i++)
+            data[i] = (uint8_t)(i * 31u + 7u);
+        bootlog_attach("/EMBKTEST.BIN", data, n);
+        kprintf("[cmd] test bootlog attach: queued %u bytes as /EMBKTEST.BIN\n", (unsigned)n);
+        return 1;
+    }
+
+    /* test xhci stats -- DID THE CONTROLLER'S INTERRUPT EVER ARRIVE? The one
+     * number a dead USB keyboard on a laptop needs: interrupts counted, HID
+     * reports counted, and whether the poll has taken over. */
+    if (strcmp(cmd, "test xhci stats") == 0) {
+        uint64_t irqs = 0, kbd = 0, mouse = 0; bool polled = false;
+        xhci_irq_stats(&irqs, &polled);
+        xhci_hid_stats(&kbd, &mouse);
+        kprintf("\n[xhci] irqs=%lu kbd_reports=%lu mouse_reports=%lu polled_fallback=%u\n",
+                (unsigned long)irqs, (unsigned long)kbd, (unsigned long)mouse,
+                polled ? 1U : 0U);
+        kprintf("[cmd] test xhci stats: OK\n");
+        return 1;
+    }
+    /* test xhci nointr -- mask the interrupt on purpose, so the polled fallback
+     * can be proven on a machine whose interrupt works (tools/xhci_nointr_test.py). */
+    if (strcmp(cmd, "test xhci nointr") == 0) {
+        xhci_force_nointr();
+        kprintf("\n[cmd] test xhci nointr: OK\n");
         return 1;
     }
 
@@ -2581,6 +2622,16 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test embkfs path") == 0) {
         int rc = embkfs_run_path_selftests();
         kprintf("\n[cmd] test embkfs path: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs verify-writes") == 0) {
+        /* Not a test: a switch, for the run that follows it. Every metadata
+         * block written from here on is read straight back and compared with
+         * what was meant to be there. See docs/TODO.md's intermittent
+         * bad-checksum entry -- this is the instrument for it. */
+        embkfs_set_verify_writes(true);
+        kprintf("\n[cmd] test embkfs verify-writes: ON (every node write is read back)\n");
         return 1;
     }
 
@@ -6330,6 +6381,74 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[cmd] test shell: expr rc=%d; ls-pipeline rc=%d; error-path rc=%d; "
                 "cmd-batch rc=%d -> %s\n",
                 c1, c2, c3, c4, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* TEXT PROGRAMS, REDIRECTIONS, ARGUMENTS, SCRIPTS -- the shell beyond its
+     * own builtins, end to end on the OS. Each line is one `shell.elf -c` run
+     * whose program checks its own results with `assert`, so an exit code of
+     * 0 is a pass and the serial log carries every message; the lines that
+     * must FAIL (argument limits) expect 1. sh is the text program: it links
+     * no shell SDK, so the shell pipes it text and captures what it prints. */
+    if (strcmp(cmd, "test shellio") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test shellio: VFS not registered\n");
+            return 1;
+        }
+        static const struct { const char *line; int want; } t[] = {
+            /* a text program's output, captured into a pipeline */
+            { "let n = $(sh -c \"printf 'a\\nb\\nc\\n'\" | lines | count); assert $n == 3 \"three lines from sh\"", 0 },
+            /* values piped INTO a text program arrive as text */
+            { "let t = $(range 4 | sh -c cat); assert $t == \"0\\n1\\n2\\n3\\n\" \"a list as lines on stdin\"", 0 },
+            { "assert $(ls /system | sh -c cat | lines | count) > 2 \"a table as its grid\"", 0 },
+            /* a text program at the END of a statement keeps the terminal */
+            { "sh -c \"echo shellio: sh wrote this to the console itself\"", 0 },
+            /* redirections of text programs */
+            { "sh -c \"printf hello\" out> /shio-a.txt; assert $(cat /shio-a.txt) == \"hello\" \"out>\"", 0 },
+            { "sh -c \"printf more\" out>> /shio-a.txt; assert $(cat /shio-a.txt) == \"hellomore\" \"out>>\"", 0 },
+            { "sh -c \"printf oops >&2\" err> /shio-e.txt; assert $(cat /shio-e.txt) == \"oops\" \"err>\"", 0 },
+            { "sh -c \"printf o; printf e >&2\" out+err> /shio-b.txt; assert $(cat /shio-b.txt) == \"oe\" \"out+err>\"", 0 },
+            { "let x = $(sh -c cat in< /shio-a.txt); assert $x == \"hellomore\" \"in<\"", 0 },
+            /* redirections of builtins */
+            { "range 3 out> /shio-r.txt; assert $(cat /shio-r.txt) == \"0\\n1\\n2\\n\" \"a builtin's value as text\"", 0 },
+            { "assert $(lines in< /shio-r.txt | count) == 3 \"in< feeds a builtin\"", 0 },
+            { "cat /shio-none err> /shio-ce.txt; assert ($(cat /shio-ce.txt) =~ \"can't open\") \"err> holds the error\"", 0 },
+            /* arguments: many, expanded from lists, and limits that fail loudly */
+            { "assert $(sh -c 'echo $#' sh a b c d e f g h i j k l | trim) == \"12\" \"twelve arguments\"", 0 },
+            { "assert $(sh -c 'echo $#' sh $(range 40) | trim) == \"40\" \"a list is one argument per item\"", 0 },
+            { "assert $(sh -c 'for f in \"$@\"; do echo \"$f\"; done' sh $(ls /system) | lines | count) == $(ls /system | count) \"a table is one per row\"", 0 },
+            { "assert $(sh -c 'echo \"$1\"' sh $(range 300 | join \"\") | wc | get bytes) == 791 \"a long argument whole\"", 0 },
+            { "sh -c 'echo $#' $(range 200)", 1 },                                        /* > 126 arguments */
+            { "sh -c 'echo $#' $(range 2000 | join \"\")", 1 },                           /* past the 4 KiB page */
+            { "sh -c 'echo $#' $(sysinfo)", 1 },                                          /* a record has no one text */
+            /* scripts: #! through the kernel, $args, relative paths */
+            { "echo \"#!/system/bin/shell.elf\\nassert $(echo $args | count) == 2 \\\"two args\\\"\\necho $args | join \\\",\\\"\\n\" | save /shio-s.esh; "
+              "assert $(/shio-s.esh one two) == \"one,two\" \"a native script run by its #! line\"", 0 },
+            { "echo \"#!/system/bin/sh\\necho sh-$1\\n\" | save /shio-p.sh; assert $(/shio-p.sh x | trim) == \"sh-x\" \"an sh script\"", 0 },
+            { "cd /; assert $(./shio-s.esh first second) == \"first,second\" \"a relative path\"", 0 },
+            /* source: a file's definitions stay */
+            { "echo \"def twice(x) { echo ($x * 2) }\\nlet loaded = 1\\n\" | save /shio-lib.esh; source /shio-lib.esh; "
+              "assert $(twice 21) == 42 \"source keeps defs\"; assert $loaded == 1 \"and lets\"", 0 },
+            /* which says what kind a command is */
+            { "assert $(which sh | get kind) == \"text program\"; assert $(which sysinfo | get kind) == \"structured program\"; "
+              "assert $(which where | get kind) == \"builtin\"; assert $(which /shio-s.esh | get kind) == \"structured script\"", 0 },
+            /* structured programs are plumbed as before */
+            { "assert $(sysinfo | get processes) > 0 \"sysinfo\"; assert $(ls / | tally | get rows) == $(ls / | count) \"tally\"", 0 },
+            { "rm /shio-a.txt | rm /shio-e.txt | rm /shio-b.txt | rm /shio-r.txt | rm /shio-ce.txt | rm /shio-s.esh | "
+              "rm /shio-p.sh | rm /shio-lib.esh", 0 },
+        };
+        char *senv[] = { "HOME=/", "TMPDIR=/", NULL };
+        int pass = 0, n = (int)(sizeof t / sizeof t[0]);
+        kprintf("\n[shellio]\n");
+        for (int i = 0; i < n; i++) {
+            char *a[] = { "/system/bin/shell.elf", "-c", (char *)t[i].line, NULL };
+            int pid = process_create_env("/system/bin/shell.elf", a, 3, senv, NULL, 0);
+            int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            int ok = code == t[i].want;
+            pass += ok;
+            kprintf("  [%s] %d: exit %d (want %d)\n", ok ? "ok" : "FAIL", i + 1, code, t[i].want);
+        }
+        kprintf("[cmd] test shellio: %d/%d -> %s\n", pass, n, pass == n ? "OK" : "FAIL");
         return 1;
     }
 

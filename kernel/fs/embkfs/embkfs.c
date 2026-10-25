@@ -2,7 +2,10 @@
 #include "drivers/timer/timer.h"
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
-#include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
+#include "block/partition.h"
+#include "drivers/usb/usb_core.h"
+#include "drivers/usb/xhci.h"
+#include "drivers/usb/usb.h"   /* embk_partition_parent — reach a volume's disk MBR */
 #include "boot/boot_protocol.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
 #include "include/kprintf.h"
@@ -362,6 +365,21 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol);   /* defined below; o
 
 static inline void embk_bm_clear(uint8_t *bm, uint64_t b) { bm[b >> 3] &= (uint8_t)~(1u << (b & 7)); }
 
+/* THE LOW BLOCKS, IN ORDER. Blocks 1..15 live before the superblock and are
+ * left free on purpose, so they are the first blocks handed out and the most
+ * reused -- and they are where the intermittent bad-checksum fault lands every
+ * time. This prints every allocation, free and write that touches them, which
+ * is what turns "a block went bad" into "this freed it, that wrote it, and the
+ * tree still pointed at it". On only with `test embkfs verify-writes`. */
+static bool g_verify_writes;
+void embkfs_set_verify_writes(bool on) { g_verify_writes = on; }
+
+#define EMBKFS_TRACE_BELOW 32ULL
+static void embkfs_trace_block(const char *what, uint64_t start, uint64_t len) {
+    if (!g_verify_writes || start >= EMBKFS_TRACE_BELOW) return;
+    kprintf("EMBKFS TRACE: %s block %lu (len %lu)\n", what, start, len);
+}
+
 static void embkfs_free_index_clear(struct embkfs_volume *vol)
 {
     if (!vol) return;
@@ -441,6 +459,7 @@ static int embkfs_free_index_rebuild(struct embkfs_volume *vol)
 static int embkfs_free_run(struct embkfs_volume *vol, uint64_t start, uint64_t len)
 {
     if (len == 0) return EMBK_OK;
+    embkfs_trace_block("FREE ", start, len);
     if (start >= vol->total_blocks || len > vol->total_blocks - start) return -EMBK_EINVAL;
 
     for (uint64_t b = 0; b < len; b++) {
@@ -629,6 +648,45 @@ static int embkfs_alloc_block(struct embkfs_volume *vol, uint64_t *out_block)
     return EMBK_OK;
 }
 
+/* ONE BLOCK FROM THE FAR END OF THE FREE SPACE -- for the root's mirror
+ * (spec §6). The allocator above hands out the first free block, which is
+ * where the tree's own nodes go; a mirror placed there sits in the same flash
+ * page as the root it is meant to survive, which the first run of
+ * tools/root_mirror_test.py showed: root at block 6, mirror at block 7. This
+ * takes the LAST block of the LAST free extent instead, the way mkfs puts the
+ * first mirror at total_blocks - 2. Same marking, same index upkeep, same
+ * transaction record as embkfs_alloc_run, so rollback and the free count see
+ * it the same way. */
+static int embkfs_alloc_block_far(struct embkfs_volume *vol, uint64_t *out_block)
+{
+    if (!out_block) return -EMBK_EINVAL;
+    for (uint32_t i = vol->free_ext_n; i-- > 0; ) {
+        if (vol->free_ext[i].len == 0) continue;
+        uint64_t blk = vol->free_ext[i].start + vol->free_ext[i].len - 1;
+        if (embk_bm_test(vol->block_bitmap, blk)) {
+            kprintf("EMBKFS: %s: free index mismatch at block %lu, rebuilding\n",
+                    vol->dev->name, blk);
+            int rrc = embkfs_free_index_rebuild(vol);
+            if (rrc != EMBK_OK) return rrc;
+            return embkfs_alloc_block(vol, out_block);     /* any block beats none */
+        }
+        embk_bm_set(vol->block_bitmap, blk);
+        vol->free_ext[i].len -= 1;                          /* taken from the tail: start stays */
+        if (vol->free_ext[i].len == 0) {
+            for (uint32_t k = i; k + 1 < vol->free_ext_n; k++)
+                vol->free_ext[k] = vol->free_ext[k + 1];
+            vol->free_ext_n--;
+        }
+        if (vol->txn)
+            embk_txn_push_run(&vol->txn->arun, &vol->txn->arun_n, &vol->txn->arun_cap,
+                              &vol->txn->overflow, blk, 1);
+        embkfs_trace_block("ALLOC", blk, 1);
+        *out_block = blk;
+        return EMBK_OK;
+    }
+    return -EMBK_ENOSPC;
+}
+
 /* Find a contiguous run of free blocks, up to `want`, mark it used, return its
  * start and the length actually found (1..want). Call repeatedly to cover a
  * file across a fragmented bitmap. Same O(n) linear scan as embkfs_alloc_block;
@@ -668,6 +726,7 @@ static int embkfs_alloc_run(struct embkfs_volume *vol, uint64_t want,
         if (vol->txn)
             embk_txn_push_run(&vol->txn->arun, &vol->txn->arun_n, &vol->txn->arun_cap,
                               &vol->txn->overflow, start, got);
+        embkfs_trace_block("ALLOC", start, got);
         *out_start = start;
         *out_got = got;
         return EMBK_OK;
@@ -908,6 +967,36 @@ static int embkfs_snapreg_load(struct embkfs_volume *vol,
     return EMBK_OK;
 }
 
+/* A DEVICE THAT FAILS A WRITE IS NOT ASKED TO TAKE ANOTHER (spec §7). Every
+ * write and flush of the tree goes through these two: the first one the
+ * device answers with an I/O error sets the volume read-only, as an unknown
+ * ro_compat bit would at mount, and every write entry point then returns
+ * EROFS before touching the device. On the stick that asked for this, each
+ * failed write cost the transport's full 30 s timeout; init alone makes eight
+ * before the desktop starts. The root mirror's staging write does not come
+ * through here -- it is a safety net that already carries on without one. */
+static int embkfs_device_failed(struct embkfs_volume *vol, int rc)
+{
+    if (rc == -EMBK_EIO && !vol->read_only) {
+        vol->read_only = true;
+        vol->device_failed = true;
+        kprintf("EMBKFS: %s: a write to the device failed with an I/O error; the volume is "
+                "read-only from now on -- later writes fail at once instead of waiting on a "
+                "failing device\n", vol->dev->name);
+    }
+    return rc;
+}
+
+static int embkfs_dev_write(struct embkfs_volume *vol, uint64_t lba, uint64_t count, const void *buf)
+{
+    return embkfs_device_failed(vol, embk_block_write(vol->dev, lba, (uint32_t)count, buf));
+}
+
+static int embkfs_dev_flush(struct embkfs_volume *vol)
+{
+    return embkfs_device_failed(vol, embk_block_flush(vol->dev));
+}
+
 /* Write `n` slots back. One block write, no transaction: the registry is not
  * part of the tree, so it has no CoW machinery to ride and needs none -- it is
  * a single sector-aligned block whose checksum makes a torn write detectable.
@@ -932,7 +1021,7 @@ static int embkfs_snapreg_store(struct embkfs_volume *vol,
     uint64_t body = sizeof *hdr + (uint64_t)EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item);
     hdr->checksum = embk_crc32c(blk + 8, (uint32_t)(body - 8), 0);
 
-    return embk_block_write(vol->dev, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
+    return embkfs_dev_write(vol, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
 }
 
 /* Collects every currently-registered snapshot. out_items/max may be
@@ -1381,8 +1470,35 @@ static int embkfs_write_node(struct embkfs_volume *vol, uint64_t block,
     h->checksum   = csum;                                   /* first field, low 32 = CRC */
 
     uint64_t spb = vol->block_size / vol->dev->block_size;
-    int rc = embk_block_write(vol->dev, block * spb, spb, buf);
+    embkfs_trace_block("NODE-WRITE", block, 1);
+    int rc = embkfs_dev_write(vol, block * spb, spb, buf);
     if (rc != EMBK_OK) return rc;
+
+    /* DID THE BLOCK ACTUALLY LAND? Off by default; switched on by `test embkfs
+     * verify-writes` to catch a rare fault that has no other witness: a node
+     * that reads back with its magic intact and its own checksum wrong. That
+     * is either one writer whose buffer changed under it or two writers on one
+     * block, and the two look identical from the read side -- so this reads the
+     * block back at the moment it was written, while it is still known what was
+     * meant to be there, and says WHICH bytes differ. See docs/TODO.md. */
+    if (g_verify_writes) {
+        static uint8_t vbuf[4096];   /* the only block size this filesystem uses */
+        if (vol->block_size <= sizeof vbuf &&
+            embk_block_read(vol->dev, block * spb, spb, vbuf) == EMBK_OK) {
+            if (memcmp(vbuf, buf, vol->block_size) != 0) {
+                uint32_t off = 0;
+                while (off < vol->block_size && vbuf[off] == buf[off]) off++;
+                uint32_t back = embk_crc32c(vbuf + 8, vol->block_size - 8, 0);
+                kprintf("EMBKFS: WRITE VERIFY FAILED: block %lu gen %lu: read back "
+                        "differs from what was written, first at byte %u "
+                        "(wrote 0x%02X, read 0x%02X); csum meant 0x%08X, block "
+                        "now checksums to 0x%08X\n",
+                        block, generation, (unsigned)off,
+                        (unsigned)buf[off], (unsigned)vbuf[off],
+                        (unsigned int)csum, (unsigned int)back);
+            }
+        }
+    }
 
     out_ptr->block = block;  out_ptr->checksum = csum;
     out_ptr->generation = generation;  out_ptr->flags = 0;
@@ -1417,7 +1533,8 @@ static void embkfs_verify_root_hmac(const struct embk_block_ptr *root, uint64_t 
  * the existing one, re-checksum the body, write primary then backup. THE COMMIT. */
 static int embkfs_write_superblock(struct embkfs_volume *vol,
                                    const struct embk_block_ptr *new_root,
-                                   uint64_t new_generation, uint64_t free_blocks)
+                                   uint64_t new_generation, uint64_t free_blocks,
+                                   const struct embk_block_ptr *new_mirror)
 {
     static uint8_t sbbuf[4096];
     uint64_t spb      = vol->block_size / vol->dev->block_size;
@@ -1443,11 +1560,25 @@ static int embkfs_write_superblock(struct embkfs_volume *vol,
         embkfs_verify_root_hmac(new_root, new_generation, vh->hmac);
     }
 
+    /* The root's mirror (spec §6): named, or the header zeroed when this
+     * commit could not stage one, so a stale header never names a block the
+     * allocator may since have reused. Outside the body checksum, by design. */
+    {
+        struct embk_mirror_header *mh =
+            (struct embk_mirror_header *)(sbbuf + EMBKFS_MIRROR_HEADER_OFFSET);
+        memset(mh, 0, sizeof *mh);
+        if (new_mirror && new_mirror->block) {
+            mh->magic = EMBKFS_MIRROR_HEADER_MAGIC;
+            mh->root_mirror = *new_mirror;
+            mh->checksum = embk_crc32c((const uint8_t *)mh, 40, 0);
+        }
+    }
+
     sb->checksum = embk_crc32c(sbbuf, EMBKFS_SB_BODY_SIZE, 0);   /* body [0..152) */
 
-    rc = embk_block_write(vol->dev, sb_block * spb, spb, sbbuf);
+    rc = embkfs_dev_write(vol, sb_block * spb, spb, sbbuf);
     if (rc != EMBK_OK) return rc;
-    return embk_block_write(vol->dev, (vol->total_blocks - 1) * spb, spb, sbbuf);
+    return embkfs_dev_write(vol, (vol->total_blocks - 1) * spb, spb, sbbuf);
 }
 
 
@@ -1590,6 +1721,15 @@ static int probe_superblock_mode(struct embk_block_device *dev, struct embkfs_vo
         if (psb->magic == EMBKFS_MAGIC) {
             uint32_t pcalc = embk_crc32c(sb_primary, EMBKFS_SB_BODY_SIZE, 0);
             primary_valid = ((uint32_t)psb->checksum == pcalc);
+            /* A SUPERBLOCK THAT IS THERE AND IS REFUSED must say so. Silence
+             * here is what left an HP ProBook reporting only "no volume found"
+             * while its stick held a perfectly good filesystem -- the one case
+             * where the device, the offset and the magic are all right and the
+             * answer is still no. */
+            if (!primary_valid)
+                kprintf("EMBKFS: %s: superblock magic is right but its checksum is not "
+                        "(stored 0x%08X, calc 0x%08X) -- not mounting\n",
+                        dev->name, (unsigned int)psb->checksum, (unsigned int)pcalc);
         }
     }
 
@@ -1780,6 +1920,26 @@ static int probe_superblock_mode(struct embk_block_device *dev, struct embkfs_vo
     vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
     vol->wcache_off = 0;    vol->wcache_len = 0;
     vol->root         = sb->root;
+    /* The root's mirror (spec §6), if this superblock names one. `sb` is the
+     * start of the sector that was read, so the header is in the same bytes. */
+    memset(&vol->root_mirror, 0, sizeof vol->root_mirror);
+    vol->root_mirror_said = false;
+    vol->root_primary_bad = 0;
+    {
+        const struct embk_mirror_header *mh =
+            (const struct embk_mirror_header *)((const uint8_t *)sb + EMBKFS_MIRROR_HEADER_OFFSET);
+        if (mh->magic == EMBKFS_MIRROR_HEADER_MAGIC &&
+            embk_crc32c((const uint8_t *)mh, 40, 0) == (uint32_t)mh->checksum &&
+            mh->root_mirror.block != 0 && mh->root_mirror.block < sb->total_blocks &&
+            mh->root_mirror.block != sb->root.block) {
+            vol->root_mirror = mh->root_mirror;
+            kprintf("EMBKFS: %s: root mirror at block %lu\n", dev->name,
+                    (unsigned long)vol->root_mirror.block);
+        } else {
+            kprintf("EMBKFS: %s: no root mirror (one bad block under the root loses the volume)\n",
+                    dev->name);
+        }
+    }
     vol->read_only    = read_only;
     vol->feature_incompat = sb->feature_incompat;
     vol->mounted      = true;
@@ -1844,9 +2004,9 @@ void embkfs_stat_get(struct embkfs_stat *out)
     *out = g_efs_stat;
 }
 
-int embkfs_read_node(struct embkfs_volume *vol,
-                     const struct embk_block_ptr *ptr,
-                     uint8_t *buf, size_t buf_size)
+static int embkfs_read_node_primary(struct embkfs_volume *vol,
+                                    const struct embk_block_ptr *ptr,
+                                    uint8_t *buf, size_t buf_size)
 {
     g_efs_stat.node_reads++;
     const char *name = vol->dev->name;
@@ -1886,6 +2046,58 @@ int embkfs_read_node(struct embkfs_volume *vol,
     if ((uint32_t)h->checksum != calc) {
         kprintf("EMBKFS: %s: block %lu checksum bad (stored 0x%08X, calc 0x%08X)\n",
                 name, ptr->block, (unsigned int)h->checksum, (unsigned int)calc);
+        /* WHOSE BYTES ARE THESE? Every node records the block it was written
+         * to and the generation that wrote it, so the header answers the only
+         * question that matters here: did this read bring back the wrong
+         * NODE (h->block != the block asked for -- a stale buffer or a read
+         * of the wrong place), or the right node from an older commit
+         * (h->block matches, generation is behind)? */
+        kprintf("EMBKFS: %s: the bytes say they are block %lu generation %lu; "
+                "asked for block %lu generation %lu\n",
+                name, (unsigned long)h->block, (unsigned long)h->generation,
+                (unsigned long)ptr->block, (unsigned long)ptr->generation);
+
+        /* WERE THE BAD BYTES ON THE DISK, OR DID THE READ BRING THEM? Those
+         * are different bugs -- one is a filesystem that wrote a block wrong,
+         * the other a block layer that hands back a blend of two transfers --
+         * and from one read they look identical. So read it again, into a
+         * different buffer, and say whether the disk agrees with itself.
+         * Costs nothing: this path has already failed. */
+        {
+            static uint8_t again[4096];
+            if (vol->block_size <= sizeof again &&
+                embk_block_read(vol->dev, lba, spb, again) == EMBK_OK) {
+                const struct embk_node_header *h2 = (const struct embk_node_header *)again;
+                uint32_t calc2 = embk_crc32c(again + 8, vol->block_size - 8, 0);
+                uint32_t diff = 0, first_d = 0xFFFFFFFFu, last_d = 0, runs = 0;
+                bool in_run = false;
+                for (uint32_t i = 0; i < vol->block_size; i++) {
+                    if (again[i] != buf[i]) {
+                        diff++;
+                        if (first_d == 0xFFFFFFFFu) first_d = i;
+                        last_d = i;
+                        if (!in_run) { runs++; in_run = true; }
+                    } else {
+                        in_run = false;
+                    }
+                }
+                /* WHERE the bytes differ says WHICH bug this is. One run at the
+                 * tail = a transfer that stopped early. Many runs scattered
+                 * through the block = two different blocks blended, i.e. the
+                 * buffer was reused underneath the reader. */
+                kprintf("EMBKFS: %s: block %lu DIFF SHAPE: %u byte(s) in %u run(s), "
+                        "first at %u, last at %u (block %u bytes)\n",
+                        name, ptr->block, (unsigned)diff, (unsigned)runs,
+                        (unsigned)first_d, (unsigned)last_d, (unsigned)vol->block_size);
+                kprintf("EMBKFS: %s: block %lu RE-READ: stored 0x%08X calc 0x%08X, "
+                        "%u byte(s) differ from the first read -- %s\n",
+                        name, ptr->block,
+                        (unsigned int)h2->checksum, (unsigned int)calc2, (unsigned)diff,
+                        ((uint32_t)h2->checksum == calc2)
+                            ? "THE DISK IS FINE: the first read was wrong"
+                            : "the disk really holds a block that fails its own checksum");
+            }
+        }
         return -EMBK_EINVAL;
     }
 
@@ -1916,6 +2128,69 @@ int embkfs_read_node(struct embkfs_volume *vol,
         return -EMBK_EINVAL;
     }
 
+    return EMBK_OK;
+}
+
+/* THE ROOT HAS A SECOND COPY (spec §6). Every lookup passes through the root,
+ * and on an HP ProBook one marginal flash block under it -- block 17 of a
+ * freshly written image -- made the whole root filesystem unreadable. So a
+ * read of the ROOT that fails, for any reason the primary reader rejects (I/O
+ * error, magic, self-checksum, Merkle link, generation), is served from the
+ * mirror, validated against the ROOT's pointer: the bytes are the root's, so
+ * they carry its checksum and generation and say they are its block. Nothing
+ * is written back to the failing block -- on the device that motivated this,
+ * a write near that page hung the device's own firmware -- and the next commit
+ * moves the root anyway. Any other node has one copy and gets no second chance. */
+int embkfs_read_node(struct embkfs_volume *vol,
+                     const struct embk_block_ptr *ptr,
+                     uint8_t *buf, size_t buf_size)
+{
+    /* ONCE THE PRIMARY HAS FAILED, STOP ASKING IT. The root is read on every
+     * lookup; a boot that served it from the mirror 273 times also logged the
+     * primary's failure 273 times -- and on the medium this is for, each of
+     * those failed reads is a 30-second timeout. A commit moves the root and
+     * clears this. */
+    bool skip_primary = (vol && ptr && vol->root_primary_bad &&
+                         ptr->block == vol->root_primary_bad &&
+                         ptr->block == vol->root.block && vol->root_mirror.block);
+    int rc = skip_primary ? -EMBK_EIO : embkfs_read_node_primary(vol, ptr, buf, buf_size);
+    if (rc == EMBK_OK) return rc;
+    if (!vol || !ptr || ptr->block != vol->root.block || vol->root_mirror.block == 0 ||
+        vol->root_mirror.block == ptr->block || vol->block_size > buf_size)
+        return rc;
+
+    const char *name = vol->dev->name;
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    uint64_t lba = vol->root_mirror.block * spb;
+    int mrc = embk_block_read(vol->dev, lba, spb, buf);
+    if (mrc != EMBK_OK) {
+        kprintf("EMBKFS: %s: root mirror at block %lu unreadable too: %s\n",
+                name, (unsigned long)vol->root_mirror.block, embk_strerror(mrc));
+        return rc;
+    }
+    const struct embk_node_header *h = (const struct embk_node_header *)buf;
+    uint32_t calc = embk_crc32c(buf + 8, vol->block_size - 8, 0);
+    if (h->magic != EMBKFS_NODE_MAGIC || (uint32_t)h->checksum != calc ||
+        (uint32_t)h->checksum != (uint32_t)ptr->checksum ||
+        h->generation != ptr->generation || h->block != ptr->block) {
+        kprintf("EMBKFS: %s: root mirror at block %lu does not match the root pointer "
+                "(magic %s, csum 0x%08X calc 0x%08X want 0x%08X, gen %lu want %lu, "
+                "says block %lu want %lu)\n",
+                name, (unsigned long)vol->root_mirror.block,
+                h->magic == EMBKFS_NODE_MAGIC ? "ok" : "BAD",
+                (unsigned)h->checksum, (unsigned)calc, (unsigned)ptr->checksum,
+                (unsigned long)h->generation, (unsigned long)ptr->generation,
+                (unsigned long)h->block, (unsigned long)ptr->block);
+        return rc;
+    }
+    if (!vol->root_mirror_said) {
+        vol->root_mirror_said = true;
+        kprintf("EMBKFS: %s: root node at block %lu could not be read (%s); using its "
+                "mirror at block %lu from now on -- the medium is failing there\n",
+                name, (unsigned long)ptr->block, embk_strerror(rc),
+                (unsigned long)vol->root_mirror.block);
+    }
+    vol->root_primary_bad = ptr->block;
     return EMBK_OK;
 }
 
@@ -2410,26 +2685,71 @@ static int embkfs_commit(struct embkfs_volume *vol,
 {
     const char *dev = vol->dev->name;
 
+    /* THE ROOT'S SECOND COPY (spec §6). Allocate a block, read the new root
+     * back (it was just written and is one block), write it there, and name
+     * it in the superblock below. A failure anywhere here is logged and the
+     * commit goes on WITHOUT a mirror: this is a safety net, never a reason a
+     * write fails. The block count is adjusted here because the callers
+     * computed new_free before this allocation existed; the previous mirror
+     * is released only once the new superblock is sealed, and directly --
+     * no snapshot ever references a mirror, so nothing holds it back. */
+    struct embk_block_ptr new_mirror; memset(&new_mirror, 0, sizeof new_mirror);
+    struct embk_block_ptr old_mirror = vol->root_mirror;
+    if (new_free > 0) {
+        uint64_t mb = 0;
+        if (embkfs_alloc_block_far(vol, &mb) == EMBK_OK) {
+            uint8_t *copy = kmalloc(vol->block_size);
+            uint64_t spb = vol->block_size / vol->dev->block_size;
+            int mrc = copy ? embk_block_read(vol->dev, new_root->block * spb, spb, copy)
+                           : -EMBK_ENOMEM;
+            if (mrc == EMBK_OK &&
+                (uint32_t)embk_crc32c(copy + 8, vol->block_size - 8, 0) != (uint32_t)new_root->checksum)
+                mrc = -EMBK_EINVAL;                /* the read-back is not the root we wrote */
+            if (mrc == EMBK_OK) mrc = embk_block_write(vol->dev, mb * spb, spb, copy);
+            if (copy) kfree(copy);
+            if (mrc == EMBK_OK) {
+                new_mirror.block = mb;
+                new_mirror.checksum = new_root->checksum;
+                new_mirror.generation = new_gen;
+                new_free -= 1;
+            } else {
+                kprintf("EMBKFS: %s: could not stage the root mirror at block %lu (%s) -- "
+                        "committing without one\n", dev, (unsigned long)mb, embk_strerror(mrc));
+                /* The block stays marked until the next mount rebuilds the
+                 * bitmap from the tree; one block, and only on this path. */
+            }
+        }
+    }
+
     /* BARRIER: force the whole new tree durable BEFORE the superblock that names
      * it. A drive's write-back cache can make writes durable out of issue order,
      * so issuing the superblock last is not enough; without this a power loss
      * could leave a valid superblock pointing at a spine that never landed. */
-    int rc = embk_block_flush(vol->dev);
+    int rc = embkfs_dev_flush(vol);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: pre-commit flush failed: %s\n", dev, embk_strerror(rc)); return rc; }
 
     /* THE COMMIT: install a new superblock naming the new root, generation bumped.
      * Until this write lands, the old superblock still names the old tree. */
-    rc = embkfs_write_superblock(vol, new_root, new_gen, new_free);
+    rc = embkfs_write_superblock(vol, new_root, new_gen, new_free, &new_mirror);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: commit failed: %s\n", dev, embk_strerror(rc)); return rc; }
 
     /* SEAL: flush again so the superblock itself is durable before we report
      * success. The new tree is already durable, so a crash here is still safe —
      * remount sees the old superblock and the intact old tree. */
-    rc = embk_block_flush(vol->dev);
+    rc = embkfs_dev_flush(vol);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: commit-seal flush failed: %s\n", dev, embk_strerror(rc)); return rc; }
 
     vol->root        = *new_root;
     vol->generation  = new_gen;
+    vol->root_mirror = new_mirror;
+    vol->root_mirror_said = false;
+    vol->root_primary_bad = 0;       /* the root moved; the new block has not failed */
+    /* The previous mirror is now unreferenced by any superblock on disk. */
+    if (old_mirror.block && old_mirror.block != new_mirror.block &&
+        old_mirror.block < vol->total_blocks &&
+        embk_bm_test(vol->block_bitmap, old_mirror.block)) {
+        if (embkfs_free_run(vol, old_mirror.block, 1) == EMBK_OK) new_free += 1;
+    }
     vol->free_blocks = new_free;
     g_efs_stat.commits++;
     return EMBK_OK;
@@ -2690,7 +3010,8 @@ static int embkfs_write_file(struct embkfs_volume *vol, uint64_t oid,
                 aes_xts_encrypt(embkfs_xts(vol), start + blk, datablk, datablk, vol->block_size);
                 csum_len = vol->block_size;
             }
-            rc = embk_block_write(vol->dev, (start + blk) * spb, spb, datablk);
+            embkfs_trace_block("DATA-WRITE", start + blk, 1);
+            rc = embkfs_dev_write(vol, (start + blk) * spb, spb, datablk);
             if (rc == EMBK_OK) { csum = embk_crc32c(datablk, csum_len, csum); written += chunk; }
         }
         kfree(comp_buf);
@@ -2820,7 +3141,16 @@ static int embkfs_make_object(struct embkfs_volume *vol, uint64_t dir_oid,
     static uint8_t probe[4096];          /* descent buffer, reused between lookups */
     bool is_dir = (mode & EMBKFS_S_IFMT) == EMBKFS_S_IFDIR;
 
-    if (vol->read_only) return -EMBK_EROFS;
+    if (vol->read_only) {
+        /* Once, after the device failed: the next write did not reach it.
+         * A volume mounted read-only on purpose stays quiet. */
+        if (vol->device_failed && !vol->refusal_said) {
+            vol->refusal_said = true;
+            kprintf("EMBKFS: %s: make \"%s\" refused: %s (the device failed a write)\n",
+                    dev, name, embk_strerror(-EMBK_EROFS));
+        }
+        return -EMBK_EROFS;
+    }
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > 255) return -EMBK_EINVAL;
 
@@ -7602,6 +7932,10 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
     vol->next_oid = 0;
     int rc = embkfs_mark_tree(vol, &vol->root);
     if (rc != EMBK_OK) return rc;
+    /* The root's mirror (spec §6) is not a node of the tree: mark it by hand,
+     * or the allocator hands it out and the copy is overwritten. */
+    if (vol->root_mirror.block && vol->root_mirror.block < vol->total_blocks)
+        embk_bm_set(vol->block_bitmap, vol->root_mirror.block);
 
     /* Also protect every retained snapshot's frozen tree (v2.2 Phase 5b) --
      * a block can be unreachable from the LIVE tree yet still be exactly
@@ -7722,6 +8056,17 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     return EMBK_OK;
 }
 
+/* What embkfs_init learned about the boot before probing, handed to the two
+ * helpers it is split into. boot_disk is resolved again after every USB
+ * rescan: a stick that enumerated late is still the disk we booted from. */
+struct embkfs_probe_ctx {
+    struct embk_block_device *boot_disk;
+    bool managed;                                   /* an update-managed install */
+    struct embk_block_device *managed_root, *managed_data;
+};
+static void embkfs_probe_all_devices(const struct embkfs_probe_ctx *ctx);
+static void embkfs_init_after_probe(const struct embkfs_probe_ctx *ctx);
+
 int embkfs_mount_readonly(struct embk_block_device *dev,struct embkfs_volume *vol) {
     int rc=probe_superblock_mode(dev,vol,true);
     if(rc)return rc;
@@ -7752,6 +8097,7 @@ void embkfs_init(void)
         g_embkfs_volume_count=1;
         kprintf("EMBKFS: managed OS slot %u mounted read-only from %s\n",bp->update_slot,managed_root->name);
     }
+    struct embkfs_probe_ctx ctx = { boot_disk, managed, managed_root, managed_data };
 
     /* Probe EVERY block device for an EMBKFS superblock; mount EVERY one
      * that validates, up to EMBKFS_MAX_VOLUMES (v2.2 Phase 1 -- previously
@@ -7763,6 +8109,35 @@ void embkfs_init(void)
      * main.c) -- so index 0 (the primary, aliased by g_embkfs_live) is
      * deterministically "whichever EMBKFS volume was found earliest in
      * boot", normally the internal disk. */
+    embkfs_probe_all_devices(&ctx);
+
+    /* NOT FOUND IS NOT THE SAME AS NOT THERE YET. The root filesystem of a
+     * machine booted from a USB stick is ON that stick, and a real stick is
+     * not necessarily enumerated by the time this runs: it answers NOT READY
+     * while it wakes, and some are still being addressed when the rest of the
+     * kernel has moved on. An HP ProBook reached this point with its own
+     * internal drive as the only block device in the machine and stopped
+     * there, with a perfectly good stick in the port.
+     *
+     * So: give USB a few more seconds and look again. Only on the failure path
+     * -- a machine that found its root pays nothing. */
+    for (int round = 0; g_embkfs_volume_count == 0 && round < 6; round++) {
+        kprintf("EMBKFS: nothing yet -- letting USB settle (%d/6)\n", round + 1);
+        for (int tick = 0; tick < 10; tick++) {
+            usb_poll();
+            timer_delay_ms(50);
+        }
+        embk_partition_scan_all();      /* a stick that arrived has partitions */
+        if (!ctx.boot_disk) ctx.boot_disk = embk_partition_boot_disk();
+        embkfs_probe_all_devices(&ctx);
+    }
+
+    embkfs_init_after_probe(&ctx);
+}
+
+static void embkfs_probe_all_devices(const struct embkfs_probe_ctx *ctx)
+{
+    struct embk_block_device *boot_disk = ctx->boot_disk;
     for (uint32_t i = 0; i < embk_block_count() && g_embkfs_volume_count < EMBKFS_MAX_VOLUMES; i++) {
         struct embk_block_device *d = embk_block_get(i);
         /* Skip a whole disk that carries a partition table: its filesystems live
@@ -7772,16 +8147,115 @@ void embkfs_init(void)
          * bogus "primary superblock" by WRITING over the MBR / boot code. */
         if (embk_block_is_partitioned(d))
             continue;
-        if(managed && (d==managed_root || (embk_partition_parent(d)==boot_disk && d!=managed_data)))continue;
+        if(ctx->managed && (d==ctx->managed_root || (embk_partition_parent(d)==boot_disk && d!=ctx->managed_data)))continue;
         if(boot_recovery_mode() && ((boot_disk && embk_partition_parent(d)!=boot_disk) || g_embkfs_volume_count))continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
             continue;
         g_embkfs_volume_count++;
     }
+}
 
+/* Everything below runs after the probe (and its retries) have had their say. */
+static void embkfs_init_after_probe(const struct embkfs_probe_ctx *ctx)
+{
+    struct embk_block_device *boot_disk = ctx->boot_disk;
     if (g_embkfs_volume_count == 0) {
         kprintf("EMBKFS: no volume found on any block device\n");
+
+        /* AND WHY NOT, DEVICE BY DEVICE. Without this the machine says only
+         * that it found nothing, mounts an empty root, and hangs with no
+         * /system/bin/init.elf -- which is exactly what an HP ProBook did on
+         * the first real boot, with no serial port to ask a second question
+         * through. One line per device: is it even readable at the offset the
+         * superblock lives at, and what is actually there? That distinguishes
+         * "the stick was not read" from "it was read and holds something
+         * else" from "the superblock is there but was rejected", which are
+         * three different bugs. */
+        kprintf("EMBKFS: what each block device holds at byte %u "
+                "(want magic 45 4D 42 4B 46 53 31 37 = \"EMBKFS17\"):\n",
+                (unsigned)EMBKFS_SB_OFFSET);
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (!d) continue;
+            if (embk_block_is_partitioned(d)) {
+                kprintf("EMBKFS:   %s: %lu blocks x %u B -- a partition table; "
+                        "its filesystems live in its partitions\n",
+                        d->name, (unsigned long)d->block_count,
+                        (unsigned)d->block_size);
+                continue;
+            }
+            static uint8_t probe[4096];
+            uint32_t bs = d->block_size ? d->block_size : 512;
+            uint64_t lba = EMBKFS_SB_OFFSET / bs;
+            if (d->block_count <= lba) {
+                kprintf("EMBKFS:   %s: %lu blocks x %u B -- too small to hold a "
+                        "superblock at that offset\n",
+                        d->name, (unsigned long)d->block_count, (unsigned)bs);
+                continue;
+            }
+            int rc = embk_block_read(d, lba, 1, probe);
+            if (rc != EMBK_OK) {
+                kprintf("EMBKFS:   %s: %lu blocks x %u B -- READ FAILED at LBA %lu: %s\n",
+                        d->name, (unsigned long)d->block_count, (unsigned)bs,
+                        (unsigned long)lba, embk_strerror(rc));
+                continue;
+            }
+            kprintf("EMBKFS:   %s: %lu blocks x %u B -- LBA %lu holds "
+                    "%02X %02X %02X %02X %02X %02X %02X %02X%s\n",
+                    d->name, (unsigned long)d->block_count, (unsigned)bs,
+                    (unsigned long)lba,
+                    probe[0], probe[1], probe[2], probe[3],
+                    probe[4], probe[5], probe[6], probe[7],
+                    (*(uint64_t *)probe == EMBKFS_MAGIC)
+                        ? "  <-- the magic IS here; the superblock was rejected for "
+                          "another reason (checksum or version)"
+                        : "");
+        }
+        /* AND WHETHER USB EVEN CAME UP. The ProBook's answer to the dump
+         * above was that the only disk in the machine was its own 500 GB
+         * internal drive: the stick it had just booted from had no block
+         * device at all. The firmware read that stick to load the loader, so
+         * the hardware works -- it is this kernel's USB stack that did not
+         * bring it up, and the lines that would have said so had already
+         * scrolled off a screen that cannot be scrolled back. So they are
+         * repeated here, where the failure is. */
+        {
+            uint32_t nc = usb_controller_count();
+            kprintf("EMBKFS: USB at this point: %u controller(s), %u device(s)\n",
+                    (unsigned)nc, (unsigned)usb_device_count());
+            for (uint32_t i = 0; i < nc; i++) {
+                const struct usb_controller *c = usb_get_controller(i);
+                if (!c) continue;
+                static const char *kind[] = { "UHCI", "OHCI", "EHCI", "xHCI" };
+                kprintf("EMBKFS:   %s at %02x:%02x.%x -- %u port(s), %u device(s) present\n",
+                        (c->kind <= USB_HC_XHCI) ? kind[c->kind] : "unknown",
+                        (unsigned)c->pci.bus, (unsigned)c->pci.device,
+                        (unsigned)c->pci.function,
+                        (unsigned)c->max_ports, (unsigned)c->devices_present);
+            }
+            if (nc == 0)
+                kprintf("EMBKFS:   no USB controller was found at all -- nothing on a "
+                        "USB stick can be reached\n");
+            /* And the ports themselves, with a fresh attempt at any that has a
+             * device and no slot. This is the one place the output survives on
+             * a machine with no serial port. */
+            xhci_report_ports();
+            /* And WHAT is attached. "A stick that never enumerated" and "a
+             * stick that enumerated and whose mass-storage interface was not
+             * claimed" are different faults with the same symptom. Class 08 is
+             * mass storage; 08/06/50 is the SCSI/bulk-only kind every USB
+             * stick in the world reports. */
+            for (uint32_t i = 0; i < usb_device_count(); i++) {
+                const struct usb_device *u = usb_device_at(i);
+                if (!u) break;
+                kprintf("EMBKFS:   usb %04x:%04x on port %u, class %02x/%02x/%02x%s\n",
+                        (unsigned)u->vid, (unsigned)u->pid, (unsigned)u->port,
+                        (unsigned)u->if_class, (unsigned)u->if_subclass,
+                        (unsigned)u->if_protocol,
+                        (u->if_class == 0x08) ? "  <-- mass storage" : "");
+            }
+        }
         return;
     }
 
@@ -7796,7 +8270,7 @@ void embkfs_init(void)
      * rather than repointing, so main.c's per-volume /sdX registration (which
      * treats index 0 as embk_live) needs no change. */
     uint32_t boot_sig;
-    if (!managed && g_embkfs_volume_count > 1 && (boot_disk || bootinfo_boot_disk_sig(&boot_sig))) {
+    if (!ctx->managed && g_embkfs_volume_count > 1 && (boot_disk || bootinfo_boot_disk_sig(&boot_sig))) {
         for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
             struct embk_block_device *disk =
                 embk_partition_parent(g_embkfs_volumes[i].dev);

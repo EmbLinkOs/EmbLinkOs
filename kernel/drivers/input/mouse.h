@@ -48,4 +48,8 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
  * MOUSE_BTN_*; wheel is a delta to accumulate (+up). */
 void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel);
 
+/* Put the cursor at (x, y), clamped to the bounds. For the compositor, which
+ * keeps it off the parts of a multi-monitor desktop no monitor shows. */
+void mouse_warp(int32_t x, int32_t y);
+
 #endif /* _MOUSE_H_ */

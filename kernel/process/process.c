@@ -2427,12 +2427,74 @@ static void spawn_discard_fds(struct process *proc) {
     }
 }
 
+static int create_image(const char *path, char *const argv[], int argc, char *const envp[],
+                        const struct spawn_file_action *actions, int n_count, uint64_t requested_caps);
+
+/* A SCRIPT names its interpreter on its first line -- `#!/system/bin/shell.elf`,
+ * optionally with one argument after it -- and running the script runs that
+ * program with the script's path in front of the original arguments:
+ *
+ *     /data/build.esh fast       ->  /system/bin/shell.elf /data/build.esh fast
+ *     (#!/system/bin/sh -e)      ->  /system/bin/sh -e /data/build.sh ...
+ *
+ * As on Unix, with two deliberate limits: the interpreter is an absolute path
+ * (the kernel resolves no names), and it may not itself be a script -- one
+ * level, so a loop of scripts naming each other cannot recurse the kernel.
+ * The script needs only to be readable; it is never mapped. */
+#define SHEBANG_MAX 128
+
+/* 1 and the interpreter (and its argument, or "") when `path` is a script;
+ * 0 when it is not; -errno for a malformed first line. */
+static int read_shebang(const char *path, char *interp, char *arg) {
+    char line[SHEBANG_MAX + 1];
+    size_t got = 0;
+    int fd = vfs_open(path, O_RDONLY, 0);
+    if (fd < 0) return 0;                        /* let the loader say why it cannot */
+    vfs_fd_read(fd, line, SHEBANG_MAX, &got);
+    vfs_close(fd);
+    if (got < 2 || line[0] != '#' || line[1] != '!') return 0;
+    line[got] = 0;
+    size_t i = 2, n = 0;
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    while (line[i] && line[i] != '\n' && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') interp[n++] = line[i++];
+    interp[n] = 0;
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    n = 0;
+    while (line[i] && line[i] != '\n' && line[i] != '\r') arg[n++] = line[i++];
+    while (n && (arg[n - 1] == ' ' || arg[n - 1] == '\t')) n--;
+    arg[n] = 0;
+    if (!line[i] && got == SHEBANG_MAX) return -EMBK_ENAMETOOLONG;   /* no end of line within reach */
+    if (interp[0] != '/') return -EMBK_ENOEXEC;
+    return 1;
+}
+
 /* Create a process with an explicit capability request. process_create_env()
  * above supplies EMBK_CAP_INHERIT for callers using the native default. */
 int process_create_caps(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count,
                        uint64_t requested_caps) {
+    char interp[SHEBANG_MAX + 1], arg[SHEBANG_MAX + 1];
+    int sb = read_shebang(path, interp, arg);
+    if (sb < 0) return sb;
+    if (!sb) return create_image(path, argv, argc, envp, actions, n_count, requested_caps);
+    char inner_i[SHEBANG_MAX + 1], inner_a[SHEBANG_MAX + 1];
+    if (read_shebang(interp, inner_i, inner_a) != 0) return -EMBK_ENOEXEC;   /* one level only */
+    char *nargv[SPAWN_ARGV_MAX];
+    int n = 0;
+    nargv[n++] = interp;
+    if (arg[0]) nargv[n++] = arg;
+    nargv[n++] = (char *)path;
+    for (int i = 1; i < argc; i++) {
+        if (n >= SPAWN_ARGV_MAX - 1) return -EMBK_E2BIG;
+        nargv[n++] = argv[i];
+    }
+    nargv[n] = 0;
+    return create_image(interp, nargv, n, envp, actions, n_count, requested_caps);
+}
+
+static int create_image(const char *path, char *const argv[], int argc, char *const envp[],
+                        const struct spawn_file_action *actions, int n_count, uint64_t requested_caps) {
     if(n_count<0 || n_count>SPAWN_ACTIONS_MAX || (n_count && !actions))return -EMBK_E2BIG;
     bool compat_fds=false;
     for(int i=0;i<n_count;i++) {

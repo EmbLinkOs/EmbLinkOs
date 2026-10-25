@@ -106,12 +106,54 @@ stick.
 | The menu, then `EmbBoot FATAL: ...` | The loader stopped before the kernel. **Photograph it.** |
 | Kernel messages that stop and never move again | A hang. **Photograph the screen** — the last lines say which driver it was in. |
 | **A red bar reading "EmbLinkOS stopped: ..."** with numbers and log lines | A kernel fault. **Photograph the whole screen.** It names the function and source line that faulted. |
-| The desktop, but the mouse or keyboard does nothing | Try a USB mouse/keyboard in a different port. Note the laptop model. |
+| The desktop, but the mouse or keyboard does nothing | Try a USB mouse/keyboard in a different port. Then read the boot log off the stick (below): its `i8042:` lines say whether the built-in keyboard and touchpad are PS/2 devices this kernel can drive. |
 | Black screen right after choosing Boot | The firmware gave no usable framebuffer. Note the model. |
 
 > **The single most useful thing is a clear photo of the screen**, plus the
 > laptop's exact model. If the machine does reach the desktop, that is worth a
 > photo too.
+
+### The boot log on the stick: `EMBLINK.LOG`
+
+A laptop has no serial port, so the kernel leaves its log where any computer
+can read it: **a file called `EMBLINK.LOG` in the root of the stick's first
+partition** (the small FAT32 one the firmware boots from). The first copy is
+written about four seconds into the boot and it is rewritten every five
+seconds after, so it is always the newest 64 KB of the log — long enough to
+cover the desktop appearing, or failing to.
+
+To read it: power the laptop off, move the stick to another computer, open the
+first partition (macOS mounts it as `EFI` or `EMBLINK`) and open `EMBLINK.LOG`
+in any text editor. The kernel writes it only to the stick it booted from —
+the volume holding `/EFI/BOOT/BOOTX64.EFI` — never to another stick you plug
+in.
+
+On a machine with Intel graphics the kernel also leaves **`EMBKDISP.BIN`**
+beside it: a read-only record of the display hardware and firmware tables
+that native modesetting is built from (docs/DISPLAYS.md). It is binary;
+`python3 tools/intel_display_dump.py /Volumes/EMBLINK/EMBKDISP.BIN` reads
+it, and the log line starting `intel-capture:` summarises it.
+
+Lines worth searching for:
+
+| Search for | What it tells you |
+|---|---|
+| `i8042:` | Whether the machine has a PS/2 controller and what answered on each port: `port 1 holds a MF2 keyboard`, `port 2 holds a standard PS/2 mouse or touchpad`, or `port 2 tested good but nothing answered a reset -- this laptop's touchpad is somewhere else (I2C, most likely)`. That last line is the one that decides whether an I²C-HID driver is the next job. |
+| `xHCI` | The USB controller's ports, what was found on them, and any `transfer failed, completion code` followed by `recovering the endpoint`. Also `DMA layout ok` — or `CROSSES A 64 KB BOUNDARY`, which names a ring the controller may misread. |
+| `servicing by polling` | `xHCI …: an event waited 51 ms and the interrupt never came -- servicing by polling; check the interrupt routing`: a key or mouse report arrived and the controller's interrupt did not deliver it, so the keyboard and mouse are read from the main loop from then on. They work; the line is the report that this laptop's interrupt routing needs looking at. |
+| `firmware memory map` | Every region the firmware reported, then one verdict line: the kernel image is either `all of it usable RAM` or `SHARED WITH FIRMWARE` — the latter means the firmware still owns memory the kernel (and its USB DMA buffers) sit in. |
+| `I/O error` | A read from the stick failed. Which one, and what happened just before it, is the diagnosis. |
+| `using its mirror` | `root node at block 17 could not be read (I/O error); using its mirror at block 32766 from now on -- the medium is failing there`: the one block every lookup passes through has gone bad on the stick, and the kernel is running from its second copy. The machine works; the stick is on its way out — copy what matters off it and use another. |
+| `read-only from now on` | `a write to the device failed with an I/O error; the volume is read-only from now on`: the stick refused a write, so the kernel stopped writing to it. The desktop still comes up; nothing you do on it is saved. The stick is failing — use another. |
+| `took` | `bulk-IN transfer of 4096 bytes took 2300 ms -- the device is slow here, not broken`: the stick has a flash page it can still read only with retries. The kernel waits for it (up to 30 s per transfer, like every other OS), but the stick is wearing out — copy what matters off it and use another. |
+| `home: desktop ready` | The desktop finished starting. |
+| `EmbLinkOS stopped` | A kernel fault; the lines after it name the function. |
+
+### Booted on, so far
+
+| Machine | Result |
+|---|---|
+| **HP ProBook** (Intel, xHCI at 00:14.0 with 18 ports, 500 GB internal drive, no battery reported) | **Reaches the desktop from the stick.** It took seven fixes that no emulator could have shown: the kernel had grown past the physical address the firmware will load it at; the clock had to stop depending on the PIT and HPET, which recent laptops gate off or hide; kernel messages and the panic screen had to reach the framebuffer, since a laptop has no serial port; VT-d had to stay off on a machine with RAM above 4 GiB; and xHCI had to power its own ports, stop disabling every port it enabled, stop sending SET_ADDRESS after the controller had already addressed the device, and give a slot back when a bring-up failed. |
 
 ### Hardware reality on a laptop
 
@@ -125,7 +167,8 @@ stick.
 | Sound | Intel HDA exists; whether the laptop's codec produces sound is unknown. |
 | Power | Shut Down and Restart work through ACPI. No sleep, no battery indicator yet. |
 
-**What the OS writes:** its own files on the stick. If the kernel faults, it may
+**What the OS writes:** its own files on the stick, including `EMBLINK.LOG` on
+the boot partition (above). If the kernel faults, it may
 also leave one small crash record (a few kilobytes) through the firmware's ACPI
 error-record store, if the laptop has one — the same mechanism other operating
 systems use for crash reports. It never writes the internal drive. **Do not run
@@ -141,6 +184,20 @@ that erases a disk.
 
 The image is `uefi-usb.img` in the repository (build it with `make uefi-usb.img`).
 The stick must be at least 256 MB; everything on it is erased.
+
+### Build it first
+
+```
+make stick
+```
+
+That regenerates the root filesystem from mkfs, rebuilds `uefi-usb.img` from
+it, and **checks the result** before printing its checksum: the filesystem
+inside must be mkfs's own (generation 1, nothing has committed to it), its
+root mirror must be intact, and the loader must be on the EFI partition. A
+plain `make` does not rebuild the stick image, and some targets boot the
+master filesystem writable; `make stick` exists so neither can hand you a
+stale or drifted image without saying so.
 
 ### On macOS
 

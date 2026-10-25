@@ -5,7 +5,7 @@ MRSH_INC := -I$(MRSH_ROOT)/include -Iports/mrsh -Ithird_party/newlib-posix
 MRSH_OBJS := $(patsubst %.c,build/mrsh/%.o,$(MRSH_SRCS))
 build/mrsh/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(USER_CC) $(NEWLIB_CFLAGS) -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096 $(MRSH_INC) -c $< -o $@
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096 $(MRSH_INC) -c $< -o $@
 build/sh.elf: $(MRSH_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(MRSH_OBJS) -lc -lgcc -o $@
 .PHONY: posixsh-host

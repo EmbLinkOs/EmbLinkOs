@@ -1,6 +1,7 @@
 #include "drivers/video/gpu.h"
 #if defined(__x86_64__)
 #include "drivers/video/intel_display.h"
+#include "drivers/video/intel_capture.h"
 #endif
 #include "drivers/char/serial.h"
 
@@ -10,6 +11,11 @@ static const struct gpu_driver *g_gpu = 0;
 
 void gpu_init(void) {
     serial_write_string("\n=== GPU init ===\n");
+#if defined(__x86_64__)
+    /* Before any driver claims the device: the record has to show the
+     * firmware's display exactly as it handed it over. */
+    intel_capture_run();
+#endif
 
     // Preference order: VirtIO-GPU (host-accelerated scan-out) first, then
     // the Bochs/QEMU stdvga DISPI interface (runtime modeset on the LFB).

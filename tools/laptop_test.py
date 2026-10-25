@@ -38,6 +38,7 @@ import hashlib, json, os, shutil, socket, subprocess, sys, tempfile, threading, 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shell_shot as S
+import qemu_guard
 
 FW_DIRS = [os.path.join(os.path.dirname(shutil.which("qemu-system-x86_64") or "/"), "..", "share", "qemu"),
            "/usr/share/qemu", "/usr/share/OVMF"]
@@ -123,7 +124,10 @@ class Machine:
                 "-device", "ahci,id=ahci",
                 "-drive", "if=none,id=sata,format=raw,file=%s" % self.sata,
                 "-device", "ide-hd,drive=sata,bus=ahci.0",
-                "-qmp", "unix:%s,server,nowait" % self.qmp_path]
+                "-qmp", "unix:%s,server,nowait" % self.qmp_path,
+                # Normal boots authenticate; every desktop test opts into the
+                # disposable live session the same way (docs/DAILY_USE.md).
+                "-fw_cfg", "name=opt/emblink/live,string=1"]
         if serial:
             argv += ["-serial", "unix:%s,server" % self.ser_path]
         self.log = bytearray()
@@ -213,8 +217,7 @@ class Machine:
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("laptop_test: another qemu-system is running; refusing to start a second one")
         return 2
     if not os.path.exists(os.path.join(ROOT, "uefi-usb.img")):
@@ -254,9 +257,26 @@ def main():
             check("is EMBKFS -- mounted at /media/" not in t,
                   "laptop: the stick's root filesystem is mounted once, not again at /media")
             check("Exception" not in t and "halted" not in t, "laptop: no kernel fault")
+            # A file handed to the boot log before any filesystem existed --
+            # the road /EMBKDISP.BIN takes on Intel hardware -- reaches the
+            # stick. Proven by reading the stick image after shutdown.
+            m.send("test bootlog attach")
+            check(m.wait_for("bootlog: wrote /EMBKTEST.BIN", 30),
+                  "laptop: the bootlog wrote an attached file to the EFI partition")
+            check(m.wait_for("bootlog: the kernel log is on the EFI partition", 30),
+                  "laptop: the bootlog wrote EMBLINK.LOG")
+            time.sleep(6)                     # one more log period, so EMBLINK.LOG holds the line above
         finally:
             m.stop()
         check(m.internal_untouched(), "laptop: neither internal disk (NVMe, SATA) was written")
+        import fat32_read
+        attached = fat32_read.read_file(m.stick, "/EMBKTEST.BIN")
+        check(attached == bytes((i * 31 + 7) & 0xff for i in range(70000)),
+              "laptop: /EMBKTEST.BIN on the stick holds exactly the 70000 bytes attached (%s)"
+              % ("missing" if attached is None else "%d bytes" % len(attached)))
+        log = fat32_read.read_file(m.stick, "/EMBLINK.LOG")
+        check(log is not None and b"test bootlog attach: queued" in log,
+              "laptop: /EMBLINK.LOG on the stick is the current kernel log")
 
         # ---- no-uart: the screen --------------------------------------------
         m = Machine("nouart", work, serial=False, display="ramfb")

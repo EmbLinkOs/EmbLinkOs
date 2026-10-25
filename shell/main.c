@@ -4,7 +4,7 @@
  *
  * Two modes:
  *   shell.elf              interactive REPL on fds 0/1 (the console)
- *   shell.elf -c "line"    run ONE line, exit 0 on success / 1 on error
+ *   shell.elf -c "line" [arg...]   run ONE line (args are $args), exit 0 / 1
  *                          (what `test shell` and scripts drive)
  *
  * The SINK (the sketch's last box): if fd 3 is a structured pipe
@@ -244,6 +244,14 @@ static int run_script(const char *path, struct scope *top) {
     return rc;
 }
 
+/* A script's arguments, as the list $args: `./build.esh fast` (its #! line
+ * runs `shell.elf ./build.esh fast`) sees ["fast"]. Text, as they came. */
+static void bind_args(struct scope *top, int argc, char **argv, int first) {
+    struct value list = value_list();
+    for (int i = first; i < argc; i++) value_list_push(&list, value_string(argv[i]));
+    (void)scope_bind(top, "args", list);
+}
+
 /* Wipe the on-screen line and replace it with `text` -- what an Up/Down
  * recall does. "\b \b" per char is the portable erase (back up, overwrite
  * with a space, back up again); the terminal and the kernel console both
@@ -393,10 +401,11 @@ int main(int argc, char **argv) {
     exec_init(&top, print_sink, NULL);
     exec_set_interrupt_check(shell_interrupted);
 
-    /* one-shot mode: shell.elf -c "ls | where size > 1mb"
+    /* one-shot mode: shell.elf -c "ls | where size > 1mb" [arg...]
      * The argument is a whole PROGRAM, so `-c 'if x { a } else { b }'` works
-     * and semicolons separate statements. */
+     * and semicolons separate statements. Arguments after it are $args. */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+        bind_args(&top, argc, argv, 3);
         int rc = run_program(argv[2], &top);
         scope_free(&top);
         return rc;
@@ -407,6 +416,7 @@ int main(int argc, char **argv) {
      * system automatable at all -- until now every capability the shell had
      * required a human to type it. */
     if (argc >= 2 && argv[1][0] != '-') {
+        bind_args(&top, argc, argv, 2);
         int rc = run_script(argv[1], &top);
         scope_free(&top);
         return rc;

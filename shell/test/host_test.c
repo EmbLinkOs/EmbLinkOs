@@ -40,7 +40,7 @@ static struct value run(const char *line, struct value input, struct scope *top)
     for (size_t i = 0; i < st->u.pipe->nstages; i++) {
         const struct command *cmd = st->u.pipe->stages[i];
         builtin_fn fn = builtin_lookup(cmd->name);
-        cur = fn ? fn(cmd, cur, top) : extern_stage_run(cmd, cur, top);
+        cur = fn ? fn(cmd, cur, top) : extern_stage_run(cmd, cur, top, false);
         if (cur.type == VAL_ERROR) break;
     }
     stmt_free(st);
@@ -635,6 +635,94 @@ static void test_vocabulary(void) {
     scope_free(&top);
 }
 
+/* --- redirections, assert, and values as text ----------------------------- */
+static int kinds_of(const char *src, enum tok_type *types, int *kinds, size_t max) {
+    size_t n = 0;
+    struct token *t = lex(src, &n);
+    if (!t) return -1;
+    size_t k = 0;
+    for (size_t i = 0; i < n && k < max; i++, k++) { types[k] = t[i].type; kinds[k] = (int)t[i].int_val; }
+    lex_free_tokens(t, n);
+    return (int)k;
+}
+
+static void test_redirect_text(void) {
+    printf("\n-- redirections, assert, text --\n");
+    enum tok_type ty[12]; int kd[12];
+    int n = kinds_of("sh out> a.txt err>> e.log in< x", ty, kd, 12);
+    CHECK(n == 8 && ty[0] == TOK_IDENT && ty[1] == TOK_REDIRECT && kd[1] == REDIR_OUT && ty[2] == TOK_IDENT &&
+          ty[3] == TOK_REDIRECT && kd[3] == REDIR_ERR_APPEND && ty[5] == TOK_REDIRECT && kd[5] == REDIR_IN,
+          "out> err>> in< lex as redirections, each followed by its file");
+    n = kinds_of("p out+err>> both.log", ty, kd, 12);
+    CHECK(n == 4 && ty[1] == TOK_REDIRECT && kd[1] == REDIR_BOTH_APPEND, "out+err>> is one redirection");
+    n = kinds_of("where out > 3", ty, kd, 12);
+    CHECK(n == 5 && ty[1] == TOK_IDENT && ty[2] == TOK_GT, "with a space, out > 3 is still a comparison");
+    n = kinds_of("sh -c \"x\" --verbose --width=80", ty, kd, 12);
+    CHECK(n == 6 && ty[1] == TOK_IDENT && ty[2] == TOK_STRING && ty[3] == TOK_IDENT && ty[4] == TOK_IDENT,
+          "-c, --verbose and --width=80 are flags: words, not a minus");
+    n = kinds_of("echo -3 5 - 2", ty, kd, 12);
+    CHECK(n == 7 && ty[1] == TOK_MINUS && ty[2] == TOK_INT && ty[4] == TOK_MINUS,
+          "-3 is still a negative number and 5 - 2 still subtraction");
+    n = kinds_of("echo layout>3", ty, kd, 12);
+    CHECK(n == 5 && ty[1] == TOK_IDENT && ty[2] == TOK_GT, "out> inside a word is not a redirection");
+
+    char err[160];
+    size_t nt = 0;
+    struct token *toks = lex("sh -c x out> f.txt err> e.txt", &nt);
+    struct stmt *st = parse(toks, nt, err, sizeof err);
+    lex_free_tokens(toks, nt);
+    const struct command *c = st && st->kind == STMT_PIPELINE ? st->u.pipe->stages[0] : NULL;
+    CHECK(c && c->nargs == 2 && c->nredirs == 2 && c->redirs[0].kind == REDIR_OUT && c->redirs[1].kind == REDIR_ERR &&
+          !strcmp(expr_as_word(c->redirs[0].target), "f.txt"), "redirections sit beside a command's arguments");
+    stmt_free(st);
+    toks = lex("sh out> a out+err> b", &nt);
+    st = parse(toks, nt, err, sizeof err);
+    lex_free_tokens(toks, nt);
+    CHECK(!st && strstr(err, "redirected twice"), "a stream redirected twice is refused");
+    stmt_free(st);
+    toks = lex("sh out>", &nt);
+    st = parse(toks, nt, err, sizeof err);
+    lex_free_tokens(toks, nt);
+    CHECK(!st && strstr(err, "expected a file"), "a redirection without a file is refused");
+    stmt_free(st);
+
+    struct scope top; scope_init(&top, NULL);
+    struct value v = run("echo 5 | assert 2 + 2 == 4", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 5, "assert passes its input through when the condition holds");
+    value_free(&v);
+    v = run("assert 1 == 2 \"one is not two\"", value_null(), &top);
+    CHECK(v.type == VAL_ERROR && strstr(value_error_msg(&v), "one is not two"), "assert fails with its message");
+    value_free(&v);
+    v = run("assert 7", value_null(), &top);
+    CHECK(v.type == VAL_ERROR && strstr(value_error_msg(&v), "neither true nor false"), "assert is strict about its condition");
+    value_free(&v);
+    v = run("echo 1 | where 1 == 1 out> f.txt", value_null(), &top);
+    CHECK(v.type == VAL_ERROR, "a redirected builtin needs the OS (host)");
+    value_free(&v);
+    scope_free(&top);
+
+    /* Text for a text program's stdin: whole, one newline, rows as a person reads them. */
+    char longs[300];
+    memset(longs, 'x', sizeof longs - 1); longs[sizeof longs - 1] = 0;
+    struct wire_buf b; wire_buf_init(&b);
+    struct value s = value_string(longs);
+    CHECK(sval_render(&s, &b) == 0 && b.len == 300 && b.data[299] == '\n', "a long string is rendered whole");
+    value_free(&s); wire_buf_free(&b); wire_buf_init(&b);
+    s = value_string("line\n");
+    CHECK(sval_render(&s, &b) == 0 && b.len == 5, "a string ending in a newline gets no second one");
+    value_free(&s); wire_buf_free(&b); wire_buf_init(&b);
+    struct value l = value_list();
+    value_list_push(&l, value_int(1)); value_list_push(&l, value_string("two"));
+    CHECK(sval_render(&l, &b) == 0 && b.len == 6 && !memcmp(b.data, "1\ntwo\n", 6), "a list is one item per line");
+    value_free(&l); wire_buf_free(&b); wire_buf_init(&b);
+    struct value t = sample_table();
+    int found = 0;
+    if (sval_render(&t, &b) == 0)
+        for (size_t i = 0; i + 10 <= b.len && !found; i++) found = !memcmp(b.data + i, "readme.txt", 10);
+    CHECK(found && b.len > 40, "a table is its grid");
+    value_free(&t); wire_buf_free(&b);
+}
+
 int main(void) {
     printf("=== shell host tests ===\n");
     test_lexer();
@@ -644,6 +732,7 @@ int main(void) {
     test_eval();
     test_vocabulary();
     test_hist();
+    test_redirect_text();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);
     return g_fail;
 }

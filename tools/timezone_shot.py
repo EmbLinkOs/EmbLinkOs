@@ -26,6 +26,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
 import shell_shot as S
+import qemu_guard
 
 DOCK_SLOTS = 4                  # Files, Terminal, Settings, Web -- the dock drops
 SETTINGS_SLOT = 2               # entries whose program is not installed
@@ -43,8 +44,7 @@ RULE = "TZ=JST-9"               # and the rule it must have adopted
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("timezone_shot: another qemu-system is running; refusing to start a second one")
         return 2
 

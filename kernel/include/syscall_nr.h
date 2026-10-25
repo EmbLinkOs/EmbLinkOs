@@ -350,6 +350,7 @@
 #define SYS_update 153
 #define SYS_monitor 154
 #define SYS_win_place 155
+#define SYS_win_where 156   /* (id, out) -> 0 | -err: where the caller's window is now */
 
 
 

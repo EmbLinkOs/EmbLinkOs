@@ -506,8 +506,21 @@ static int rename_impl(struct vnode *old_dir, const char *old_name, size_t old_l
     for (size_t i = 0; i < new_len; i++) newz[i] = new_name[i];
     newz[new_len] = '\0';
 
-    return embkfs_rename_name(vol_of(old_dir), old_dir->ino, oldz,
-                              new_dir->ino, newz);
+    /* AND UNDER THE LOCK, like every other operation that touches the tree.
+     * This one call was missing it, and that is the whole of the intermittent
+     * corruption in docs/TODO.md: rename descends and rewrites the tree
+     * through the same shared static scratch buffers as everything else, so a
+     * rename running while ANY other thread is in the filesystem -- the page
+     * cache's writeback thread wakes every two seconds -- read its nodes into
+     * a buffer the other thread was refilling. Measured: EMBKFS asked for
+     * "block 13 generation 159" and the bytes it got said "block 5 generation
+     * 157", while the same block re-read immediately afterwards was perfect.
+     * The disk was never wrong; the buffer was. */
+    fs_lock();
+    int rc = embkfs_rename_name(vol_of(old_dir), old_dir->ino, oldz,
+                                new_dir->ino, newz);
+    fs_unlock();
+    return rc;
 }
 
 static int embkfs_vfs_rename(struct vnode *old_dir,const char *old_name,size_t old_len,

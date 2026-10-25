@@ -142,10 +142,22 @@ static EFI_PHYSICAL_ADDRESS alloc_pages(EFI_ALLOCATE_TYPE how,
     EFI_PHYSICAL_ADDRESS m = at;
     EFI_STATUS s = ST->BootServices->AllocatePages(how, EfiLoaderData, pages, &m);
     if (EFI_ERROR(s)) {
+        /* SAY WHICH MEMORY AND WHY. This used to print the label and the
+         * words "AllocatePages failed", which on a machine that will not boot
+         * tells nobody anything. The kernel is placed at a FIXED physical
+         * address, so this failure means the firmware has something of its own
+         * there -- and the address and page count are what identify it. */
+        con_print("\n*** could not reserve memory for ");
         con_print(what);
-        con_print("AllocatePages status="); con_printhex(s);
-        con_print(" address="); con_printhex(at);
-        con_print(" pages="); con_printhex(pages); con_print("\n");
+        con_print("\n    pages   "); con_printhex(pages);
+        con_print("\n    address "); con_printhex(at);
+        con_print("\n    status  "); con_printhex(s);
+        con_print("\n");
+        /* WHAT THE FIRMWARE HAS THERE. For a fixed address, the entries that
+         * overlap the request -- the kernel is linked at 32 MiB, which a
+         * below-16 MiB listing never reaches. Otherwise every entry below
+         * 16 MiB. */
+        EFI_PHYSICAL_ADDRESS want_end = at + (EFI_PHYSICAL_ADDRESS)pages * 4096;
         UINTN bytes = 0, key = 0, stride = 0;
         uint32_t version = 0;
         EFI_MEMORY_DESCRIPTOR *map = 0;
@@ -155,12 +167,17 @@ static EFI_PHYSICAL_ADDRESS alloc_pages(EFI_ALLOCATE_TYPE how,
             !EFI_ERROR(ST->BootServices->GetMemoryMap(&bytes, map, &key, &stride, &version))) {
             for (UINTN offset = 0; stride >= sizeof(*map) && offset + sizeof(*map) <= bytes; offset += stride) {
                 EFI_MEMORY_DESCRIPTOR *d = (void *)((uint8_t *)map + offset);
-                if (d->PhysicalStart >= 0x1000000) continue;
+                EFI_PHYSICAL_ADDRESS d_end = d->PhysicalStart + d->NumberOfPages * 4096;
+                if (how == AllocateAddress ? (d_end <= at || d->PhysicalStart >= want_end)
+                                           : d->PhysicalStart >= 0x1000000) continue;
                 con_print("  memory "); con_printhex(d->PhysicalStart);
                 con_print(" pages="); con_printhex(d->NumberOfPages);
                 con_print(" type="); con_printhex(d->Type); con_print("\n");
             }
         }
+        con_print("    This memory is not free on this machine. The kernel is linked to\n"
+                  "    load at a fixed physical address; something the firmware owns is\n"
+                  "    already there. Photograph this screen.\n");
         con_die("AllocatePages failed");
     }
     return m;

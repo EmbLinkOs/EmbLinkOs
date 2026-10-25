@@ -19,9 +19,16 @@ def digest(path):
         for block in iter(lambda:f.read(1048576),b''): h.update(block)
     return h.hexdigest()
 
+def free_vnc_display():
+    """A VNC display number whose port nothing on this machine listens on."""
+    for n in range(40,90):
+        with socket.socket() as s:
+            if s.connect_ex(('127.0.0.1',5900+n)):return n
+    raise RuntimeError('no free VNC port')
+
 class Guest:
-    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None,graphics="virtio"):
-        if graphics not in ("virtio","bochs"):raise ValueError("unsupported graphics fixture")
+    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None,graphics="virtio",cpu_compose=False):
+        if graphics not in ("virtio","bochs","virtio-dual","virgl"):raise ValueError("unsupported graphics fixture")
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
         shutil.copyfile(firmware/'OVMF_VARS_4M.fd',out/'vars.fd')
@@ -33,6 +40,24 @@ class Guest:
              '-qmp',f'unix:{out / "qmp.sock"},server=on,wait=off','-no-reboot','-no-shutdown']
         if graphics=="bochs":
             at=cmd.index('-vga');cmd[at:at+4]=['-vga','std']
+        self.graphics=graphics
+        if graphics=="virgl":
+            # The host's GPU through virglrenderer: virtio-vga-gl, rendered
+            # off-screen on a DRM render node (EMBLINK_RENDERNODE, vgem is
+            # enough with Mesa's llvmpipe). A GL scanout has no surface for
+            # screendump, so frames are read over VNC (capture()).
+            self.vnc=free_vnc_display()
+            node=os.environ.get('EMBLINK_RENDERNODE','/dev/dri/renderD128')
+            at=cmd.index('-device');cmd[at+1]=f'virtio-vga-gl,xres={resolution[0]},yres={resolution[1]},id=gpu0'
+            at=cmd.index('-display');cmd[at+1]=f'egl-headless,rendernode={node}'
+            cmd+=['-vnc',f'127.0.0.1:{self.vnc}']
+        if cpu_compose:
+            cmd+=['-fw_cfg','name=opt/emblink/compose,string=0']
+        if graphics=="virtio-dual":
+            # Two heads. Headless QEMU reports only head 0 as connected; fw_cfg
+            # tells the guest's driver that two are plugged in (fw_cfg.c).
+            at=cmd.index('-device');cmd[at+1]=f'virtio-vga,max_outputs=2,xres={resolution[0]},yres={resolution[1]},id=gpu0'
+            cmd+=['-fw_cfg','name=opt/emblink/outputs,string=2']
         if boot_nvme:
             cmd+=['-drive',f'format=raw,file={disk},if=none,id=bootdisk',
                   '-device','nvme,drive=bootdisk,serial=EMBLINKBOOT']
@@ -71,6 +96,17 @@ class Guest:
                     self.qmp.cmd('human-monitor-command',**{'command-line':f'sendkey {self.menu}'})
                     time.sleep(.2)
                     self.qmp.cmd('human-monitor-command',**{'command-line':'sendkey ret'})
+    def capture(self,path):
+        """The guest's screen into `path` (.ppm from screendump; .png over VNC
+        for a GL scanout). Returns the path written."""
+        path=Path(path)
+        if self.graphics!="virgl":
+            self.qmp.screendump(str(path));return path
+        path=path.with_suffix('.png')
+        vncdo=os.environ.get('EMBLINK_VNCDO') or shutil.which('vncdo') or os.path.expanduser('~/vncenv/bin/vncdo')
+        r=subprocess.run([vncdo,'-s',f'127.0.0.1::{5900+self.vnc}','capture',str(path)],capture_output=True,text=True,timeout=120)
+        if r.returncode or not path.exists():raise RuntimeError('VNC capture failed: '+r.stderr[-400:])
+        return path
     def wait(self,needle,timeout=180,start=0):
         end=time.monotonic()+timeout
         while needle not in self.seen[start:]:

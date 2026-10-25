@@ -11,6 +11,7 @@
 #include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
 #include "block/block.h"
 #include "fs/automount.h"       // block-device registration for USB mass storage
+#include "process/ksync.h"      // one synchronous transaction on the bus at a time
 #if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"           // irq_register (interrupt-driven event servicing)
 #include "arch/x86_64/irq/ioapic.h"        // ioapic_route_level for the PCI interrupt
@@ -54,11 +55,28 @@
 #define XHCI_IMAN_IE          (1U << 1)  // Interrupt Enable
 
 #define XHCI_PORTSC_CCS      (1U << 0)
+#define XHCI_PORTSC_PP       (1U << 9)   /* port power: OFF after reset when PPC */
 #define XHCI_PORTSC_PED      (1U << 1)
 #define XHCI_PORTSC_PR       (1U << 4)
 #define XHCI_PORTSC_SPEED_SHIFT 10
 #define XHCI_PORTSC_SPEED_MASK  (0xFU << XHCI_PORTSC_SPEED_SHIFT)
 #define XHCI_PORTSC_RW1C_MASK   0x00FE0000U
+
+/* WRITING PORTSC IS NOT WRITING BACK WHAT YOU READ. Bit 1, Port Enabled, is
+ * write-1-to-CLEAR: a read-modify-write that faithfully preserves it DISABLES
+ * the port it meant to leave alone. Every write to this register therefore
+ * goes through here, which drops PED and the change bits, and the caller ORs
+ * back exactly what it means to set.
+ *
+ * This is why a real machine enumerated nothing. After a successful reset the
+ * port comes up ENABLED; the very next line wrote the register back to
+ * acknowledge the change bits, PED among them, so the port was switched off a
+ * microsecond after it came up and the driver read PED as clear and reported
+ * that the port "would not enable". On QEMU the USB 3 path returns before
+ * that write ever happens, which is why every test passed. */
+static inline uint32_t xhci_portsc_keep(uint32_t v) {
+    return v & ~(XHCI_PORTSC_RW1C_MASK | XHCI_PORTSC_PED);
+}
 
 #define XHCI_TRB_TYPE_SHIFT 10
 #define XHCI_TRB_LINK            6U
@@ -66,6 +84,9 @@
 #define XHCI_TRB_ADDRESS_DEVICE 11U
 #define XHCI_TRB_CFG_ENDPOINT   12U  // Configure Endpoint command TRB type
 #define XHCI_TRB_DISABLE_SLOT   10U  // Disable Slot command TRB type
+#define XHCI_TRB_STOP_ENDPOINT  15U  // Stop Endpoint: abandon a TD that will never complete
+#define XHCI_TRB_RESET_ENDPOINT 14U  // Reset Endpoint: take it out of Halted
+#define XHCI_TRB_SET_TR_DEQUEUE 16U  // Set TR Dequeue Pointer: resynchronise the ring
 #define XHCI_TRB_EVAL_CONTEXT   13U  // Evaluate Context command TRB type
 
 /* How many root ports this driver remembers the state of. The controller
@@ -138,6 +159,23 @@ struct xhci_runtime_state {
      * by xhci_poll(). Exactly one of the two services a controller, never
      * both: they would race on the event ring's dequeue pointer. */
     bool irq_driven;
+    /* DOES THE INTERRUPT ARRIVE? HID input on this controller is delivered by
+     * its interrupt and by nothing else, and a laptop's routing (MSI-X on a
+     * chipset nobody has booted this on, or an INTx line the I/O APIC route
+     * got wrong) is exactly the kind of thing that is broken on a machine one
+     * has never seen. So the interrupts are COUNTED, and xhci_poll() watches
+     * for EVIDENCE of one that did not come: an event sitting unconsumed at
+     * the ring's dequeue pointer across two polls XHCI_NOINTR_EVIDENCE_MS
+     * apart. A working interrupt consumes it in microseconds; an idle
+     * keyboard never produces one, so silence proves nothing -- the first cut
+     * of this watched for silence, masked a working interrupt two seconds
+     * into every boot, and measured its own mistake. When the evidence is
+     * there the interrupt is masked for good and the main loop drains the
+     * ring instead, that first event included. For good, not shared: a ring
+     * drained from two contexts is a race on its dequeue pointer. */
+    uint64_t irq_count;
+    uint64_t pending_seen_us;   /* when the poll first saw an event waiting; 0 = none waiting */
+    bool     polled_fallback;   /* the interrupt was given up on; xhci_poll() services this one */
     /* SCRATCHPAD: pages the controller asked for (HCSPARAMS2) and owns. QEMU
      * asks for none, so a driver written against it never allocates them --
      * and a real Intel or AMD controller that asked and was given nothing is
@@ -208,31 +246,48 @@ struct xhci_runtime_state {
     volatile uint8_t *op_regs;
     volatile uint8_t *runtime_regs;
     volatile uint8_t *doorbell_regs;
+    /* EVERY DMA BLOCK BELOW IS 4 KB-ALIGNED, AND THAT IS NOT FUSSINESS.
+     *
+     * xHCI 1.2 section 4.11.5.1: a TRB ring segment shall not cross a 64 KB
+     * boundary; section 6.4.1: neither shall a data buffer. These arrays used
+     * to be aligned to 64 bytes, which is what the individual TRBs and contexts
+     * need, and they sat wherever .bss put them -- which moves every time the
+     * kernel grows by a byte anywhere in front of them. A build of this kernel
+     * placed one slot's EP0 ring at 0x5afe80-0x5b0080, straddling 0x5b0000.
+     * QEMU does not enforce the rule; a laptop's controller may fetch the
+     * wrong TRB, and what the filesystem then sees is an I/O error on a stick
+     * that is fine.
+     *
+     * 4 KB alignment settles it structurally: every block here is either at
+     * most 4 KB or made of sub-objects of at most 4 KB that start on their own
+     * 4 KB-aligned page, and a 64 KB line is itself 4 KB-aligned, so nothing
+     * can cross one. xhci_check_dma_layout() verifies it at init all the same
+     * and writes the answer into the boot log, because the layout is decided
+     * at link time and this comment is not a proof. */
     // Scratch buffer used by GET_DESCRIPTOR to receive DMA'd descriptor data.
     uint8_t  xfr_buf[XHCI_MAX_SLOTS_TRACKED][64] __attribute__((aligned(64)));
 
-    uint64_t dcbaa[256] __attribute__((aligned(64)));
-    struct xhci_trb cmd_ring[XHCI_CMD_RING_TRBS] __attribute__((aligned(64)));
-    struct xhci_trb evt_ring[XHCI_EVENT_RING_TRBS] __attribute__((aligned(64)));
+    uint64_t dcbaa[256] __attribute__((aligned(4096)));
+    struct xhci_trb cmd_ring[XHCI_CMD_RING_TRBS] __attribute__((aligned(4096)));
+    struct xhci_trb evt_ring[XHCI_EVENT_RING_TRBS] __attribute__((aligned(4096)));
     struct xhci_erst_entry erst[1] __attribute__((aligned(64)));
 
     // One input/device context pair plus a small EP0 transfer ring per slot.
-    uint8_t input_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(64)));
-    uint8_t device_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(64)));
+    uint8_t input_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(4096)));
+    uint8_t device_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(4096)));
     struct xhci_trb ep0_ring[XHCI_MAX_SLOTS_TRACKED][XHCI_EP0_RING_TRBS]
-        __attribute__((aligned(64)));
+        __attribute__((aligned(4096)));
     // Interrupt-IN transfer ring for HID/interrupt endpoints.
     struct xhci_trb intin_ring[XHCI_MAX_SLOTS_TRACKED][XHCI_INT_IN_RING_TRBS]
-        __attribute__((aligned(64)));
+        __attribute__((aligned(4096)));
     // Per-slot ring of distinct 64-byte receive buffers for interrupt-IN reports.
     uint8_t  hid_buf[XHCI_MAX_SLOTS_TRACKED][XHCI_INTIN_NUM_BUFS][64]
         __attribute__((aligned(64)));
 
     // Bulk transfer rings (OUT, IN) plus BOT command/status wrappers and a
-    // 4 KB data bounce. The bounce is 4 KB-aligned so a single data-stage TRB
-    // never crosses a 64 KB boundary (an xHCI TRB buffer restriction).
+    // 4 KB data bounce.
     struct xhci_trb bulk_ring[XHCI_MAX_SLOTS_TRACKED][2][XHCI_BULK_RING_TRBS]
-        __attribute__((aligned(64)));
+        __attribute__((aligned(4096)));
     uint8_t  msc_cbw[XHCI_MAX_SLOTS_TRACKED][64] __attribute__((aligned(64)));  // 31-byte CBW
     uint8_t  msc_csw[XHCI_MAX_SLOTS_TRACKED][64] __attribute__((aligned(64)));  // 13-byte CSW
     uint8_t  msc_data[XHCI_MAX_SLOTS_TRACKED][MSC_XFER_BYTES]
@@ -277,6 +332,78 @@ static inline void xhci_write64(volatile uint8_t *base, uint32_t off, uint64_t v
 // the wrong physical memory and every command/transfer silently times out.
 static inline uint64_t xhci_dma(const volatile void *p) {
     return KV2P((uint64_t)(uintptr_t)p);
+}
+
+/* HOW LONG TO WAIT FOR A DEVICE IS A TIME, NOT A LOOP COUNT.
+ *
+ * Every wait in this driver was "poll the event ring N million times", which
+ * is a different length of time on every machine and, on real silicon, a few
+ * hundred milliseconds. A USB stick with a flash page going marginal reads
+ * that page with internal retries that take SECONDS -- macOS reads it fine,
+ * slowly -- and a host that gives up in 300 ms turns a slow block into an
+ * I/O error on the one block a filesystem cannot do without. Every other
+ * host allows a mass-storage command up to 30 s (that is the SCSI disk
+ * timeout Linux uses). So: a budget in microseconds from the TSC, and the
+ * iteration count only as the fallback for a machine whose clock reads 0.
+ *
+ * The waits stay busy-polls: the bus lock is held, the interrupt is off, and
+ * the caller is a synchronous block read. That is the existing design; this
+ * changes only what "too long" means. */
+#define XHCI_BUDGET_CMD_US    5000000ULL   /* an xHCI command: milliseconds normally  */
+#define XHCI_BUDGET_CTRL_US   5000000ULL   /* a control transfer                       */
+#define XHCI_BUDGET_BULK_US  30000000ULL   /* a bulk stage: the SCSI disk timeout      */
+#define XHCI_SLOW_NOTE_US     1000000ULL   /* log a transfer that took longer than this */
+
+struct xhci_wait { uint64_t t0; uint64_t budget_us; uint32_t iters; uint32_t max_iters; };
+
+static inline void xhci_wait_begin(struct xhci_wait *w, uint64_t budget_us, uint32_t max_iters) {
+    w->t0 = time_get_us(); w->budget_us = budget_us; w->iters = 0; w->max_iters = max_iters;
+}
+/* True while the caller should keep polling. */
+static inline bool xhci_wait_more(struct xhci_wait *w) {
+    w->iters++;
+    if (w->t0 != 0) {                              /* a real clock: use the budget */
+        return (time_get_us() - w->t0) < w->budget_us;
+    }
+    return w->iters < w->max_iters;                /* no clock: the old count      */
+}
+static inline uint64_t xhci_wait_elapsed_ms(const struct xhci_wait *w) {
+    return w->t0 ? (time_get_us() - w->t0) / 1000ULL : 0;
+}
+
+/* Does any DMA object of this controller cross a 64 KB line? One line per
+ * offender and one summary line, into the log, at init. See the note on the
+ * struct. `what` is named per sub-object (per slot, per direction) because
+ * the rule is per ring segment and per buffer, not per array. */
+static uint32_t xhci_check_range(const char *what, uint32_t slot, const volatile void *p,
+                                 uint64_t len) {
+    uint64_t a = xhci_dma(p), b = a + len - 1U;
+    if ((a >> 16) == (b >> 16)) return 0;
+    kprintf("xHCI: %s%s%u at %lx-%lx CROSSES A 64 KB BOUNDARY -- the controller may "
+            "fetch the wrong TRB\n", what, slot ? " slot " : "", (unsigned)slot, a, b + 1U);
+    return 1;
+}
+static void xhci_check_dma_layout(struct xhci_runtime_state *rt) {
+    uint32_t bad = 0;
+    bad += xhci_check_range("DCBAA", 0, rt->dcbaa, sizeof rt->dcbaa);
+    bad += xhci_check_range("command ring", 0, rt->cmd_ring, sizeof rt->cmd_ring);
+    bad += xhci_check_range("event ring", 0, rt->evt_ring, sizeof rt->evt_ring);
+    bad += xhci_check_range("ERST", 0, rt->erst, sizeof rt->erst);
+    for (uint32_t i = 0; i < XHCI_MAX_SLOTS_TRACKED; i++) {
+        bad += xhci_check_range("input context", i + 1U, rt->input_ctx[i], sizeof rt->input_ctx[i]);
+        bad += xhci_check_range("device context", i + 1U, rt->device_ctx[i], sizeof rt->device_ctx[i]);
+        bad += xhci_check_range("EP0 ring", i + 1U, rt->ep0_ring[i], sizeof rt->ep0_ring[i]);
+        bad += xhci_check_range("interrupt-IN ring", i + 1U, rt->intin_ring[i], sizeof rt->intin_ring[i]);
+        bad += xhci_check_range("bulk OUT ring", i + 1U, rt->bulk_ring[i][0], sizeof rt->bulk_ring[i][0]);
+        bad += xhci_check_range("bulk IN ring", i + 1U, rt->bulk_ring[i][1], sizeof rt->bulk_ring[i][1]);
+        bad += xhci_check_range("bounce buffer", i + 1U, rt->msc_data[i], sizeof rt->msc_data[i]);
+    }
+    if (bad)
+        kprintf("xHCI: DMA layout: %u object(s) cross a 64 KB line -- this is the "
+                "line to report\n", (unsigned)bad);
+    else
+        kprintf("xHCI: DMA layout ok -- no ring or buffer crosses a 64 KB line "
+                "(runtime state at %lx)\n", xhci_dma(rt));
 }
 
 // Pick or allocate per-controller runtime state by BDF.
@@ -629,7 +756,8 @@ static bool xhci_poll_cmd_completion(struct xhci_runtime_state *rt,
 
     volatile uint8_t *ir = runtime + XHCI_RT_IR0;
 
-    for (uint32_t i = 0; i < max_iters; i++) {
+    struct xhci_wait w; xhci_wait_begin(&w, XHCI_BUDGET_CMD_US, max_iters);
+    while (xhci_wait_more(&w)) {
         struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
         uint32_t d3 = ev->d3;
         uint32_t cycle = d3 & 1U;
@@ -761,7 +889,7 @@ static bool xhci_prepare_address_device_context(struct xhci_runtime_state *rt,
 // USB SETUP request types / requests (standard device request subset).
 #define USB_BMRT_H2D_STD_DEV   0x00U  // host-to-device, standard, device
 #define USB_BMRT_D2H_STD_DEV   0x80U  // device-to-host, standard, device
-// USB_REQ_GET_DESCRIPTOR already defined in usb.h
+// USB_REQ_GET_DESCRIPTOR and USB_REQ_CLEAR_FEATURE already come from usb.h
 #define USB_REQ_SET_ADDRESS_CMD 0x05U // kept distinct from the usb.h constant name
 #define USB_DESC_DEVICE_TYPE   0x01U
 #define USB_DESC_CONFIG_TYPE   0x02U
@@ -853,7 +981,8 @@ static bool xhci_ep0_control_transfer(struct xhci_runtime_state *rt,
 
     // Poll interrupter-0 event ring for our Transfer Event.
     volatile uint8_t *ir = runtime + XHCI_RT_IR0;
-    for (uint32_t i = 0; i < 8000000U; i++) {
+    struct xhci_wait w; xhci_wait_begin(&w, XHCI_BUDGET_CTRL_US, 8000000U);
+    while (xhci_wait_more(&w)) {
         struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
         uint32_t d3 = ev->d3;
         if ((d3 & 1U) != rt->evt_cycle) { continue; }
@@ -982,32 +1111,6 @@ static bool xhci_run_ctx_command(struct xhci_runtime_state *rt, uint32_t type,
         return false;
     }
     return true;
-}
-
-// Send SET_ADDRESS.  In xHCI the host controller manages the USB address
-// internally after Address Device; we still issue the SET_ADDRESS request
-// so the device's own address register is programmed correctly.
-// `addr` is the new USB device address (1–127).
-static bool xhci_set_address(struct xhci_runtime_state *rt,
-                              volatile uint8_t *runtime,
-                              volatile uint8_t *doorbell,
-                              uint8_t slot_id, uint8_t addr) {
-    // bmRequestType=0x00 host-to-device, bRequest=SET_ADDRESS,
-    // wValue=addr, wIndex=0, wLength=0 — no DATA stage.
-    uint32_t d0 = (uint32_t)USB_BMRT_H2D_STD_DEV
-                | ((uint32_t)USB_REQ_SET_ADDRESS_CMD << 8)
-                | ((uint32_t)addr << 16); // wValue = new address
-    uint32_t d1 = 0;                      // wIndex=0, wLength=0
-    bool ok = xhci_ep0_control_transfer(rt, runtime, doorbell, slot_id,
-                                        d0, d1, false, NULL, 0);
-    if (!ok) {
-        kprintf("xHCI slot%u: SET_ADDRESS(%u) failed\n",
-                (unsigned int)slot_id, (unsigned int)addr);
-    } else {
-        kprintf("xHCI slot%u: SET_ADDRESS(%u) OK\n",
-                (unsigned int)slot_id, (unsigned int)addr);
-    }
-    return ok;
 }
 
 // Send SET_CONFIGURATION to move the device from the Address state into the
@@ -1167,6 +1270,15 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
                                 iproto == USB_HID_PROTO_KBD ? "Keyboard" : "Mouse");
                         xhci_hid_set_boot_protocol(rt, runtime_ptr, doorbell_ptr,
                                                    slot_id, buf[off + 2U]);
+                        /* SET_IDLE(0): report on change only, as the legacy
+                         * core asks. A keyboard's default idle rate repeats
+                         * its last report every 500 ms otherwise. */
+                        {
+                            uint32_t i0 = 0x21U | (0x0AU << 8) | (0U << 16);
+                            (void)xhci_ep0_control_transfer(rt, runtime_ptr, doorbell_ptr,
+                                                            slot_id, i0, (uint32_t)buf[off + 2U],
+                                                            false, NULL, 0);
+                        }
                         // Find the interrupt-IN endpoint address from the blob.
                         uint8_t ep_addr = 0;
                         uint8_t ep_intv = 0;
@@ -1632,6 +1744,9 @@ static void xhci_service_events(struct xhci_runtime_state *rt) {
 // ring, so the handler can't consume the completion the busy-poll is waiting on.
 static void xhci_intr_enable(struct xhci_runtime_state *rt, bool on) {
     if (!rt->runtime_regs) { return; }
+    /* A controller the poll has taken over stays masked: the block path
+     * re-enables after every request, and "for good" has to mean it. */
+    if (on && rt->polled_fallback) { on = false; }
     volatile uint8_t *ir = rt->runtime_regs + XHCI_RT_IR0;
     xhci_write32(ir, XHCI_IR_IMAN, on ? XHCI_IMAN_IE : 0U);
 }
@@ -1656,7 +1771,8 @@ static void xhci_ack_interrupt(struct xhci_runtime_state *rt) {
 void xhci_irq(void) {
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *rt = &g_xhci_runtime[i];
-        if (!rt->used) { continue; }
+        if (!rt->used || rt->polled_fallback) { continue; }   /* given up on: the poll owns it */
+        rt->irq_count++;
         xhci_ack_interrupt(rt);
         xhci_service_events(rt);
     }
@@ -1723,16 +1839,117 @@ void xhci_enable_irq(void) {
 #endif
 }
 
+/* ==========================================================================
+ * ONE SYNCHRONOUS TRANSACTION ON THE BUS AT A TIME.
+ *
+ * Three things drive this controller from ordinary thread context, and until
+ * now none of them knew about the others:
+ *
+ *   - a filesystem read or write (usb_msc_block_read/write), on whichever
+ *     thread asked for the file;
+ *   - the 500 ms hotplug tick (xhci_rescan), on the boot CPU's main loop,
+ *     which walks every root and hub port and, on a change, runs a WHOLE
+ *     enumeration -- control transfers, Address Device, SCSI INQUIRY;
+ *   - xhci_poll(), the event-ring drain for a controller with no usable
+ *     interrupt, also on the boot loop.
+ *
+ * They share one command ring, one event ring and one set of per-slot bounce
+ * buffers, and each of them WAITS for its own completion by reading the event
+ * ring in a loop. Two at once is not a slow bus, it is a wrong one: whoever
+ * polls first consumes the other's completion event, so the other waits for
+ * something that has already been taken and eventually reports a transfer that
+ * "failed". Above that, the filesystem sees an I/O error on a stick that is
+ * working perfectly -- and, because the block read it fails is a metadata read
+ * the mount needs, the failure does not stay small.
+ *
+ * It is the same bug ata.c had (see g_ata_lock there) and it gets the same
+ * answer: a SLEEPING lock, because the holder waits on a device round trip and
+ * a spinlock holder must never do that. The event-drain tick takes it with
+ * mutex_trylock -- it runs every pass of a loop and has nothing to gain by
+ * queueing behind a 4 KB read.
+ *
+ * WHAT IT DELIBERATELY DOES NOT COVER: the 500 ms hotplug rescan. A rescan
+ * that finds a stick ENUMERATES AND MOUNTS it before it returns, and the mount
+ * reads blocks -- taking the filesystem lock first and this one second. A
+ * filesystem read of a USB volume takes them in that same order. Holding this
+ * lock across the rescan would take them in the opposite order, and two
+ * threads doing that is a hung machine, which is worse than the problem. So
+ * the rescan runs unlocked and the transfers under it are serialised
+ * individually; a plug event arriving in the middle of a read can still lose a
+ * completion, which is a retry, not a corruption. docs/TODO.md records it.
+ *
+ * NOT taken by xhci_irq(): an interrupt handler cannot sleep. The block path
+ * silences the interrupt (xhci_intr_enable) for exactly that reason, which is
+ * the handler's half of this same arrangement.
+ * ========================================================================== */
+static struct mutex g_xhci_bus_lock = MUTEX_INIT;
+
 /* Service every controller that is NOT interrupt-driven: aarch64's always,
  * and an x86 controller that found no usable interrupt ("staying polled"),
  * whose HID reports nothing drained before this. Called from usb_poll(), in
  * schedulable context. */
+#define XHCI_NOINTR_EVIDENCE_MS 50ULL   /* an event waiting this long is one the interrupt missed */
+
 void xhci_poll(void) {
+    /* Busy bus: a transfer is in flight and is polling for its own completion.
+     * Draining the event ring under it would steal that completion. Next pass. */
+    if (!mutex_trylock(&g_xhci_bus_lock)) { return; }
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *rt = &g_xhci_runtime[i];
-        if (!rt->used || rt->irq_driven) { continue; }
+        if (!rt->used) { continue; }
+        if (rt->irq_driven && !rt->polled_fallback) {
+            /* Interrupt-driven and, so far, trusted. Is something waiting that
+             * the interrupt should have delivered? */
+            const struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
+            bool waiting = ((ev->d3 & 1U) == rt->evt_cycle);
+            uint64_t now = time_get_us();
+            if (!waiting || !now) {
+                rt->pending_seen_us = 0;
+            } else if (!rt->pending_seen_us) {
+                rt->pending_seen_us = now;
+            } else if (now - rt->pending_seen_us >= XHCI_NOINTR_EVIDENCE_MS * 1000ULL) {
+                xhci_intr_enable(rt, false);          /* masked, for good */
+                rt->polled_fallback = true;
+                kprintf("xHCI %x:%x.%x: an event waited %lu ms and the interrupt never came -- "
+                        "servicing by polling; check the interrupt routing\n",
+                        (unsigned)rt->bus, (unsigned)rt->device, (unsigned)rt->function,
+                        (unsigned long)((now - rt->pending_seen_us) / 1000ULL));
+            }
+            if (!rt->polled_fallback) { continue; }
+        }
         xhci_ack_interrupt(rt);
         xhci_service_events(rt);
+    }
+    mutex_unlock(&g_xhci_bus_lock);
+}
+
+/* For `test xhci stats` and the boot log. */
+void xhci_irq_stats(uint64_t *irqs, bool *polled) {
+    uint64_t n = 0; bool p = false;
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        if (!g_xhci_runtime[i].used) { continue; }
+        n += g_xhci_runtime[i].irq_count;
+        if (g_xhci_runtime[i].polled_fallback) { p = true; }
+    }
+    if (irqs) *irqs = n;
+    if (polled) *polled = p;
+}
+
+/* `test xhci nointr`: put every controller in the state a laptop with broken
+ * interrupt routing is in -- interrupt masked, none counted -- so the fallback
+ * can be proven where the interrupt otherwise works (tools/xhci_nointr_test.py).
+ * The next keypress leaves an event waiting, which is the evidence it needs. */
+void xhci_force_nointr(void) {
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used || !rt->irq_driven) { continue; }
+        xhci_intr_enable(rt, false);
+        rt->irq_count = 0;
+        rt->polled_fallback = false;
+        rt->pending_seen_us = 0;
+        kprintf("xHCI %x:%x.%x: interrupt masked on request -- the next event must be "
+                "caught by the fallback\n",
+                (unsigned)rt->bus, (unsigned)rt->device, (unsigned)rt->function);
     }
 }
 
@@ -1748,6 +1965,7 @@ struct xhci_msc_dev {
     volatile uint8_t *runtime;
     volatile uint8_t *doorbell;
     uint8_t slot_id;
+    uint8_t iface;      /* bInterfaceNumber: the Bulk-Only Reset is addressed to it */
     bool used;
 };
 static struct xhci_msc_dev g_msc_devs[XHCI_MAX_CONTROLLERS * XHCI_MAX_SLOTS_TRACKED];
@@ -1784,6 +2002,169 @@ static bool xhci_bulk_enqueue_trb(struct xhci_runtime_state *rt, uint32_t idx,
 // Synchronous single-TRB bulk transfer; busy-polls the shared event ring for
 // the completion. dir_in: true = bulk-IN, false = bulk-OUT. Returns true on a
 // Success (1) or Short Packet (13) completion code.
+/* A HALTED ENDPOINT STAYS HALTED UNTIL THE DRIVER SAYS OTHERWISE.
+ *
+ * Any transfer error -- a STALL from the device, a transaction error on the
+ * wire, a babble -- puts an xHCI endpoint in the Halted state, and every
+ * transfer submitted to it afterwards fails immediately. There was no recovery
+ * here at all, so the FIRST error a real USB stick produced made that stick
+ * permanently unreadable: an HP ProBook mounted its root filesystem, started
+ * init, and then filled its screen with "node block 17 read (LBA 136) failed:
+ * I/O error", forever, because nothing ever un-halted the bulk-IN endpoint.
+ * QEMU's storage device never stalls, so nothing here had met one.
+ *
+ * The sequence the spec asks for (xHCI 4.6.8 / 4.6.10): Reset Endpoint to take
+ * it out of Halted, then Set TR Dequeue Pointer so the controller and this
+ * driver agree about where the ring now is -- the failed TRB is left behind
+ * deliberately. Then, for mass storage, the class's own reset recovery
+ * (USB Bulk-Only Transport 5.3.4): clear the halt feature on the endpoint the
+ * device stalled, so IT stops refusing too. */
+static bool xhci_ep_recover(struct xhci_msc_dev *m, uint32_t d)
+{
+    struct xhci_runtime_state *rt = m->rt;
+    uint32_t idx = (uint32_t)m->slot_id - 1U;
+    uint8_t dci = rt->bulk_dci[idx][d];
+    if (!dci || !rt->doorbell_regs) return false;
+
+    /* 1. Reset Endpoint. */
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) return false;
+    struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+    trb->d0 = 0; trb->d1 = 0; trb->d2 = 0;
+    trb->d3 = (XHCI_TRB_RESET_ENDPOINT << XHCI_TRB_TYPE_SHIFT) |
+              ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    uint8_t cc = 0, got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U) {
+        kprintf("xHCI slot%u: Reset Endpoint (dci %u) returned %u\n",
+                (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+        /* carry on: the dequeue pointer still has to be resynchronised */
+    }
+
+    /* 2. Set TR Dequeue Pointer, to where this driver will enqueue next. */
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) return false;
+    uint64_t deq = xhci_dma(&rt->bulk_ring[idx][d][rt->bulk_enqueue[idx][d]]);
+    trb = &rt->cmd_ring[rt->cmd_enqueue];
+    trb->d0 = (uint32_t)((deq | (rt->bulk_cycle[idx][d] ? 1ULL : 0ULL)) & 0xFFFFFFFFULL);
+    trb->d1 = (uint32_t)(deq >> 32);
+    trb->d2 = 0;
+    trb->d3 = (XHCI_TRB_SET_TR_DEQUEUE << XHCI_TRB_TYPE_SHIFT) |
+              ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    cc = 0; got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U) {
+        kprintf("xHCI slot%u: Set TR Dequeue (dci %u) returned %u\n",
+                (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+        return false;
+    }
+
+    /* 3. And tell the DEVICE to stop refusing: CLEAR_FEATURE(ENDPOINT_HALT). */
+    /* The endpoint's USB address, back out of its xHCI device context index:
+     * DCI = endpoint number * 2 + (IN ? 1 : 0). */
+    uint8_t ep_addr = (uint8_t)((dci >> 1) | (d ? 0x80U : 0U));
+    uint32_t d0 = 0x02U                                   /* bmRequestType: endpoint */
+                | ((uint32_t)USB_REQ_CLEAR_FEATURE << 8)  /* bRequest              */
+                | (0U << 16);                             /* wValue: ENDPOINT_HALT */
+    uint32_t d1 = (uint32_t)ep_addr;                      /* wIndex: the endpoint  */
+    (void)xhci_ep0_control_transfer(rt, m->runtime, m->doorbell, m->slot_id,
+                                    d0, d1, false, NULL, 0);
+    return true;
+}
+
+/* A TRANSFER THAT NEVER COMPLETES is a different failure from one the
+ * controller reports, and it needs a different recovery. There is no event,
+ * so the endpoint is not Halted: Reset Endpoint would answer Context State
+ * Error. The TD is still on the ring, owned by the controller, and the device
+ * is wherever it is -- on a worn USB stick, stuck in its own firmware after
+ * a write. What an HP ProBook showed: the data stage of a WRITE(10) accepted,
+ * the 13-byte status never sent, and then nothing on either pipe.
+ *
+ * The ladder the specifications give (xHCI 4.6.9; USB Mass Storage Bulk-Only
+ * 1.0 section 5.3.4), and the one Linux's usb-storage climbs:
+ *   1. Stop Endpoint on both bulk pipes, so the controller abandons the TD.
+ *   2. Set TR Dequeue Pointer on both, so ring and driver agree again.
+ *   3. Bulk-Only Mass Storage Reset: a class request on EP0 that tells the
+ *      device to drop its half of the transaction.
+ *   4. CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints.
+ * The caller then retries the command once. What this cannot do is a port
+ * reset (the next rung, when EP0 does not answer either); docs/TODO.md. */
+static bool xhci_ep_stop(struct xhci_msc_dev *m, uint32_t d)
+{
+    struct xhci_runtime_state *rt = m->rt;
+    uint32_t idx = (uint32_t)m->slot_id - 1U;
+    uint8_t dci = rt->bulk_dci[idx][d];
+    if (!dci || !rt->doorbell_regs) return false;
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) return false;
+    struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+    trb->d0 = 0; trb->d1 = 0; trb->d2 = 0;
+    trb->d3 = (XHCI_TRB_STOP_ENDPOINT << XHCI_TRB_TYPE_SHIFT) |
+              ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    uint8_t cc = 0, got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U) {
+        kprintf("xHCI slot%u: Stop Endpoint (dci %u) returned %u\n",
+                (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+        return false;
+    }
+    return true;
+}
+
+static void xhci_msc_timeout_recover(struct xhci_msc_dev *m)
+{
+    struct xhci_runtime_state *rt = m->rt;
+    kprintf("xHCI slot%u: recovering the device after a timeout (Stop Endpoint, "
+            "Bulk-Only Reset, clear halts)\n", (unsigned)m->slot_id);
+    for (uint32_t d = 0; d < 2U; d++) {
+        if (!xhci_ep_stop(m, d)) continue;
+        /* Set TR Dequeue: the same step xhci_ep_recover takes after its Reset
+         * Endpoint, on an endpoint that is now Stopped rather than Halted. */
+        uint32_t idx = (uint32_t)m->slot_id - 1U;
+        uint8_t dci = rt->bulk_dci[idx][d];
+        if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) continue;
+        uint64_t deq = xhci_dma(&rt->bulk_ring[idx][d][rt->bulk_enqueue[idx][d]]);
+        struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+        trb->d0 = (uint32_t)((deq | (rt->bulk_cycle[idx][d] ? 1ULL : 0ULL)) & 0xFFFFFFFFULL);
+        trb->d1 = (uint32_t)(deq >> 32);
+        trb->d2 = 0;
+        trb->d3 = (XHCI_TRB_SET_TR_DEQUEUE << XHCI_TRB_TYPE_SHIFT) |
+                  ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+                  (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+        xhci_cmd_advance(rt);
+        xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+        uint8_t cc = 0, got = 0;
+        if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U)
+            kprintf("xHCI slot%u: Set TR Dequeue (dci %u) returned %u\n",
+                    (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+    }
+
+    /* 3. Bulk-Only Mass Storage Reset: bmRequestType 0x21 (host-to-device,
+     *    class, interface), bRequest 0xFF, wValue 0, wIndex the interface. */
+    uint32_t d0 = 0x21U | (0xFFU << 8) | (0U << 16);
+    uint32_t d1 = (uint32_t)m->iface;
+    bool reset_ok = xhci_ep0_control_transfer(rt, m->runtime, m->doorbell, m->slot_id,
+                                              d0, d1, false, NULL, 0);
+    if (!reset_ok)
+        kprintf("xHCI slot%u: the device did not answer the Bulk-Only Reset on EP0 -- "
+                "it needs a port reset, which this driver does not do yet\n",
+                (unsigned)m->slot_id);
+
+    /* 4. CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints. */
+    for (uint32_t d = 0; d < 2U; d++) {
+        uint32_t idx = (uint32_t)m->slot_id - 1U;
+        uint8_t dci = rt->bulk_dci[idx][d];
+        if (!dci) continue;
+        uint8_t ep_addr = (uint8_t)((dci >> 1) | (d ? 0x80U : 0U));
+        uint32_t c0 = 0x02U | ((uint32_t)USB_REQ_CLEAR_FEATURE << 8) | (0U << 16);
+        (void)xhci_ep0_control_transfer(rt, m->runtime, m->doorbell, m->slot_id,
+                                        c0, (uint32_t)ep_addr, false, NULL, 0);
+    }
+}
+
 static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
                            uint64_t phys, uint32_t len) {
     struct xhci_runtime_state *rt = m->rt;
@@ -1798,7 +2179,8 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
     xhci_ring_doorbell(m->doorbell, m->slot_id, rt->bulk_dci[idx][d]);
 
     volatile uint8_t *ir = m->runtime + XHCI_RT_IR0;
-    for (uint32_t i = 0; i < 30000000U; i++) {
+    struct xhci_wait w; xhci_wait_begin(&w, XHCI_BUDGET_BULK_US, 30000000U);
+    while (xhci_wait_more(&w)) {
         struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
         if ((ev->d3 & 1U) != rt->evt_cycle) { continue; }
         uint32_t type    = (ev->d3 >> XHCI_TRB_TYPE_SHIFT) & 0x3FU;
@@ -1808,8 +2190,34 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
         if (rt->evt_dequeue >= XHCI_EVENT_RING_TRBS) { rt->evt_dequeue = 0; rt->evt_cycle ^= 1U; }
         xhci_write64(ir, XHCI_IR_ERDP, xhci_dma(&rt->evt_ring[rt->evt_dequeue]) | (1ULL << 3));
         if (type != XHCI_TRB_TRANSFER_EVENT || ev_slot != m->slot_id) { continue; }
-        return (cc == 1U || cc == 13U);
+        if (cc == 1U || cc == 13U) {                     /* Success / Short Packet */
+            /* A transfer that succeeded but took its time is the evidence a
+             * dying stick leaves: say so, once per slow transfer. */
+            uint64_t ms = xhci_wait_elapsed_ms(&w);
+            if (ms * 1000ULL >= XHCI_SLOW_NOTE_US)
+                kprintf("xHCI slot%u: bulk-%s transfer of %u bytes took %lu ms -- "
+                        "the device is slow here, not broken\n", (unsigned)m->slot_id,
+                        dir_in ? "IN" : "OUT", (unsigned)len, (unsigned long)ms);
+            return true;
+        }
+        /* Anything else is a failed transfer, and the ones a stick actually
+         * produces (STALL, Babble, Transaction Error) leave the endpoint
+         * HALTED: every later transfer on it fails until something un-halts it,
+         * and until now nothing did, so one bad transfer was a device dead for
+         * the life of the boot. Recover unconditionally: on a code that did not
+         * halt, the Reset Endpoint answers Context State Error, which is logged
+         * and costs nothing, and that is cheaper than a table of which codes
+         * halt on which controller. */
+        kprintf("xHCI slot%u: bulk-%s transfer failed, completion code %u -- recovering "
+                "the endpoint\n", (unsigned)m->slot_id, dir_in ? "IN" : "OUT",
+                (unsigned)cc);
+        xhci_ep_recover(m, d);
+        return false;
     }
+    kprintf("xHCI slot%u: bulk-%s transfer of %u bytes: no completion after %lu ms\n",
+            (unsigned)m->slot_id, dir_in ? "IN" : "OUT", (unsigned)len,
+            (unsigned long)xhci_wait_elapsed_ms(&w));
+    xhci_msc_timeout_recover(m);
     return false;
 }
 
@@ -1901,16 +2309,27 @@ static int usb_msc_block_read(struct embk_block_device *dev, uint64_t lba,
     uint32_t bsize = dev->block_size;
     uint32_t max_sec = MSC_XFER_BYTES / bsize; if (max_sec == 0U) { max_sec = 1U; }
     int rc = 0;
+    // The bus is ours for this request: see g_xhci_bus_lock. Taken BEFORE the
+    // interrupt is silenced so a waiter sleeps with the controller in its
+    // normal state, not with its interrupt off.
+    mutex_lock(&g_xhci_bus_lock);
     // Silence the xHCI IRQ so its handler can't drain the bulk completions this
     // synchronous path busy-polls for; re-enable (draining any queued HID) after.
     xhci_intr_enable(m->rt, false);
     while (count > 0U) {
         uint32_t chunk = (count > max_sec) ? max_sec : count;
-        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
+        /* ONE RETRY, BECAUSE THE FIRST FAILURE IS NOW RECOVERABLE. The bulk
+         * path un-halts the endpoint after an error (xhci_ep_recover), so the
+         * command that failed can simply be asked again -- and a stick that
+         * stalls once should not become a filesystem that reports I/O errors.
+         * A second failure is a real one and is reported. */
+        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk) &&
+            !scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
         memcpy(out, bounce, chunk * bsize);
         out += (size_t)chunk * (size_t)bsize; lba += chunk; count -= chunk;
     }
     xhci_intr_enable(m->rt, true);
+    mutex_unlock(&g_xhci_bus_lock);
     return rc;
 }
 static int usb_msc_block_write(struct embk_block_device *dev, uint64_t lba,
@@ -1922,28 +2341,36 @@ static int usb_msc_block_write(struct embk_block_device *dev, uint64_t lba,
     uint32_t bsize = dev->block_size;
     uint32_t max_sec = MSC_XFER_BYTES / bsize; if (max_sec == 0U) { max_sec = 1U; }
     int rc = 0;
+    mutex_lock(&g_xhci_bus_lock);    // see usb_msc_block_read
     xhci_intr_enable(m->rt, false);  // see usb_msc_block_read
     while (count > 0U) {
         uint32_t chunk = (count > max_sec) ? max_sec : count;
         memcpy(bounce, in, (size_t)chunk * (size_t)bsize);
-        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
+        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk) &&
+            !scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
         in += (size_t)chunk * (size_t)bsize; lba += chunk; count -= chunk;
     }
     xhci_intr_enable(m->rt, true);
+    mutex_unlock(&g_xhci_bus_lock);
     return rc;
 }
 
 // Find the first bulk IN and bulk OUT endpoints in the config-descriptor blob.
 static bool xhci_find_bulk_endpoints(struct xhci_runtime_state *rt, uint8_t slot_id,
                                      uint8_t *out_ep, uint8_t *in_ep,
-                                     uint16_t *out_mps, uint16_t *in_mps) {
+                                     uint16_t *out_mps, uint16_t *in_mps,
+                                     uint8_t *iface) {
     uint32_t idx = (uint32_t)slot_id - 1U;
     uint8_t *buf = rt->xfr_buf[idx];
     bool have_out = false, have_in = false;
     uint32_t off = 0;
+    if (iface) { *iface = 0; }
     while (off + 2U <= 64U) {
         uint8_t dlen = buf[off], dtype = buf[off + 1U];
         if (dlen == 0U) { break; }
+        if (dtype == USB_DESC_INTERFACE && off + 3U <= 64U && iface && !have_in && !have_out) {
+            *iface = buf[off + 2U];          /* the interface the bulk pipes belong to */
+        }
         if (dtype == USB_DESC_ENDPOINT && off + 7U <= 64U) {
             uint8_t ep_addr = buf[off + 2U];
             uint8_t attrs   = buf[off + 3U];
@@ -2044,8 +2471,9 @@ static bool xhci_configure_bulk_endpoints(struct xhci_runtime_state *rt,
 static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
                            volatile uint8_t *op, volatile uint8_t *runtime,
                            volatile uint8_t *doorbell) {
-    uint8_t out_ep = 0, in_ep = 0; uint16_t out_mps = 512, in_mps = 512;
-    if (!xhci_find_bulk_endpoints(rt, slot_id, &out_ep, &in_ep, &out_mps, &in_mps)) {
+    uint8_t out_ep = 0, in_ep = 0;
+    uint8_t iface = 0; uint16_t out_mps = 512, in_mps = 512;
+    if (!xhci_find_bulk_endpoints(rt, slot_id, &out_ep, &in_ep, &out_mps, &in_mps, &iface)) {
         kprintf("xHCI slot%u: MSC missing bulk IN/OUT endpoints\n", (unsigned int)slot_id);
         return false;
     }
@@ -2064,6 +2492,7 @@ static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
     if (!m) { kprintf("xHCI: MSC device table full\n"); return false; }
     m->used = true; m->rt = rt; m->runtime = runtime; m->doorbell = doorbell;
     m->slot_id = slot_id;
+    m->iface = iface;
     m->blk.block_size = 512; // provisional until READ CAPACITY (scsi_rw10 reads it)
     rt->msc_active[slot_id - 1U] = true;
 
@@ -2133,13 +2562,21 @@ static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
  * The change bits are write-1-to-clear and live in the same register as the
  * control bits, so every write has to preserve the ones it does not mean to
  * touch -- XHCI_PORTSC_RW1C_MASK is exactly that set. */
+static void xhci_teardown_slot(struct xhci_runtime_state *rt, uint8_t slot);
+
 static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
     uint32_t reg = XHCI_PORTSC_BASE + (port_index * XHCI_PORT_STRIDE);
     uint32_t portsc = xhci_read32(op, reg);
 
-    if (portsc & XHCI_PORTSC_PED) return true;      /* already enabled */
+    /* NO EARLY RETURN ON "ALREADY ENABLED". A port that is enabled is not the
+     * same as a device that is in the Default state and ready to be addressed:
+     * after a failed attempt the device is still addressed from that attempt,
+     * ignores an Address Device aimed at the default address, and the command
+     * comes back a USB transaction error. A reset is what puts it back where
+     * enumeration starts. USB 3 ports train themselves to Enabled on connect
+     * and take a hot reset here perfectly well. */
 
-    xhci_write32(op, reg, (portsc & ~XHCI_PORTSC_RW1C_MASK) | XHCI_PORTSC_PR);
+    xhci_write32(op, reg, xhci_portsc_keep(portsc) | XHCI_PORTSC_PR);
     for (int i = 0; i < 2000000; i++) {
         portsc = xhci_read32(op, reg);
         if (!(portsc & XHCI_PORTSC_PR)) break;
@@ -2148,7 +2585,7 @@ static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
     /* Acknowledge every change bit the reset raised, or the next read of this
      * register reports a connection that already happened. */
     portsc = xhci_read32(op, reg);
-    xhci_write32(op, reg, portsc);
+    xhci_write32(op, reg, xhci_portsc_keep(portsc) | (portsc & XHCI_PORTSC_RW1C_MASK));
     return (xhci_read32(op, reg) & XHCI_PORTSC_PED) != 0;
 }
 
@@ -2259,9 +2696,29 @@ static uint8_t xhci_enumerate_device(struct xhci_runtime_state *rt, uint8_t root
     rt->ep0_enqueue[sidx] = 0;
     rt->ep0_cycle[sidx]   = 1;
 
-    if (!xhci_get_device_descriptor(rt, runtime, doorbell, slot)) { return 0; }
-    xhci_set_address(rt, runtime, doorbell, slot, slot);
-    if (!xhci_get_config_descriptor(rt, runtime, doorbell, slot)) { return 0; }
+    /* NO SET_ADDRESS. The Address Device command above IS the addressing: the
+     * controller issued it and holds the address in the slot context. Sending
+     * the standard request again is a protocol error against a device that is
+     * already in the Address state, and it is what an HP ProBook's own webcam
+     * refused -- "Address Device code=1", a device descriptor read perfectly,
+     * and then "SET_ADDRESS(5) failed" one line later, taking the whole
+     * bring-up with it. QEMU's devices tolerated it; a real one does not have
+     * to. (xHCI 4.6.5: the host controller manages device addresses.)
+     *
+     * AND A FAILURE MUST GIVE THE SLOT BACK. Every return below used to leave
+     * the slot allocated and the device sitting in the Address state, so the
+     * next attempt asked for a NEW slot and addressed a device that was no
+     * longer listening at the default address -- which is why the ProBook's
+     * other three ports all came back "Address Device code=4" with slot
+     * numbers climbing 5, 6, 7, 8. */
+    if (!xhci_get_device_descriptor(rt, runtime, doorbell, slot)) {
+        xhci_teardown_slot(rt, slot);
+        return 0;
+    }
+    if (!xhci_get_config_descriptor(rt, runtime, doorbell, slot)) {
+        xhci_teardown_slot(rt, slot);
+        return 0;
+    }
     uint8_t cfg_val = rt->xfr_buf[sidx][5];
     xhci_set_configuration(rt, runtime, doorbell, slot, cfg_val);
     rt->slot_to_port[sidx] = root_port;
@@ -2504,6 +2961,8 @@ static void xhci_teardown_port(struct xhci_runtime_state *rt, uint32_t root_port
 void xhci_rescan(void *hc) {
     struct xhci_runtime_state *rt = (struct xhci_runtime_state *)hc;
     if (!rt || !rt->used || !rt->op_regs) return;
+    /* NOT under g_xhci_bus_lock: this mounts what it finds, and a mount takes
+     * the filesystem lock and then this one. See the lock order note above. */
 
     for (uint32_t port = 1; port <= rt->max_ports; port++) {
         uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
@@ -2516,7 +2975,8 @@ void xhci_rescan(void *hc) {
          * acknowledged is reported again on every pass, and on a controller
          * driven by its interrupt it never stops. */
         if (portsc & XHCI_PORTSC_RW1C_MASK)
-            xhci_write32(rt->op_regs, reg, portsc);
+            xhci_write32(rt->op_regs, reg,
+                         xhci_portsc_keep(portsc) | (portsc & XHCI_PORTSC_RW1C_MASK));
 
         if (now == was) continue;
         rt->port_connected[port - 1U] = now;
@@ -2657,6 +3117,9 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     }
 
     struct xhci_runtime_state *rt = xhci_get_runtime_state(ctrl);
+    /* Before the controller is touched: does the memory it will be handed obey
+     * the 64 KB rule? The answer goes into the boot log either way. */
+    if (rt) xhci_check_dma_layout(rt);
     if (!rt) {
         kprintf("xHCI: no runtime slots available\n");
         return false;
@@ -2701,6 +3164,61 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
      * because nothing had looked. */
     rt->max_ports = max_ports < XHCI_MAX_PORTS_TRACKED ? max_ports
                                                        : XHCI_MAX_PORTS_TRACKED;
+
+    /* TURN THE PORTS ON. A host controller reset leaves every port UNPOWERED
+     * on any controller that implements port power control (HCCPARAMS1 bit 3,
+     * PPC) -- and an unpowered port reports no device, forever, however many
+     * times it is scanned. QEMU's controller has PPC clear and its ports are
+     * always on, so this driver never needed the bit and never had it.
+     *
+     * An HP ProBook is where that showed: the firmware read the USB stick to
+     * load this kernel, and the kernel then reported "xHCI at 00:14.0 -- 18
+     * port(s), 0 device(s) present" and could not find its own root
+     * filesystem. The machine was looking at eighteen ports it had switched
+     * off itself.
+     *
+     * PP is set preserving the RW1C change bits (writing them back as read
+     * would clear status the port had raised), then the spec's power-good
+     * settling time before anything is believed. */
+    {
+        bool ppc = (hccparams1 & (1U << 3)) != 0;
+        uint32_t powered = 0;
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
+            uint32_t v = xhci_read32(op, reg);
+            if (!(v & XHCI_PORTSC_PP)) {
+                xhci_write32(op, reg, xhci_portsc_keep(v) | XHCI_PORTSC_PP);
+                powered++;
+            }
+        }
+        if (powered) {
+            timer_delay_ms(20);              /* power-good */
+            kprintf("xHCI: powered %u port(s) that came up dark (port power control %s)\n",
+                    (unsigned)powered, ppc ? "supported" : "not advertised");
+        }
+
+        /* AND THEN WAIT FOR SOMETHING TO ANNOUNCE ITSELF. A device does not
+         * appear the instant its port has power: USB 2 debounce alone is
+         * 100 ms, and a stick that was just reset with the controller has to
+         * re-attach. Scanning immediately -- which is what this did -- reads
+         * every port as empty and never looks again. Half a second, ended the
+         * moment anything connects, and only paid on a machine where nothing
+         * has yet. */
+        for (int waited = 0; waited < 500; waited += 25) {
+            bool any = false;
+            for (uint32_t port = 1; port <= rt->max_ports && !any; port++) {
+                uint32_t v = xhci_read32(op, XHCI_PORTSC_BASE +
+                                             ((port - 1U) * XHCI_PORT_STRIDE));
+                if (v & XHCI_PORTSC_CCS) any = true;
+            }
+            if (any) {
+                if (waited)
+                    kprintf("xHCI: a device announced itself after %d ms\n", waited);
+                break;
+            }
+            timer_delay_ms(25);
+        }
+    }
     for (uint32_t port = 1; port <= rt->max_ports; port++) {
         uint32_t portsc = xhci_read32(op, XHCI_PORTSC_BASE +
                                           ((port - 1U) * XHCI_PORT_STRIDE));
@@ -2720,7 +3238,64 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
             (unsigned int)ctrl->devices_present,
             (unsigned int)ctrl->max_ports);
 
+    /* NOTHING AT ALL is worth a raw dump: on a machine that booted off one of
+     * these ports, "no devices" is a claim that needs evidence, and PORTSC is
+     * the evidence -- power, connect, enable and speed, per port, as the
+     * hardware reports them. */
+    if (ctrl->devices_present == 0) {
+        kprintf("xHCI: every port as the controller reports it (PORTSC):\n");
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t v = xhci_read32(op, XHCI_PORTSC_BASE +
+                                         ((port - 1U) * XHCI_PORT_STRIDE));
+            kprintf("xHCI:   port %2u: %08x%s%s%s\n", (unsigned)port, (unsigned)v,
+                    (v & XHCI_PORTSC_PP)  ? " powered"   : " DARK",
+                    (v & XHCI_PORTSC_CCS) ? " connected" : "",
+                    (v & XHCI_PORTSC_PED) ? " enabled"   : "");
+        }
+    }
+
     return true;
+}
+
+/* EVERY PORT, AND WHAT HAPPENS WHEN WE TRY IT AGAIN -- printed where it can be
+ * read. A machine with no serial port shows the last fifty lines of its boot,
+ * and USB bring-up happens hundreds of lines earlier: on the ProBook the
+ * controller reported four connected ports and not one enumerated device, and
+ * every message explaining why had scrolled past. So the no-root path calls
+ * this, at the end, and it says PORTSC for every port and then tries each
+ * connected one again, out loud. */
+void xhci_report_ports(void) {
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used || !rt->op_regs) continue;
+        kprintf("xHCI %02x:%02x.%x: %u port(s)\n", (unsigned)rt->bus,
+                (unsigned)rt->device, (unsigned)rt->function, (unsigned)rt->max_ports);
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t v = xhci_read32(rt->op_regs, XHCI_PORTSC_BASE +
+                                     ((port - 1U) * XHCI_PORT_STRIDE));
+            if (!(v & (XHCI_PORTSC_CCS | XHCI_PORTSC_PED)) && (v & XHCI_PORTSC_PP))
+                continue;                      /* powered and empty: nothing to say */
+            kprintf("xHCI:   port %2u PORTSC %08x  %s%s%s slot %u\n",
+                    (unsigned)port, (unsigned)v,
+                    (v & XHCI_PORTSC_PP)  ? "powered "   : "DARK ",
+                    (v & XHCI_PORTSC_CCS) ? "connected " : "",
+                    (v & XHCI_PORTSC_PED) ? "enabled "   : "",
+                    (unsigned)rt->port_slot[port - 1U]);
+        }
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t v = xhci_read32(rt->op_regs, XHCI_PORTSC_BASE +
+                                     ((port - 1U) * XHCI_PORT_STRIDE));
+            if (!(v & XHCI_PORTSC_CCS) || rt->port_slot[port - 1U]) continue;
+            kprintf("xHCI: port %u is connected and has no slot -- trying it again\n",
+                    (unsigned)port);
+            bool ok = xhci_bring_up_port(rt, port);
+            kprintf("xHCI: port %u bring-up %s (PORTSC now %08x, slot %u)\n",
+                    (unsigned)port, ok ? "SUCCEEDED" : "failed",
+                    (unsigned)xhci_read32(rt->op_regs, XHCI_PORTSC_BASE +
+                                          ((port - 1U) * XHCI_PORT_STRIDE)),
+                    (unsigned)rt->port_slot[port - 1U]);
+        }
+    }
 }
 
 /* How many devices this driver currently has addressed, across every xHCI

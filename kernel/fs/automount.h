@@ -34,4 +34,14 @@ uint32_t automount_count(void);
 bool automount_at(uint32_t idx, const char **at, const char **dev,
                   const char **fs);
 
+/* The first FAT32 volume mounted, or NULL -- the boot log's way off a machine
+ * that has no other one. See automount.c. */
+struct fat32_volume;
+/* The `index`-th mounted FAT32 volume (0 = first), NULL past the last. An
+ * INDEX rather than "the first one", because a caller that means a PARTICULAR
+ * volume -- the one it booted from, say -- has to be able to look at them all
+ * and recognise it. Handing out the first one and hoping is how the boot log
+ * came to write itself onto someone's photo stick. */
+struct fat32_volume *automount_fat32_volume(int index);
+
 #endif

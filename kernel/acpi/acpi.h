@@ -246,7 +246,27 @@ struct acpi_power_info {
      * kernel with no reference cannot know how fast its own TSC runs. 0 =
      * absent (or not in I/O space, which is the only kind read here). */
     uint16_t pm_tmr_port;
+    /* IA-PC BOOT ARCHITECTURE FLAGS (FADT+109, ACPI 2.0 and later). The only
+     * place the firmware states whether this machine HAS the legacy hardware
+     * a PC kernel would otherwise just assume. Bit 1 is the 8042: a laptop
+     * whose keyboard and touchpad hang off I2C instead says 0 here, and a
+     * kernel that pokes 0x60/0x64 anyway is configuring a device that is not
+     * there. `iapc_valid` is false on an ACPI 1.0 FADT, where the field does
+     * not exist -- absence of the flag is not a claim that the 8042 is gone. */
+    bool     iapc_valid;
+    uint16_t iapc_boot_arch;
 };
+
+/* FADT IA-PC boot architecture flags (ACPI 6.x table 5.10). */
+#define ACPI_IAPC_LEGACY_DEVICES  (1u << 0)
+#define ACPI_IAPC_8042            (1u << 1)
+#define ACPI_IAPC_NO_VGA          (1u << 2)
+#define ACPI_IAPC_NO_MSI          (1u << 3)
+
+/* Does this machine have a PS/2 controller? Returns the firmware's answer and
+ * sets *known to false when the firmware did not say (ACPI 1.0, or no tables
+ * at all), in which case the caller should probe rather than believe. */
+bool acpi_i8042_present(bool *known);
 
 /* ---- what the AML interpreter answers (kernel/acpi/acpi_dev.c) ----------
  *

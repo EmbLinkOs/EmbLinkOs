@@ -297,6 +297,64 @@ static void scan_dot_path(struct lexer *L) {
 }
 
 /* -------------------------------------------------------------------------
+ * A FLAG: a word that starts with '-' -- `sh -c`, `ls -la`, `wget -O f`,
+ * `--verbose`, `--width=80`. A program's options are text, and without this
+ * `-c` lexed as a unary minus applied to the column `c`, so no program that
+ * takes a flag could be run from this shell. A '-' starts a flag only at the
+ * start of a word and only before a letter or another '-': `-3` is still a
+ * negative number and `a - b`, with spaces, still subtraction. The flag runs
+ * to the next space or anything that ends a command; it lexes as a bare word,
+ * which a command receives as its text.
+ * ------------------------------------------------------------------------- */
+static bool word_start(const struct lexer *L) {
+    if (L->pos == 0) return true;
+    char b = L->src[L->pos - 1];
+    return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '(' || b == '{' || b == '|' || b == ';';
+}
+
+static bool flag_at(const struct lexer *L) {
+    char n = L->src[L->pos + 1];
+    return word_start(L) && (is_alpha(n) || (n == '-' && is_alpha(L->src[L->pos + 2])));
+}
+
+static void scan_flag(struct lexer *L) {
+    size_t start = L->pos, col = L->col;
+    for (;;) {
+        char c = peek(L);
+        if (!c || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '|' || c == ';' || c == ')' ||
+            c == '}' || c == '&' || c == '"' || c == '\'') break;
+        advance(L);
+    }
+    struct token *t = emit(L, TOK_IDENT);
+    if (t) { t->lexeme = L->src + start; t->lexeme_len = L->pos - start; t->col = col; }
+}
+
+/* -------------------------------------------------------------------------
+ * A redirection word at the start of a token: out> out>> err> err>>
+ * out+err> out+err>> in<. Longest spelling first, so `out>>` is not read as
+ * `out>` and a stray `>`. Returns the kind, 0 for none; *len its length.
+ * ------------------------------------------------------------------------- */
+static int redirect_at(const struct lexer *L, size_t *len) {
+    static const struct { const char *s; int kind; } forms[] = {
+        { "out+err>>", REDIR_BOTH_APPEND }, { "out+err>", REDIR_BOTH },
+        { "out>>", REDIR_OUT_APPEND }, { "out>", REDIR_OUT },
+        { "err>>", REDIR_ERR_APPEND }, { "err>", REDIR_ERR },
+        { "in<", REDIR_IN },
+    };
+    /* only where a word could begin: not the tail of `layout>3` */
+    if (L->pos > 0) {
+        char b = L->src[L->pos - 1];
+        if (b != ' ' && b != '\t' && b != '\r' && b != '\n' && b != '|' && b != ';' && b != '(' && b != '{')
+            return 0;
+    }
+    for (size_t i = 0; i < sizeof forms / sizeof forms[0]; i++) {
+        size_t n = strlen(forms[i].s);
+        if (strncmp(L->src + L->pos, forms[i].s, n) == 0) { *len = n; return forms[i].kind; }
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Main loop
  * ------------------------------------------------------------------------- */
 struct token *lex(const char *src, size_t *out_n) {
@@ -320,7 +378,16 @@ struct token *lex(const char *src, size_t *out_n) {
         if (c == ' ' || c == '\t' || c == '\r') { advance(&L); continue; }
         if (c == '#') { while (peek(&L) && peek(&L) != '\n') advance(&L); continue; }
 
-        if (is_digit(c))            { scan_number(&L); }
+        size_t rlen = 0;
+        int rkind = (c == 'o' || c == 'e' || c == 'i') ? redirect_at(&L, &rlen) : 0;
+        if (rkind) {
+            size_t col = L.col;
+            for (size_t k = 0; k < rlen; k++) advance(&L);
+            struct token *t = emit(&L, TOK_REDIRECT);
+            if (t) { t->lexeme = L.src + L.pos - rlen; t->lexeme_len = rlen; t->col = col; t->int_val = rkind; }
+        }
+        else if (c == '-' && flag_at(&L)) { scan_flag(&L); }
+        else if (is_digit(c))       { scan_number(&L); }
         else if (c == '"' || c == '\'') { advance(&L); scan_string(&L, c); }
         else if (c == '$' && peek2(&L) == '(') {
             size_t col = L.col;
@@ -364,6 +431,7 @@ void lex_free_tokens(struct token *toks, size_t n) {
 const char *tok_type_name(enum tok_type t) {
     switch (t) {
         case TOK_DOLLAR_LPAREN: return "'$('"; case TOK_AMP: return "'&'";
+        case TOK_REDIRECT: return "a redirection";
         case TOK_NEWLINE: return "newline"; case TOK_SEMI: return "';'";
         case TOK_LBRACE: return "'{'"; case TOK_RBRACE: return "'}'";
         case TOK_IF: return "if"; case TOK_ELSE: return "else";

@@ -52,6 +52,63 @@ static const char *g_launch_dir = 0;
 static char        g_clock[32] = "up 0:00";
 static char        g_datetime[48] = "--:--";
 static float       g_sw = 0, g_sh = 0;   /* screen size (the desktop window) */
+
+/* THE MONITORS. The desktop window spans every one (one surface,
+ * embk_monitor.h); each monitor shows a whole wallpaper of its own, and the
+ * dock, the lock card and every sheet belong to the primary -- centred on the
+ * whole desktop they would land across the seam between two monitors. With
+ * one monitor the primary is the whole screen. */
+#define HOME_MAX_OUT 4
+static float    g_px, g_py, g_pw, g_ph;           /* the primary monitor */
+static int      g_nout;
+static float    g_ox[HOME_MAX_OUT], g_oy[HOME_MAX_OUT], g_ow[HOME_MAX_OUT], g_oh[HOME_MAX_OUT];
+static uint32_t g_out_gen;
+static uint32_t g_out_set;      /* which monitors are connected (display_arrange.h) */
+static unsigned g_out_connected;
+
+static void outputs_poll(void) {
+    struct embk_display_layout d;
+    d.version = EMBK_DISPLAY_LAYOUT_VERSION;
+    g_nout = 0; g_px = g_py = 0; g_pw = g_sw; g_ph = g_sh;
+    if (embk_display_layout(&d) || !d.count) return;
+    g_out_gen = d.generation;
+    g_out_set = arrange_connected_set(&d);
+    g_out_connected = arrange_connected(&d);
+    for (unsigned i = 0; i < d.count && i < EMBK_DISPLAY_MAX_OUTPUTS && g_nout < HOME_MAX_OUT; i++) {
+        const struct embk_output *o = &d.outputs[i];
+        if (!(o->flags & EMBK_OUTPUT_ENABLED) || !o->width || !o->height) continue;
+        g_ox[g_nout] = (float)o->x; g_oy[g_nout] = (float)o->y;
+        g_ow[g_nout] = (float)o->width; g_oh[g_nout] = (float)o->height;
+        if (o->flags & EMBK_OUTPUT_PRIMARY) { g_px = g_ox[g_nout]; g_py = g_oy[g_nout]; g_pw = g_ow[g_nout]; g_ph = g_oh[g_nout]; }
+        g_nout++;
+    }
+}
+
+/* The monitor a point is on, or the nearest; 1 when it is the primary. */
+static int out_of(float x, float y, float *ox, float *oy, float *ow, float *oh) {
+    int best = -1; float bestd = 0;
+    for (int i = 0; i < g_nout; i++) {
+        float cx = x < g_ox[i] ? g_ox[i] : x > g_ox[i] + g_ow[i] - 1 ? g_ox[i] + g_ow[i] - 1 : x;
+        float cy = y < g_oy[i] ? g_oy[i] : y > g_oy[i] + g_oh[i] - 1 ? g_oy[i] + g_oh[i] - 1 : y;
+        float d = (cx - x) * (cx - x) + (cy - y) * (cy - y);
+        if (best < 0 || d < bestd) { best = i; bestd = d; }
+    }
+    if (best < 0) { *ox = 0; *oy = 0; *ow = g_sw; *oh = g_sh; return 1; }
+    *ox = g_ox[best]; *oy = g_oy[best]; *ow = g_ow[best]; *oh = g_oh[best];
+    return g_ox[best] == g_px && g_oy[best] == g_py;
+}
+
+/* A zero-sized overlay root with one child at (x, y): how anything is put
+ * on a particular monitor of the desktop window. */
+static void at_begin(uint64_t key, float x, float y) {
+    em_flush();
+    ui_begin_vstack(key); ui_set_overlay(true);
+    ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 },
+                (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
+    ui_set_clip_children(false);
+    ui_begin_vstack(key ^ 0x5157ull); ui_set_offset(x, y);
+}
+static void at_end(void) { ui_end_stack(); ui_end_stack(); }
 static char      **g_session_env = 0;
 
 static void launch_folder(const char *path) {
@@ -942,8 +999,10 @@ static void lock_ui(void) {
          * how a lock gets asked for -- show straight through the top of the
          * lock screen. Measured: the whole of that rectangle was still the
          * desktop, seconds later, hummingbird and all. */
-        VStack(.width = g_sw, .height = g_sh, .align = Center, .justify = Center,
+        VStack(.width = g_sw, .height = g_sh, .align = Leading, .justify = Leading,
                .spacing = 0, .background = lock_tint(), .key = key) {
+          at_begin(0x10C4CA2Dull, g_px, g_py);
+          VStack(.width = g_pw, .height = g_ph, .align = Center, .justify = Center, .spacing = 0) {
             /* FILL, not Leading: a Leading card hugs its children, and a
              * password field that hugs its (empty) content is a 28-pixel box
              * -- which is what the first version drew. */
@@ -973,6 +1032,8 @@ static void lock_ui(void) {
                 }
                 if (g_lock_msg[0]) Text(g_lock_msg).caption().color(lock_warn());
             }
+          }
+          at_end();
         }
     }
     /* NO dismissal. The launcher closes when the scrim is clicked and Esc
@@ -984,12 +1045,13 @@ static void lock_ui(void) {
 static void apps_grid(void) {
     if(!g_apps_open)return;
     g_apps_frames++;
-    float width=g_sw-96;if(width>720)width=720;
-    float height=g_sh-132;if(height>536)height=536;
+    float width=g_pw-96;if(width>720)width=720;
+    float height=g_ph-132;if(height>536)height=536;
     int cols=width<560?4:6;
     char sheet[24];snprintf(sheet,sizeof sheet,"apps%u",g_apps_gen);
     Overlay() {
-        VStack(.width=g_sw,.height=g_sh,.align=Center,.justify=Center,.key=sheet) {
+        at_begin(0xA995EE7ull, g_px, g_py);
+        VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {
             Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
                 HStack(.spacing=12,.align=Center) {
                     Icon(IconGrid).color(T.accent);
@@ -1023,6 +1085,7 @@ static void apps_grid(void) {
                 Text("Drag an application to the dock to keep it close.").caption().secondary();
             }
         }
+        at_end();
     }
     if(g_apps_frames>=3 && OverlayDismissed())apps_set_open(0);
 }
@@ -1034,12 +1097,16 @@ static void apps_grid(void) {
 
 /* Keep an icon fully inside the work area (below the top bar, above the dock). */
 static void desk_clamp(struct app_item *it) {
-    float maxx = g_sw - DESK_CELL_W - DESK_MARGIN;
-    float maxy = g_sh - 64 - DESK_CELL_H - DESK_MARGIN;
-    if (maxx < DESK_MARGIN) maxx = DESK_MARGIN;
-    if (maxy < 40) maxy = 40;
-    if (it->x < DESK_MARGIN) it->x = DESK_MARGIN;
-    if (it->y < 40) it->y = 40;
+    /* ...of the monitor it is on: the bars only take room on the primary. */
+    float ox, oy, ow, oh;
+    int prim = out_of(it->x + DESK_CELL_W / 2, it->y + DESK_CELL_H / 2, &ox, &oy, &ow, &oh);
+    float minx = ox + DESK_MARGIN, miny = oy + (prim ? 40 : DESK_MARGIN);
+    float maxx = ox + ow - DESK_CELL_W - DESK_MARGIN;
+    float maxy = oy + oh - (prim ? 64 : 0) - DESK_CELL_H - DESK_MARGIN;
+    if (maxx < minx) maxx = minx;
+    if (maxy < miny) maxy = miny;
+    if (it->x < minx) it->x = minx;
+    if (it->y < miny) it->y = miny;
     if (it->x > maxx) it->x = maxx;
     if (it->y > maxy) it->y = maxy;
 }
@@ -1047,11 +1114,11 @@ static void desk_clamp(struct app_item *it) {
 /* Give any unplaced icon a spot: down the left edge, wrapping into a new
  * column at the bottom -- the arrangement the desktop used to hard-code. */
 static void desk_autoplace(void) {
-    float x = DESK_MARGIN, y = 48;
+    float x = g_px + DESK_MARGIN, y = g_py + 48;
     for (int i = 0; i < g_desk_n; i++) {
         if (g_desk[i].placed) continue;
-        while (y + DESK_CELL_H > g_sh - 64 - DESK_MARGIN && x + DESK_CELL_W * 2 < g_sw) {
-            x += DESK_CELL_W + 8; y = 48;          /* column full -> next column */
+        while (y + DESK_CELL_H > g_py + g_ph - 64 - DESK_MARGIN && x + DESK_CELL_W * 2 < g_px + g_pw) {
+            x += DESK_CELL_W + 8; y = g_py + 48;   /* column full -> next column */
         }
         g_desk[i].x = x; g_desk[i].y = y; g_desk[i].placed = 1;
         desk_clamp(&g_desk[i]);
@@ -1373,7 +1440,30 @@ static void home_ui(void) {
             int wi = (g_cfg.wallpaper >= 0 && g_cfg.wallpaper < OSCFG_WALLPAPERS)
                      ? g_cfg.wallpaper : 0;
             const struct oscfg_wallpaper *wp = &oscfg_wallpapers[wi];
-            if (wp->path) {
+            if (g_nout > 1) {
+                /* SEVERAL MONITORS: each shows the whole picture, not its
+                 * slice of one stretched across them all. */
+                for (int i = 0; i < g_nout; i++) {
+                    at_begin(0xBAC70000ull + (uint64_t)i, g_ox[i], g_oy[i]);
+                    ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_ow[i] },
+                                (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_oh[i] });
+                    if (wp->path) {
+                        uint32_t iw = 0, ih = 0;
+                        const uint32_t *ipx = em_image(wp->path, &iw, &ih);
+                        if (ipx) ui_image_fill((uint64_t)(uintptr_t)ipx, ipx, iw, ih);
+                    } else {
+                        ui_box_begin(0xBAC6D100ull + (uint64_t)i);
+                        ui_set_paint(em_lgrad3(
+                            (Color){ wp->a[0], wp->a[1], wp->a[2], 1.f },
+                            (Color){ wp->b[0], wp->b[1], wp->b[2], 1.f },
+                            (Color){ wp->c[0], wp->c[1], wp->c[2], 1.f }, wp->angle));
+                        ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_ow[i] },
+                                    (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_oh[i] });
+                        ui_box_end();
+                    }
+                    at_end();
+                }
+            } else if (wp->path) {
                 BackgroundImage(wp->path);
             } else {
                 /* A DRAWN wallpaper. Same node, same place in the tree as the
@@ -1393,11 +1483,13 @@ static void home_ui(void) {
         {
             float px,py;ui_pointer_pos(&px,&py);
             int band=oscfg_dock_band(&g_cfg);
-            int show=!g_cfg.dock_autohide || g_drag ||
-                (g_cfg.dock_edge==1?px<band:g_cfg.dock_edge==2?px>g_sw-band:py>g_sh-band-(g_cfg.bar_edge?g_cfg.bar_size:0));
+            /* On the primary monitor, like the top bar. */
+            int on_primary=px>=g_px && px<g_px+g_pw && py>=g_py && py<g_py+g_ph;
+            int show=!g_cfg.dock_autohide || g_drag || (on_primary &&
+                (g_cfg.dock_edge==1?px<g_px+band:g_cfg.dock_edge==2?px>g_px+g_pw-band:py>g_py+g_ph-band-(g_cfg.bar_edge?g_cfg.bar_size:0)));
             float extent=24+g_dock_n*DOCK_SLOT_W+(g_dock_n?g_dock_n-1:0)*10;
-            float x=g_cfg.dock_edge==1?10:g_cfg.dock_edge==2?g_sw-DOCK_PILL_H-10:(g_sw-extent)*.5f;
-            float y=g_cfg.dock_edge?(g_sh-extent)*.5f:g_sh-DOCK_BAND-(g_cfg.bar_edge?g_cfg.bar_size:0);
+            float x=g_px+(g_cfg.dock_edge==1?10:g_cfg.dock_edge==2?g_pw-DOCK_PILL_H-10:(g_pw-extent)*.5f);
+            float y=g_py+(g_cfg.dock_edge?(g_ph-extent)*.5f:g_ph-DOCK_BAND-(g_cfg.bar_edge?g_cfg.bar_size:0));
             em_flush();ui_begin_vstack(0xD0C4B0);ui_set_overlay(true);
             ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=0},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=0});
             ui_set_clip_children(false);
@@ -1749,6 +1841,7 @@ int main(int argc, char **argv, char **envp) {
         return 1;
     }
     g_sw = (float)sw; g_sh = (float)sh;   /* home_ui sizes the Screen to these */
+    outputs_poll();
     /* ...and TELL THE TOOLKIT, which em_app_run would have done for us. em
      * sizes popover dismiss-scrims to the viewport, so an unset one leaves a
      * 0x0 scrim: the context menu would open and then refuse to be dismissed
@@ -1778,15 +1871,23 @@ int main(int argc, char **argv, char **envp) {
     spawn_app("/system/bin/notifyd.elf", NULL);
     embk_puts(1, "home: desktop ready\n");
 
-    uint64_t screen_next=0,restore_token=0;int restore_attempted=0,restore_presented=0;
+    uint64_t screen_next=0,restore_token=0,arr_token=0;int restore_attempted=0,restore_presented=0;
+    uint32_t arr_set_tried=0,presented_gen=0;   /* the display layout the last presented frame was drawn for */
     for (;;) {
         cfg_poll(); /* Load saved preferences before deciding whether to restore a mode. */
         if(embk_uptime_ms()>=screen_next) {
             screen_next=embk_uptime_ms()+200;uint32_t nw=0,nh=0;embk_screen_size(&nw,&nh);
+            uint32_t gen_before=g_out_gen;outputs_poll();
+            if(g_out_gen!=gen_before && nw==sw && nh==sh) {
+                /* The monitors moved under the same desktop size: re-place, repaint. */
+                for(int i=0;i<g_desk_n;i++)desk_clamp(&g_desk[i]);
+                g_invalidate=2;g_full_present=2;em_structure_changed();
+            }
             if(nw && nh && (nw!=sw || nh!=sh)) {
                 void *next=NULL;
                 if(embk_win_resize(win,nw,nh,&next)>=0 && next) {
                     restore_presented=0;pixels=next;sw=nw;sh=nh;g_sw=nw;g_sh=nh;em_set_viewport(nw,nh);
+                    outputs_poll();
                     rt=(struct render_target){(uint32_t *)pixels,nw,nh,nw*4,EMBK_PIXFMT_BGRA8888_PRE};
                     scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());
                     for(int i=0;i<g_desk_n;i++)desk_clamp(&g_desk[i]);
@@ -1803,7 +1904,9 @@ int main(int argc, char **argv, char **envp) {
                         struct embk_monitor_request req={.version=1,.token=restore_token};
                         if(!embk_monitor(EMBK_MONITOR_KEEP,&req,sizeof req))restore_token=0;
                     }
-                }else if(g_cfg.display_width && g_cfg.display_height && (monitor.flags&EMBK_MONITOR_MODESET)) {
+                }else if(g_cfg.display_width && g_cfg.display_height && (monitor.flags&EMBK_MONITOR_MODESET) && g_out_connected<2) {
+                    /* One monitor's resolution. With several connected, what
+                     * comes back is their arrangement, below. */
                     if(monitor.width==(unsigned)g_cfg.display_width && monitor.height==(unsigned)g_cfg.display_height)restore_attempted=1;
                     else if(monitor.phase==EMBK_MONITOR_IDLE || monitor.phase==EMBK_MONITOR_ERROR) {
                         struct embk_monitor_request req={1,monitor.generation,g_cfg.display_width,g_cfg.display_height,0};
@@ -1812,6 +1915,42 @@ int main(int argc, char **argv, char **envp) {
                         else if(rc!=-1)restore_attempted=1;
                     }
                 }else restore_attempted=1;
+            }
+        }
+        /* SEVERAL MONITORS: the arrangement kept in Settings comes back
+         * whenever exactly its monitors are connected -- at login, and every
+         * time they are plugged in again, by which point the kernel has put
+         * the newcomer on the right. The same trial as the resolution above,
+         * confirmed once the desktop has drawn a frame at the arranged size.
+         * An arrangement made for other monitors is left alone
+         * (display_arrange.h), and nothing is tried behind the lock. */
+        if(arr_token || (g_out_set!=arr_set_tried && !g_locked)) {
+            struct embk_display_layout d;
+            if(!embk_display_layout(&d)) {
+                if(arr_token) {
+                    struct embk_monitor_info m;
+                    if(embk_monitor(EMBK_MONITOR_GET,&m,sizeof m) || m.token!=arr_token || !(m.flags&EMBK_MONITOR_OWN_TRIAL))arr_token=0;
+                    else if(restore_presented && presented_gen==d.generation && m.phase==EMBK_MONITOR_TRIAL &&
+                            sw==d.desktop_width && sh==d.desktop_height) {
+                        struct embk_monitor_request req={.version=1,.token=arr_token};
+                        if(!embk_monitor(EMBK_MONITOR_KEEP,&req,sizeof req)) {
+                            arr_token=0;embk_puts(1,"home: saved display arrangement restored\n");
+                        }
+                    }
+                }else if(d.phase==EMBK_MONITOR_IDLE || d.phase==EMBK_MONITOR_ERROR) {
+                    uint32_t set=arrange_connected_set(&d);
+                    struct embk_layout_request r;
+                    if(!(d.flags&EMBK_LAYOUT_MULTI) || arrange_connected(&d)<2 ||
+                       arrange_saved_request(&d,&g_cfg.display_layout,&r)!=1)arr_set_tried=set;
+                    else {
+                        int rc=embk_monitor(EMBK_MONITOR_LAYOUT_APPLY,&r,sizeof r);
+                        if(!rc) {
+                            struct embk_monitor_info m;
+                            if(!embk_monitor(EMBK_MONITOR_GET,&m,sizeof m))arr_token=m.token;
+                            restore_presented=0;arr_set_tried=set;
+                        }else if(rc!=-EMBK_EPERM && rc!=-EMBK_EBUSY && rc!=-EMBK_EAGAIN)arr_set_tried=set;
+                    }
+                }
             }
         }
         /* TAKEN HERE, a frame after the menu item was chosen and a frame after
@@ -1897,7 +2036,7 @@ int main(int argc, char **argv, char **envp) {
 
         if (r.full || r.n_dirty == 0 || g_full_present > 0) {
             if (g_full_present > 0) g_full_present--;
-            if(embk_win_present(win, pixels, sw, sh)>=0)restore_presented=1;
+            if(embk_win_present(win, pixels, sw, sh)>=0){restore_presented=1;presented_gen=g_out_gen;}
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
             if (r.has_scroll_present) {           /* a scroll blit moved pixels */

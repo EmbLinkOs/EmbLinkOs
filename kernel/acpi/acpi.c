@@ -334,6 +334,13 @@ static bool find_s5(const struct acpi_sdt_header *t, uint8_t *typa, uint8_t *typ
     return false;
 }
 
+bool acpi_i8042_present(bool *known) {
+    bool k = g_power.fadt_found && g_power.iapc_valid;
+    if (known) *known = k;
+    if (!k) return true;               /* unknown: let the caller probe */
+    return (g_power.iapc_boot_arch & ACPI_IAPC_8042) != 0;
+}
+
 static bool fadt_has(const struct acpi_fadt *f, size_t off, size_t size) {
     return f->header.length >= off + size;
 }
@@ -354,6 +361,13 @@ static void parse_power(const struct rsdp *r) {
 
     uint32_t flags = fadt_has(f, offsetof(struct acpi_fadt, flags), 4) ? f->flags : 0;
     g_power.hw_reduced = (flags & ACPI_FADT_HW_REDUCED) != 0;
+
+    /* What legacy hardware does the firmware admit to? Read only if the table
+     * is long enough to hold the field (an ACPI 1.0 FADT stops before it). */
+    if (fadt_has(f, offsetof(struct acpi_fadt, iapc_boot_arch), 2)) {
+        g_power.iapc_valid     = true;
+        g_power.iapc_boot_arch = f->iapc_boot_arch;
+    }
 
     /* The PM timer: the 64-bit GAS when it is filled in and in I/O space, the
      * ACPI 1.0 port otherwise. A hardware-reduced platform has none. */

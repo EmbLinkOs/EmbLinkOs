@@ -54,10 +54,20 @@ struct expr {
 };
 
 /* --- pipeline / command --- */
+/* Where one of a command's streams goes: `out> notes.txt`. The target is an
+ * expression like any argument -- a bare word is the path itself, `$f` and
+ * `"..."` are evaluated -- and `kind` is lex.h's enum redirect_kind. */
+struct redirect {
+    int          kind;
+    struct expr *target;   /* owned */
+};
+
 struct command {
     char         *name;    /* "ls", "where", ... (owned) */
     struct expr **args;    /* each arg is an expression (owned) */
     size_t        nargs;
+    struct redirect *redirs;   /* in the order written (owned) */
+    size_t        nredirs;
     size_t        line, col;
 };
 

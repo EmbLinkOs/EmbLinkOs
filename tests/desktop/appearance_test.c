@@ -24,6 +24,30 @@ int main(void) {
     for(int i=0;i<OSCFG_PRESETS;i++){oscfg_preset(&copy,i);CHECK(copy.display_width==1920 && copy.display_height==1080);}
     copy.display_width=INT_MAX;oscfg_clamp(&copy);CHECK(!copy.display_width && !copy.display_height);
     copy.display_width=1280;copy.display_height=0;oscfg_clamp(&copy);CHECK(!copy.display_width && !copy.display_height);
+    /* The saved arrangement of several monitors: exact round trip, kept by
+     * presets, dropped whole when any part of it is wrong. */
+    c.display_layout=(struct display_saved){0,3,{{0xDEADBEEFu,1,1,1920,1080,2560,180},{0x12345678u,1,0,2560,1440,0,0},{77u,0,0,0,0,0,0}}};
+    n=oscfg_format(&c,out,sizeof out);CHECK(n>0);
+    CHECK(strstr(out,"display_output 3735928559 1 1 1920 1080 2560 180\n")!=NULL);
+    oscfg_defaults(&copy);oscfg_parse(&copy,out);oscfg_clamp(&copy);
+    CHECK(!memcmp(&copy.display_layout,&c.display_layout,sizeof c.display_layout));
+    for(int i=0;i<OSCFG_PRESETS;i++){oscfg_preset(&copy,i);CHECK(!memcmp(&copy.display_layout,&c.display_layout,sizeof c.display_layout));}
+    {
+        static const char *bad[]={
+            "display_mirror 0\ndisplay_output 1 1 1 1920\n",                                       /* short */
+            "display_mirror 0\ndisplay_output 1 1 1 1920 1080 0 0\ndisplay_output 2 1 1 1920 1080 1920 0\n", /* two primaries */
+            "display_mirror 0\ndisplay_output 1 1 1 99999 1080 0 0\n",                             /* no such size */
+            "display_mirror 0\ndisplay_output 0 1 1 1920 1080 0 0\n",                              /* no identity */
+            "display_mirror 0\ndisplay_output 1 0 0 1920 1080 0 0\ndisplay_output 2 1 1 1920 1080 0 0\n", /* off, with a size */
+            "display_mirror 0\ndisplay_output 1 1 1 640 480 0 0\ndisplay_output 2 1 0 640 480 640 0\ndisplay_output 3 1 0 640 480 1280 0\ndisplay_output 4 1 0 640 480 1920 0\ndisplay_output 5 1 0 640 480 2560 0\n", /* five */
+        };
+        for(unsigned i=0;i<sizeof bad/sizeof bad[0];i++) {
+            char text[512];snprintf(text,sizeof text,"%s",bad[i]);
+            oscfg_defaults(&copy);oscfg_parse(&copy,text);oscfg_clamp(&copy);
+            CHECK(copy.display_layout.count==0 && !copy.display_layout.out[0].id);
+        }
+    }
+    c.display_layout=(struct display_saved){0};
     #define SET_MAX(name,value,lo,hi) c.name=INT_MAX;
     OSCFG_CONTOUR_FIELDS(SET_MAX)
     #undef SET_MAX

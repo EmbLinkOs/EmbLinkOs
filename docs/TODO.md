@@ -1479,10 +1479,128 @@ it can only be late.
   an accelerated guest-memory scan-out (TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
   per dirty rect). `framebuffer.c` gained a RAM backbuffer with dirty-rect
   `fb_present()`, clipped fill/copy rects, lines, circles, alpha-blit.
-  Remaining: `virtio_gpu.c` only negotiates VIRTIO_F_VERSION_1 (no indirect
-  descriptors, no multiple scanouts, no 3D/Virgl); `bochs_vbe.c` has no
-  `-vga qxl` support. (The LFB mapping is now write-combining via
+  Since then `virtio_gpu.c` drives several scanouts and, with VIRGL, a 3D
+  context the compositor draws through (docs/DISPLAYS.md, "GPU composition").
+  Remaining: no indirect descriptors; `bochs_vbe.c` has no `-vga qxl` support. (The LFB mapping is now write-combining via
   `vmm_map_mmio_wc` — see the `vmm_map_mmio` entry above.)
+
+### Native display, multiple monitors, GPU acceleration -- in that order (2026-10-25)
+
+The order is the user's. Target hardware for the native work is the HP
+ProBook 450 G7 (Comet Lake-U, Gen9 display, Comet Point PCH, eDP panel);
+see docs/DISPLAYS.md. QEMU has no Intel display engine, so each Intel step is
+done when the laptop shows it, not when a host test passes.
+
+- [x] **Step 1, capture.** `/EMBKDISP.BIN` on the boot stick: PCI, OpRegion
+      and VBT, every Gen9 display register block, DPCD and EDID over AUX,
+      HDMI EDID over GMBUS, pcode memory latencies, the framebuffer's GTT
+      entries. Read-only apart from AUX/GMBUS/pcode requests.
+      `tools/intel_display_dump.py` decodes it. Host-tested against a
+      simulated laptop (`tests/drivers/intel_capture_test.c`,
+      `intel_capture_decode_test.py`).
+- [ ] **The ProBook's own capture.** Boot the stick on the laptop and read
+      back `EMBKDISP.BIN`. Until it exists, every later step would be written
+      against assumptions about this board's wiring.
+- [ ] **The capture runs on every boot of Intel hardware.** About one file
+      and a few milliseconds of AUX traffic. Once native modesetting is
+      verified it should become something asked for, not something always
+      done.
+- [x] **Step 2, the arithmetic** (`intel_config.c`): DP link choice and
+      fallback, M/N, HDMI WRPLL, CDCLK, DDB split, watermarks from the pcode
+      latencies, panel fitter -- checked against values worked by hand.
+- [x] **Step 3, eDP modeset** (`intel_hw.c`, `intel_native.c`): power wells,
+      CDCLK with the pcode handshake, DPLLs, DDI clocks and buffers, link
+      training (CR/EQ, TPS3, the eDP rate table, fallback), transcoder,
+      plane, DDB and watermarks, panel power sequencing, backlight, GGTT
+      framebuffers. Inherits the firmware's mode when it is the panel's own.
+      Checked against a register model (`intel_hw_test.c`, `intel_native_test.c`).
+- [x] **Step 4, other modes on the panel** through the pipe scaler, behind
+      Settings → Displays, with the previous mode restored when one fails.
+- [ ] **None of it has run on Intel silicon.** QEMU has no Intel display
+      engine. The ProBook's capture and one boot of the stick are the test.
+- [ ] **The built-in DDI buffer translation tables are transcribed from
+      i915** (`intel_trans_dp`, `intel_trans_hdmi` in `intel_hw.c`). A port
+      the firmware programmed keeps the firmware's table, so the eDP panel
+      never depends on them; HDMI and an unlit DP port do. Compare them with
+      the capture's DDI B-D tables once a monitor was lit by the firmware.
+- [x] **Step 5, external outputs** (`intel_native.c`): the VBT's DP and HDMI
+      ports on DDI B-D, monitors found by their hotplug lines and asked over
+      AUX (DPCD, EDID) or GMBUS (EDID; DP++ passive adaptors; HDMI or DVI
+      from the CTA block), modes filtered by link, TMDS and display clock;
+      up to three pipes scanning one surface, PLLs shared or assigned, the
+      display buffer re-split in a safe order, CDCLK raised when needed, a
+      failed layout undone. Checked against a register model
+      (`intel_native_test.c`).
+- [ ] **DP++ adaptors** (HDMI through a level shifter on a DP port): the
+      adaptor's TMDS-output enable over DDC is not written.
+- [ ] **CDCLK's VCO never changes.** eDP rates that need the other VCO
+      (2.16/4.32 Gbps under 8100 MHz, or 1.62/2.7/5.4 under 8640) are vetoed
+      rather than reached by re-clocking DPLL0, which would need every pipe
+      off.
+- [ ] **SAGV is left as the firmware set it.** i915 disables it through pcode
+      when a pipe's watermarks cannot ride out the SAGV block time; this
+      driver does not, so a configuration that needs it could underrun.
+- [ ] **An underrun is only reported** (`intel-native: pipe X underran`),
+      not acted on.
+- [x] **Multiple monitors** (docs/DISPLAYS.md, "Several monitors"): one
+      desktop surface over every monitor in use, extend and mirror, a
+      primary that carries the menu bar and dock, a wallpaper per monitor;
+      hotplug extends and shrinks it; windows cross monitors, fill the one
+      they are on, and travel with their monitor when it is rearranged;
+      Settings arranges the displays (use, resolution, position, primary,
+      extend/mirror) through the keep/revert trial; the kept arrangement is
+      saved per set of monitors and restored at login and on reconnection.
+      VirtIO GPU multi-head and native Intel. Host-tested (layout,
+      controller, arrangement, preferences) and run in QEMU with two heads
+      (`tools/multimonitor_smoke.py`, captures 138-145).
+- [ ] **Multiple monitors on the ProBook.** The Intel external outputs have
+      only met the register model. The laptop's HDMI port and USB-C DP with a
+      monitor on each are the test, as for the panel.
+- [ ] **Plugging monitors in and out while running is not exercised in QEMU.**
+      Headless QEMU cannot connect a head after boot; the controller test
+      drives that path with a fake two-output driver instead.
+- [ ] **DisplayPort MST** (docks, daisy chains) is not spoken: an MST hub
+      shows at most its first monitor, in SST mode.
+- [ ] **One timing per size.** A monitor's modes are offered by size; the
+      refresh rate is the preferred mode's, or the one nearest 60 Hz. No
+      refresh-rate choice, no per-monitor interface scale, no rotation.
+- [ ] **A DP sink without an EDID** (an adaptor with nothing behind it, some
+      KVMs) counts as nothing connected; i915 falls back to 1024x768.
+- [ ] **Connections are polled once a second**, not taken from the hotplug
+      interrupt.
+- [x] ~~**GPU acceleration**~~ -- the desktop is composed on the GPU
+      (docs/DISPLAYS.md, "GPU composition"): through virgl on QEMU's
+      virtio-vga-gl (frame for frame with the CPU compositor in
+      `tools/virgl_smoke.py`), and with the Gen9 blitter on Intel (execlists,
+      aliasing PPGTT; blits for every copy and fill, the CPU for what blends;
+      proven on a model of the engine). Both probe the hardware first and fall
+      back to the CPU on any failure. Remaining:
+  - [ ] **The blitter has not run on the ProBook.** Bring-up, the probe blit
+        and a frame need checking on the machine (`intel-blt:` and
+        `compositor: composing on the Intel blitter` in the log, Settings >
+        Displays > Rendering).
+  - [ ] **Blending on Intel is the CPU's.** Glass, translucent windows,
+        shadows and rounded corners are drawn by `soft_compose.c`; the render
+        engine (RCS with real shaders) would take them.
+  - [ ] **The pointer is drawn into each frame.** virtio-gpu has a cursor
+        queue and Gen9 a cursor plane; neither is used.
+  - [ ] **No GPU rendering for applications.** The 3D context is the
+        compositor's; EmUI apps still rasterise on the CPU.
+- [x] ~~**Then the shell**~~ -- done (docs/SHELL.md §3 Scripts, §7): text
+      programs in pipelines (input as text, stdout captured unless the
+      program ends a statement, where it keeps the terminal -- interactive
+      programs work), `out>`/`err>`/`out+err>`/`in<` and their appending forms
+      on programs and builtins, flags (`-c`, `--x`) as words, arguments
+      expanded from lists and tables with the kernel's limits named when
+      broken, `#!` in the kernel with `$args`, `source`, `assert`, `which`
+      saying what kind a command is. `test shellio` checks all of it on the OS.
+      Remaining:
+  - [ ] Here-documents and POSIX's `2>&1` spelling in the native shell (sh
+        has both).
+  - [ ] Streaming text stages: a text program's output is captured whole
+        (to 16 MB) before the next stage runs.
+  - [ ] A larger argument budget: argv and the environment share one 4 KiB
+        page at a program's start (kernel/process/process.c).
 
 ### Keyboard
 
@@ -7697,7 +7815,264 @@ for them to run against:
       a long sequential run; the rerun passed. The harness missed the verdict
       line rather than the program failing -- but that is an inference, not a
       measurement.
-
 - [ ] Give the parallel raw key-event stream explicit event-time process/session
   ownership, including queued-event handling across login/lock transitions;
   the new character/modifier poll retains the existing focused-reader gate.
+
+**The kernel is not relocatable, and the ceiling is close**
+
+- [ ] **The per-core fault stacks live in .bss**: 16 KB for ring-3 entry plus
+      16 KB for #DF, per slot in `cpu_table`, so MAX_CPUS costs 32 KB each in
+      the kernel IMAGE. That is why MAX_CPUS is 16 and why the image has to be
+      watched (`tools/kernel_fits.py`, run at every link). Allocating those
+      stacks per core at bring-up would free a megabyte and let MAX_CPUS go
+      back up; a relocatable kernel would remove the ceiling altogether. Until
+      then the guard fails the build rather than a machine failing to boot.
+      *Since master linked the kernel at 32 MiB (`docs/UPDATES.md`), the 8 MiB
+      reservation no longer bounds it: the guard holds a 32 MiB budget above
+      the link address, which is a budget and not a measurement -- no real
+      machine's memory map above 32 MiB has been read yet.*
+
+**Instruments left behind from the EMBKFS corruption hunt**
+
+- [ ] `test embkfs verify-writes` switches on two things that are off by
+      default: every metadata block is read back immediately after writing and
+      compared, and every allocation, free and write of the low blocks (1..15,
+      the ones before the superblock, which the allocator hands out first) is
+      traced. They cost I/O, which is why they are a switch -- but they are
+      what found the fault, so they stay. The re-read on a failed checksum, and
+      the line that prints which block and generation the bytes claim to be,
+      run always: they are failure paths and they turn one unusable symptom
+      into a diagnosis.
+- [ ] **The ATA DMA paths now wait for the CONTROLLER to report completion**
+      (bus-master Interrupt set, Active clear) rather than trusting the drive's
+      interrupt alone, acknowledge a pending drive interrupt before issuing,
+      and poison the destination so a transfer that moves nothing cannot be
+      silent. All three are correct by the specification and none of them fixed
+      the corruption that prompted them -- that was the unlocked rename. Worth
+      keeping, worth being honest about.
+
+**USB: one transaction at a time, and the one place that still is not**
+
+The USB block drivers had no lock. Two threads doing I/O through one host
+controller share its command ring, its event ring and its bounce buffers, and
+each waits for its own completion by reading the event ring in a loop -- so
+whoever polls first consumes the other's completion and the other reports a
+transfer that "failed". Above that it is an I/O error on a stick that is
+working perfectly. It is the bug `ata.c` had (`g_ata_lock`), and the answer is
+the same: a sleeping lock around each request, in `xhci.c` (`g_xhci_bus_lock`)
+and in `usb_core.c` (`usb_bus_lock`, shared by UHCI/OHCI/EHCI).
+
+- [ ] **The 500 ms hotplug rescan runs unlocked, on purpose.** A rescan that
+      finds a stick enumerates AND MOUNTS it before returning, and the mount
+      reads blocks -- taking the filesystem lock first and the USB lock second,
+      which is the order a file read takes them in too. Holding the USB lock
+      across the rescan would take them in the opposite order, and two threads
+      doing that hangs the machine outright: strictly worse than the problem.
+      So the transfers under the rescan are serialised individually and the
+      scan itself is not, which leaves one window: plug something in at the
+      exact moment another thread is mid-transfer and a completion can still be
+      taken. The cost is a retry, not corruption. Closing it properly means
+      registering the new block device OUTSIDE the enumeration -- deferring the
+      `embk_block_register` call to after the scan drops the lock -- which is a
+      change to boot ordering on a machine that currently boots, so it waits
+      for a day when it can be measured on that machine rather than guessed at.
+
+**The boot log wrote itself onto whatever stick was plugged in**
+
+`automount_fat32_volume()` returned "the first mounted FAT32 volume", and the
+boot log wrote 64 KB there every five seconds. Plug a stick into a running
+EmbLinkOS and it is mounted within half a second -- and if it took the first
+slot, the log landed on someone else's stick, over the same USB pipe they were
+reading through. `tools/usb_hotplug.py` caught it as an OHCI bulk timeout and a
+volume that "is mounted but cannot be listed". The boot volume is now
+recognised rather than guessed: the one carrying `/EFI/BOOT/BOOTX64.EFI`, the
+loader that started this kernel, pinned once found.
+
+**PS/2 has one owner now (`kernel/drivers/input/i8042.c`)**
+
+`keyboard.c` and `mouse.c` each did their own read-modify-write of the 8042
+config byte, touching "only their own bits" so the two inits would compose in
+either order. Sound reasoning, and it still loses a laptop its keyboard: it
+skips the step before the read. UEFI drives the keyboard until the moment it
+hands over, and a scancode left in the output buffer is what the read returns
+-- so the config byte written back is a keystroke. The controller now has one
+owner that quiets both ports, flushes, self-tests, tests each port and asks
+each device what it is, and the two drivers ask it for a port and get a yes or
+a no.
+
+- [ ] **Not yet on silicon.** The bring-up is right by the datasheet and passes
+      in QEMU, which has both ports and answers everything. What it is FOR is
+      an HP ProBook whose USB keyboard dies the moment this kernel owns the
+      controller. The boot log will now say what that machine actually has:
+      `i8042: port 1 holds a ...` / `port 2 holds a ...`, or `no second port`.
+- [ ] **If the touchpad is not on port 2, it is I2C-HID**, which is a real
+      piece of work: Intel LPSS I2C, the ACPI device (PNP0C50) and its HID
+      descriptor protocol. Nothing of that exists yet. Do not start it until
+      the log says it is needed.
+- [ ] **Touchpad gestures are not implemented.** A PS/2 touchpad in its default
+      mode is a three-byte relative mouse, which is what `mouse.c` parses, so
+      the cursor moves and the physical buttons click. Tap-to-click, two-finger
+      scroll and edge scroll all live in the Synaptics/ELAN extended protocols
+      (the `0xE8/0xE6` knock) and none of them are read here.
+
+**Two things the boot log could not say, and now does (2026-09-30)**
+
+The ProBook's I/O errors survived the bus lock, and its ESP held no
+`EMBLINK.LOG` at all -- the stick's reads were failing before the log's first
+write at four seconds. With no serial port, the log is the only witness, and
+it was missing the two facts that decide the remaining theories:
+
+- [x] **The firmware memory map went to the serial port only.** `pmm_print_map`
+      was `serial_write_*` throughout; it is `kprintf` now, one line per entry,
+      and the kernel states the verdict itself: whether any non-usable region
+      overlaps the image at `[kernel_start, kernel_end)`, where every xHCI ring
+      and bounce buffer lives. A firmware that reserves low memory where OVMF
+      does not would corrupt those silently.
+- [ ] **The verdict counts the kernel's own pages as the firmware's.** The UEFI
+      loader allocates the image, and the translated map reports exactly that
+      range as Reserved, so every UEFI boot says `SHARED WITH FIRMWARE` --
+      before the move to 32 MiB (`[0x100000, 0x79b000)`) and after it
+      (`[0x2000000, 0x26c0000)`, OVMF, 2026-10-25). The verdict has to tell the
+      loader's reservation of the image from a firmware region inside it
+      before a real machine's `!!!` line can be believed.
+- [x] **No ring may cross a 64 KB line (xHCI 1.2 §4.11.5.1; data buffers, §6.4.1).**
+      The rings were 64-byte aligned and placed by the linker; this build had one
+      slot's EP0 ring at `0x5afe80-0x5b0080`, across `0x5b0000`. QEMU does not
+      enforce the rule. Every DMA block is 4 KB-aligned now, which makes a
+      crossing structurally impossible, and `xhci_check_dma_layout()` verifies
+      it at init and writes `DMA layout ok` (or the offender) into the log.
+- [ ] **Neither is yet shown to be the ProBook's fault.** Both are real defects
+      by the specification; whether either is what the laptop trips on is what
+      the next `EMBLINK.LOG` -- or, if the stick still cannot be written, the
+      next photograph -- will say. A claim is measured or it is not made.
+
+**The ProBook's I/O errors: one block, read slowly (2026-09-30, evening)**
+
+The photograph after the bus lock showed the failure is ONE block -- node
+block 17, LBA 136, the root of the metadata tree -- failing on every read
+that reaches the stick, while every other block reads and every lookup the
+node cache can serve succeeds. On the Mac, `dd` of those eight sectors
+returns bytes without error. The stick is not dead there; it is slow there.
+
+- [x] **Every xHCI wait was an iteration count.** "Poll the event ring
+      30,000,000 times" is a few hundred milliseconds on real silicon and a
+      different number everywhere else; a flash page being read with internal
+      retries takes seconds, and every other host allows a mass-storage
+      command 30 s. Waits are TSC budgets now (5 s command, 5 s control, 30 s
+      bulk), and a bulk transfer that succeeds after more than a second says
+      `took N ms -- the device is slow here, not broken` in the log.
+- [ ] **Not yet measured on the ProBook.** The theory predicts the next boot
+      reaches the desktop, slowly, with that line in `EMBLINK.LOG`. If the
+      boot still fails, the same log now carries the memory map verdict and
+      the DMA layout verdict, and the failing transfer says how long it waited.
+- [ ] **The hash of the stick's block 17 does not match the current image's.**
+      Expected if the stick still holds the previous image (the root node's
+      bytes change with every build); a corruption if it holds this one. Which
+      it is was not yet known when this was written.
+- [x] **A single marginal page no longer kills the volume -- when it is under
+      the ROOT.** The root node has a byte-identical mirror (EMBKFS spec v2.3
+      section 6): mkfs writes it at `total_blocks - 2`, every commit writes the
+      new root twice and names the copy in the superblock at +320, mount marks
+      it used, and a root read that fails for any reason is served from it with
+      one line in the log. `make test-root-mirror` proves it three ways,
+      including blkdebug injecting an I/O error on the root's own sectors.
+- [ ] **An interior node or a leaf is still one copy.** The files under it go
+      with it. Duplicating all metadata (every node written twice, every
+      pointer carrying both) is the next step up and is not done.
+
+**With the real timeout, the ProBook reads everything and dies on its first write (2026-09-30, late)**
+
+The next photograph: every read succeeds -- `ls /:` lists the root, init.elf
+loads, login runs -- and then `make "Trash"` commits, and:
+
+    xHCI slot2: bulk-IN transfer of 13 bytes: no completion after 30004 ms
+    xHCI slot2: bulk-OUT transfer of 31 bytes: no completion after 30000 ms
+
+The data stage of the WRITE(10) completed (the stick acknowledged it); the
+13-byte status wrapper never came; and the next command's 31-byte CBW was not
+accepted either. Silence on both pipes is a flash controller stuck in its own
+error handling, and the write went to block 16, the neighbour of the block it
+already reads slowly -- one flash page, read-modify-written. The Mac's `dd`
+of the whole image is sequential and never touches that path. The stick is
+worn out there. (Slot 2, incidentally: the slot whose EP0 ring straddled the
+64 KB line in the build before.)
+
+- [x] **Recovery after a timeout, three rungs of four.** The BOT spec (USB
+      Mass Storage Bulk-Only 1.0, section 5.3.4) defines it: Stop Endpoint and
+      Set TR Dequeue on both bulk rings so the controller abandons the TD,
+      Bulk-Only Mass Storage Reset on EP0, CLEAR_FEATURE(HALT) on both bulk
+      endpoints, then the command is retried once
+      (`xhci_msc_timeout_recover`). Linux's usb-storage does the same.
+- [ ] **The fourth rung, a port reset, is not built.** When the device does
+      not answer the Bulk-Only Reset on EP0 either, only a USB reset of the
+      port brings it back, and that means re-enumerating the slot while the
+      block device stays registered. The log says "needs a port reset, which
+      this driver does not do yet" at exactly that moment.
+- [x] **A stick that wedges on a write now hosts a read-only root that still
+      reaches the desktop** (EMBKFS spec v2.3 section 7): the first device write
+      or flush that fails with I/O error sets the volume read-only, every later
+      write fails at once with EROFS, init's mkdirs fail fast, the desktop is
+      spawned. `make test-ro-fallback` proves it with blkdebug failing every
+      write. No driver change makes that flash block writable; another stick is
+      still the answer for a machine that needs to write.
+
+**USB keyboard and mouse on the ProBook: the interrupt is the suspect (2026-09-30, night)**
+
+They work in the firmware and stop the moment this kernel owns the
+controller. The full/low-speed pitfalls are already handled (EP0 packet size
+per speed, Evaluate Context after bMaxPacketSize0, the per-speed interval
+formula); what remained unknowable was whether the controller's interrupt --
+the only thing that delivers HID input here -- ever arrived. Nothing counted
+it.
+
+- [x] `xhci_irq` counts per controller, and `test xhci stats` prints
+      `[xhci] irqs= kbd_reports= mouse_reports= polled_fallback=`.
+- [x] **A polled fallback, on evidence.** An interrupt-driven controller with
+      an event left unconsumed at its dequeue pointer across two polls 50 ms
+      apart has its interrupt masked for good and is serviced from the main
+      loop; one line names the fault. The first cut watched for SILENCE --
+      two seconds with no interrupt while a keyboard was armed -- and masked a
+      working interrupt on every boot, because an idle keyboard raises none;
+      the harness caught it (`irqs=0 polled_fallback=1` at baseline). Silence
+      is not evidence. `tools/xhci_nointr_test.py` proves the real trigger by
+      masking the interrupt on purpose (`test xhci nointr`) and typing.
+- [ ] **Not yet measured on the ProBook.** If tomorrow's log says "servicing
+      by polling", the routing is the bug (MSI-X on this chipset, or the
+      INTx line), and the keyboard works meanwhile. If it says nothing and the
+      keyboard is still dead, enumeration is the suspect and the log's
+      `xHCI slotN:` lines say which step.
+
+**The master `embkfs.img` was booted writable by several targets (noticed and fixed 2026-10-01)**
+
+- [x] `tools/console_test.py` (behind most `test-*` targets), `tools/power_test.py`,
+      `tools/secureboot_test.py` and six interactive `run-*` targets attached
+      `embkfs.img` itself as the second disk, so the kernel's boot-time commits
+      landed in the MASTER -- the file the stick image is packed from. One run
+      left it at generation 2 with its root at block 6, and a stick image was
+      packed from that before anyone looked. Every one of them now copies the
+      master to a scratch image first (`build/console-root.img`,
+      `$(EMBKFS_SCRATCH)`, ...), as `run-embkfs-cow` and `tools/usb_hotplug.py`
+      always did.
+- [x] **`make stick`** regenerates the master, rebuilds `uefi-usb.img` (the
+      default target does not) and runs `tools/stick_check.py`, which refuses
+      an image whose embedded filesystem is not mkfs's, whose root mirror is
+      not intact, or whose ESP lacks the loader -- then prints the checksum
+      for the handover.
+
+**An intermittent kernel fault at boot (seen 2026-10-01, under QEMU)**
+
+- [ ] `test-embkfs-crash` once reported "the desktop never came up" with the
+      cores sampled five times over a second: CPUs 0, 2 and 3 in
+      `spin_lock+0x1f`, CPU 1 in `isr_handler+0x784` -- which is `isr.c:448`,
+      the `cli; hlt` at the end of the PANIC path. So CPU 1 took a kernel
+      fault during boot and halted holding a spinlock the other three then
+      waited on. The same suite had passed on the same kernel an hour earlier
+      and passed again after; roughly one boot in fifteen that day. Which
+      fault, where, on what address: unknown -- the panic path printed it
+      with `rawcon_puts`, and rawcon stopped mirroring to serial once panicked,
+      so the text existed only as pixels. That mirror is fixed (the panic's
+      own lines reach serial; the hang report quotes the console), so the next
+      occurrence names itself. Until it does, this is an observation, not a
+      diagnosis, and nothing has been changed in the name of fixing it.
+

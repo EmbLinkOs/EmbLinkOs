@@ -16,6 +16,22 @@ void vmm_unmap_mmio(uint64_t p,uint64_t n){assert(p==(uintptr_t)regs&&n==REGS_SI
 void spin_lock(spinlock_t *l){assert(!l->locked);l->locked=1;}
 void spin_unlock(spinlock_t *l){assert(l->locked);l->locked=0;}
 void kprintf(const char *f,...){(void)f;}
+/* The native-modesetting entry points: intel_native.c has its own test. */
+static bool recovery;static int native_rc=-1,native_calls;
+bool boot_recovery_mode(void){return recovery;}
+int intel_native_init(const struct intel_native_probe *p){native_calls++;assert(p->mmio==(volatile uint8_t *)regs && p->bar0==0xf0000000 && p->aperture==0xe0000000);return native_rc;}
+int intel_native_boot_mode(struct gpu_mode *o){(void)o;return 0;}
+uint32_t intel_native_pitch(uint32_t w){return w*4;}
+uint32_t intel_native_resource_id(void){return 0;}
+bool intel_native_prepare(struct gpu_target *t,void *b,uint64_t n,uint32_t w,uint32_t h){(void)t;(void)b;(void)n;(void)w;(void)h;return false;}
+bool intel_native_select(const struct gpu_target *t){(void)t;return false;}
+bool intel_native_release(const struct gpu_target *t){(void)t;return true;}
+void intel_native_describe(struct embk_monitor_info *i){(void)i;}
+unsigned intel_native_output_count(void){return 1;}
+bool intel_native_output_info(unsigned i,struct gpu_output *o){(void)i;(void)o;return false;}
+const struct gpu_compose *intel_native_compose(void){return 0;}
+int intel_native_poll_outputs(void){return 0;}
+bool intel_native_apply_layout(const struct gpu_target *t,const struct gpu_layout *l){(void)t;(void)l;return false;}
 static void fixture(void){memset(regs,0,sizeof regs);regs[0x70180/4]=(1u<<31)|(4u<<24);regs[0x70188/4]=120;regs[0x70190/4]=(1079u<<16)|1919;regs[0x7019c/4]=0x1000;regs[PWM_CTL/4]=(1u<<31)|(1u<<29);regs[PWM_FREQ/4]=(1000u<<16)|600;}
 int main(void){
     fixture();const struct gpu_driver *d=intel_display_probe();assert(d && mappings==1);
@@ -31,5 +47,12 @@ int main(void){
     regs[PWM_FREQ/4]=100000;regs[PWM_DUTY/4]=70000;assert(intel_display_probe());
     assert(!intel_backlight_get(&p)&&p==70);assert(!intel_backlight_set(25));
     assert(regs[PWM_FREQ/4]==100000&&regs[PWM_DUTY/4]==25000);
-    puts("Intel display: linear firmware plane/aperture validation, SPT/CNP native PWM, preserved frequency/polarity, unsupported modes refused OK");
+    /* Native modesetting: offered when its init succeeds, never on a Recovery boot. */
+    fixture();devices[0].device_id=0x9b41;devices[1].device_id=0x0284;native_rc=0;native_calls=0;
+    d=intel_display_probe();assert(d && d->prepare && d->select && d->pitch && native_calls==1);
+    recovery=true;native_calls=0;
+    d=intel_display_probe();assert(d && !d->prepare && native_calls==0);
+    recovery=false;native_rc=-5;
+    d=intel_display_probe();assert(d && !d->prepare && native_calls==1);
+    puts("Intel display: linear firmware plane/aperture validation, SPT/CNP native PWM, preserved frequency/polarity, unsupported modes refused, native modesetting offered except on Recovery OK");
 }

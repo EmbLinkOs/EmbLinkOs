@@ -41,7 +41,8 @@ ONE QEMU AT A TIME. Two guests on one host starve each other and produce
 scheduler-timing failures that are not in the kernel; this file refuses to
 start if another qemu-system is running rather than manufacture one.
 """
-import os, sys, time, signal, subprocess, threading, socket, json, random, bisect, re
+import os, sys, time, signal, subprocess, threading, socket, json, random, bisect, re, shutil
+import qemu_guard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,8 +56,7 @@ def main(cmds):
     # a real debugging session: every tool here refused to start, reporting
     # "another qemu-system is running", while nothing was running but the
     # waiters themselves. -x matches the program, which is the question.
-    if any(subprocess.run(["pgrep", "-x", exe], capture_output=True).returncode == 0
-           for exe in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("console_test: another qemu-system is running; refusing to start a second one", file=sys.stderr)
         return 2
 
@@ -67,13 +67,22 @@ def main(cmds):
     # block device holds it. It is the configuration of a real machine whose
     # only disk is an NVMe SSD, minus the firmware.
     nvme_root = os.environ.get("NVME_ROOT")
+    # THE MASTER IS NEVER THE DISK. embkfs.img is mkfs's output and the file
+    # the stick image is packed from; the kernel commits to whatever it mounts
+    # (home directories on first boot, at least), and for a long time this
+    # harness mounted the master itself. One such run and the master sits at
+    # generation 2 with its root moved -- and the next stick image carries
+    # that, which is how an image with a drifted root filesystem nearly went
+    # to a laptop. So: a fresh copy per run, as tools/usb_hotplug.py does.
+    root_img = os.path.join(ROOT, "build", "console-root.img")
+    shutil.copyfile(os.path.join(ROOT, "embkfs.img"), root_img)
     argv = ["qemu-system-x86_64", "-cpu", "max",
             "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT]
     if nvme_root:
-        argv += ["-drive", "format=raw,file=%s/embkfs.img,if=none,id=nvroot" % ROOT,
+        argv += ["-drive", "format=raw,file=%s,if=none,id=nvroot" % root_img,
                  "-device", "nvme,serial=EMBKROOT,drive=nvroot"]
     else:
-        argv += ["-drive", "format=raw,file=%s/embkfs.img,if=ide,index=1" % ROOT]
+        argv += ["-drive", "format=raw,file=%s,if=ide,index=1" % root_img]
     # NVME_DISK: a scratch image on its own NVMe controller, for `test nvme`.
     # NVME_BLOCK sets its logical block size (512 default; 4096 is 4Kn).
     nvme = os.environ.get("NVME_DISK")

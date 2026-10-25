@@ -32,6 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
 import shell_shot as S
+import qemu_guard
 
 # The menu bar's network glyph: a dot when there is a link, a dash when there is
 # not. Small band, because everything around it (the CPU readout, the clock) is
@@ -53,8 +54,7 @@ def ink(path, band, thresh=110):
 
 def main():
     nic = sys.argv[1] if len(sys.argv) > 1 else "e1000"
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("netlink_shot: another qemu-system is running; refusing to start a second one")
         return 2
 

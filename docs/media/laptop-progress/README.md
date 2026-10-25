@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-137 actual EmbLinkOS captures document the original laptop work, its
+155 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades and live display configuration. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition and the native shell running any program. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,127 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: live display configuration
+## Latest: the native shell runs any program
+
+The structured shell used to speak only to programs built with its own SDK. A text program -- sh, a port, a script -- now takes its part in a pipeline: what is piped in arrives as text, what it prints is captured as a string when a later stage wants it, and at the end of a line it keeps the terminal. Redirections are words with the arrow attached (`out>`, `err>`, `in<`), because `>` compares here; scripts run by their `#!` line; `source` loads definitions; arguments that break the kernel's limits are refused by name. These are QEMU captures of the Terminal, typed into over QMP; `test shellio` checks the same behaviour on the OS. See [SHELL.md](../../SHELL.md).
+
+### Text programs in pipelines
+
+sh links no shell SDK, so it is a text program: its output is captured and split by lines, values piped into it arrive as text (a list as lines, ls's table as its grid), and -c is a flag, not a minus.
+
+![Text programs in pipelines in EmbLinkOS](151-shell-text-pipes.png)
+
+### Redirections that do not collide with >
+
+out>, err>, out>> and in< on sh and on builtins: sysinfo's text goes to a file, sh's stdout and stderr to two, a third line appended, and range's value written as text and counted back.
+
+![Redirections that do not collide with > in EmbLinkOS](152-shell-redirections.png)
+
+### Scripts run by their #! line
+
+A native script and an sh script saved from the prompt run as commands: the kernel reads the #! line and starts the interpreter with the script and its arguments. source loads a definition into the session.
+
+![Scripts run by their #! line in EmbLinkOS](153-shell-scripts.png)
+
+### What a command is, and limits that say so
+
+which tells a text program from a structured one. 200 arguments break the kernel's limit of 126, and the shell names it before anything is spawned.
+
+![What a command is, and limits that say so in EmbLinkOS](154-shell-which-limits.png)
+
+### An interactive sh from the native prompt
+
+A text program that ends a statement keeps the terminal: sh runs interactively in the Terminal, and exit returns to the native prompt.
+
+![An interactive sh from the native prompt in EmbLinkOS](155-shell-interactive-sh.png)
+
+## GPU composition
+
+The desktop is composed on the GPU where the adapter can do it: through virgl on QEMU's virtio-vga-gl -- the host's OpenGL, here Mesa's llvmpipe -- and with the Gen9 blitter on Intel laptops. These are captures of the virgl path; a GL scanout has no surface for QEMU's screendump, so they were read over VNC from an egl-headless display, unmodified. The same guest run with composition kept on the CPU gave the comparison frames; the Intel blitter has only met a model of its engine. See [DISPLAYS.md](../../DISPLAYS.md#gpu-composition).
+
+### The desktop composed on the host's GPU
+
+After setup and login the compositor draws through virgl: the wallpaper window, the translucent menu bar, the frosted dock and the pointer are draws in a 3D context, straight into the scanout resource. It matches the CPU-composed desktop pixel for pixel.
+
+![The desktop composed on the host's GPU in EmbLinkOS](146-gpu-desktop.png)
+
+### Kernel title bars, rings and shadows on the GPU
+
+The Windows demo, started from the Terminal: two windows with kernel title bars over a third. Rounded corners, the 1px border ring and the focus shadow are fragment shaders; the title bars are drawn by the CPU on a canvas the GPU shows.
+
+![Kernel title bars, rings and shadows on the GPU in EmbLinkOS](147-gpu-windows.png)
+
+### Settings names what composes
+
+Settings > Displays > Rendering reports host GPU (virgl) once the compositor's probe frame came back right.
+
+![Settings names what composes in EmbLinkOS](148-gpu-settings.png)
+
+### The same scene composed on the CPU
+
+The same guest and the same input with composition kept on the CPU: Rendering says Software. The smoke test compares every GPU frame with its CPU twin.
+
+![The same scene composed on the CPU in EmbLinkOS](149-cpu-settings.png)
+
+### A resolution trial under the GPU
+
+Apply Resolution at 1024 × 768: a new surface and scanout resource, attached to the 3D context, the canvas made again over the new backbuffer. Revert brings 1280 × 800 back, still composed on the GPU.
+
+![A resolution trial under the GPU in EmbLinkOS](150-gpu-resolution-trial.png)
+
+## Several monitors
+
+The desktop spans every monitor in use. Each monitor shows its own rectangle of one surface and its own wallpaper, and the primary carries the menu bar and the dock. A monitor plugged in extends the desktop. Settings arranges the displays through the same keep-or-revert trial as a resolution change, and a kept arrangement returns for the same monitors after login. These are QEMU captures of a two-head virtio-vga (each head captured separately); native Intel external monitors have only met a register model. See [DISPLAYS.md](../../DISPLAYS.md).
+
+### A second monitor extends the desktop
+
+The second VirtIO head is connected at login and the kernel extends the desktop to 2304 × 800. The 1280 × 800 primary keeps the menu bar, the dock and the desktop icons.
+
+![A second monitor extends the desktop in EmbLinkOS](138-multimonitor-extended.png)
+
+### The second monitor shows its own wallpaper
+
+The 1024 × 768 head to the right shows a whole wallpaper of its own, not a slice of one picture stretched across both.
+
+![The second monitor shows its own wallpaper in EmbLinkOS](139-multimonitor-second-wallpaper.png)
+
+### Fill on the monitor the window is on
+
+The Editor was dragged across the seam with its unsaved text. Fill from the zoom light covers the second monitor exactly.
+
+![Fill on the monitor the window is on in EmbLinkOS](140-multimonitor-window-filled.png)
+
+### Arranging the displays
+
+With two monitors connected, Settings → Displays draws them to scale: Extend or Mirror, and for the selected display Use this display, Resolution, Position and Make Primary.
+
+![Arranging the displays in EmbLinkOS](141-multimonitor-settings.png)
+
+### The second monitor moved to the left
+
+After Apply Arrangement and Keep Changes, the second monitor is left of the panel. The panel keeps the menu bar, and the preferences are saved.
+
+![The second monitor moved to the left in EmbLinkOS](142-multimonitor-arranged-left.png)
+
+### Make Primary moves the menu bar and the dock
+
+The second monitor is now primary: the menu bar and the dock are on it. The Editor kept its place and its text.
+
+![Make Primary moves the menu bar and the dock in EmbLinkOS](143-multimonitor-primary-moved.png)
+
+### A mirror trial
+
+Mirror shows one picture on both monitors at 1024 × 768, the size both can show, with the 30-second confirmation. Revert puts the extended arrangement back.
+
+![A mirror trial in EmbLinkOS](144-multimonitor-mirror-trial.png)
+
+### The arrangement returns after a cold boot
+
+After a new UEFI/NVMe boot and password login, the desktop restores the kept arrangement for these two monitors and confirms it once it has drawn a frame of it.
+
+![The arrangement returns after a cold boot in EmbLinkOS](145-multimonitor-restored.png)
+
+## Live display configuration
 
 Settings changes the actual VirtIO/Bochs scanout, asks for confirmation and
 retains the previous framebuffer for rollback. Timeout, closing the requester

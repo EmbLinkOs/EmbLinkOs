@@ -5,6 +5,7 @@
 #include "drivers/char/serial.h"
 #include "include/spinlock.h"
 #include "boot/boot_protocol.h"
+#include "include/arch_irq.h"   /* arch_cpu_halt_forever */
 
 /* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
  * docs/architecture/process-and-scheduling.md), same "add the lock, don't
@@ -22,6 +23,7 @@ static const char *type_names[] = {
 };
 
 
+extern uint8_t kernel_start[]; // Symbol defined in linker script, marks the start of the kernel in memory
 extern uint8_t kernel_end[]; // Symbol defined in linker script, marks the end of the kernel in memory
 // Bitmap pointer - lives at BITMAP_ADDR and is used to track allocated/free pages. Each bit represents a page (4KB).
 
@@ -45,45 +47,49 @@ static inline int bitmap_test(uint64_t page_index) {
 }
 
 
+/* THE MAP GOES INTO THE LOG, NOT JUST DOWN THE SERIAL LINE. This used to be
+ * serial_write_* throughout, which on a laptop -- no serial port -- is a
+ * report to nobody. It is the one thing the boot log on the stick most needs
+ * to carry: the kernel is loaded at a FIXED physical address and its DMA
+ * buffers (every xHCI ring and bounce buffer is a static array in .bss) sit
+ * wherever the image puts them, and whether the firmware still owns any of
+ * that range is a question only this map answers. So the kernel answers it
+ * itself, below, in one line a person can search for, rather than leaving
+ * 126 entries for someone to cross-check against a symbol table by hand.
+ * The range comes from the linker script, not a constant here: the link
+ * address moved from 1 MiB to 32 MiB once, and a copy of it would not have. */
 void pmm_print_map(void) {
     uint32_t count = boot_mmap_count();
+    uint64_t kstart = KV2P((uint64_t)kernel_start);
+    uint64_t kend   = KV2P((uint64_t)kernel_end);
 
-    serial_write_string("\n=== E820 Memory Map ===\n");
-    serial_write_string("entries: ");
-    serial_write_hex(count);
-    serial_write_string("\n");
-
+    kprintf("\n=== firmware memory map: %u entries ===\n", (unsigned)count);
     uint64_t total_usable = 0;
+    uint32_t overlaps = 0;
     for (uint32_t i = 0; i < count; i++) {
         const struct boot_mmap_entry *entry = boot_mmap_at(i);
+        uint64_t b = entry->base, e = entry->base + entry->length;
+        const char *tn = (entry->type >= 1 && entry->type <= 5) ? type_names[entry->type]
+                                                                 : "unknown";
+        kprintf("  [%3u] %016lx-%016lx %s\n", (unsigned)i, b, e, tn);
 
-        serial_write_string("[");
-        serial_write_hex(i);
-        serial_write_string("]  Base:");
-        serial_write_hex(entry->base);
-        serial_write_string(", Length:");
-        serial_write_hex(entry->length);
-        serial_write_string(", Type:");
-
-        if (entry->type >=1 && entry->type <=5) {
-           serial_write_string(type_names[entry->type]);
-        } else {
-           serial_write_string("unknown");
-        }
-        serial_write_string("\n");
-
-        if (entry->type == E820_USABLE)
+        if (entry->type == E820_USABLE) {
             total_usable += entry->length;
+        } else if (b < kend && e > kstart) {
+            /* A region the firmware did not give us, lying inside the range
+             * the kernel image occupies. Every byte of the image in that
+             * range -- code, data, DMA rings -- is shared with whatever the
+             * firmware still does there. This is the line to search for. */
+            overlaps++;
+            kprintf("  !!! entry %u (%s) OVERLAPS THE KERNEL IMAGE [%lx, %lx): "
+                    "%lx-%lx is not ours to use\n",
+                    (unsigned)i, tn, kstart, kend,
+                    (b > kstart ? b : kstart), (e < kend ? e : kend));
+        }
     }
-
-    /* The number the map is actually FOR. It was computed and then thrown
-     * away, which is also why -Wall (now on, via the aarch64 build) flagged
-     * it: a running total nobody prints is either a bug or dead weight, and
-     * here it was the former -- "entries: 1" tells you nothing about whether
-     * the machine has the memory you asked for. */
-    serial_write_string("usable total: ");
-    serial_write_hex(total_usable);
-    serial_write_string(" bytes\n");
+    kprintf("  usable total: %lu MiB; kernel image at [%lx, %lx) %s\n",
+            (unsigned long)(total_usable >> 20), kstart, kend,
+            overlaps ? "-- SHARED WITH FIRMWARE, see above" : "-- all of it usable RAM");
 }
 
 
@@ -130,7 +136,54 @@ void pmm_init(void) {
     bitmap_size = (total_pages + 7) / 8; // Size of bitmap in bytes (round up to nearest byte)
 
     // step 3: We will place our bitmap at the end of the kernel in memory, which is defined by the linker script as 'kernel_end'. We need to ensure that the bitmap does not overlap with the kernel or any reserved areas.
-    pmm_bitmap = (uint8_t *)kernel_end; // Place bitmap right after the kernel in memory
+    /* WHERE THE BITMAP GOES IS NOT "WHEREVER THE KERNEL ENDS".
+     *
+     * This used to be exactly that -- pmm_bitmap = kernel_end -- with a comment
+     * saying the bitmap must not overlap the kernel or any reserved area, and
+     * nothing checking that it does not. The next thing that happens is 0xFF
+     * written across the whole bitmap: on an 8 GB machine, a quarter of a
+     * megabyte, straight after the kernel image, wherever that lands.
+     *
+     * Under OVMF it lands in free memory and nobody notices. On a real machine
+     * the firmware reserves low memory where it likes, and the bitmap's
+     * position moves every time the KERNEL changes size -- so a kernel that
+     * grew by 64 KB (a bigger log ring) can start scribbling over an area the
+     * firmware still owns, and the machine that booted yesterday hangs today
+     * with nothing to show for it.
+     *
+     * So the map is asked. The first usable region with room for the bitmap at
+     * or after the end of the kernel image wins, and it has to be below the
+     * gigabyte the higher-half window covers, because the bitmap is written
+     * through that window before paging is rebuilt. */
+    {
+        uint64_t kend = KV2P((uint64_t)kernel_end);
+        kend = (kend + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+        uint64_t chosen = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const struct boot_mmap_entry *e = boot_mmap_at(i);
+            if (e->type != E820_USABLE) continue;
+            uint64_t start = e->base > kend ? e->base : kend;
+            start = (start + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+            uint64_t end = e->base + e->length;
+            if (start >= end) continue;                 /* entirely below the kernel */
+            if (end - start < bitmap_size) continue;    /* not enough room here */
+            if (start + bitmap_size > 0x40000000ULL) continue;  /* past the mapped window */
+            chosen = start;
+            break;
+        }
+        if (!chosen) {
+            serial_write_string("\nPMM FATAL: no usable memory below 1 GiB can hold the "
+                                "page bitmap\n");
+            arch_cpu_halt_forever();
+        }
+        pmm_bitmap = (uint8_t *)KP2V(chosen);
+        if (chosen != kend) {
+            serial_write_string("PMM: the memory after the kernel is not usable; bitmap "
+                                "placed at ");
+            serial_write_hex(chosen);
+            serial_write_string(" instead\n");
+        }
+    }
 
     serial_write_string("\n=== PMM Layout ===\n");
     serial_write_string("Kernel End: ");
@@ -174,7 +227,17 @@ void pmm_init(void) {
 
     // step 6: Reserve kernel + bitmap region
     uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size; // Calculate the physical end of the bitmap region
-    uint64_t reserve_end_page = (bitmap_phys_end + PAGE_SIZE - 1) / PAGE_SIZE ; // Reserve the entire bitmap region for now
+    uint64_t kernel_phys_end = KV2P((uint64_t)kernel_end);
+    /* Everything below the kernel's end is reserved as before; the bitmap is
+     * reserved too, wherever the map allowed it to go. */
+    uint64_t reserve_end_page = (kernel_phys_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    {
+        uint64_t b0 = KV2P(pmm_bitmap) / PAGE_SIZE;
+        uint64_t b1 = (bitmap_phys_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        for (uint64_t p = b0; p < b1 && p < total_pages; p++) {
+            if (!bitmap_test(p)) { bitmap_set(p); free_pages--; used_pages++; }
+        }
+    }
 
     for (uint64_t p = 0; p <= reserve_end_page && p < total_pages; p++) {
         if (!bitmap_test(p)) {

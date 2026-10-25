@@ -1,7 +1,10 @@
-/* Gen9 display handoff and native PCH PWM. Preserve the firmware's trained
- * link, timings and GTT. This is not a render engine or a general modesetter.
- * Register definitions checked against Intel's Gen9 display layout and Linux
- * 6.12 intel_backlight_regs.h / skl_universal_plane_regs.h. */
+/* Gen9 display: the firmware handoff, native PCH PWM, and the entry to
+ * native modesetting (intel_native.c). The handoff checks that the firmware's
+ * plane really is the boot framebuffer before anything is trusted; native
+ * modesetting then takes over unless this is a Recovery or Diagnostics boot,
+ * which keep the firmware's display as the way out. Register definitions
+ * checked against Intel's Gen9 display layout and Linux 6.12
+ * intel_backlight_regs.h / skl_universal_plane_regs.h. */
 #include "drivers/video/intel_display.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/bus/pci.h"
@@ -10,8 +13,9 @@
 #include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
+#include "drivers/video/intel_native.h"
 
-#define REGS_SIZE 0x100000u
+#define REGS_SIZE INTEL_NATIVE_REGS   /* all of the register half of BAR0: pcode and the GGTT flush live above 1 MiB */
 #define PWM_CTL 0xc8250u
 #define PWM_FREQ 0xc8254u
 #define PWM_DUTY 0xc8258u
@@ -32,11 +36,16 @@ static int supported(uint16_t id) {
     case 0x5902:case 0x5906:case 0x590b:case 0x5912:case 0x5916:case 0x5917:
     case 0x591b:case 0x591d:case 0x5926:case 0x5927:
     case 0x3e90:case 0x3e91:case 0x3e92:case 0x3e9b:case 0x3ea0:case 0x3ea5:
-    case 0x3ea6:case 0x3ea8:case 0x9b41:case 0x9bc4:case 0x9bc5:case 0x9bc8:return 1;
+    case 0x3ea6:case 0x3ea8:
+    /* Comet Lake, all of i915's INTEL_CML_IDS: U GT1/GT2 (the ProBook 450 G7
+     * family) and H/S GT1/GT2. Same Gen9 display engine as Kaby Lake. */
+    case 0x9b21:case 0x9baa:case 0x9bac:case 0x9b41:case 0x9bca:case 0x9bcc:
+    case 0x9ba2:case 0x9ba4:case 0x9ba5:case 0x9ba8:
+    case 0x9bc2:case 0x9bc4:case 0x9bc5:case 0x9bc6:case 0x9bc8:case 0x9be6:case 0x9bf6:return 1;
     default:return 0;
     }
 }
-static unsigned pch_layout(void) {
+unsigned intel_pch_layout(void) {
     for(unsigned i=0;i<pci_devices_count();i++) {
         const struct pci_device *d=pci_get_device(i);
         if(!d || d->vendor_id!=0x8086 || d->class_code!=6 || d->subclass!=1)continue;
@@ -77,6 +86,20 @@ int intel_backlight_set(unsigned percent) {
 }
 static bool get_mode(struct gpu_mode *out) {*out=current;return true;}
 static const struct gpu_driver driver={.name="Intel Gen9 display (firmware mode)",.get_mode=get_mode};
+/* Native: the boot keeps the firmware's mode when it is the panel's own, and
+ * every later change is a real modeset. */
+static bool native_get_mode(struct gpu_mode *out) {
+    struct gpu_mode m;
+    if(intel_native_boot_mode(&m)==1)current=m;
+    *out=current;return true;
+}
+static const struct gpu_driver native_driver={.name="Intel Gen9 display (native)",.get_mode=native_get_mode,
+    .prepare=intel_native_prepare,.select=intel_native_select,.release=intel_native_release,
+    .describe=intel_native_describe,.resource_id=intel_native_resource_id,.pitch=intel_native_pitch,
+    .output_count=intel_native_output_count,.output_info=intel_native_output_info,
+    .apply_layout=intel_native_apply_layout,.poll_outputs=intel_native_poll_outputs,
+    .compose=intel_native_compose,
+    .max_lit=3};   /* Gen9: pipes A, B and C */
 const struct gpu_driver *intel_display_probe(void) {
     const struct boot_protocol *bp=boot_protocol_get();
     registers=NULL;pwm_kind=0;
@@ -110,10 +133,18 @@ const struct gpu_driver *intel_display_probe(void) {
         }
         if(!matches) {vmm_unmap_mmio((uint64_t)registers,REGS_SIZE);registers=NULL;continue;}
         current=(struct gpu_mode){bp->fb_addr,bp->fb_width,bp->fb_height,bp->fb_pitch,32,bp->fb_format};
-        pwm_kind=pch_layout();unsigned percent;
+        pwm_kind=intel_pch_layout();unsigned percent;
         if(intel_backlight_get(&percent))pwm_kind=0;
         kprintf("intel-display: %04x firmware scanout verified, %ux%u, %u pipe(s), PWM %s\n",
             d->device_id,current.width,current.height,matches,pwm_kind?"available":"unavailable");
+        if(boot_recovery_mode()) {
+            kprintf("intel-display: Recovery/Diagnostics boot: the firmware's display is kept, no native modesetting\n");
+            return &driver;
+        }
+        struct intel_native_probe np={d->bus,d->device,d->function,d->device_id,pwm_kind,registers,
+            mmio.address,mmio.size,aperture.address,aperture.size,&current,0};
+        if(!intel_native_init(&np))return &native_driver;
+        kprintf("intel-display: native modesetting unavailable; the firmware's mode stays\n");
         return &driver;
     }
     return NULL;

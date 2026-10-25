@@ -169,6 +169,21 @@ static bool try_mount_one(struct embk_block_device *dev,
     return false;
 }
 
+/* THE FIRST FAT32 VOLUME THIS MACHINE MOUNTED, or NULL.
+ *
+ * For the boot log the kernel leaves on the stick (kernel/lib/bootlog.c): on a
+ * machine with no serial port, no working keyboard and no pointer, a file on
+ * the EFI partition is the ONLY way anything it knows can reach a person --
+ * and it is FAT32, which every desktop operating system can read. */
+struct fat32_volume *automount_fat32_volume(int index) {
+    int seen = 0;
+    for (int i = 0; i < AUTO_MAX; i++) {
+        if (!g_auto[i].used || !g_auto[i].is_fat || !g_auto[i].vol) continue;
+        if (seen++ == index) return (struct fat32_volume *)g_auto[i].vol;
+    }
+    return NULL;
+}
+
 int automount_attach(struct embk_block_device *disk) {
     if (!disk) return -EMBK_EINVAL;
 

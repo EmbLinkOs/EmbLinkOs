@@ -138,7 +138,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/module/module.c \
                   kernel/module/exports.c \
                   kernel/fs/fd.c \
-                  kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c kernel/display/control.c kernel/display/edid.c \
+                  kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c kernel/display/control.c kernel/display/edid.c kernel/display/layout.c \
                   kernel/fs/namespace.c \
                   kernel/fs/epfs.c \
                   kernel/fs/embkfs/embkfs.c \
@@ -190,6 +190,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/video/gpu.c \
                   kernel/drivers/video/bootanim.c \
                   kernel/drivers/video/virtio_gpu.c \
+                  kernel/drivers/video/virgl.c \
+                  kernel/drivers/video/virgl_compose.c \
                   kernel/net/net.c \
                   kernel/net/virtio_net.c \
                   kernel/net/e1000.c \
@@ -465,7 +467,9 @@ ARM_INC_js        := $(QJS_CFLAGS)
 # main and its own extra objects.
 ARM_MAIN_sh := third_party/mrsh/main.c
 ARM_SH_SRCS := $(filter-out third_party/mrsh/main.c,$(MRSH_SRCS))
-ARM_INC_sh := $(MRSH_INC) -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096
+# -std=gnu11 as on x86 (ports/mrsh/sources.mk): GCC 16 defaults to C23, where
+# glob.c's `()` function pointers mean `(void)`.
+ARM_INC_sh := $(MRSH_INC) -std=gnu11 -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096
 ARM_SH_OBJS := $(patsubst %.c,$(ARM_USER)/mrsh/%.o,$(ARM_SH_SRCS))
 ARM_EXTRAOBJ_sh := $(ARM_SH_OBJS)
 define ARM_SH_OBJECT
@@ -668,7 +672,8 @@ ARM_LIBEMBK_SRC := ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
                    ui/backend/scene_render.c ui/layout/layout.c \
                    ui/reactive/reactive.c ui/declare/declare.c \
                    ui/theme/theme.c ui/kit/kit.c ui/dsl/em.c ui/dsl/em_app.c \
-                   user/lib/auth.c user/lib/fileops.c
+                   user/lib/auth.c user/lib/fileops.c user/lib/document.c user/lib/workspace.c \
+                   user/lib/display_arrange.c kernel/display/layout.c
 
 # build/aarch64/user/pic_ui_scene_scene.o -- the source path flattened, so two
 # files with the same basename in different directories cannot collide.
@@ -678,7 +683,7 @@ ARM_LIBEMBK     := $(ARM_USER)/libembk.so
 
 define ARM_PIC_OBJ
 $(ARM_USER)/pic_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
-	$$(USER_CC) $$(NEWLIB_CFLAGS) -fPIC $$(UIDEMO_INC) -c $$< -o $$@
+	$$(USER_CC) $$(NEWLIB_CFLAGS) -fPIC $$(UIDEMO_INC) -iquote kernel -c $$< -o $$@
 endef
 $(foreach src,$(ARM_LIBEMBK_SRC),$(eval $(call ARM_PIC_OBJ,$(src))))
 

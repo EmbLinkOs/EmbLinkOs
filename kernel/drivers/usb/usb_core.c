@@ -6,6 +6,7 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "block/block.h"
+#include "process/ksync.h"   /* one synchronous transaction on the bus at a time */
 #include "fs/automount.h"
 #include "net/usb_net.h"
 #include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
@@ -82,6 +83,16 @@ struct usb_device *usb_device_on_port(void *hc, uint8_t port) {
     for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
         struct usb_device *d = &g_usb_devices[i];
         if (d->in_use && d->hc == hc && d->port == port) return d;
+    }
+    return NULL;
+}
+
+/* The Nth device in use, for a caller that wants to SAY what is attached --
+ * the no-root diagnostic in embkfs.c. NULL past the end. */
+const struct usb_device *usb_device_at(uint32_t index) {
+    for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
+        if (!g_usb_devices[i].in_use) continue;
+        if (index-- == 0) return &g_usb_devices[i];
     }
     return NULL;
 }
@@ -236,7 +247,16 @@ static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
     return true;
 }
 
+/* See the note on usb_bus_lock in usb.h. */
+static struct mutex g_usb_bus_lock = MUTEX_INIT;
+void usb_bus_lock(void)   { mutex_lock(&g_usb_bus_lock); }
+void usb_bus_unlock(void) { mutex_unlock(&g_usb_bus_lock); }
+bool usb_bus_trylock(void){ return mutex_trylock(&g_usb_bus_lock) != 0; }
+
 void usb_core_poll(void) {
+    /* A transfer is in flight and is polling for its own completion. Draining
+     * an interrupt endpoint under it would take that completion. Next tick. */
+    if (!usb_bus_trylock()) { return; }
     for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
         struct usb_device *dev = &g_usb_devices[i];
         if (!dev->in_use || !dev->hid_active) continue;
@@ -261,6 +281,7 @@ void usb_core_poll(void) {
             dev->ops->int_submit(dev, dev->hid_ep, dev->hid_mps);
         }
     }
+    usb_bus_unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -355,15 +376,20 @@ static int usb_msc_block_read(struct embk_block_device *bdev, uint64_t lba,
     struct usb_msc *m = (struct usb_msc *)bdev->driver_data;
     uint8_t *dst = (uint8_t *)buffer;
     uint32_t per = MSC_CHUNK_BYTES / m->block_size;
+    usb_bus_lock();                      /* the bus is ours for this request */
     while (count) {
         uint32_t n = count > per ? per : count;
         size_t bytes = (size_t)n * (size_t)m->block_size;
-        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)n)) return -EMBK_EIO;
+        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)n)) {
+            usb_bus_unlock();
+            return -EMBK_EIO;
+        }
         memcpy(dst, m->data, bytes);
         dst += bytes;
         lba += n;
         count -= n;
     }
+    usb_bus_unlock();
     return EMBK_OK;
 }
 
@@ -372,14 +398,19 @@ static int usb_msc_block_write(struct embk_block_device *bdev, uint64_t lba,
     struct usb_msc *m = (struct usb_msc *)bdev->driver_data;
     const uint8_t *src = (const uint8_t *)buffer;
     uint32_t per = MSC_CHUNK_BYTES / m->block_size;
+    usb_bus_lock();                      /* see usb_msc_block_read */
     while (count) {
         uint32_t n = count > per ? per : count;
         memcpy(m->data, src, (size_t)n * (size_t)m->block_size);
-        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)n)) return -EMBK_EIO;
+        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)n)) {
+            usb_bus_unlock();
+            return -EMBK_EIO;
+        }
         src += n * m->block_size;
         lba += n;
         count -= n;
     }
+    usb_bus_unlock();
     return EMBK_OK;
 }
 
@@ -411,15 +442,34 @@ static bool usb_msc_attach(struct usb_device *dev) {
     cdb[0] = 0x12; cdb[4] = 36;
     usb_msc_bot(m, cdb, 6, true, 36);
 
-    // TEST UNIT READY until it settles, clearing sense data in between.
-    for (int tries = 0; tries < 5; tries++) {
+    /* TEST UNIT READY until it settles, clearing sense data in between.
+     *
+     * FIVE TRIES AND FIFTY MILLISECONDS WAS AN EMULATOR'S IDEA OF PATIENCE.
+     * QEMU's stick is ready the instant it is asked; a real one answers NOT
+     * READY while its controller wakes up, and the ones that have been sitting
+     * in a drawer can take a second or more. A stick that is merely slow must
+     * not look like a stick that is absent -- which, on a machine whose ROOT
+     * FILESYSTEM is on it, is the difference between booting and not. Forty
+     * tries at 50 ms is two seconds of patience, paid only when a device is
+     * actually being brought up. */
+    bool ready = false;
+    for (int tries = 0; tries < 40; tries++) {
         memset(cdb, 0, sizeof(cdb));
-        if (usb_msc_bot(m, cdb, 6, false, 0)) break;
+        if (usb_msc_bot(m, cdb, 6, false, 0)) {
+            if (tries)
+                kprintf("USB MSC: ready after %d attempt(s) (%d ms)\n",
+                        tries + 1, tries * 50);
+            ready = true;
+            break;
+        }
         memset(cdb, 0, sizeof(cdb));
         cdb[0] = 0x03; cdb[4] = 18;             // REQUEST SENSE
         usb_msc_bot(m, cdb, 6, true, 18);
-        timer_delay_ms(10);
+        timer_delay_ms(50);
     }
+    if (!ready)
+        kprintf("USB MSC: never reported ready after 2 s -- asking for its "
+                "capacity anyway\n");
 
     // READ CAPACITY(10)
     memset(cdb, 0, sizeof(cdb));
