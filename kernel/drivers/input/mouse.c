@@ -298,6 +298,12 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
 #endif /* __x86_64__ */
 }
 
+void mouse_warp(int32_t x,int32_t y) {
+    spin_lock(&pointer_state_lock);
+    if(x<0)x=0;if(y<0)y=0;if(x>=g_w)x=g_w-1;if(y>=g_h)y=g_h-1;
+    g_x=x;g_y=y;
+    spin_unlock(&pointer_state_lock);
+}
 void mouse_set_bounds(uint32_t w,uint32_t h) {
     if(!w || !h)return;
     spin_lock(&pointer_state_lock);

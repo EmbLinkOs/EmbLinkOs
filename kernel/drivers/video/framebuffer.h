@@ -32,6 +32,10 @@ struct fb_surface;
 struct fb_surface *fb_prepare_mode(uint32_t w,uint32_t h);
 /* Called under the compositor lock; returns the retained old surface. */
 struct fb_surface *fb_select_surface(struct fb_surface *);
+/* Show `s` as a desktop spread over several outputs (gpu_driver.apply_layout). */
+struct gpu_layout;
+struct fb_surface *fb_select_layout(struct fb_surface *s, const struct gpu_layout *layout);
+struct fb_surface *fb_current_surface(void);
 void fb_release_surface(struct fb_surface *);
 void fb_init(void);
 void fb_put_pixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b);

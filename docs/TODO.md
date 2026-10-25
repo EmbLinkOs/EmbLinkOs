@@ -1523,9 +1523,14 @@ done when the laptop shows it, not when a host test passes.
       the firmware programmed keeps the firmware's table, so the eDP panel
       never depends on them; HDMI and an unlit DP port do. Compare them with
       the capture's DDI B-D tables once a monitor was lit by the firmware.
-- [ ] **Step 5, external outputs.** The DP and HDMI enable/disable paths
-      exist and are tested; offering them -- hotplug polling, a second pipe,
-      the desktop on two outputs -- is the multiple-monitor item below.
+- [x] **Step 5, external outputs** (`intel_native.c`): the VBT's DP and HDMI
+      ports on DDI B-D, monitors found by their hotplug lines and asked over
+      AUX (DPCD, EDID) or GMBUS (EDID; DP++ passive adaptors; HDMI or DVI
+      from the CTA block), modes filtered by link, TMDS and display clock;
+      up to three pipes scanning one surface, PLLs shared or assigned, the
+      display buffer re-split in a safe order, CDCLK raised when needed, a
+      failed layout undone. Checked against a register model
+      (`intel_native_test.c`).
 - [ ] **DP++ adaptors** (HDMI through a level shifter on a DP port): the
       adaptor's TMDS-output enable over DDC is not written.
 - [ ] **CDCLK's VCO never changes.** eDP rates that need the other VCO
@@ -1537,10 +1542,32 @@ done when the laptop shows it, not when a host test passes.
       driver does not, so a configuration that needs it could underrun.
 - [ ] **An underrun is only reported** (`intel-native: pipe X underran`),
       not acted on.
-- [ ] **Multiple monitors**: more than one output in the gpu and compositor
-      layers -- per-output framebuffer and mode, a desktop that spans them,
-      windows that move between them, Settings arranging them. Verifiable in
-      QEMU with a multi-head virtio-gpu and on the laptop with two pipes.
+- [x] **Multiple monitors** (docs/DISPLAYS.md, "Several monitors"): one
+      desktop surface over every monitor in use, extend and mirror, a
+      primary that carries the menu bar and dock, a wallpaper per monitor;
+      hotplug extends and shrinks it; windows cross monitors, fill the one
+      they are on, and travel with their monitor when it is rearranged;
+      Settings arranges the displays (use, resolution, position, primary,
+      extend/mirror) through the keep/revert trial; the kept arrangement is
+      saved per set of monitors and restored at login and on reconnection.
+      VirtIO GPU multi-head and native Intel. Host-tested (layout,
+      controller, arrangement, preferences) and run in QEMU with two heads
+      (`tools/multimonitor_smoke.py`, captures 138-145).
+- [ ] **Multiple monitors on the ProBook.** The Intel external outputs have
+      only met the register model. The laptop's HDMI port and USB-C DP with a
+      monitor on each are the test, as for the panel.
+- [ ] **Plugging monitors in and out while running is not exercised in QEMU.**
+      Headless QEMU cannot connect a head after boot; the controller test
+      drives that path with a fake two-output driver instead.
+- [ ] **DisplayPort MST** (docks, daisy chains) is not spoken: an MST hub
+      shows at most its first monitor, in SST mode.
+- [ ] **One timing per size.** A monitor's modes are offered by size; the
+      refresh rate is the preferred mode's, or the one nearest 60 Hz. No
+      refresh-rate choice, no per-monitor interface scale, no rotation.
+- [ ] **A DP sink without an EDID** (an adaptor with nothing behind it, some
+      KVMs) counts as nothing connected; i915 falls back to 1024x768.
+- [ ] **Connections are polled once a second**, not taken from the hotplug
+      interrupt.
 - [ ] **GPU acceleration**: compositing and fills on the GPU instead of the
       CPU -- on Intel the blitter engine (command streamer, execlists), in
       QEMU whatever the virtual device offers.

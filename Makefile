@@ -201,6 +201,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/video/intel_gmbus.c kernel/drivers/video/intel_capture.c \
              kernel/drivers/video/intel_vbt.c kernel/drivers/video/intel_config.c \
              kernel/drivers/video/intel_hw.c kernel/drivers/video/intel_native.c kernel/display/edid_modes.c \
+             kernel/display/layout.c \
              kernel/acpi/display.c kernel/acpi/power.c \
              kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
              kernel/drivers/i2c/designware.c kernel/drivers/i2c/designware_protocol.c \
@@ -1614,7 +1615,15 @@ $(BUILD)/picobj_document.o: user/lib/document.c user/lib/document.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_workspace.o: user/lib/workspace.c user/lib/workspace.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-LIBEMBK_OBJS = $(BUILD)/picobj_workspace.o  $(BUILD)/picobj_document.o  $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+# Arranging several monitors (Settings, the desktop) runs the kernel's own
+# layout rules, so an arrangement is refused in userland for the reasons the
+# kernel would refuse it. -iquote: kernel/ names only "display/layout.h", it
+# never shadows a libc header.
+$(BUILD)/picobj_display_arrange.o: user/lib/display_arrange.c user/lib/display_arrange.h user/lib/embk_monitor.h kernel/display/layout.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC -iquote kernel -c $< -o $@
+$(BUILD)/picobj_display_layout.o: kernel/display/layout.c kernel/display/layout.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC -iquote kernel -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_display_arrange.o $(BUILD)/picobj_display_layout.o $(BUILD)/picobj_workspace.o  $(BUILD)/picobj_document.o  $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
@@ -3610,6 +3619,12 @@ service-test:
 doc-model-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/note user/note/doc.c user/note/syntax.c user/note/doc_test.c -o $(BUILD)/doc_model_test
 	$(BUILD)/doc_model_test
+
+.PHONY: display-arrange-test
+display-arrange-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/lib -iquote kernel user/lib/display_arrange.c kernel/display/layout.c \
+	    tests/desktop/display_arrange_test.c -o $(BUILD)/display_arrange_test
+	$(BUILD)/display_arrange_test
 
 .PHONY: contour-test
 contour-test:

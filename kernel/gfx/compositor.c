@@ -5,6 +5,8 @@
 
 #include "gfx/compositor.h"
 #include "drivers/video/framebuffer.h"
+#include "drivers/video/gpu.h"
+#include "display/layout.h"
 #include "drivers/video/console.h"
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
@@ -174,6 +176,20 @@ static int on_workspace(const struct comp_window *w) {
 #define SHADOW_PAD (SHADOW_W_FOCUS + SHADOW_DY + 2)   /* repaint growth     */
 #define WORK_TOP ((int)g_desktop.top)         /* universal system/status bar */
 #define WORK_BOTTOM ((int)g_desktop.bottom)      /* desktop taskbar */
+
+/* THE OUTPUTS. One desktop surface, and the rectangles of it the monitors
+ * show, primary first (display/layout.h). With one monitor this is the whole
+ * framebuffer. The bars -- top bar and dock -- live on the primary only, so
+ * its work area is the output minus them and every other output's is all of
+ * itself. */
+static struct layout_rect g_outs[LAYOUT_MAX_OUTPUTS];
+static unsigned g_nouts;
+
+static void outputs_whole(const fb_info_t *fi)
+{
+    if (!g_nouts && fi) { g_outs[0] = (struct layout_rect){ 0, 0, fi->width, fi->height }; g_nouts = 1; }
+}
+
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
 static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
 static int      g_cursor_under_valid;
@@ -281,6 +297,33 @@ static void aurora_build(int W, int H) {
 /* A desktop (home) window is chromeless -- no title bar above its content. */
 static int win_titlebar_h(const struct comp_window *w) {
     return (w->desktop || w->chromeless) ? 0 : COMP_TITLEBAR_H;
+}
+
+/* The work area of the output a rectangle's centre is on (or nearest). */
+static void work_area_for(int x, int y, int w, int h, int *x0, int *y0, int *x1, int *y1)
+{
+    outputs_whole(fb_get_info());
+    int32_t cx = x + w / 2, cy = y + h / 2;
+    layout_clamp_point(g_outs, g_nouts, &cx, &cy);
+    int i = layout_rect_at(g_outs, g_nouts, cx, cy);
+    if (i < 0) i = 0;
+    const struct layout_rect *o = &g_outs[i];
+    *x0 = o->x; *y0 = o->y; *x1 = o->x + (int)o->w; *y1 = o->y + (int)o->h;
+    if (i == 0) { *x0 += (int)g_desktop.left; *y0 += WORK_TOP; *x1 -= (int)g_desktop.right; *y1 -= WORK_BOTTOM; }
+}
+
+/* Keep a window's top-left inside the work area of the output it is on. */
+static void clamp_to_work(const struct comp_window *w, int *x, int *y)
+{
+    int x0, y0, x1, y1, th = win_titlebar_h(w);
+    work_area_for(*x, *y, (int)w->cw, (int)w->ch + th, &x0, &y0, &x1, &y1);
+    int maxx = x1 - (int)w->cw, maxy = y1 - th - (int)w->ch;
+    if (maxx < x0) maxx = x0;
+    if (maxy < y0) maxy = y0;
+    if (*x < x0) *x = x0;
+    if (*x > maxx) *x = maxx;
+    if (*y < y0) *y = y0;
+    if (*y > maxy) *y = maxy;
 }
 
 static void win_frame_rect(const struct comp_window *w,
@@ -1445,7 +1488,14 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     for(uint32_t row=0;row<copyh;row++)
         memcpy((uint32_t *)kview+(uint64_t)row*nw,w->content+(uint64_t)row*w->cw,(size_t)copyw*4);
     w->cw = nw; w->ch = nh;
-    w->fullscreen = (nw >= fi->width && nh >= fi->height);
+    {   /* full screen means covering the output it is on, not the whole desktop */
+        outputs_whole(fi);
+        int32_t cx = w->x + (int32_t)nw / 2, cy = w->y + (int32_t)nh / 2;
+        layout_clamp_point(g_outs, g_nouts, &cx, &cy);
+        int oi = layout_rect_at(g_outs, g_nouts, cx, cy);
+        const struct layout_rect *o = &g_outs[oi < 0 ? 0 : oi];
+        w->fullscreen = (nw >= o->w && nh >= o->h);
+    }
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
@@ -1565,16 +1615,8 @@ static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int rais
      * "Fill", and without this the two did the same thing. Measured before the
      * exemption: asking for the display and y=0 left the bar untouched,
      * because this clamp put the window back under it. */
-    if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi) {
-        int maxx = (int)fi->width - (int)g_desktop.right - (int)w->cw;
-        int maxy = (int)fi->height - WORK_BOTTOM - win_titlebar_h(w) - (int)w->ch;
-        if (maxx < (int)g_desktop.left) maxx = (int)g_desktop.left;
-        if (maxy < WORK_TOP) maxy = WORK_TOP;
-        if (x < (int)g_desktop.left) x = (int)g_desktop.left;
-        if (x > maxx) x = maxx;
-        if (y < WORK_TOP) y = WORK_TOP;
-        if (y > maxy) y = maxy;
-    }
+    if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi)
+        clamp_to_work(w, &x, &y);
     w->x = x; w->y = y;
     if(raise)w->z = w->widget ? g_widget_z++ : g_next_z++;   /* explicit moves raise */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
@@ -1590,6 +1632,14 @@ int64_t compositor_win_move(int pid,uint32_t id,int32_t x,int32_t y) {
 }
 int64_t compositor_win_place(int pid,uint32_t id,int32_t x,int32_t y) {
     return win_position(pid,id,x,y,0);
+}
+
+int64_t compositor_win_where(int pid,uint32_t id,struct comp_win_geometry *out) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w=win_find(pid,id);
+    if(w)*out=(struct comp_win_geometry){w->x,w->y,w->cw,w->ch};
+    spin_unlock(&g_comp_lock);
+    return w?0:-EMBK_ENOENT;
 }
 
 int64_t compositor_win_destroy(int pid, uint32_t id) {
@@ -2133,6 +2183,11 @@ void compositor_pointer_tick(void) {
     if (!g_active) return;               /* no desktop yet -> nothing to route */
     int32_t x, y; uint32_t b;
     mouse_get_state(&x, &y, &b);
+    if (g_nouts > 1) {                       /* nothing shows the gaps between monitors */
+        int32_t cx = x, cy = y;
+        layout_clamp_point(g_outs, g_nouts, &cx, &cy);
+        if (cx != x || cy != y) { mouse_warp(cx, cy); x = cx; y = cy; }
+    }
 
     spin_lock(&g_comp_lock);
     struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
@@ -2277,17 +2332,8 @@ void compositor_pointer_tick(void) {
             if (nx != w->x || ny != w->y) {
                 int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
                 const fb_info_t *fi = fb_get_info();
-                if (fi && !w->widget && !w->translucent) {
-                    int maxx = (int)fi->width - (int)g_desktop.right - (int)w->cw;
-                    int maxy = (int)fi->height - WORK_BOTTOM -
-                               win_titlebar_h(w) - (int)w->ch;
-                    if (maxx < (int)g_desktop.left) maxx = (int)g_desktop.left;
-                    if (maxy < WORK_TOP) maxy = WORK_TOP;
-                    if (nx < 0) nx = 0;
-                    if (nx > maxx) nx = maxx;
-                    if (ny < WORK_TOP) ny = WORK_TOP;
-                    if (ny > maxy) ny = maxy;
-                }
+                if (fi && !w->widget && !w->translucent)
+                    clamp_to_work(w, &nx, &ny);
                 w->x = nx; w->y = ny;
                 int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
                 DIRTY(ox0, oy0, ox1, oy1);
@@ -2560,26 +2606,79 @@ int compositor_desktop_healthy(void) {
 
 void compositor_display_lock(void) {spin_lock(&g_comp_lock);}
 void compositor_display_unlock(void) {spin_unlock(&g_comp_lock);}
-struct fb_surface *compositor_select_display(struct fb_surface *next) {
+/* A new surface -- and, with several monitors, a new arrangement of them.
+ * Windows on an output that went away move to the primary; every window is
+ * kept inside the work area of the output it is on now. */
+/* What each output showed before the current layout: a window -- or the
+ * pointer -- on a monitor goes WITH that monitor when the arrangement changes,
+ * so moving the external display to the other side of the laptop in Settings
+ * moves its windows too. Only windows whose monitor went away are re-homed. */
+static struct gpu_layout g_prev_layout;
+
+/* The move of the output (old layout) that point (x, y) was on. The primary
+ * is asked first: mirrored outputs all cover the same pixels, and leaving a
+ * mirror gathers the windows on the primary rather than on output 0. */
+static int output_shift(const struct gpu_layout *was, const struct gpu_layout *now, int x, int y, int *dx, int *dy) {
+    for(unsigned k=0;k<was->count && k<GPU_MAX_OUTPUTS;k++) {
+        unsigned i=k==0?was->primary:k<=was->primary?k-1:k;
+        if(i>=was->count)continue;
+        const struct gpu_output_cfg *o=&was->out[i];
+        if(!o->enabled || x<o->x || y<o->y || x>=o->x+(int)o->width || y>=o->y+(int)o->height)continue;
+        if(i>=now->count || !now->out[i].enabled)return 0;
+        *dx=now->out[i].x-o->x;*dy=now->out[i].y-o->y;return 1;
+    }
+    return 0;
+}
+
+struct fb_surface *compositor_select_layout(struct fb_surface *next, const struct gpu_layout *gl,
+                                            const struct layout_rect *rects, unsigned n) {
     spin_lock(&g_comp_lock);
-    struct fb_surface *old=fb_select_surface(next);
+    const fb_info_t *before=fb_get_info();
+    struct gpu_layout was=g_prev_layout;
+    if(!was.count && before)was=(struct gpu_layout){1,0,{{1,0,0,before->width,before->height}}};
+    struct fb_surface *old=gl?fb_select_layout(next,gl):fb_select_surface(next);
     if(old) {
         const fb_info_t *fi=fb_get_info();
+        struct gpu_layout now=gl?*gl:(struct gpu_layout){1,0,{{1,0,0,fi->width,fi->height}}};
         g_cursor_under_valid=0;g_cursor_valid=0;
         g_cap_pid=0;g_cap_win=0;g_dragging=0;g_drag_on=0;g_ptr_buttons=0;g_buttons_suppressed=1;
         anim_finish();
+        g_nouts=0;
+        for(unsigned i=0;i<n && i<LAYOUT_MAX_OUTPUTS;i++)g_outs[g_nouts++]=rects[i];
+        outputs_whole(fi);
         for(unsigned i=0;i<COMP_MAX_WINDOWS;i++) {
             struct comp_window *w=&g_wins[i];if(!w->used)continue;
             w->pend_count=w->pend_phase=0;
-            if(w->desktop){w->x=0;w->y=0;}
-            else {
-                if(w->x>(int)fi->width-120)w->x=(int)fi->width-120;
-                if(w->y>(int)fi->height-60)w->y=(int)fi->height-60;
-                if(w->x<0)w->x=0;if(w->y<(int)g_desktop.top)w->y=g_desktop.top;
-            }
+            if(w->desktop){w->x=0;w->y=0;continue;}
+            if(w->widget || w->translucent)continue;   /* the bars place themselves */
+            int32_t x=w->x,y=w->y;
+            int dx,dy,th=win_titlebar_h(w);
+            if(output_shift(&was,&now,x+(int)w->cw/2,y+(th+(int)w->ch)/2,&dx,&dy)){x+=dx;y+=dy;}
+            (void)layout_rehome(g_outs,g_nouts,&x,&y,w->cw,w->ch+(uint32_t)th);
+            int cx=x,cy=y;
+            if(!w->fullscreen)clamp_to_work(w,&cx,&cy);
+            w->x=cx;w->y=cy;
         }
         mouse_set_bounds(fi->width,fi->height);
+        int32_t px,py;uint32_t buttons;int dx,dy;
+        mouse_get_state(&px,&py,&buttons);
+        if(output_shift(&was,&now,px,py,&dx,&dy)){px+=dx;py+=dy;}
+        else{px=g_outs[0].x+(int32_t)g_outs[0].w/2;py=g_outs[0].y+(int32_t)g_outs[0].h/2;}
+        layout_clamp_point(g_outs,g_nouts,&px,&py);
+        mouse_warp(px,py);
+        g_prev_layout=now;
         paint_region(0,0,fi->width,fi->height);
     }
     spin_unlock(&g_comp_lock);return old;
+}
+struct fb_surface *compositor_select_display(struct fb_surface *next) {
+    return compositor_select_layout(next,0,0,0);
+}
+unsigned compositor_outputs(struct layout_rect *out,unsigned max) {
+    spin_lock(&g_comp_lock);
+    outputs_whole(fb_get_info());
+    unsigned n=g_nouts<max?g_nouts:max;
+    for(unsigned i=0;i<n;i++)out[i]=g_outs[i];
+    spin_unlock(&g_comp_lock);
+    return n;
 }

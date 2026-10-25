@@ -426,9 +426,10 @@ static void bar(void) {
     if(py>=strip_y && py<strip_y+g_bar_cfg.bar_size)reveal_until=now+900;
     int hidden=g_bar_cfg.bar_autohide && !em_menu_any_open() && now>reveal_until;
     if(!em_menu_any_open()) {
-        uint32_t sw,sh;embk_screen_size(&sw,&sh);
+        /* On the primary monitor: with several, the bar belongs to one. */
+        int ox,oy,ow,oh;em_primary_output(&ox,&oy,&ow,&oh);(void)ow;
         int canvas=(int)em_viewport_height();
-        em_window_move_to(0,g_bar_cfg.bar_edge?(int)sh-canvas+(hidden?g_bar_cfg.bar_size-2:0):(hidden?2-g_bar_cfg.bar_size:0));
+        em_window_move_to(ox,oy+(g_bar_cfg.bar_edge?oh-canvas+(hidden?g_bar_cfg.bar_size-2:0):(hidden?2-g_bar_cfg.bar_size:0)));
 
     }
     VStack(.width=em_viewport_width(),.height=em_viewport_height(),.align=Fill,.spacing=EmZero) {
@@ -472,10 +473,9 @@ static EmApp em_app_spec_ = {
 
 int main(void) {
     em_app_follow_display_width(1);
-    uint32_t sw = 0, sh = 0;
-    embk_screen_size(&sw, &sh);
-    if (sw) em_app_spec_.size.w = (int)sw;    /* a menu bar spans the display */
-    (void)sh;
+    int pw = 0;
+    em_primary_output(0, 0, &pw, 0);
+    if (pw) em_app_spec_.size.w = pw;         /* a menu bar spans its monitor */
     /* Off the render path, deliberately -- see bar_cfg_thread. */
     oscfg_defaults(&g_bar_cfg);
     g_bar_pending = g_bar_cfg;

@@ -196,3 +196,22 @@ const struct display_mode *edid_known_mode(unsigned width, unsigned height, unsi
 {
     return by_size(width, height, hz);
 }
+
+int edid_hdmi(const uint8_t *edid, unsigned len)
+{
+    if (!edid || len < 256) return 0;
+    for (unsigned e = 1; e <= edid[126] && (e + 1) * 128u <= len; e++) {
+        const uint8_t *b = edid + e * 128;
+        if (b[0] != 0x02 || b[1] < 3 || !block_ok(b)) continue;
+        unsigned dtd_at = b[2];
+        if (dtd_at < 4 || dtd_at > 127) continue;
+        for (unsigned at = 4; at < dtd_at; ) {
+            unsigned tag = b[at] >> 5, n = b[at] & 0x1fu;
+            if (at + 1 + n > dtd_at) break;
+            /* The HDMI vendor-specific block: IEEE OUI 00-0C-03, least significant byte first. */
+            if (tag == 3 && n >= 3 && b[at + 1] == 0x03 && b[at + 2] == 0x0c && b[at + 3] == 0x00) return 1;
+            at += 1 + n;
+        }
+    }
+    return 0;
+}

@@ -50,8 +50,93 @@ static void sink_status(void)
     if (lane == 0x7) dpcd[0x204] = 0x1;
 }
 
+/* ---- external monitors ------------------------------------------------------
+ * Off unless a test sets ext_mode: AUX B-D then answer from ext[] rather than
+ * the panel's sink (a missing sink never answers), GMBUS serves an HDMI
+ * monitor's EDID on gmbus_sim_pin, and the test drives SDEISR's live bits.
+ * External DP sinks train at level 0; `dead` ones never do. */
+static int ext_mode;
+struct ext_sink { int present, dead; uint8_t dpcd[0x800]; const uint8_t *edid; unsigned i2c_at; };
+static struct ext_sink ext[4];
+static const uint8_t *gmbus_edid;
+static unsigned gmbus_sim_pin;
+static uint32_t gmbus2, gmbus_left;
+static unsigned gmbus_pos;
+
+static void ext_status(struct ext_sink *e)
+{
+    unsigned lanes = e->dpcd[0x101] & 0x1f, pat = e->dpcd[0x102] & 3u;
+    uint8_t lane = e->dead ? 0 : pat == 1 ? 0x1 : (pat == 2 || pat == 3) ? 0x7 : 0;
+    memset(e->dpcd + 0x202, 0, 6);
+    for (unsigned l = 0; l < lanes; l++) e->dpcd[0x202 + l / 2] |= (uint8_t)(lane << ((l & 1) * 4));
+    if (lane == 0x7) e->dpcd[0x204] = 0x1;
+}
+
+static void ext_aux(unsigned ch, uint32_t ctl)
+{
+    struct ext_sink *e = &ext[ch];
+    if (!e->present) { regs[DP_AUX_CH_CTL(ch) / 4] = 1u << 28; return; }   /* nothing there: a timeout */
+    unsigned size = (ctl >> 20) & 0x1f;
+    uint8_t tx[20];
+    for (unsigned i = 0; i < size; i++)
+        tx[i] = (uint8_t)(regs[DP_AUX_CH_DATA(ch, i / 4) / 4] >> ((3 - i % 4) * 8));
+    unsigned req = tx[0] >> 4, addr = (unsigned)(tx[0] & 0xf) << 16 | (unsigned)tx[1] << 8 | tx[2];
+    uint8_t reply[20] = { 0 };
+    unsigned n = 1;
+    if (req == 0x8) {
+        unsigned len = tx[3] + 1u;
+        for (unsigned i = 0; i < len && addr + i < sizeof e->dpcd; i++) e->dpcd[addr + i] = tx[4 + i];
+        if (addr <= 0x102 && addr + len > 0x102) ext_status(e);
+    } else if (req == 0x9) {
+        unsigned len = tx[3] + 1u;
+        if (addr == 0x202) ext_status(e);
+        for (unsigned i = 0; i < len; i++) reply[1 + i] = addr + i < sizeof e->dpcd ? e->dpcd[addr + i] : 0;
+        n += len;
+    } else {
+        unsigned rd = req & 1u, mot = req & 4u;
+        if (addr != 0x50 || !e->edid) reply[0] = 0x40;
+        else if (size == 3) { if (!mot) e->i2c_at = 0; }
+        else if (!rd) e->i2c_at = tx[4];
+        else {
+            unsigned len = tx[3] + 1u;
+            for (unsigned i = 0; i < len; i++) reply[1 + i] = e->edid[(e->i2c_at + i) & 0xff];
+            e->i2c_at += len;
+            n += len;
+        }
+    }
+    for (unsigned i = 0; i < 5; i++) {
+        uint32_t w = 0;
+        for (unsigned b = 0; b < 4; b++) if (i * 4 + b < n) w |= (uint32_t)reply[i * 4 + b] << ((3 - b) * 8);
+        regs[DP_AUX_CH_DATA(ch, i) / 4] = w;
+    }
+    regs[DP_AUX_CH_CTL(ch) / 4] = (1u << 30) | (n << 20);
+}
+
+/* GMBUS: indexed reads at slave 0x50 on one pin; anything else NAKs. */
+static void gmbus_cmd(uint32_t v)
+{
+    if (v & (1u << 31)) { gmbus2 = 0; return; }                  /* SW_CLR_INT */
+    if (!(v & (1u << 30))) return;                                /* not SW_RDY */
+    unsigned cycle = (v >> 25) & 7u;
+    if (cycle == 4) { gmbus2 = 0; return; }                       /* STOP */
+    unsigned pin = regs[0xc5100 / 4] & 7u, slave = (v >> 1) & 0x7f;
+    if (!gmbus_edid || pin != gmbus_sim_pin || slave != 0x50) { gmbus2 = 1u << 10; return; }
+    gmbus_pos = (v >> 8) & 0xff;
+    gmbus_left = (v >> 16) & 0x1ff;
+    gmbus2 = (1u << 9) | (1u << 11);
+}
+
+static uint32_t gmbus_data(void)
+{
+    uint32_t w = 0;
+    for (unsigned b = 0; b < 4 && gmbus_left; b++, gmbus_left--) w |= (uint32_t)gmbus_edid[gmbus_pos++ & 0xff] << (b * 8);
+    gmbus2 = (1u << 9) | (gmbus_left ? (1u << 11) : (1u << 14));
+    return w;
+}
+
 static void aux_exec(unsigned ch, uint32_t ctl)
 {
+    if (ext_mode && ch != 0) { ext_aux(ch, ctl); return; }
     unsigned size = (ctl >> 20) & 0x1f;
     uint8_t tx[20];
     for (unsigned i = 0; i < size; i++)
@@ -103,6 +188,8 @@ static uint32_t sim_read(void *ctx, uint32_t off)
     assert(off < sizeof regs && !(off & 3));
     clock_us++;
     if (off >= 0x70040 && off < 0x73000 && (off & 0xfff) == 0x040) regs[off / 4]++;   /* frame counter */
+    if (ext_mode && off == 0xc5108) return gmbus2;
+    if (ext_mode && off == 0xc510c) return gmbus_data();
     return regs[off / 4];
 }
 
@@ -112,6 +199,7 @@ static void sim_write(void *ctx, uint32_t off, uint32_t v)
     assert(off < sizeof regs && !(off & 3));
     clock_us++;
     if (ntrace < sizeof trace / sizeof trace[0]) trace[ntrace++] = (struct write){ off, v };
+    if (ext_mode && off == 0xc5104) { gmbus_cmd(v); return; }
     for (unsigned ch = 0; ch < 4; ch++)
         if (off == DP_AUX_CH_CTL(ch)) {
             if (v & (1u << 31)) aux_exec(ch, v);

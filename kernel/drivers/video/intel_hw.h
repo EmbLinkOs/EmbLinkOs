@@ -92,6 +92,17 @@ void intel_hw_disable(struct intel_hw *hw, const struct intel_crtc_cfg *cfg, int
  * flip). Takes effect at the next vblank. */
 void intel_hw_plane_flip(struct intel_hw *hw, const struct intel_crtc_cfg *cfg);
 
+/* Re-program a lit pipe's plane whole -- surface, stride, offset, size -- with
+ * its share of the display buffer and its watermarks, latched together at the
+ * next vblank, which this waits for. For when another pipe comes or goes and
+ * the buffer is split again: a pipe whose share shrinks must be moved before
+ * the new pipe is given the blocks it gave up. */
+void intel_hw_plane_update(struct intel_hw *hw, const struct intel_crtc_cfg *cfg);
+
+/* Power for AUX channels B-D (they live in power well 2), so a monitor on an
+ * external port can be asked what it is before anything is lit there. */
+int intel_hw_aux_power(struct intel_hw *hw);
+
 /* Wait for the pipe's next vblank (its frame counter to move; 50 ms at most). */
 void intel_hw_wait_vblank(struct intel_hw *hw, unsigned pipe);
 

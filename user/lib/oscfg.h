@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "embk.h"
+#include "display_arrange.h"
 
 /* WHERE THE FILE LIVES, resolved once, from the environment.
  *
@@ -226,6 +227,9 @@ struct oscfg {
     int bar_date;      /* show the date beside the time                   */
     int bar_cpu;       /* show the CPU readout                            */
     int display_width,display_height; /* confirmed per-user resolution; 0 = boot mode */
+    /* The confirmed arrangement of several monitors, for the set connected
+     * when it was kept (display_arrange.h); count 0 = none saved. */
+    struct display_saved display_layout;
 };
 
 /* The screen band the DOCK owns, in pixels, for a given preference.
@@ -317,6 +321,22 @@ static inline void oscfg_preset(struct oscfg *c, int preset) {
 static inline void oscfg_clamp(struct oscfg *c) {
     if(c->display_width<640 || c->display_width>4096 || c->display_height<480 || c->display_height>2160 ||
        (uint64_t)c->display_width*c->display_height>8388608)c->display_width=c->display_height=0;
+    {
+        /* A saved arrangement is all or nothing: one bad entry and it is
+         * dropped, and the monitors come up the way the kernel places them. */
+        struct display_saved *l=&c->display_layout;int ok=l->count>=0 && l->count<=(int)EMBK_DISPLAY_MAX_OUTPUTS,primaries=0;
+        l->mirror=!!l->mirror;
+        for(int i=0;ok && i<l->count;i++) {
+            if(!l->out[i].id || (l->out[i].enabled!=0 && l->out[i].enabled!=1) || (l->out[i].primary!=0 && l->out[i].primary!=1))ok=0;
+            else if(l->out[i].enabled) {
+                if(l->out[i].width<320 || l->out[i].width>8192 || l->out[i].height<200 || l->out[i].height>4320 ||
+                   l->out[i].x<0 || l->out[i].x>8192 || l->out[i].y<0 || l->out[i].y>4320)ok=0;
+                primaries+=l->out[i].primary;
+            }else if(l->out[i].primary || l->out[i].width || l->out[i].height || l->out[i].x || l->out[i].y)ok=0;
+        }
+        if(!ok || (l->count && primaries!=1))memset(l,0,sizeof *l);
+        for(int i=l->count;i<(int)EMBK_DISPLAY_MAX_OUTPUTS;i++)memset(&l->out[i],0,sizeof l->out[i]);
+    }
     #define OSCFG_BOUND(name, value, lo, hi) if(c->name < lo)c->name=lo; if(c->name > hi)c->name=hi;
     OSCFG_CONTOUR_FIELDS(OSCFG_BOUND)
     #undef OSCFG_BOUND
@@ -426,6 +446,19 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
         while (*p && *p != '\n') p++;
         if (*p) *p++ = 0;
         if (line[0] == '#' || !line[0]) continue;
+        /* One monitor of the saved arrangement: id enabled primary w h x y.
+         * The id is unsigned, so it is read here and not by the %d below. */
+        if (!strncmp(line, "display_output ", 15)) {
+            struct display_saved *l = &c->display_layout;
+            unsigned id; int e, pr, w, h, x, y;
+            if (sscanf(line + 15, "%u %d %d %d %d %d %d", &id, &e, &pr, &w, &h, &x, &y) == 7 &&
+                l->count >= 0 && l->count < (int)EMBK_DISPLAY_MAX_OUTPUTS) {
+                l->out[l->count].id = id; l->out[l->count].enabled = e; l->out[l->count].primary = pr;
+                l->out[l->count].width = w; l->out[l->count].height = h; l->out[l->count].x = x; l->out[l->count].y = y;
+                l->count++;
+            } else l->count = -1;                     /* malformed: oscfg_clamp drops the whole arrangement */
+            continue;
+        }
         if (sscanf(line, "%31s %d", key, &val) != 2) continue;
         #define OSCFG_PARSE(name, value, lo, hi) if (!strcmp(key, #name)) { c->name=val; continue; }
         OSCFG_CONTOUR_FIELDS(OSCFG_PARSE)
@@ -436,6 +469,7 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
         else if(!strcmp(key,"power_profile"))c->power_profile=val;
         else if(!strcmp(key,"display_width"))c->display_width=val;
         else if(!strcmp(key,"display_height"))c->display_height=val;
+        else if(!strcmp(key,"display_mirror")){memset(&c->display_layout,0,sizeof c->display_layout);c->display_layout.mirror=val;}
         else if(!strcmp(key,"volume"))c->volume=val;
         else if(!strcmp(key,"muted"))c->muted=val;
         else if (!strcmp(key, "accent"))    c->accent    = val;
@@ -473,6 +507,18 @@ static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
     int added=snprintf(out+n,(size_t)(cap-n),"display_width %d\ndisplay_height %d\n",c->display_width,c->display_height);
     if(added<0 || added>=cap-n)return -1;
     n+=added;
+    const struct display_saved *l=&c->display_layout;
+    if(l->count>0) {
+        added=snprintf(out+n,(size_t)(cap-n),"display_mirror %d\n",l->mirror);
+        if(added<0 || added>=cap-n)return -1;
+        n+=added;
+        for(int i=0;i<l->count && i<(int)EMBK_DISPLAY_MAX_OUTPUTS;i++) {
+            added=snprintf(out+n,(size_t)(cap-n),"display_output %u %d %d %d %d %d %d\n",(unsigned)l->out[i].id,
+                           l->out[i].enabled,l->out[i].primary,l->out[i].width,l->out[i].height,l->out[i].x,l->out[i].y);
+            if(added<0 || added>=cap-n)return -1;
+            n+=added;
+        }
+    }
     return n;
 }
 

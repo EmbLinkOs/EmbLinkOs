@@ -22,6 +22,9 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "include/spinlock.h"
+#if defined(__x86_64__)
+#include "arch/x86_64/boot/fw_cfg.h"
+#endif
 
 // ---- virtio PCI capability layout ------------------------------------------
 #define VIRTIO_PCI_CAP_COMMON_CFG  1
@@ -179,6 +182,15 @@ struct virtio_gpu_state {
     bool failed,edid_supported;
     struct display_identity identity;
     bool scanout_ready;
+
+    /* Every head: what the host says (or a headless test forces), its EDID. */
+    unsigned num_scanouts, forced_heads;
+    bool polled_once;
+    struct {
+        bool connected, has_identity;
+        uint32_t width, height;
+        struct display_identity identity;
+    } heads[GPU_MAX_OUTPUTS];
 
     struct vring_desc  desc[VQ_SIZE]  __attribute__((aligned(4096)));
     struct vring_avail avail          __attribute__((aligned(4096)));
@@ -522,12 +534,119 @@ static void vgpu_read_edid(void) {
         (void)display_edid_parse(response.bytes,response.size,&s->identity);
 }
 
+/* ---- several heads -------------------------------------------------------
+ * virtio-gpu config space (virtio 1.2, 5.7.4): events_read, events_clear,
+ * num_scanouts. VIRTIO_GPU_EVENT_DISPLAY in events_read says the host's
+ * display configuration changed -- a head was connected or resized. */
+#define VGPU_CFG_EVENTS_READ  0x0
+#define VGPU_CFG_EVENTS_CLEAR 0x4
+#define VGPU_CFG_NUM_SCANOUTS 0x8
+#define VGPU_EVENT_DISPLAY    1u
+
+static unsigned vgpu_heads(void) {
+    unsigned n = g_vgpu.num_scanouts;
+    return n > GPU_MAX_OUTPUTS ? GPU_MAX_OUTPUTS : n;
+}
+
+static void vgpu_read_heads(void) {
+    struct virtio_gpu_state *s = &g_vgpu;
+    struct virtio_gpu_ctrl_hdr cmd;
+    memset(&cmd, 0, sizeof cmd);
+    cmd.type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
+    struct virtio_gpu_resp_display_info info;
+    if (!vgpu_submit(&cmd, sizeof cmd, &info, sizeof info, VIRTIO_GPU_RESP_OK_DISPLAY_INFO)) return;
+    for (unsigned i = 0; i < vgpu_heads(); i++) {
+        int on = info.pmodes[i].enabled || i < s->forced_heads || i == 0;
+        uint32_t w = info.pmodes[i].r.width, h = info.pmodes[i].r.height;
+        if (w < 320 || h < 200) { w = 1024; h = 768; }
+#if defined(EMBK_VGPU_CAP_W) && defined(EMBK_VGPU_CAP_H)
+        if (w > (EMBK_VGPU_CAP_W)) w = (EMBK_VGPU_CAP_W);
+        if (h > (EMBK_VGPU_CAP_H)) h = (EMBK_VGPU_CAP_H);
+#endif
+        s->heads[i].connected = on;
+        s->heads[i].width = w;
+        s->heads[i].height = h;
+        if (s->edid_supported) {
+            struct {struct virtio_gpu_ctrl_hdr header;uint32_t scanout,padding;} request={0};
+            struct {struct virtio_gpu_ctrl_hdr header;uint32_t size,padding;uint8_t bytes[1024];} response;
+            request.header.type=0x010a;request.scanout=i;
+            s->heads[i].has_identity = vgpu_submit(&request,sizeof request,&response,sizeof response,0x1104) &&
+                response.size<=1024 && !display_edid_parse(response.bytes,response.size,&s->heads[i].identity);
+        }
+    }
+}
+
+static unsigned vgpu_output_count(void) { return vgpu_heads(); }
+
+static bool vgpu_output_info(unsigned i, struct gpu_output *o) {
+    struct virtio_gpu_state *s = &g_vgpu;
+    if (i >= vgpu_heads()) return false;
+    memset(o, 0, sizeof *o);
+    snprintf(o->name, sizeof o->name, "Virtual-%u", i + 1);
+    o->connected = s->heads[i].connected;
+    if (s->heads[i].has_identity) {
+        o->has_edid = 1;
+        strncpy(o->model, s->heads[i].identity.name, sizeof o->model - 1);
+        memcpy(o->manufacturer, s->heads[i].identity.manufacturer, 4);
+        o->width_mm = s->heads[i].identity.width_mm;
+        o->height_mm = s->heads[i].identity.height_mm;
+    }
+    /* A virtual head shows any size: its preferred one first, then the usual. */
+    static const uint16_t std[][2] = { {800,600},{1024,768},{1280,720},{1280,800},{1280,1024},{1440,900},
+                                       {1600,900},{1680,1050},{1920,1080},{1920,1200},{2560,1440} };
+    o->modes[o->mode_count++] = (struct gpu_output_mode){ (uint16_t)s->heads[i].width, (uint16_t)s->heads[i].height, 60000, 1 };
+    for (unsigned k = 0; k < sizeof std / sizeof std[0] && o->mode_count < GPU_OUTPUT_MODES; k++)
+        if (std[k][0] != s->heads[i].width || std[k][1] != s->heads[i].height)
+            o->modes[o->mode_count++] = (struct gpu_output_mode){ std[k][0], std[k][1], 60000, 0 };
+    return true;
+}
+
+static bool vgpu_apply_layout(const struct gpu_target *surface, const struct gpu_layout *l) {
+    struct virtio_gpu_state *s = &g_vgpu;
+    for (unsigned i = 0; i < vgpu_heads(); i++) {
+        struct virtio_gpu_set_scanout sc;
+        memset(&sc, 0, sizeof sc);
+        sc.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+        sc.scanout_id = i;
+        if (i < l->count && l->out[i].enabled) {
+            sc.r.x = (uint32_t)l->out[i].x; sc.r.y = (uint32_t)l->out[i].y;
+            sc.r.width = l->out[i].width; sc.r.height = l->out[i].height;
+            sc.resource_id = surface->resource_id;
+        }                                      /* else resource 0: the head is switched off */
+        if (!vgpu_simple_cmd(&sc, sizeof sc)) return false;
+    }
+    s->width = surface->mode.width;
+    s->height = surface->mode.height;
+    s->active_resource = surface->resource_id;
+    s->scanout_ready = true;
+    return true;
+}
+
+static int vgpu_poll_outputs(void) {
+    struct virtio_gpu_state *s = &g_vgpu;
+    bool before[GPU_MAX_OUTPUTS];
+    for (unsigned i = 0; i < GPU_MAX_OUTPUTS; i++) before[i] = s->heads[i].connected;
+    int event = 0;
+    if (s->vp.devcfg && (vr32(s->vp.devcfg, VGPU_CFG_EVENTS_READ) & VGPU_EVENT_DISPLAY)) {
+        vw32(s->vp.devcfg, VGPU_CFG_EVENTS_CLEAR, VGPU_EVENT_DISPLAY);
+        event = 1;
+    }
+    if (!event && s->polled_once) return 0;
+    s->polled_once = true;
+    vgpu_read_heads();
+    int changed = !event;                      /* the first poll always reports the heads there are */
+    for (unsigned i = 0; i < GPU_MAX_OUTPUTS; i++) if (before[i] != s->heads[i].connected) changed = 1;
+    return changed;
+}
+
 static const struct gpu_driver g_vgpu_driver = {
     .name = "virtio-gpu",
     .prepare=vgpu_prepare,.select=vgpu_select,.release=vgpu_release,.describe=vgpu_describe,.resource_id=vgpu_resource,
     .get_mode = vgpu_get_mode,
     .flush = vgpu_flush,
     .attach_backing = vgpu_attach_backing,
+    .output_count = vgpu_output_count, .output_info = vgpu_output_info,
+    .apply_layout = vgpu_apply_layout, .poll_outputs = vgpu_poll_outputs,
 };
 
 const struct gpu_driver *virtio_gpu_probe(void) {
@@ -552,6 +671,14 @@ const struct gpu_driver *virtio_gpu_probe(void) {
         return 0;
     }
     g_vgpu.present = true;
+    g_vgpu.num_scanouts = g_vgpu.vp.devcfg ? vr32(g_vgpu.vp.devcfg, VGPU_CFG_NUM_SCANOUTS) : 1;
+    if (!g_vgpu.num_scanouts) g_vgpu.num_scanouts = 1;
+#if defined(__x86_64__)
+    g_vgpu.forced_heads = (unsigned)boot_qemu_outputs();
+#endif
     vgpu_read_edid();
+    vgpu_read_heads();
+    kprintf("virtio-gpu: %u head(s)%s\n", g_vgpu.num_scanouts,
+            g_vgpu.forced_heads > 1 ? " (a headless test connects them)" : "");
     return &g_vgpu_driver;
 }

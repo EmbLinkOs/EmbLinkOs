@@ -37,6 +37,13 @@ static struct embk_display_info g_display;
 static struct embk_gpu_info g_graphics;
 static struct embk_monitor_info g_monitor;
 static int g_monitor_rc,g_mode_pick=-1;
+/* Several monitors: what is on screen, and the arrangement being edited. */
+static struct embk_display_layout g_layout;
+static int g_layout_rc=-1;
+static struct arrange g_arr,g_arr_base;
+static unsigned g_arr_generation,g_arr_sel;
+static int g_arr_valid,g_layout_trial;
+static char g_arr_message[160];
 static unsigned g_mode_generation;
 static char g_mode_message[128];
 static struct embk_power_info g_power;
@@ -81,6 +88,10 @@ static void sample_system(void) {
         g_wifi_rc=embk_wifi_get(&g_wifi);
         g_update_rc=embk_update(EMBK_UPDATE_STATUS,&g_update,sizeof g_update);
         g_monitor_rc=embk_monitor(EMBK_MONITOR_GET,&g_monitor,sizeof g_monitor);
+        g_layout_rc=embk_display_layout(&g_layout);
+        /* An arrangement trial that ended without us (timeout, a lock) is over. */
+        if(g_layout_trial && !g_monitor_rc && g_monitor.phase!=EMBK_MONITOR_QUEUED && g_monitor.phase!=EMBK_MONITOR_APPLYING &&
+           g_monitor.phase!=EMBK_MONITOR_TRIAL)g_layout_trial=0;
         g_audio_rc=embk_audio_get(&g_audio);g_display_rc=embk_display_get(&g_display);
         g_power_rc=embk_power_get(&g_power);embk_gpu_get(&g_graphics);embk_policy_get(&g_policy);
         if(!g_wifi_rc && g_wifi_pending && g_wifi.completed_id &&
@@ -469,13 +480,220 @@ static int monitor_action(unsigned action) {
     g_sample_next=0;em_request_frame();return rc;
 }
 
+/* ---- several monitors ---------------------------------------------------
+ * An arrangement is edited here and shown only on Apply, through the same
+ * trial a resolution change has: Keep saves it for this set of monitors (the
+ * desktop restores it whenever they are connected again), anything else puts
+ * the previous arrangement back. display_arrange.h turns "the monitor is on
+ * the left" into coordinates and refuses what the kernel would refuse, with
+ * the reason, before anything changes on screen. */
+static unsigned output_number(unsigned i) {
+    unsigned n=1;
+    for(unsigned k=0;k<i && k<g_layout.count;k++)if(g_layout.outputs[k].flags&EMBK_OUTPUT_CONNECTED)n++;
+    return n;
+}
+static const char *output_title(unsigned i) {
+    const struct embk_output *o=&g_layout.outputs[i];
+    return o->model[0]?o->model:o->name;
+}
+static void arrangement_sync(void) {
+    if(g_arr_valid && g_layout.generation==g_arr_generation)return;
+    /* The screen changed under the edit (a monitor plugged in, a trial ended):
+     * the edit described displays that are not there any more. Start over. */
+    arrange_from_layout(&g_layout,&g_arr);g_arr_base=g_arr;
+    g_arr_generation=g_layout.generation;g_arr_valid=1;g_arr_message[0]=0;
+    if(g_arr_sel>=g_arr.count || !(g_layout.outputs[g_arr_sel].flags&EMBK_OUTPUT_CONNECTED)) {
+        g_arr_sel=0;
+        for(unsigned i=0;i<g_arr.count;i++)if(g_arr.out[i].primary){g_arr_sel=i;break;}
+    }
+}
+static void arrange_note(int rc) {
+    if(rc==ARRANGE_TOO_MANY && g_layout.max_enabled)
+        snprintf(g_arr_message,sizeof g_arr_message,"This computer shows at most %u displays at once. Turn one off first.",g_layout.max_enabled);
+    else snprintf(g_arr_message,sizeof g_arr_message,"%s",rc?arrange_error(rc):"");
+}
+
+/* The displays to scale, as they would be placed: click one to choose it. */
+static void arrangement_preview(void) {
+    enum { PW=440, PH=180, PAD=14 };
+    struct embk_layout_request r;
+    (void)arrange_request(&g_layout,&g_arr,&r);   /* placed even when refused: an overlap is shown, not hidden */
+    int64_t x0=INT64_MAX,y0=INT64_MAX,x1=INT64_MIN,y1=INT64_MIN;
+    for(unsigned i=0;i<g_arr.count;i++) {
+        if(!g_arr.out[i].enabled)continue;
+        int64_t x=g_arr.mirror?0:r.out[i].x,y=g_arr.mirror?0:r.out[i].y;
+        if(x<x0)x0=x;
+        if(y<y0)y0=y;
+        if(x+(int64_t)g_arr.out[i].width>x1)x1=x+g_arr.out[i].width;
+        if(y+(int64_t)g_arr.out[i].height>y1)y1=y+g_arr.out[i].height;
+    }
+    if(x0==INT64_MAX)return;
+    float sx=(float)(PW-2*PAD)/(float)(x1-x0),sy=(float)(PH-2*PAD)/(float)(y1-y0),k=sx<sy?sx:sy;
+    float ox=(PW-(float)(x1-x0)*k)*.5f,oy=(PH-(float)(y1-y0)*k)*.5f;
+    HStack(.justify=Center,.grow=1,.key="arrangement-row") {
+        VStack(.width=PW,.height=PH,.background=T.surface_alt,.corner=10,.border=1,.border_color=T.border,.key="arrangement") {
+            em_flush();ui_set_pos_container(1);ui_set_clip_children(true);
+            static const char *keys[EMBK_DISPLAY_MAX_OUTPUTS]={"arr-0","arr-1","arr-2","arr-3"};
+            for(unsigned i=0;i<g_arr.count && i<EMBK_DISPLAY_MAX_OUTPUTS;i++) {
+                const struct arrange_out *o=&g_arr.out[i];
+                if(!o->enabled)continue;
+                /* Mirrored displays are one picture: draw it once, named for all. */
+                int first=1;
+                if(g_arr.mirror)for(unsigned k=0;k<i;k++)if(g_arr.out[k].enabled)first=0;
+                if(!first)continue;
+                float x=ox+(float)((g_arr.mirror?0:r.out[i].x)-x0)*k,y=oy+(float)((g_arr.mirror?0:r.out[i].y)-y0)*k;
+                float w=(float)o->width*k-4,h=(float)o->height*k-4;
+                int sel=g_arr.mirror?1:i==g_arr_sel;
+                char number[32],detail[48];
+                if(g_arr.mirror) {
+                    int n=0;number[0]=0;
+                    for(unsigned m=0;m<g_arr.count;m++)if(g_arr.out[m].enabled) {
+                        size_t at=strlen(number);snprintf(number+at,sizeof number-at,"%s%u",n++?" = ":"",output_number(m));
+                    }
+                    snprintf(detail,sizeof detail,"Mirrored · %u × %u",o->width,o->height);
+                }else {
+                    snprintf(number,sizeof number,"%u",output_number(i));
+                    snprintf(detail,sizeof detail,"%u × %u",o->width,o->height);
+                }
+                VStack(.width=w<24?24:w,.height=h<24?24:h,.spacing=2,.align=Center,.justify=Center,.corner=6,
+                       .background=sel?T.accent_soft:T.surface,.border=sel?2:1,.border_color=sel?T.accent:T.border_strong,.key=keys[i]) {
+                    struct instance_handle self=ui_open();
+                    ui_set_overlay(true);ui_set_insets(y+2,0,0,x+2,1|8,false);
+                    Text(number).heading();
+                    if(h>=56)Text(g_arr.mirror?detail:output_title(i)).caption().secondary();
+                    if(h>=80 && !g_arr.mirror)Text(detail).caption().tertiary();
+                    if(o->primary && h>=96 && !g_arr.mirror)Text("Menu bar").caption().tertiary();
+                    em_flush();
+                    if(ui_consume_click(self) && !g_arr.mirror)g_arr_sel=i;
+                }
+            }
+        }
+    }
+}
+
+static void arrangement_display_card(unsigned i) {
+    const struct embk_output *o=&g_layout.outputs[i];
+    struct arrange_out *a=&g_arr.out[i];
+    char title[80];snprintf(title,sizeof title,"Display %u · %s",output_number(i),output_title(i));
+    Section(title,.key="arr-display") {
+        char detail[128];
+        if(o->flags&EMBK_OUTPUT_EDID)
+            snprintf(detail,sizeof detail,"%s · %.3s · %u × %u mm%s",o->name,o->manufacturer,o->width_mm,o->height_mm,
+                     (o->flags&EMBK_OUTPUT_BUILTIN)?" · built in":"");
+        else snprintf(detail,sizeof detail,"%s%s",o->name,(o->flags&EMBK_OUTPUT_BUILTIN)?" · built in":"");
+        Text(detail).caption().secondary();
+        HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key="arr-use") {
+            setting_label("Use this display",a->primary?"The primary display shows the menu bar and the dock.":"");
+            bool on=!!a->enabled;Toggle("",&on);Sync();
+            if(on!=!!a->enabled)arrange_note(arrange_set_enabled(&g_layout,&g_arr,i,on));
+        }
+        if(!a->enabled)return;
+        /* Resolution: this display's own sizes, or -- mirrored -- the sizes every one of them can show. */
+        uint32_t mw[16],mh[16];unsigned n=0;
+        if(g_arr.mirror)n=arrange_common_modes(&g_layout,&g_arr,mw,mh,16);
+        else for(unsigned k=0;k<o->mode_count && k<16;k++){mw[n]=o->modes[k].width;mh[n]=o->modes[k].height;n++;}
+        if(n) {
+            const char *names[16];char labels[16][40];int pick=-1;
+            for(unsigned k=0;k<n;k++) {
+                int preferred=0;
+                for(unsigned m=0;m<o->mode_count && m<16;m++)
+                    if(o->modes[m].width==mw[k] && o->modes[m].height==mh[k] && (o->modes[m].flags&EMBK_MONITOR_PREFERRED))preferred=1;
+                snprintf(labels[k],sizeof labels[k],"%u × %u%s",mw[k],mh[k],preferred?" · Recommended":"");names[k]=labels[k];
+                if(mw[k]==a->width && mh[k]==a->height)pick=(int)k;
+            }
+            if(pick<0)pick=0;
+            int was=pick;
+            HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key="arr-res") {
+                setting_label("Resolution",g_arr.mirror?"Every mirrored display shows this size.":"");
+                Dropdown(names,(int)n,&pick);Sync();
+            }
+            if(pick!=was && pick>=0 && (unsigned)pick<n) {
+                for(unsigned k=0;k<g_arr.count;k++)
+                    if(k==i || (g_arr.mirror && g_arr.out[k].enabled)){g_arr.out[k].width=mw[pick];g_arr.out[k].height=mh[pick];}
+                g_arr_message[0]=0;
+            }
+        }
+        if(!g_arr.mirror && !a->primary) {
+            static const char *sides[4]={"Right","Left","Above","Below"};
+            HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key="arr-side") {
+                setting_label("Position","Where it stands, seen from the primary display.");
+                int side=a->side,was=side;Segmented(sides,4,&side);Sync();
+                if(side!=was){a->side=side;a->order=INT32_MAX;a->offset=0;g_arr_message[0]=0;}
+            }
+            HStack(.spacing=10,.key="arr-primary") {
+                if(Button("Make Primary").secondary().clicked())arrange_note(arrange_set_primary(&g_layout,&g_arr,i));
+            }
+        }
+    }
+}
+
+static void arrangement_apply(const struct embk_layout_request *r) {
+    struct embk_layout_request copy=*r;
+    int rc=embk_monitor(EMBK_MONITOR_LAYOUT_APPLY,&copy,sizeof copy);
+    if(rc)snprintf(g_arr_message,sizeof g_arr_message,"Could not change the displays (%d).",rc);
+    else {g_layout_trial=1;g_arr_message[0]=0;}
+    g_sample_next=0;em_request_frame();
+}
+
+static void pane_arrangement(void) {
+    arrangement_sync();
+    Section("Displays",.key="arr-displays") {
+        static const char *modes[2]={"Extend","Mirror"};
+        HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key="arr-mode") {
+            setting_label("Several displays","Extend makes one desktop across them; Mirror shows the same picture on each.");
+            int mirror=g_arr.mirror,was=mirror;Segmented(modes,2,&mirror);Sync();
+            if(mirror!=was)arrange_note(arrange_set_mirror(&g_layout,&g_arr,mirror));
+        }
+        arrangement_preview();
+        if(!g_arr.mirror)Text("Select a display to change it.").caption().tertiary();
+    }
+    if(g_arr.mirror) {
+        /* One picture: the settings every mirrored display shares. */
+        unsigned p=g_arr_sel;
+        for(unsigned i=0;i<g_arr.count;i++)if(g_arr.out[i].primary)p=i;
+        arrangement_display_card(p);
+        Section("Mirrored displays",.key="arr-mirrored") {
+            for(unsigned i=0;i<g_arr.count;i++) {
+                if(!(g_layout.outputs[i].flags&EMBK_OUTPUT_CONNECTED) || i==p)continue;
+                char label[80];snprintf(label,sizeof label,"Display %u · %s",output_number(i),output_title(i));
+                HStack(.spacing=16,.align=Center,.py=4,.grow=1,.key=i==0?"m0":i==1?"m1":i==2?"m2":"m3") {
+                    setting_label(label,"");
+                    bool on=!!g_arr.out[i].enabled;Toggle("",&on);Sync();
+                    if(on!=!!g_arr.out[i].enabled)arrange_note(arrange_set_enabled(&g_layout,&g_arr,i,on));
+                }
+            }
+        }
+    }else if(g_arr_sel<g_arr.count)arrangement_display_card(g_arr_sel);
+    HStack(.spacing=10,.align=Center,.grow=1,.key="arr-apply") {
+        struct embk_layout_request r;
+        int rc=arrange_request(&g_layout,&g_arr,&r);
+        int edited=memcmp(&g_arr,&g_arr_base,sizeof g_arr)!=0;
+        if(g_layout.phase==EMBK_MONITOR_QUEUED || g_layout.phase==EMBK_MONITOR_APPLYING || g_layout.phase==EMBK_MONITOR_REVERTING)
+            Text("Changing the displays…").caption().secondary();
+        else if(g_arr_message[0])Text(g_arr_message).caption().secondary();
+        else if(rc)Text(arrange_error(rc)).caption().secondary();
+        Spacer();
+        if(edited && g_layout.phase!=EMBK_MONITOR_TRIAL) {
+            if(Button("Discard").secondary().clicked()){g_arr=g_arr_base;g_arr_message[0]=0;}
+            if(!rc && arrange_differs(&g_layout,&r) && (g_layout.phase==EMBK_MONITOR_IDLE || g_layout.phase==EMBK_MONITOR_ERROR) &&
+               Button("Apply Arrangement").primary().clicked())arrangement_apply(&r);
+        }
+    }
+    if(g_layout.last_error)Text("The requested arrangement could not be shown; the previous one is back.").caption().secondary();
+}
+
 static void pane_display(void) {
+    int several=!g_layout_rc && (g_layout.flags&EMBK_LAYOUT_MULTI) && arrange_connected(&g_layout)>1;
     Section("Graphics") {
-        ListRow(IconGrid,"Resolution",g_res);
+        if(several) {
+            char desk[48];snprintf(desk,sizeof desk,"%u × %u",g_layout.desktop_width,g_layout.desktop_height);
+            ListRow(IconGrid,"Desktop",desk);
+        }else ListRow(IconGrid,"Resolution",g_res);
         ListRow(IconInfo,"Graphics",g_graphics.driver);
         ListRow(IconInfo,"Rendering","Software");
     }
-    Section("Display") {
+    if(several)pane_arrangement();
+    else Section("Display") {
         if(!g_monitor_rc) {
             Text(g_monitor.name).heading();
             if(g_monitor.flags&EMBK_MONITOR_EDID) {
@@ -833,19 +1051,27 @@ static void app(void) {
         if(!g_monitor_rc && g_monitor.phase==EMBK_MONITOR_TRIAL && (g_monitor.flags&EMBK_MONITOR_OWN_TRIAL)) {
           Overlay() {
             Dialog(.width=400,.padding=22,.spacing=14) {
-                Text("Keep this display setting?").title();
-                char countdown[120];snprintf(countdown,sizeof countdown,"The previous resolution returns in %u seconds unless you keep this setting.",(g_monitor.remaining_ms+999)/1000);
+                Text(g_layout_trial?"Keep this arrangement?":"Keep this display setting?").title();
+                char countdown[120];snprintf(countdown,sizeof countdown,g_layout_trial?"The previous arrangement returns in %u seconds unless you keep this one.":
+                                             "The previous resolution returns in %u seconds unless you keep this setting.",(g_monitor.remaining_ms+999)/1000);
                 Text(countdown).body().secondary();
                 HStack(.spacing=10) {
-                    Spacer();if(Button("Revert").secondary().clicked())monitor_action(EMBK_MONITOR_REVERT);
+                    Spacer();if(Button("Revert").secondary().clicked()){monitor_action(EMBK_MONITOR_REVERT);g_layout_trial=0;}
                     if(Button("Keep Changes").primary().clicked()) {
                         unsigned w=g_monitor.width,h=g_monitor.height;
-                        if(!monitor_action(EMBK_MONITOR_KEEP)){g_cfg.display_width=w;g_cfg.display_height=h;commit();}
+                        /* What is kept is what is on screen: read it, then confirm. */
+                        struct embk_display_layout shown;int have=g_layout_trial && !embk_display_layout(&shown);
+                        if(!monitor_action(EMBK_MONITOR_KEEP)) {
+                            if(have)arrange_save(&shown,&g_cfg.display_layout);
+                            else {g_cfg.display_width=w;g_cfg.display_height=h;}
+                            commit();
+                        }
+                        g_layout_trial=0;
                     }
                 }
             }
           }
-          if(OverlayDismissed())monitor_action(EMBK_MONITOR_REVERT);
+          if(OverlayDismissed()){monitor_action(EMBK_MONITOR_REVERT);g_layout_trial=0;}
         }
         if(g_update_confirm) {
           Overlay() {

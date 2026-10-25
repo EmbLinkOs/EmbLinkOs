@@ -95,7 +95,10 @@ static bool native_get_mode(struct gpu_mode *out) {
 }
 static const struct gpu_driver native_driver={.name="Intel Gen9 display (native)",.get_mode=native_get_mode,
     .prepare=intel_native_prepare,.select=intel_native_select,.release=intel_native_release,
-    .describe=intel_native_describe,.resource_id=intel_native_resource_id,.pitch=intel_native_pitch};
+    .describe=intel_native_describe,.resource_id=intel_native_resource_id,.pitch=intel_native_pitch,
+    .output_count=intel_native_output_count,.output_info=intel_native_output_info,
+    .apply_layout=intel_native_apply_layout,.poll_outputs=intel_native_poll_outputs,
+    .max_lit=3};   /* Gen9: pipes A, B and C */
 const struct gpu_driver *intel_display_probe(void) {
     const struct boot_protocol *bp=boot_protocol_get();
     registers=NULL;pwm_kind=0;

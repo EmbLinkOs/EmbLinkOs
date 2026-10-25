@@ -1898,6 +1898,12 @@ static int64_t sys_win_move(const struct sysargs *a) {
     return compositor_win_move(pid, (uint32_t)a->arg[0], (int32_t)a->arg[1], (int32_t)a->arg[2]);
 }
 
+static int64_t sys_win_where(const struct sysargs *a) {
+    struct comp_win_geometry g;
+    int64_t rc=compositor_win_where((int)current_process->pid,(uint32_t)a->arg[0],&g);
+    if(rc)return rc;
+    return copy_to_user((void *)(uintptr_t)a->arg[1],&g,sizeof g)?-EMBK_EFAULT:0;
+}
 static int64_t sys_win_place(const struct sysargs *a) {
     return compositor_win_place((int)current_process->pid,(uint32_t)a->arg[0],(int32_t)a->arg[1],(int32_t)a->arg[2]);
 }
@@ -2853,12 +2859,25 @@ static int64_t sys_update(const struct sysargs *a) {
 
 static int64_t sys_monitor(const struct sysargs *a) {
     if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU)))return -EMBK_EPERM;
-    if(a->arg[0]>EMBK_MONITOR_REVERT || a->arg[2]>UINT32_MAX)return -EMBK_EINVAL;
+    if(a->arg[0]>EMBK_MONITOR_LAYOUT_APPLY || a->arg[2]>UINT32_MAX)return -EMBK_EINVAL;
     unsigned op=a->arg[0],n=a->arg[2];
     if(op==EMBK_MONITOR_GET) {
         if(n!=sizeof(struct embk_monitor_info))return -EMBK_EINVAL;
         struct embk_monitor_info info;int rc=monitor_control(op,&info,n);
         return rc?rc:copy_to_user((void *)(uintptr_t)a->arg[1],&info,n)?-EMBK_EFAULT:0;
+    }
+    if(op==EMBK_MONITOR_LAYOUT_GET) {
+        if(n!=sizeof(struct embk_display_layout))return -EMBK_EINVAL;
+        struct embk_display_layout *d=kmalloc(sizeof *d);if(!d)return -EMBK_ENOMEM;
+        int rc=monitor_control(op,d,n);
+        if(!rc && copy_to_user((void *)(uintptr_t)a->arg[1],d,n))rc=-EMBK_EFAULT;
+        kfree(d);return rc;
+    }
+    if(op==EMBK_MONITOR_LAYOUT_APPLY) {
+        if(n!=sizeof(struct embk_layout_request))return -EMBK_EINVAL;
+        struct embk_layout_request req;
+        if(copy_from_user(&req,(void *)(uintptr_t)a->arg[1],n))return -EMBK_EFAULT;
+        return monitor_control(op,&req,n);
     }
     if(n!=sizeof(struct embk_monitor_request))return -EMBK_EINVAL;
     struct embk_monitor_request request;
@@ -2869,6 +2888,7 @@ static int64_t sys_monitor(const struct sysargs *a) {
 static syscall_handler_t syscall_table[] = {
     [SYS_monitor] = sys_monitor,
     [SYS_win_place] = sys_win_place,
+    [SYS_win_where] = sys_win_where,
     [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,

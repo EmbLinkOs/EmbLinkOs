@@ -797,6 +797,11 @@ int em_widget_run(const EmWidget *wg);
 int em_app_run(const EmApp *app);
 /* Opt a system strip into width tracking without changing the EmApp ABI. */
 void em_app_follow_display_width(int enabled);
+/* The monitor that carries the top bar and the dock, on the desktop. With one
+ * monitor it is the whole screen. */
+void em_primary_output(int *x, int *y, int *w, int *h);
+/* The monitor a point is on (or the nearest one); 1 if it is the primary. */
+int em_output_at(int px, int py, int *x, int *y, int *w, int *h);
 /* Ask the EM_APPLICATION runtime to close cleanly after the current UI pass.
  * Unlike calling exit() from a view callback, this destroys the compositor
  * window first, so the next screen never inherits stale pixels. */

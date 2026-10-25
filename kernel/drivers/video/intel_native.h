@@ -40,4 +40,11 @@ bool intel_native_select(const struct gpu_target *t);
 bool intel_native_release(const struct gpu_target *t);
 void intel_native_describe(struct embk_monitor_info *info);
 
+/* Several outputs (gpu_driver's output hooks): the panel is output 0, the
+ * VBT's DP/HDMI ports follow. A layout lights at most three at once. */
+unsigned intel_native_output_count(void);
+bool intel_native_output_info(unsigned i, struct gpu_output *out);
+int  intel_native_poll_outputs(void);
+bool intel_native_apply_layout(const struct gpu_target *t, const struct gpu_layout *l);
+
 #endif

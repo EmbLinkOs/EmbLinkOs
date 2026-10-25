@@ -953,6 +953,18 @@ void intel_hw_plane_flip(struct intel_hw *hw, const struct intel_crtc_cfg *c)
     wait_vblank(r, c->pipe);
 }
 
+void intel_hw_plane_update(struct intel_hw *hw, const struct intel_crtc_cfg *c)
+{
+    watermarks(hw->regs, c);
+    plane_write(hw->regs, c);                 /* PLANE_SURF last: arms the whole update */
+    wait_vblank(hw->regs, c->pipe);
+}
+
+int intel_hw_aux_power(struct intel_hw *hw)
+{
+    return power_on(hw, PW_2);
+}
+
 int intel_hw_hpd_live(struct intel_hw *hw, unsigned ddi)
 {
     const struct intel_regs *r = hw->regs;

@@ -3,7 +3,10 @@
  * prepare/select/release framebuffers in the GGTT, scale lower modes with the
  * panel fitter, flip when only the surface changes, put the previous mode
  * back when a new one fails, modeset at boot when the firmware's mode is
- * wrong, and describe only what the panel can show.
+ * wrong, and describe only what the panel can show. Then several outputs:
+ * the VBT's ports, monitors found on their hotplug lines (DP over AUX, HDMI
+ * over GMBUS), one surface scanned by up to three pipes, the display buffer
+ * split between them in a safe order, mirroring, and a failed layout undone.
  *
  * Built with the kernel's types.h bypassed (-D_TYPES_H and the C library's
  * bool/size_t), because intel_native.c includes kernel headers that macOS's
@@ -181,8 +184,11 @@ static void test_inherit_and_modes(void)
     assert(!intel_native_release(&t));                                    /* still on screen */
     assert(intel_native_select(&boot) && intel_native_release(&t));
 
-    /* Nothing larger than the panel; the panel's mode preferred, its name shown. */
-    assert(!intel_native_prepare(&t, 0, (uint64_t)intel_native_pitch(2560) * 1440, 2560, 1440));
+    /* A surface larger than the panel can be prepared -- it may be a desktop
+     * over several monitors -- but the panel alone never shows one. */
+    assert(intel_native_prepare(&t, 0, (uint64_t)intel_native_pitch(2560) * 1440, 2560, 1440));
+    assert(!intel_native_select(&t) && intel_native_release(&t));
+    /* The panel's mode preferred, its name shown. */
     struct embk_monitor_info info;
     memset(&info, 0, sizeof info);
     static const unsigned std[][2] = { { 1280, 720 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 }, { 1024, 768 } };
@@ -239,12 +245,170 @@ static void test_boot_modeset(void)
     sink_gone = 0;
 }
 
+/* ---- several outputs ----------------------------------------------------- */
+#define SDEISR 0xc4000u
+static uint8_t dp_edid[256], hdmi_edid[256];
+
+static void fix_sum(uint8_t *b)
+{
+    unsigned sum = 0;
+    for (unsigned i = 0; i < 127; i++) sum += b[i];
+    b[127] = (uint8_t)(256 - (sum & 0xff));
+}
+
+static void plug(unsigned ddi, int on)
+{
+    static const uint8_t live[4] = { 24, 21, 22, 23 };
+    if (on) regs[SDEISR / 4] |= 1u << live[ddi]; else regs[SDEISR / 4] &= ~(1u << live[ddi]);
+}
+
+static unsigned written(uint32_t off, uint32_t mask, uint32_t bits)    /* the first write of `bits`, or ~0 */
+{
+    for (unsigned i = 0; i < ntrace; i++) if (trace[i].off == off && (trace[i].val & mask) == bits) return i;
+    return ~0u;
+}
+
+static uint32_t surface(struct gpu_target *t, uint32_t w, uint32_t h)
+{
+    memset(t, 0, sizeof *t);
+    assert(intel_native_prepare(t, 0, (uint64_t)intel_native_pitch(w) * h, w, h));
+    return (uint32_t)(t->mode.phys_addr - APERTURE);
+}
+
+static void test_external_outputs(void)
+{
+    laptop(1920, 1080, 142500, 1, 1920, 1080);
+    ext_mode = 1;
+    memset(ext, 0, sizeof ext);
+    gmbus_edid = 0; gmbus_sim_pin = 1;
+    pcode_reply = 1;
+    struct intel_native_probe p = probe();
+    assert(intel_native_init(&p) == 0);
+    struct gpu_mode m;
+    assert(intel_native_boot_mode(&m) == 0);
+
+    /* The fixture's VBT: the panel on DDI A, HDMI on DDI B, DP over USB-C on DDI C. */
+    struct gpu_output o;
+    assert(intel_native_output_count() == 3);
+    assert(intel_native_output_info(0, &o) && !strcmp(o.name, "eDP-1") && o.builtin && o.connected && o.has_edid);
+    assert(o.modes[0].width == 1920 && o.modes[0].height == 1080 && o.modes[0].preferred && !strcmp(o.model, "B156HAN02.1"));
+    int has720 = 0, has1440 = 0;
+    for (unsigned k = 0; k < o.mode_count; k++) {
+        has720 |= o.modes[k].width == 1280 && o.modes[k].height == 720;
+        has1440 |= o.modes[k].width == 2560;
+    }
+    assert(has720 && !has1440);                              /* smaller ones, scaled up; nothing larger */
+    assert(intel_native_output_info(1, &o) && !strcmp(o.name, "HDMI-1") && !o.connected && !o.mode_count);
+    assert(intel_native_output_info(2, &o) && !strcmp(o.name, "DP-1") && !o.connected);
+    assert(!intel_native_output_info(3, &o));
+    assert(intel_native_poll_outputs() == 1 && intel_native_poll_outputs() == 0);   /* first look; then quiet */
+
+    /* Something on the USB-C port's hotplug line that does not answer: three
+     * looks, then it is left alone until the line drops and rises again. */
+    plug(2, 1);
+    quiet = 1;
+    for (int i = 0; i < 5; i++) assert(intel_native_poll_outputs() == 0);
+    quiet = 0;
+    assert(intel_native_output_info(2, &o) && !o.connected);
+
+    /* A 2560x1440 DisplayPort monitor, also offering 1920x1080. */
+    make_edid(dp_edid, "DEL", 0xa0b1, 2560, 1440, 24150, "DELL U2717D");
+    dp_edid[38] = 1920 / 8 - 31; dp_edid[39] = 3u << 6;      /* standard timing: 1920x1080 @ 60, 16:9 */
+    for (unsigned i = 40; i < 54; i++) dp_edid[i] = 1;
+    fix_sum(dp_edid);
+    ext[2].present = 1; ext[2].edid = dp_edid;
+    ext[2].dpcd[0] = 0x12; ext[2].dpcd[1] = 0x14; ext[2].dpcd[2] = 0x84; ext[2].dpcd[3] = 0x01;
+    plug(2, 0); assert(intel_native_poll_outputs() == 0);
+    plug(2, 1); assert(intel_native_poll_outputs() == 1);
+    assert(intel_native_output_info(2, &o) && o.connected && o.has_edid && !strcmp(o.model, "DELL U2717D"));
+    assert(o.modes[0].width == 2560 && o.modes[0].preferred && o.mode_count >= 2 && o.modes[1].width == 1920);
+
+    /* Extend: the panel at the origin, the monitor on its right, one surface. */
+    struct gpu_target t;
+    uint32_t ggtt = surface(&t, 4480, 1440), pitch = intel_native_pitch(4480);
+    struct gpu_layout two = { 3, 0, { { 1, 0, 0, 1920, 1080 }, { 0, 0, 0, 0, 0 }, { 1, 1920, 0, 2560, 1440 } } };
+    ntrace = 0;
+    assert(intel_native_apply_layout(&t, &two));
+    /* The panel kept its pipe and its picture timing: only its plane moved. */
+    assert(conf_writes() == 0 && regs[0x7019c / 4] == ggtt && regs[0x70188 / 4] == pitch / 64 && regs[0x701a4 / 4] == 0);
+    /* Pipe B, transcoder B, DDI C, DP SST at 2.7 Gbps x4 (the least that carries 241.5 MHz), from DPLL1. */
+    uint32_t fn = regs[0x61400 / 4];
+    assert((fn >> 31) && ((fn >> 28) & 7) == 2 && ((fn >> 24) & 7) == 2 && ((fn >> 1) & 7) == 3);
+    assert(regs[0x71008 / 4] >> 30 & 1);
+    assert(((regs[0x6c05c / 4] >> (2 * 3 + 1)) & 3) == 1 && ((regs[0x6c058 / 4] >> (1 * 6 + 1)) & 7) == 1);   /* 2.7: code 1 */
+    /* Its plane: the monitor's 2560x1440 rectangle of the surface, from x 1920. */
+    assert(regs[0x7119c / 4] == ggtt && regs[0x711a4 / 4] == 1920 && regs[0x71190 / 4] == ((1439u << 16) | 2559));
+    /* The display buffer split by width, without overlap; pipe A's share
+     * shrank before pipe B was given any. */
+    uint32_t a = regs[0x7027c / 4], b = regs[0x7127c / 4];
+    assert((a & 0x3ff) == 0 && (a >> 16) + 1 <= (b & 0x3ff) && (b >> 16) < 892 && (b >> 16) - (b & 0x3ff) > (a >> 16) - (a & 0x3ff));
+    assert(written(0x7019c, ~0u, ggtt) < written(0x71008, 1u << 31, 1u << 31));
+
+    /* An HDMI television too: three outputs, pipe C, its own PLL, an AVI infoframe. */
+    make_edid(hdmi_edid, "SAM", 0x0f00, 1920, 1080, 14850, "SAMSUNG");
+    hdmi_edid[126] = 1; fix_sum(hdmi_edid);
+    uint8_t *x = hdmi_edid + 128;
+    x[0] = 0x02; x[1] = 3; x[2] = 10; x[4] = (3u << 5) | 5; x[5] = 0x03; x[6] = 0x0c; x[7] = 0x00; x[8] = 0x10;
+    fix_sum(x);
+    gmbus_edid = hdmi_edid;
+    plug(1, 1);
+    assert(intel_native_poll_outputs() == 1);
+    assert(intel_native_output_info(1, &o) && o.connected && !strcmp(o.model, "SAMSUNG") && o.modes[0].width == 1920);
+    struct gpu_target t3;
+    uint32_t ggtt3 = surface(&t3, 6400, 1440);
+    struct gpu_layout three = { 3, 0, { { 1, 0, 0, 1920, 1080 }, { 1, 1920, 0, 1920, 1080 }, { 1, 3840, 0, 2560, 1440 } } };
+    ntrace = 0;
+    assert(intel_native_apply_layout(&t3, &three));
+    fn = regs[0x62400 / 4];
+    assert((fn >> 31) && ((fn >> 28) & 7) == 1 && ((fn >> 24) & 7) == 0 && (regs[0x72008 / 4] >> 30 & 1));
+    unsigned hdmi_pll = (regs[0x6c05c / 4] >> (1 * 3 + 1)) & 3;
+    assert(hdmi_pll == 2 && ((regs[0x6c058 / 4] >> (2 * 6 + 5)) & 1) && regs[0x6c048 / 4] != 0);   /* DPLL2, HDMI mode, CFGCR1 */
+    assert(regs[0x62200 / 4] & (1u << 12));
+    /* The DP monitor kept pipe B and its link: its plane moved to x 3840, nothing else. */
+    assert(written(0x71008, 0, 0) == ~0u && regs[0x7119c / 4] == ggtt3 && regs[0x711a4 / 4] == 3840);
+    assert(regs[0x7219c / 4] == ggtt3 && regs[0x721a4 / 4] == 1920);
+    uint32_t a3 = regs[0x7027c / 4], b3 = regs[0x7127c / 4], c3 = regs[0x7227c / 4];
+    assert((a3 >> 16) < (b3 & 0x3ff) && (b3 >> 16) < (c3 & 0x3ff) && (c3 >> 16) < 892);   /* in pipe order, apart */
+
+    /* A monitor that is not plugged in cannot be lit. */
+    plug(1, 0);
+    assert(intel_native_poll_outputs() == 1 && intel_native_output_info(1, &o) && !o.connected);
+    ntrace = 0;
+    assert(!intel_native_apply_layout(&t3, &three) && ntrace == 0);
+    /* Back to two: pipe C goes dark and its PLL with it. */
+    ntrace = 0;
+    assert(intel_native_apply_layout(&t, &two));
+    assert(!(regs[0x72008 / 4] >> 30 & 1) && !(regs[0x46040 / 4] >> 31));   /* transcoder C off, DPLL2 off */
+    assert(intel_native_release(&t3));
+
+    /* Mirror: both show 1920x1080 from the surface's origin. */
+    struct gpu_target tm;
+    uint32_t ggm = surface(&tm, 1920, 1080);
+    struct gpu_layout mirror = { 3, 0, { { 1, 0, 0, 1920, 1080 }, { 0, 0, 0, 0, 0 }, { 1, 0, 0, 1920, 1080 } } };
+    assert(intel_native_apply_layout(&tm, &mirror));
+    assert(regs[0x7019c / 4] == ggm && regs[0x7119c / 4] == ggm && regs[0x701a4 / 4] == 0 && regs[0x711a4 / 4] == 0);
+    assert(regs[0x71190 / 4] == ((1079u << 16) | 1919) && ((regs[0x6c058 / 4] >> (1 * 6 + 1)) & 7) == 2);   /* 1.62: code 2 */
+
+    /* A monitor that will not train: the new layout fails and the previous
+     * picture is put back on the panel. */
+    ext[2].dead = 1;
+    quiet = 1;
+    assert(!intel_native_apply_layout(&t, &two));
+    quiet = 0;
+    assert((regs[0x7f008 / 4] >> 30 & 1) && regs[0x7019c / 4] == ggm);
+    ext[2].dead = 0;
+    ext_mode = 0;
+}
+
 int main(void)
 {
     test_inherit_and_modes();
     test_failure_restores();
     test_boot_modeset();
+    test_external_outputs();
     puts("Intel native modesetting: firmware mode inherited, GGTT framebuffers prepared/selected/released, "
-         "panel fitter, plane flips, failed modeset restored, boot modeset, 1366-wide panel, describe OK");
+         "panel fitter, plane flips, failed modeset restored, boot modeset, 1366-wide panel, describe; "
+         "VBT ports, DP and HDMI monitors found by hotplug, three pipes on one surface, display buffer order, "
+         "mirroring, a failed layout undone OK");
     return 0;
 }

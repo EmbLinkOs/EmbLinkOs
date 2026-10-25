@@ -84,7 +84,21 @@ int main(void)
     assert(edid_modes(e, 128, m, 32) == 1 && m[0].hdisplay == 1920 && (m[0].flags & DISPLAY_MODE_PREFERRED));
     const struct display_mode *k = edid_known_mode(1366, 768, 60);
     assert(k && k->clock_khz == 85500);
+    /* HDMI or DVI: the HDMI vendor-specific block (OUI 00-0C-03) in a CTA
+     * extension, and nothing else, makes an HDMI sink. */
+    make_edid(e, "SAM", 0x0f00, 1920, 1080, 14850, "SAMSUNG");
+    assert(!edid_hdmi(e, 128) && !edid_hdmi(e, 256));
+    e[126] = 1; checksum(e);
+    x = e + 128; memset(x, 0, 128);
+    x[0] = 0x02; x[1] = 3; x[2] = 10;
+    x[4] = (3u << 5) | 5; x[5] = 0x03; x[6] = 0x0c; x[7] = 0x00; x[8] = 0x10; x[9] = 0x00;
+    checksum(x);
+    assert(edid_hdmi(e, 256) == 1 && edid_hdmi(e, 128) == 0);
+    x[6] = 0x0d; checksum(x);                          /* another vendor's block */
+    assert(edid_hdmi(e, 256) == 0);
+    x[6] = 0x0c; checksum(x); x[127] ^= 1;             /* a corrupt extension says nothing */
+    assert(edid_hdmi(e, 256) == 0);
     puts("EDID modes: detailed timings, CTA video codes and DTDs, established and standard timings, "
-         "preferred flags, de-duplication, bounds, bad checksums and truncation OK");
+         "preferred flags, de-duplication, bounds, bad checksums and truncation, HDMI vs DVI OK");
     return 0;
 }

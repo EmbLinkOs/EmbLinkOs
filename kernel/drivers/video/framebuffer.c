@@ -1,4 +1,5 @@
 #include "drivers/video/framebuffer.h"
+#include "display/layout.h"
 #include "drivers/video/gpu.h"
 #include "drivers/char/serial.h"
 #include "mm/vmm.h"
@@ -806,7 +807,7 @@ int fb_run_selftests(void) {
 struct fb_surface *fb_prepare_mode(uint32_t w,uint32_t h) {
     const struct gpu_driver *gpu=gpu_active();
     if(!gpu || !gpu->prepare || !gpu->select || !gpu->release ||
-       w<640 || h<480 || w>4096 || h>2160 || (uint64_t)w*h>8388608)return NULL;
+       w<640 || h<480 || w>LAYOUT_MAX_W || h>LAYOUT_MAX_H || (uint64_t)w*h>LAYOUT_MAX_PIXELS)return NULL;   /* one surface may span several monitors */
     uint32_t pitch=gpu->pitch?gpu->pitch(w):w*4;
     if(pitch<w*4)return NULL;
     struct fb_surface *s=kcalloc(1,sizeof *s);if(!s)return NULL;
@@ -822,6 +823,17 @@ struct fb_surface *fb_prepare_mode(uint32_t w,uint32_t h) {
         if(!s->front){fb_release_surface(s);return NULL;}
     }
     return s;
+}
+struct fb_surface *fb_select_layout(struct fb_surface *s,const struct gpu_layout *layout) {
+    const struct gpu_driver *gpu=gpu_active();
+    if(!s || !gpu || !gpu->apply_layout || !layout || !gpu->apply_layout(&s->gpu,layout))return NULL;
+    struct fb_surface *old=current_surface;current_surface=s;
+    const struct gpu_mode *m=&s->gpu.mode;
+    fb=(fb_info_t){m->phys_addr,m->width,m->height,m->pitch,m->bpp,m->format};
+    fb_front=s->front;fb_back=s->back;fb_draw=s->back;fb_bypp=4;
+    if(fb_front)rawcon_adopt(fb_front,fb.width,fb.height,fb.pitch,fb.bpp,fb.format);
+    spin_lock(&fb_dirty_lock);dirty_any=false;spin_unlock(&fb_dirty_lock);
+    return old;
 }
 struct fb_surface *fb_select_surface(struct fb_surface *s) {
     const struct gpu_driver *gpu=gpu_active();
@@ -843,6 +855,7 @@ void fb_release_surface(struct fb_surface *s) {
     kfree(s->allocation);if(s!=&boot_surface)kfree(s);
 }
 
+struct fb_surface *fb_current_surface(void) {return current_surface;}
 bool fb_can_change_mode(void) {
     const struct gpu_driver *g=gpu_active();
     return current_surface->back && fb.bpp==32 && g && g->prepare && g->select && g->release;

@@ -1,9 +1,10 @@
 # Graphics and displays
 
-EmbLinkOS currently has one active framebuffer output and a CPU compositor.
-Settings → Displays reports the adapter, rendering backend, current resolution
-and validated monitor identity when EDID is available. Resolution and interface
-scale are separate: scale remains in Appearance.
+EmbLinkOS drives one monitor or several with a CPU compositor. Settings →
+Displays reports the adapter, rendering backend, current resolution and
+validated monitor identity when EDID is available, and arranges the monitors
+when more than one is connected. Resolution and interface scale are separate:
+scale remains in Appearance.
 
 ## Live resolution changes
 
@@ -52,6 +53,77 @@ without prepare/select/release hooks remain at the firmware resolution and
 Settings explains that live changes are unavailable. See [DAILY_USE.md](DAILY_USE.md)
 for the supported Intel families and brightness limitations.
 
+## Several monitors
+
+The desktop spans every monitor in use: it is one surface, and each monitor
+shows its own rectangle of it (`kernel/display/layout.c`). The **primary**
+monitor carries the menu bar and the dock; every monitor shows a whole
+wallpaper of its own, the desktop's icons and any windows placed on it.
+
+- **Plugging a monitor in** extends the desktop to the right at the monitor's
+  preferred mode, at once and without a confirmation -- nobody chose it, so
+  there is nothing to keep or revert. **Pulling it out** removes it: windows
+  that were on it move to the primary, keeping their offset where they fit,
+  and if it was the primary the role passes to a monitor still connected. A
+  monitor connected while the displays are mirrored joins the mirror when it
+  can show the mirrored size; otherwise it waits, connected and unused, for
+  Settings. Connections are polled once a second, never during a trial.
+- **Settings → Displays** draws the arrangement to scale. Click a display to
+  change it: *Use this display*, *Resolution* (the sizes that monitor
+  offers), *Position* (right of, left of, above or below the primary) and
+  *Make Primary*; *Extend* or *Mirror* applies to all of them. An
+  arrangement the kernel would refuse is refused before anything changes,
+  with the reason: displays that overlap or do not share an edge, a desktop
+  over 8192 × 4320, a size a monitor does not offer, mirrored displays with no
+  size in common, or more displays in use than the adapter can light (Intel
+  Gen9: three). **Apply Arrangement** starts the same 30-second trial as a
+  resolution change; **Keep Changes** saves it, anything else puts the
+  previous arrangement back.
+- **An arrangement belongs to its monitors.** The kept arrangement is saved
+  for the set of monitors connected when it was kept, each recognised by its
+  connector and its EDID maker, model and size. It returns after login, and
+  whenever exactly those monitors are connected again -- the desktop applies
+  it through a trial and confirms it once it has drawn a frame of it. It is
+  never forced onto a different set of monitors, and a size that monitor no
+  longer offers makes it stand aside. With one monitor connected, the saved
+  single resolution applies as before.
+- **Windows** move between monitors by their title bar: a window rests
+  against a monitor's edge until its centre crosses onto the next. Fill,
+  halves and Full use the monitor the window is on (the menu bar and dock
+  take room only on the primary). When the arrangement changes, windows and
+  the pointer travel with their monitor -- the monitor moved, not the windows
+  on it -- and the pointer cannot leave the area the monitors show.
+- **Mirror** shows one picture on every monitor in use, at the primary's own
+  size when every monitor can show it, otherwise the largest size they share.
+  Leaving the mirror gathers the windows on the primary.
+
+Adapters. VirtIO GPU drives up to four heads: GET_DISPLAY_INFO and a per-head
+GET_EDID describe them, SET_SCANOUT gives each head its rectangle of one
+resource, and display-change events announce connections. Headless QEMU
+reports only head 0 as connected; `-fw_cfg name=opt/emblink/outputs,string=N`
+tells the driver that N heads are plugged in. Native Intel Gen9 drives the
+panel and the board's DP and HDMI ports (below). Bochs DISPI and the firmware
+framebuffer have one output.
+
+Programs read the layout through `embk_display_layout()` (`EMBK_MONITOR_LAYOUT_GET`
+in `user/lib/embk_monitor.h`); EmUI places, fills and clamps windows on the
+monitor they are on. Settings and the desktop share `user/lib/display_arrange.c`,
+which runs the kernel's own layout rules.
+
+Verification: `tests/drivers/display_layout_test.c` (validation, placement,
+pointer bounds, re-homing), `tests/drivers/display_control_test.c` (the real
+controller with a two-output driver: hotplug, arrangement trials kept,
+reverted and timed out, refusals, mirror joins, an adapter's output limit),
+`tests/desktop/display_arrange_test.c` (the arrangement model and saved
+arrangements) and `make contour-test` (the saved arrangement in the
+preferences file) on the host; `tools/multimonitor_smoke.py` on a real
+UEFI/NVMe guest with a two-head virtio-vga -- the desktop extends at login, a
+window crosses to the second monitor and fills it, Settings moves the second
+monitor to the left and makes it primary, a mirror trial is reverted, and the
+kept arrangement returns after a cold boot and password login. Plugging
+monitors in and out while running cannot be driven from headless QEMU; the
+controller test covers that path.
+
 ## Native Intel modesetting on the HP ProBook 450 G7
 
 The target is the HP ProBook 450 G7: 10th-generation Core (Comet Lake-U),
@@ -69,7 +141,7 @@ measured on the laptop, and each one leaves its evidence on the boot stick.
 | 2. Arithmetic | Link choice, M/N, HDMI PLL, CDCLK, DDB, watermarks, panel fitter (`intel_config.c`) | Built, checked against hand-worked values |
 | 3. eDP modeset | The whole pipeline programmed natively (`intel_hw.c`), the policy around it (`intel_native.c`) | Built, checked against a register model |
 | 4. Other modes | Lower resolutions on the panel through the pipe scaler, behind Settings → Displays | Built, checked against a register model |
-| 5. External outputs | DP and HDMI enable paths exist in `intel_hw.c`; driving a second output is the multiple-monitor work | Hardware layer built; outputs not yet offered |
+| 5. External outputs | The VBT's DP and HDMI ports found by hotplug, up to three pipes on one surface (`intel_native.c`) | Built, checked against a register model |
 
 None of steps 2-5 has run on Intel silicon yet: QEMU has no Intel display
 engine. The laptop's capture (step 1) and a boot of the stick on the ProBook
@@ -171,14 +243,57 @@ with AVI infoframes, failure undone), and `intel_native_test.c` (inherit,
 prepare/select/release, panel fitter, plane flips, a failed modeset restored,
 boot modesets, a 1366-wide panel).
 
+### External monitors
+
+The VBT names the board's ports -- on the ProBook, HDMI on DDI B and
+DisplayPort over USB-C on DDI C -- with their AUX channels, DDC pins, link-rate
+ceilings and HDMI drive levels. Each port is polled through its hotplug line.
+When the line rises, the monitor is asked what it is: a DP port reads the
+sink's DPCD and EDID over AUX (AUX B-D need power well 2, which is turned on
+first); an HDMI port, or a DP++ port whose AUX is silent because a passive HDMI
+adaptor is in it, reads the EDID over GMBUS, and the EDID's HDMI
+vendor-specific block decides between HDMI (with AVI infoframes) and DVI. A
+monitor slow to answer gets three looks a second apart. Its modes are the
+EDID's, each kept only if this port can carry it -- a DP link up to HBR2 x4
+(or the VBT's ceiling), 300 MHz TMDS for HDMI, 165 MHz for DVI, a display
+clock fast enough, a plane no larger than 5120 × 4096 -- one timing per size,
+the one nearest 60 Hz, with the monitor's preferred mode first.
+
+A layout lights up to three outputs: the panel on pipe A, monitors on pipes
+B and C (or A, when the panel is off). Every pipe scans its rectangle of the
+one desktop surface: the 256 KiB-aligned part of the offset goes in
+PLANE_SURF and the rest in PLANE_OFFSET, as i915 does for linear surfaces.
+DP monitors at the same link rate share a DPLL; an HDMI monitor gets its own
+WRPLL; the panel keeps DPLL0. The display buffer is split between the lit
+pipes in proportion to their widths, and the watermarks follow each pipe's
+share. The order of a change is what keeps every pipe fed: outputs leaving,
+or changing more than their plane, go dark first; pipes that stay take their
+new share of the buffer (latched at a vblank) before any new pipe is given
+blocks someone else held; CDCLK rises, with the pipes off, when a new mode
+needs it; then new outputs light. If anything fails, every output is put
+back as it was. A pipe that only moves within the surface is a plane update:
+the panel adding a monitor beside it never blanks. A monitor the firmware
+lit at boot (the boot picture mirrored to it) is turned off when the driver
+starts and joins the desktop through the first poll.
+
+`tests/drivers/intel_native_test.c` runs this against the register model
+with a DP sink on AUX C and an HDMI monitor on GMBUS pin 1: the VBT's ports,
+a sink that does not answer, DP and HDMI detection, extend with the panel's
+plane moved and pipe B lit on DDI C at 2.7 Gbps x4, three outputs on pipes
+A-C with the HDMI monitor on its own PLL, the display buffer order checked in
+the write trace, unplugging, mirroring at 1.62 Gbps, a refused request for a
+monitor that is gone, and a monitor that will not train undone with the
+previous picture back.
+
 ## Protocol references
 
 The VirtIO GPU device protocol specifies GET_EDID (optional feature bit 1),
 RESOURCE_CREATE_2D, RESOURCE_ATTACH_BACKING, SET_SCANOUT and RESOURCE_UNREF:
 [VirtIO 1.2, GPU device](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
 The firmware handoff follows the UEFI Graphics Output and EDID Active protocols;
-DISPI uses the Bochs VBE register interface already used at startup. No Intel
-register programming is added by this milestone.
+DISPI uses the Bochs VBE register interface already used at startup. Intel
+register programming follows Linux's i915 for Skylake to Comet Lake; each
+file names the i915 functions it follows.
 
 ## Validation and remaining work
 
@@ -193,11 +308,13 @@ Runtime acceptance is x86-64; ARM64 is compile-checked only. Its existing
 screen-session isolation remains unported. The strip-width opt-in is a function
 so the public EmApp descriptor keeps its existing binary layout.
 
-This milestone does not implement multiple outputs, connector hotplug, native
-Intel/AMD/NVIDIA modesetting, DisplayPort/HDMI link training, accelerated rendering,
-refresh-rate selection, rotation, HDR/color profiles or suspend restoration.
-Physical laptop display testing is still required. These are follow-up graphics
-milestones, not capabilities inferred from successful virtual-device tests.
+Not implemented: AMD/NVIDIA modesetting, DisplayPort MST (a dock's daisy
+chain shows at most its first monitor), choosing a refresh rate (one timing
+per size), per-monitor interface scale, rotation, HDR/color profiles,
+accelerated rendering and suspend restoration. Physical laptop display testing
+is still required: none of the Intel paths has run on the ProBook yet. These
+are follow-up graphics milestones, not capabilities inferred from successful
+virtual-device tests.
 
 Verified on 2026-10-25: both x86-64 backends completed the native display suite,
 including actual scanout dimensions, visible confirmation, explicit/timeout/exit/
@@ -207,3 +324,9 @@ passing checks. Native ABI verification reports 155 unique calls and 14 matching
 capabilities. The EmApp descriptor matches master (72 bytes, final field at 64).
 BIOS POSIX and UEFI/NVMe device, preferences, files, IPC, session, compositor and
 POSIX regressions pass. The ARM64 kernel links; runtime acceptance is outstanding.
+
+Verified again on 2026-10-25 with several monitors: `tools/multimonitor_smoke.py`
+passes on a two-head virtio-vga, both backends still pass `tools/display_smoke.py`
+(a resolution trial on one monitor is now a layout trial on VirtIO), the
+display, arrangement, controller and Intel host suites pass under ASan/UBSan,
+and the ARM64 kernel, image and rootfs with every app build with GCC 16.

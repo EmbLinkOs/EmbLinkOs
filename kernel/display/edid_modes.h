@@ -13,4 +13,8 @@ int edid_parse_dtd(const uint8_t *dtd, struct display_mode *m);
 /* The standard (DMT/CTA) timing for a size and refresh, or NULL. */
 const struct display_mode *edid_known_mode(unsigned width, unsigned height, unsigned hz);
 
+/* An HDMI sink rather than DVI: a CTA-861 extension carries the HDMI
+ * vendor-specific data block. Only an HDMI sink takes infoframes. */
+int edid_hdmi(const uint8_t *edid, unsigned len);
+
 #endif
