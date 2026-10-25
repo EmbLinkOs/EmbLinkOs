@@ -41,6 +41,7 @@
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
+#include "kit.h"         /* ui_control_interact */
 
 #define MAX_ENTRIES 512
 

@@ -11,6 +11,7 @@
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
+#include "kit.h"         /* ui_control_interact */
 #include "system_status.h"
 
 enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_WINDOWS, PANE_ACCESS, PANE_WIFI, PANE_SOUND, PANE_DISPLAY, PANE_POWER, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_UPDATE, PANE_ABOUT, PANE_N };

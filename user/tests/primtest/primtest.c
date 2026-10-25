@@ -18,6 +18,15 @@
 
 #include "embk.h"
 
+/* primtest links no libc, and the compiler emits a call to memset for the
+ * IPC-cancel test's zero-initialised spawn action -- the same reason init.c
+ * carries one. The attribute stops GCC compiling the loop into a call to
+ * itself. */
+#define NO_LOOP_IDIOMS __attribute__((optimize("no-tree-loop-distribute-patterns")))
+NO_LOOP_IDIOMS void *memset(void *d, int c, unsigned long n) {
+    unsigned char *p = d; while (n--) *p++ = (unsigned char)c; return d;
+}
+
 /* --- shared state the thread test proves is genuinely shared ------------ */
 volatile int  counter    = 5;   /* .data: mutated by the second thread below */
 volatile int  thread_ran = 0;   /* set ONLY by second_thread_entry -- proof
