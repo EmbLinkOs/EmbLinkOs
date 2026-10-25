@@ -15,7 +15,8 @@ Terminal and types the way a person would, over QMP:
 The behaviour is asserted by shell/test/edit_test.c and complete_test.c on the
 host and by tools/terminal_smoke.py on the OS; this is what it looks like.
 
-    python3 tools/shell_edit_shot.py
+    python3 tools/shell_edit_shot.py        # the native shell
+    python3 tools/shell_edit_shot.py sh     # sh on the same editor
 Build uefi-usb.img first; never rebuild binaries while the guest runs.
 """
 import shutil, subprocess, sys, tempfile
@@ -43,6 +44,16 @@ def main():
         term = d.launch('Terminal', 'Terminal')
         d.click(term['x'] + term['cw'] // 2, term['y'] + term['ch'] // 2)
         d.hover(term['x'] + term['cw'] + 60, term['y'] + 40)
+        if sys.argv[1:] == ['sh']:
+            d.type('sh\n'); d.g.pump(3)
+            d.type('for n in 1 2 3; do\n'); d.g.pump(1)
+            d.type('echo "item $n"\n'); d.g.pump(1)
+            d.type('done\n'); d.g.pump(3)
+            d.type('ec'); d.key('tab'); d.g.pump(2)
+            d.type('h'); d.key('tab'); d.g.pump(2)
+            shot(d, 'sh-edit')
+            assert b'PANIC' not in bytes(d.g.seen)
+            return
         for line in ['echo "the shell edits its own line"', 'date', 'ls /system']:
             d.type(line + '\n'); d.g.pump(3)
         d.type('clear\n'); d.g.pump(2)

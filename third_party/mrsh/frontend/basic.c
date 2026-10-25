@@ -13,6 +13,7 @@
 #include <string.h>
 #include <mrsh/shell.h>
 #include <mrsh/parser.h>
+#include <mrsh/buffer.h>
 #include "frontend.h"
 #include <unistd.h>
 #include <termios.h>
@@ -41,16 +42,21 @@ static void to_terminal(void *ctx, const char *bytes, size_t n) {
 	}
 }
 
-/* Unfinished: mrsh's parser asks for a continuation line. */
+/* Unfinished: more input would complete it. mrsh flags a continuation only
+ * for an open quote; an open `for ... do`, `if ... then` or a trailing `|` is
+ * a syntax error -- positioned at the very end of the input. So: an error
+ * past the last line is "unfinished"; one inside the text is a real mistake,
+ * and Enter runs the line so mrsh can say what it is. Parsed from a plain
+ * buffer, as mrsh's own REPL does (mrsh_parser_with_data ends its copy with a
+ * NUL the parser reads as one more character). */
 static bool unfinished(void *ctx, const char *text) {
 	(void)ctx;
-	size_t n = strlen(text);
-	char *copy = malloc(n + 2);
-	if (!copy) return false;
-	memcpy(copy, text, n);
-	copy[n] = '\n';
-	copy[n + 1] = '\0';
-	struct mrsh_parser *parser = mrsh_parser_with_data(copy, n + 1);
+	int lines = 1;
+	for (const char *c = text; *c; c++) lines += *c == '\n';
+	struct mrsh_buffer buf = {0};
+	mrsh_buffer_append(&buf, text, strlen(text));
+	mrsh_buffer_append_char(&buf, '\n');
+	struct mrsh_parser *parser = mrsh_parser_with_buffer(&buf);
 	bool more = false;
 	while (parser) {
 		struct mrsh_program *prog = mrsh_parse_line(parser);
@@ -59,11 +65,13 @@ static bool unfinished(void *ctx, const char *text) {
 			if (mrsh_parser_eof(parser)) break;
 			continue;
 		}
-		more = mrsh_parser_continuation_line(parser);
+		struct mrsh_position at;
+		const char *err = mrsh_parser_error(parser, &at);
+		more = mrsh_parser_continuation_line(parser) || (err && at.line > lines);
 		break;
 	}
 	if (parser) mrsh_parser_destroy(parser);
-	free(copy);
+	mrsh_buffer_finish(&buf);
 	return more;
 }
 
@@ -92,7 +100,7 @@ void interactive_init(struct mrsh_state *state) {
 	/* A prompt that says where you are, as the native shell's does, unless
 	 * PS1 is the user's own. */
 	if (!mrsh_env_get(state, "PS1", NULL))
-		mrsh_env_set(state, "PS1", "\033[1;33m${USER:-user}@${HOSTNAME:-emblink}:${PWD}\033[0m sh$ ",
+		mrsh_env_set(state, "PS1", "\033[1;33m${USER:-user}@${HOSTNAME:-emblink}:${PWD}\033[0m sh\\$ ",
 			MRSH_VAR_ATTRIB_NONE);
 }
 
