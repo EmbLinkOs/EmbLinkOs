@@ -540,7 +540,11 @@ NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/$(USER_TRIPLE)/lib,)
 # the host harness does not link jsdom at all. Nothing about that symptom
 # points at a Makefile.
 ifeq ($(ARCH),aarch64)
-NEWLIB_CFLAGS = -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+# -mno-outline-atomics, as the ARM kernel has (arch.mk says why): GCC's
+# outline atomic helpers are hidden symbols in libgcc.a, so libembk.so cannot
+# reference them and every app linking it fails ("hidden symbol
+# __aarch64_swp4_acq ... referenced by DSO").
+NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 else
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 endif

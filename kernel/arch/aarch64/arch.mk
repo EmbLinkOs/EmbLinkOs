@@ -465,7 +465,9 @@ ARM_INC_js        := $(QJS_CFLAGS)
 # main and its own extra objects.
 ARM_MAIN_sh := third_party/mrsh/main.c
 ARM_SH_SRCS := $(filter-out third_party/mrsh/main.c,$(MRSH_SRCS))
-ARM_INC_sh := $(MRSH_INC) -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096
+# -std=gnu11 as on x86 (ports/mrsh/sources.mk): GCC 16 defaults to C23, where
+# glob.c's `()` function pointers mean `(void)`.
+ARM_INC_sh := $(MRSH_INC) -std=gnu11 -DEMBLINK_TARGET -D_ELIX_LEVEL=1 -DARG_MAX=4096
 ARM_SH_OBJS := $(patsubst %.c,$(ARM_USER)/mrsh/%.o,$(ARM_SH_SRCS))
 ARM_EXTRAOBJ_sh := $(ARM_SH_OBJS)
 define ARM_SH_OBJECT
@@ -668,7 +670,7 @@ ARM_LIBEMBK_SRC := ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
                    ui/backend/scene_render.c ui/layout/layout.c \
                    ui/reactive/reactive.c ui/declare/declare.c \
                    ui/theme/theme.c ui/kit/kit.c ui/dsl/em.c ui/dsl/em_app.c \
-                   user/lib/auth.c user/lib/fileops.c
+                   user/lib/auth.c user/lib/fileops.c user/lib/document.c user/lib/workspace.c
 
 # build/aarch64/user/pic_ui_scene_scene.o -- the source path flattened, so two
 # files with the same basename in different directories cannot collide.
