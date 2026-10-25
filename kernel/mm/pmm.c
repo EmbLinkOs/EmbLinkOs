@@ -152,9 +152,9 @@ void pmm_init(void) {
      * with nothing to show for it.
      *
      * So the map is asked. The first usable region with room for the bitmap at
-     * or after the end of the kernel image wins, and it has to be below the
-     * gigabyte the higher-half window covers, because the bitmap is written
-     * through that window before paging is rebuilt. */
+     * or after the end of the kernel image wins, and it has to be inside the
+     * higher-half window the boot page tables map (PMM_BOOT_WINDOW_END),
+     * because the bitmap is written through it before paging is rebuilt. */
     {
         uint64_t kend = KV2P((uint64_t)kernel_end);
         kend = (kend + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
@@ -167,13 +167,13 @@ void pmm_init(void) {
             uint64_t end = e->base + e->length;
             if (start >= end) continue;                 /* entirely below the kernel */
             if (end - start < bitmap_size) continue;    /* not enough room here */
-            if (start + bitmap_size > 0x40000000ULL) continue;  /* past the mapped window */
+            if (start + bitmap_size > PMM_BOOT_WINDOW_END) continue;  /* past the mapped window */
             chosen = start;
             break;
         }
         if (!chosen) {
-            serial_write_string("\nPMM FATAL: no usable memory below 1 GiB can hold the "
-                                "page bitmap\n");
+            serial_write_string("\nPMM FATAL: no usable memory inside the boot window can "
+                                "hold the page bitmap\n");
             arch_cpu_halt_forever();
         }
         pmm_bitmap = (uint8_t *)KP2V(chosen);
