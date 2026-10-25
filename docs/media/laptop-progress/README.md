@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-150 actual EmbLinkOS captures document the original laptop work, its
+155 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors and GPU composition. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition and the native shell running any program. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,41 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: GPU composition
+## Latest: the native shell runs any program
+
+The structured shell used to speak only to programs built with its own SDK. A text program -- sh, a port, a script -- now takes its part in a pipeline: what is piped in arrives as text, what it prints is captured as a string when a later stage wants it, and at the end of a line it keeps the terminal. Redirections are words with the arrow attached (`out>`, `err>`, `in<`), because `>` compares here; scripts run by their `#!` line; `source` loads definitions; arguments that break the kernel's limits are refused by name. These are QEMU captures of the Terminal, typed into over QMP; `test shellio` checks the same behaviour on the OS. See [SHELL.md](../../SHELL.md).
+
+### Text programs in pipelines
+
+sh links no shell SDK, so it is a text program: its output is captured and split by lines, values piped into it arrive as text (a list as lines, ls's table as its grid), and -c is a flag, not a minus.
+
+![Text programs in pipelines in EmbLinkOS](151-shell-text-pipes.png)
+
+### Redirections that do not collide with >
+
+out>, err>, out>> and in< on sh and on builtins: sysinfo's text goes to a file, sh's stdout and stderr to two, a third line appended, and range's value written as text and counted back.
+
+![Redirections that do not collide with > in EmbLinkOS](152-shell-redirections.png)
+
+### Scripts run by their #! line
+
+A native script and an sh script saved from the prompt run as commands: the kernel reads the #! line and starts the interpreter with the script and its arguments. source loads a definition into the session.
+
+![Scripts run by their #! line in EmbLinkOS](153-shell-scripts.png)
+
+### What a command is, and limits that say so
+
+which tells a text program from a structured one. 200 arguments break the kernel's limit of 126, and the shell names it before anything is spawned.
+
+![What a command is, and limits that say so in EmbLinkOS](154-shell-which-limits.png)
+
+### An interactive sh from the native prompt
+
+A text program that ends a statement keeps the terminal: sh runs interactively in the Terminal, and exit returns to the native prompt.
+
+![An interactive sh from the native prompt in EmbLinkOS](155-shell-interactive-sh.png)
+
+## GPU composition
 
 The desktop is composed on the GPU where the adapter can do it: through virgl on QEMU's virtio-vga-gl -- the host's OpenGL, here Mesa's llvmpipe -- and with the Gen9 blitter on Intel laptops. These are captures of the virgl path; a GL scanout has no surface for QEMU's screendump, so they were read over VNC from an egl-headless display, unmodified. The same guest run with composition kept on the CPU gave the comparison frames; the Intel blitter has only met a model of its engine. See [DISPLAYS.md](../../DISPLAYS.md#gpu-composition).
 
