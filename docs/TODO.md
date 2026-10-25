@@ -7984,10 +7984,13 @@ worn out there. (Slot 2, incidentally: the slot whose EP0 ring straddled the
       port brings it back, and that means re-enumerating the slot while the
       block device stays registered. The log says "needs a port reset, which
       this driver does not do yet" at exactly that moment.
-- [ ] **A stick that wedges on a write cannot host a writable root.** No driver
-      change makes that flash block writable. Another stick is the answer for
-      this machine; a read-only root that still reaches the desktop would be
-      the answer for a machine whose only stick is like this one.
+- [x] **A stick that wedges on a write now hosts a read-only root that still
+      reaches the desktop** (EMBKFS spec v2.3 section 7): the first device write
+      or flush that fails with I/O error sets the volume read-only, every later
+      write fails at once with EROFS, init's mkdirs fail fast, the desktop is
+      spawned. `make test-ro-fallback` proves it with blkdebug failing every
+      write. No driver change makes that flash block writable; another stick is
+      still the answer for a machine that needs to write.
 
 **USB keyboard and mouse on the ProBook: the interrupt is the suspect (2026-09-30, night)**
 
@@ -8031,4 +8034,20 @@ it.
       an image whose embedded filesystem is not mkfs's, whose root mirror is
       not intact, or whose ESP lacks the loader -- then prints the checksum
       for the handover.
+
+**An intermittent kernel fault at boot (seen 2026-10-01, under QEMU)**
+
+- [ ] `test-embkfs-crash` once reported "the desktop never came up" with the
+      cores sampled five times over a second: CPUs 0, 2 and 3 in
+      `spin_lock+0x1f`, CPU 1 in `isr_handler+0x784` -- which is `isr.c:448`,
+      the `cli; hlt` at the end of the PANIC path. So CPU 1 took a kernel
+      fault during boot and halted holding a spinlock the other three then
+      waited on. The same suite had passed on the same kernel an hour earlier
+      and passed again after; roughly one boot in fifteen that day. Which
+      fault, where, on what address: unknown -- the panic path printed it
+      with `rawcon_puts`, and rawcon stopped mirroring to serial once panicked,
+      so the text existed only as pixels. That mirror is fixed (the panic's
+      own lines reach serial; the hang report quotes the console), so the next
+      occurrence names itself. Until it does, this is an observation, not a
+      diagnosis, and nothing has been changed in the name of fixing it.
 

@@ -440,7 +440,9 @@ struct embkfs_volume {
     bool     root_mirror_said;       /* the "using its mirror" line, once per mount */
     uint64_t root_primary_bad;       /* root block whose primary failed: reads go straight to the
                                         mirror until a commit moves the root (0 = none) */
-    bool     read_only;              /* forced RO by an ro_compat bit  */
+    bool     read_only;              /* forced RO by an ro_compat bit, or by a failed device write */
+    bool     device_failed;          /* read_only because the device failed a write (spec §7) */
+    bool     refusal_said;           /* the first write refused after that, logged once */
     bool     mounted;                /* true once the SB validated     */
     uint64_t feature_incompat;       /* mirrors the on-disk field; only ever
                                        * gains bits (e.g. COMPRESSION the

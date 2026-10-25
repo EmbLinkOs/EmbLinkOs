@@ -215,8 +215,56 @@ It saves the volume when the **root** dies. An interior node or a leaf with
 one copy is still one copy; the files under it are lost with it. Duplicating
 all metadata is the next step up and is not this.
 
+## 7. Read-only on device failure (v2.3.1)
+
+A device that fails a write is not asked to take another. The first write or
+flush that EMBKFS issues to its block device and gets `EIO` back — a node
+write, a data-extent write, the superblock write, either of the commit
+barrier flushes, the snapshot registry — sets the volume read-only, exactly as
+an unknown `feature_ro_compat` bit would at mount, and logs it once:
+
+```
+EMBKFS: sdb: a write to the device failed with an I/O error; the volume is
+read-only from now on -- later writes fail at once instead of waiting on a
+failing device
+```
+
+From then on every write entry point returns `EROFS` before touching the
+device; reads are unaffected. The transaction whose write failed is rolled
+back as before, so the on-disk tree is the last committed one. The first
+write refused after that is logged once too --
+`make "yves" refused: read-only file system (the device failed a write)` --
+so the log shows that writes stopped reaching the device; a volume mounted
+read-only on purpose (Recovery, an unknown `ro_compat` bit) stays quiet.
+
+The device has to say so for any of this to happen. The IDE driver used to
+check only the bus master's status after a DMA write, and a disk that refused
+the data reports that in its own status register (ERR or DF): the write was
+reported done and the data was gone. Both are checked now, after each PIO
+sector and after the write's cache flush too.
+
+Why this is a filesystem decision and not the caller's: on the device that
+motivated it (a USB stick whose flash wedged on the first write) each failed
+write cost the host transport's full timeout, 30 s, and init alone makes eight
+writes at boot before the desktop is spawned. Reads worked throughout. A
+read-only root that reaches the desktop in seconds is strictly better than a
+writable one that reaches nothing in minutes — and it says, in the log, why.
+
+The one write that does **not** trip this is the root mirror's (§6.3): the
+mirror is a safety net and its staging already proceeds without one on
+failure; a failing mirror write is logged by that path and does not make the
+volume read-only on its own.
+
 ## Validation status
 
+- **§7 read-only on device failure** — `make test-ro-fallback`
+  (tools/ro_fallback_test.py), two live-session boots of the same image: a
+  control (no read-only line, root listed) and QEMU `blkdebug` failing every
+  write with errno 5, reads untouched (`iotype = "write"`): the first commit
+  fails, the read-only line appears, init's account directory is refused with
+  `read-only file system` without reaching the device, 2 I/O errors in all,
+  the root is listed and the desktop starts. Passed 2026-10-25, with
+  `test-root-mirror`.
 - **§6 root mirror** — `make test-root-mirror` (tools/root_mirror_test.py), three boots of the
   same image: healthy (mirror line absent, root listed), root block overwritten with noise
   (`bad node magic`, served from the mirror, root listed), and QEMU `blkdebug` injecting

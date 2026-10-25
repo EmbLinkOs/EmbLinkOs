@@ -29,6 +29,7 @@
 #define ATA_STATUS_BSY          0x80    // Busy
 #define ATA_STATUS_DRDY         0x40    // Drive ready
 #define ATA_STATUS_DRQ          0x08    // Data request
+#define ATA_STATUS_DF           0x20    // Device fault
 #define ATA_STATUS_ERR          0x01    // Error
 
 // Command register bits

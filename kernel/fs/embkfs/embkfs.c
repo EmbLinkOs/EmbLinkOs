@@ -967,6 +967,36 @@ static int embkfs_snapreg_load(struct embkfs_volume *vol,
     return EMBK_OK;
 }
 
+/* A DEVICE THAT FAILS A WRITE IS NOT ASKED TO TAKE ANOTHER (spec §7). Every
+ * write and flush of the tree goes through these two: the first one the
+ * device answers with an I/O error sets the volume read-only, as an unknown
+ * ro_compat bit would at mount, and every write entry point then returns
+ * EROFS before touching the device. On the stick that asked for this, each
+ * failed write cost the transport's full 30 s timeout; init alone makes eight
+ * before the desktop starts. The root mirror's staging write does not come
+ * through here -- it is a safety net that already carries on without one. */
+static int embkfs_device_failed(struct embkfs_volume *vol, int rc)
+{
+    if (rc == -EMBK_EIO && !vol->read_only) {
+        vol->read_only = true;
+        vol->device_failed = true;
+        kprintf("EMBKFS: %s: a write to the device failed with an I/O error; the volume is "
+                "read-only from now on -- later writes fail at once instead of waiting on a "
+                "failing device\n", vol->dev->name);
+    }
+    return rc;
+}
+
+static int embkfs_dev_write(struct embkfs_volume *vol, uint64_t lba, uint64_t count, const void *buf)
+{
+    return embkfs_device_failed(vol, embk_block_write(vol->dev, lba, (uint32_t)count, buf));
+}
+
+static int embkfs_dev_flush(struct embkfs_volume *vol)
+{
+    return embkfs_device_failed(vol, embk_block_flush(vol->dev));
+}
+
 /* Write `n` slots back. One block write, no transaction: the registry is not
  * part of the tree, so it has no CoW machinery to ride and needs none -- it is
  * a single sector-aligned block whose checksum makes a torn write detectable.
@@ -991,7 +1021,7 @@ static int embkfs_snapreg_store(struct embkfs_volume *vol,
     uint64_t body = sizeof *hdr + (uint64_t)EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item);
     hdr->checksum = embk_crc32c(blk + 8, (uint32_t)(body - 8), 0);
 
-    return embk_block_write(vol->dev, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
+    return embkfs_dev_write(vol, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
 }
 
 /* Collects every currently-registered snapshot. out_items/max may be
@@ -1441,7 +1471,7 @@ static int embkfs_write_node(struct embkfs_volume *vol, uint64_t block,
 
     uint64_t spb = vol->block_size / vol->dev->block_size;
     embkfs_trace_block("NODE-WRITE", block, 1);
-    int rc = embk_block_write(vol->dev, block * spb, spb, buf);
+    int rc = embkfs_dev_write(vol, block * spb, spb, buf);
     if (rc != EMBK_OK) return rc;
 
     /* DID THE BLOCK ACTUALLY LAND? Off by default; switched on by `test embkfs
@@ -1546,9 +1576,9 @@ static int embkfs_write_superblock(struct embkfs_volume *vol,
 
     sb->checksum = embk_crc32c(sbbuf, EMBKFS_SB_BODY_SIZE, 0);   /* body [0..152) */
 
-    rc = embk_block_write(vol->dev, sb_block * spb, spb, sbbuf);
+    rc = embkfs_dev_write(vol, sb_block * spb, spb, sbbuf);
     if (rc != EMBK_OK) return rc;
-    return embk_block_write(vol->dev, (vol->total_blocks - 1) * spb, spb, sbbuf);
+    return embkfs_dev_write(vol, (vol->total_blocks - 1) * spb, spb, sbbuf);
 }
 
 
@@ -2695,7 +2725,7 @@ static int embkfs_commit(struct embkfs_volume *vol,
      * it. A drive's write-back cache can make writes durable out of issue order,
      * so issuing the superblock last is not enough; without this a power loss
      * could leave a valid superblock pointing at a spine that never landed. */
-    int rc = embk_block_flush(vol->dev);
+    int rc = embkfs_dev_flush(vol);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: pre-commit flush failed: %s\n", dev, embk_strerror(rc)); return rc; }
 
     /* THE COMMIT: install a new superblock naming the new root, generation bumped.
@@ -2706,7 +2736,7 @@ static int embkfs_commit(struct embkfs_volume *vol,
     /* SEAL: flush again so the superblock itself is durable before we report
      * success. The new tree is already durable, so a crash here is still safe —
      * remount sees the old superblock and the intact old tree. */
-    rc = embk_block_flush(vol->dev);
+    rc = embkfs_dev_flush(vol);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: commit-seal flush failed: %s\n", dev, embk_strerror(rc)); return rc; }
 
     vol->root        = *new_root;
@@ -2981,7 +3011,7 @@ static int embkfs_write_file(struct embkfs_volume *vol, uint64_t oid,
                 csum_len = vol->block_size;
             }
             embkfs_trace_block("DATA-WRITE", start + blk, 1);
-            rc = embk_block_write(vol->dev, (start + blk) * spb, spb, datablk);
+            rc = embkfs_dev_write(vol, (start + blk) * spb, spb, datablk);
             if (rc == EMBK_OK) { csum = embk_crc32c(datablk, csum_len, csum); written += chunk; }
         }
         kfree(comp_buf);
@@ -3111,7 +3141,16 @@ static int embkfs_make_object(struct embkfs_volume *vol, uint64_t dir_oid,
     static uint8_t probe[4096];          /* descent buffer, reused between lookups */
     bool is_dir = (mode & EMBKFS_S_IFMT) == EMBKFS_S_IFDIR;
 
-    if (vol->read_only) return -EMBK_EROFS;
+    if (vol->read_only) {
+        /* Once, after the device failed: the next write did not reach it.
+         * A volume mounted read-only on purpose stays quiet. */
+        if (vol->device_failed && !vol->refusal_said) {
+            vol->refusal_said = true;
+            kprintf("EMBKFS: %s: make \"%s\" refused: %s (the device failed a write)\n",
+                    dev, name, embk_strerror(-EMBK_EROFS));
+        }
+        return -EMBK_EROFS;
+    }
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > 255) return -EMBK_EINVAL;
 

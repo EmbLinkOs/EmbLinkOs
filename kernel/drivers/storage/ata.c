@@ -401,11 +401,18 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
             kprintf("ATA: IRQ wait timeout at sector %u\n", (unsigned int)i);
             return -1; // Wait for DRQ to set
         }
+        /* The drive's word on this sector: ERR or DF means it was not stored. */
+        if (inb(d->io_base + ATA_REG_STATUS) & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
+            kprintf("ATA: write of lba %lu failed at sector %u (error %x)\n", (unsigned long)lba,
+                    (unsigned int)i, (unsigned int)inb(d->io_base + ATA_REG_ERROR));
+            return -1;
+        }
     }
 
     // Flush the cache after writing
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH); // Send Cache flush command
     ata_wait_not_busy(d->io_base); // Wait for BSY to clear
+    if (inb(d->io_base + ATA_REG_STATUS) & (ATA_STATUS_ERR | ATA_STATUS_DF)) return -1;
 
     return 0;
 }
@@ -634,11 +641,18 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     // 9. Stop bus master
     outb(bmide + BMIDE_COMMAND, 0);
 
-    // 10. Check error, clear status
+    // 10. Check error, clear status. Both words: the bus master's (the
+    //     transfer) and the DRIVE's -- a disk that could not store the data
+    //     says so in its own status register (ERR or DF), and the bus master
+    //     moved every byte regardless. Reading only the first reported a
+    //     write the disk had refused as done, and the data was simply gone.
     uint8_t status = inb(bmide + BMIDE_STATUS);
     outb(bmide + BMIDE_STATUS, status | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR);
-    if (status & BMIDE_STATUS_ERROR) {
-        kprintf("ATA DMA: write error (status %x)\n", (unsigned int)status);
+    uint8_t drive = inb(d->io_base + ATA_REG_STATUS);
+    if ((status & BMIDE_STATUS_ERROR) || (drive & (ATA_STATUS_ERR | ATA_STATUS_DF))) {
+        kprintf("ATA DMA: write of lba %lu count %u failed (bus master %x, drive status %x, error %x)\n",
+                (unsigned long)lba, (unsigned)count, (unsigned int)status, (unsigned int)drive,
+                (unsigned int)inb(d->io_base + ATA_REG_ERROR));
         return -1;
     }
 
@@ -647,6 +661,10 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
     if (ata_wait_irq(d->io_base) < 0) {
         ata_wait_not_busy(d->io_base);   // fallback if no flush IRQ
+    }
+    if (inb(d->io_base + ATA_REG_STATUS) & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
+        kprintf("ATA DMA: cache flush after lba %lu failed\n", (unsigned long)lba);
+        return -1;
     }
 
     (void)used_bounce;

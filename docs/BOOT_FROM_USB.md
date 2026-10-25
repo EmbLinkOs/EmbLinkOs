@@ -144,6 +144,7 @@ Lines worth searching for:
 | `firmware memory map` | Every region the firmware reported, then one verdict line: the kernel image is either `all of it usable RAM` or `SHARED WITH FIRMWARE` — the latter means the firmware still owns memory the kernel (and its USB DMA buffers) sit in. |
 | `I/O error` | A read from the stick failed. Which one, and what happened just before it, is the diagnosis. |
 | `using its mirror` | `root node at block 17 could not be read (I/O error); using its mirror at block 32766 from now on -- the medium is failing there`: the one block every lookup passes through has gone bad on the stick, and the kernel is running from its second copy. The machine works; the stick is on its way out — copy what matters off it and use another. |
+| `read-only from now on` | `a write to the device failed with an I/O error; the volume is read-only from now on`: the stick refused a write, so the kernel stopped writing to it. The desktop still comes up; nothing you do on it is saved. The stick is failing — use another. |
 | `took` | `bulk-IN transfer of 4096 bytes took 2300 ms -- the device is slow here, not broken`: the stick has a flash page it can still read only with retries. The kernel waits for it (up to 30 s per transfer, like every other OS), but the stick is wearing out — copy what matters off it and use another. |
 | `home: desktop ready` | The desktop finished starting. |
 | `EmbLinkOS stopped` | A kernel fault; the lines after it name the function. |
@@ -198,8 +199,8 @@ plain `make` does not rebuild the stick image, and some targets boot the
 master filesystem writable; `make stick` exists so neither can hand you a
 stale or drifted image without saying so.
 
-
 ### On macOS
+
 1. Plug the stick in and **find it** — look for the size that matches your stick:
 
    ```bash

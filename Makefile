@@ -2963,6 +2963,14 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 test-root-mirror: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/root_mirror_test.py || exit 1
 
+# A disk that fails every write (QEMU blkdebug): the first failed write makes
+# the volume read-only, later writes fail at once with EROFS, and the boot
+# still lists the root -- against a control boot of the same image
+# (EMBKFS spec v2.3 section 7).
+.PHONY: test-ro-fallback
+test-ro-fallback: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/ro_fallback_test.py || exit 1
+
 .PHONY: test-xhci-nointr
 test-xhci-nointr: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/xhci_nointr_test.py || exit 1
