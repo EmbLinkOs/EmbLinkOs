@@ -30,3 +30,6 @@ __pycache__/
 build/webreal/
 build/sbkeys/
 build/modules/
+
+# Finder metadata
+.DS_Store

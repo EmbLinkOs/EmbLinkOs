@@ -1331,7 +1331,7 @@ EMLIBC_INC    := -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include -Iuse
 # do heavy FP), and x86-64 passes float/double in XMM, so FP is impossible with
 # it. crt0 already realigns the stack (and $-16) for SSE. emlibc's non-FP code
 # is unaffected; math.c needs this.
-EMLIBC_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
+EMLIBC_CFLAGS  = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
                  -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
 
 # emlibc's math = a thin glue (emlibc_math.o) over LIFTED fdlibm (Sun's freely-
@@ -1341,7 +1341,7 @@ EMLIBC_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red
 EMLIBC_FD_DIR  := $(EMLIBC_DIR)/math/fdlibm
 EMLIBC_FD_SRCS := $(wildcard $(EMLIBC_FD_DIR)/*.c)
 EMLIBC_FD_OBJS := $(patsubst $(EMLIBC_FD_DIR)/%.c,build/emlibc_fd_%.o,$(EMLIBC_FD_SRCS))
-EMLIBC_FD_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+EMLIBC_FD_CFLAGS  = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
                     -O2 -w -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include \
                     -Iuser/lib -I$(EMLIBC_FD_DIR)
 
