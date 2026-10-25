@@ -1,5 +1,34 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Shared descriptions and socket I/O (2026-10-25)
+
+Descriptors now share append/nonblocking status, socket identity and regular-file
+cursor serialization across dup and spawn. CLOEXEC stays per descriptor.
+TCP/UDP inheritance preserves other owners through child exit or termination.
+In-flight I/O retains its resolved backing across close/reuse and syscall
+bounce chunks; PTY pins preserve immediate last-master hangup. Cached append
+chooses EOF under the cache write lock rather than seeking only at open time.
+UDP send lengths, oversized-datagram refusal, empty datagrams, nonblocking UDP
+receive and TCP accept are covered by real local fixtures.
+
+Native acceptance passes **223/223 description checks** twice through the
+serial wrapper and again in Terminal; **83/83 network checks** pass via serial
+and through `sh` in Terminal. Concurrent records, parent/child traffic, final
+ownership release and eight pending-read close/reuse cases per invocation are
+checked. Description, pipe and PTY allocations return to baseline. The spawn
+suite now passes **360/360**, alongside 203 process, 108 PTY and 338 shell checks.
+ASan/UBSan/leak checks on production fd code pass 128 barrier-controlled races.
+The existing host shell/SDK/VT suites and wider document/device/IPC/session/
+kill-I/O integration pass; x86 images boot and the AArch64 kernel links.
+
+The [description contract](FILE_DESCRIPTIONS.md) records the native wire ABI,
+reference model and remaining limits. Append is atomic per kernel write chunk,
+not across arbitrary large writes; uncached append and complete ordering with
+truncate/mapped writes remain work. Job control and broad developer utilities
+remain open. This adds no ARM userspace runtime or physical-network validation.
+The [progress gallery](media/laptop-progress/README.md) has 116 actual captures,
+preserving all prior 114 images and metadata.
+
 ## Spawn-based sh (2026-10-24)
 
 The image now includes an initial mrsh-based `sh` port. Quoting, parameters,
@@ -44,8 +73,8 @@ retained ownership without a second libc lookup. A full handle table fails
 before constructing or running another child.
 
 The adapter supports 61 user actions, 64 descriptors and the existing bounded
-argv/environment startup page. TCP/UDP inheritance returns ENOSYS until sockets
-have a shared lifetime; marking them close-on-exec excludes them. Process-group,
+argv/environment startup page. This stage initially refused TCP/UDP inheritance;
+the later shared-description milestone above supplies ownership. Process-group,
 scheduler, identity and signal attribute flags return ENOTSUP. `fork`, in-place
 `exec` and job control remain open. The later sh milestone above uses the
 adapter without fork. The native shell is

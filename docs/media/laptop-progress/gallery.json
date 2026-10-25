@@ -2217,6 +2217,46 @@
       "featured": true,
       "milestone": "Initial spawn-based sh with scripts, pipelines and native terminal integration",
       "historical": false
+    },
+    {
+      "id": "115-shared-descriptors-and-append",
+      "phase": "Shared descriptions and socket I/O",
+      "title": "Shared descriptors and concurrent file I/O",
+      "caption": "The native description witness passes 223 checks in the normal Terminal session. It covers shared status and independent CLOEXEC, simultaneous shared-cursor reads/writes, independent append writers, access checks on redirected standard descriptors, socket ownership and final release. The same suite passes twice through the serial wrapper.",
+      "alt": "Shared descriptors and concurrent file I/O in EmbLinkOS",
+      "file": "115-shared-descriptors-and-append.png",
+      "capture_date": "2026-10-25",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe, e1000e; local TCP/UDP echo fixtures and live desktop session",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "ae797cebdc03e3bdc2223cd0eda1dc9eff12f906ee00ca859871e8e50358c266",
+      "source_capture": "shared-descriptors-and-append.ppm",
+      "source_sha256": "d187a2b319fad01a6554b1607ac5e0c64a30d8af697bff6e584db3e0fa41e79b",
+      "source_commit": "a33f0461b776b1c1ab7614631e7015d039e76361",
+      "featured": true,
+      "milestone": "Shared descriptor flags, socket ownership, I/O loans and cached append",
+      "historical": false
+    },
+    {
+      "id": "116-shared-socket-traffic",
+      "phase": "Shared descriptions and socket I/O",
+      "title": "Socket ownership through the development shell",
+      "caption": "The real sh runs 83 network checks in Terminal. Local TCP/UDP echo fixtures establish traffic after child exit and termination, eight pending reads retained across descriptor close/reuse, successful byte counts, oversized packet rejection and empty datagrams. This is software stack acceptance on an emulated e1000e, not physical Wi-Fi validation.",
+      "alt": "Socket ownership through the development shell in EmbLinkOS",
+      "file": "116-shared-socket-traffic.png",
+      "capture_date": "2026-10-25",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe, e1000e; local TCP/UDP echo fixtures and live desktop session",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "ccbb0ceb61e635094734d8e1c1cc212cc879305d767d72e7fc913706a9c23046",
+      "source_capture": "shared-socket-traffic.ppm",
+      "source_sha256": "6dfdbe353867b6c8e4ac66a8ae770cc19cbe1e010178359b79b73cc168e57740",
+      "source_commit": "a33f0461b776b1c1ab7614631e7015d039e76361",
+      "featured": true,
+      "milestone": "Shared descriptor flags, socket ownership, I/O loans and cached append",
+      "historical": false
     }
   ]
 }

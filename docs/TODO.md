@@ -12,7 +12,8 @@
 - [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
 - [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.
 - [x] Bounded posix_spawn/posix_spawnp with ordered actions, CLOEXEC and independent starting-directory context.
-- [ ] Shared socket descriptor lifetime, shared status flags and full append semantics.
+- [x] Shared socket lifetime/status, in-flight I/O loans, serialized cursors and cached per-chunk append.
+- [ ] Large-write atomicity, uncached append primitives and truncate/mapped-write ordering.
 - [x] Initial mrsh-based sh port with explicit workers, pipelines, substitution and scripts.
 - [ ] Broader shell conformance, utility coverage and remaining process/libc compatibility.
 - [ ] Full process-group job control and resize notifications.
@@ -1810,14 +1811,12 @@ text.
       absence of contention means the lock is unnecessary.
 - [x] ~~O_TRUNC reserved but not honored.~~ **DONE** — `fd.c` shrinks to zero
   through the VFS truncate op at open time.
-- [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
-  stat per write, and a TOCTOU window between the stat and the write. **NOT
-  fixed by the fd_lock above** — that guards the fd TABLE, but two O_APPEND
-  writers (even in different processes, or two fds to one file) race on the
-  file's CONTENTS, not the table. A correct fix is FS-level: an atomic
-  append-at-end op (or a per-object append lock) in the write path, not fd.c.
-  A per-fd lock would give false confidence (misses the two-fds-one-file case).
-  Now genuinely reachable (threads on SMP), so no longer just theoretical.
+- [x] Cached O_APPEND chooses EOF under the same cache lock as its write,
+  including independent opens and processes. Shared cursors serialize read,
+  write and seek. Uncached append refuses with ENOSYS rather than racing.
+- [ ] Append atomicity across multiple syscall bounce chunks, uncached backend
+  primitives and complete ordering with truncate/mapped writes. See
+  [FILE_DESCRIPTIONS.md](FILE_DESCRIPTIONS.md).
 
 ---
 

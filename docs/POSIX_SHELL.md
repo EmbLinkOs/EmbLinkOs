@@ -77,8 +77,9 @@ control.
   separate output limit. The transport bounds do not bound produced output.
 - Arithmetic retains upstream limitations; comprehensive overflow and recursive
   expression hardening remain open.
-- Socket inheritance, shared descriptor status flags and full append semantics
-  retain the adapter limitations documented in the process contract.
+- Socket inheritance and shared status now work. Cached append selects EOF
+  per kernel write chunk; large-write atomicity and uncached append retain the
+  limits in the [description contract](FILE_DESCRIPTIONS.md).
 - No broad Unix utilities, SSH, Vim, zsh or CPython subprocess compatibility is
   implied. Those need their own implementation and acceptance.
 
@@ -112,7 +113,7 @@ background job survives, waits for that job, and returns to the native shell.
 
 On the delivered x86 image the witness passes **338/338 checks** in each of
 two serial-wrapper runs and again inside the logged-in Terminal namespace.
-The serial regressions also pass 357 spawn, 203 process and 108 PTY checks,
+The latest serial regressions also pass 360 spawn, 203 process and 108 PTY checks,
 with pipe/device allocation returning to baseline. The capability suite checks
 that native and POSIX spawn OPEN actions cannot bypass filesystem permission.
 The wider device/preferences/files/document/page-cache/IPC/compositor/session

@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-114 actual EmbLinkOS captures document the original laptop work, its
+116 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn and spawn-based sh. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh and shared descriptor I/O. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,23 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: spawn-based sh
+## Latest: shared descriptions and socket I/O
+
+The native witness passes 223 checks in Terminal, including concurrent file
+records, append, shared status and socket ownership. Through sh, 83 network
+checks verify actual TCP/UDP echo traffic after child exit/termination, pending
+reads across close/reuse, empty datagrams and oversized-packet refusal. The
+[contract](../../FILE_DESCRIPTIONS.md) records bounds and remaining work.
+
+These original-pixel QMP captures use a disposable UEFI/NVMe live session with
+an emulated e1000e and local echo servers, without a synthetic ACPI fixture.
+Captures 01–114 and their metadata are unchanged.
+
+![Shared descriptors and concurrent file I/O](115-shared-descriptors-and-append.png)
+
+![Socket ownership through the development shell](116-shared-socket-traffic.png)
+
+## Earlier: spawn-based sh
 
 The image now includes an initial mrsh-based shell alongside the native prompt.
 The shared 83-case script corpus passes 338 checks in Terminal and twice through

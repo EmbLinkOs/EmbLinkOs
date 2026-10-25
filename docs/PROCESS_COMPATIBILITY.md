@@ -3,7 +3,7 @@
 EmbLinkOS uses explicit spawn actions and parent-owned child handles. The newlib
 adapter supplies real `pipe()`, `waitpid()`, `wait()`, `posix_spawn()` and
 `posix_spawnp()` on that model. This is a bounded process compatibility layer,
-not a ported POSIX shell or fork/exec.
+underlying the [bounded sh port](POSIX_SHELL.md), without fork/exec.
 
 ## Descriptor pipes
 
@@ -21,8 +21,8 @@ they wait for the entire write to fit, or fail without inserting a prefix in
 nonblocking mode. Larger writes may be partial. A missing reader returns `EPIPE`;
 there is no asynchronous `SIGPIPE` delivery.
 
-`F_GETFL` now reports the actual access mode and nonblocking state, rather than
-claiming every descriptor is read/write. Native pipe object-handle operations
+`F_GETFL` reports actual access mode plus shared append/nonblocking state;
+`F_SETFL` updates supported status through all duplicates. Native pipe object-handle operations
 retain their partial-write contract. Syscall 49 still returns object handles;
 **new syscall 150, `pipe_fds`, returns descriptors**. An unused register in an
 older one-argument syscall is not an option field. Neither call interprets one.
@@ -144,10 +144,11 @@ zero attribute flags can be applied: identity, process-group, scheduler and sign
 flags return `ENOTSUP` without mutation; unknown bits return `EINVAL`.
 `addfchdir_np` returns `ENOTSUP` because the VFS cannot reconstruct an fd's path.
 
-**Socket limitation:** TCP/UDP descriptors do not yet have a shared lifetime.
-An inheritable socket makes this adapter return `ENOSYS`, avoiding a copied
-child descriptor closing the parent's connection. Marking it `FD_CLOEXEC`
-excludes it. Socket transfer/dup actions are not supported by this policy.
+TCP/UDP descriptors now have shared lifetime and identity. Snapshots and
+ordered dup/close actions preserve other owners through child exit or
+termination. Close-on-exec exclusions still apply. Shared status, in-flight
+I/O loans and cached append behavior are documented in
+[FILE_DESCRIPTIONS.md](FILE_DESCRIPTIONS.md).
 
 ## Spawn validation
 
@@ -164,7 +165,7 @@ swaps, preserved parent state, closed stdio, action limits, directory setup
 before constructors, exact environments, PATH search, failure cleanup and all
 32 retained statuses. A full handle table must not execute a marker child.
 Two spawned children transform 66,049 bytes through bounded descriptor pipes.
-The current run passes **357/357 spawn checks** in each of two serial runs and
+The later shared-description run passes **360/360 spawn checks** in each of two serial runs and
 again inside Terminal. Fixtures live in the invoking user's home (or `/data`
 for the kernel-context wrapper), so the GUI run uses the normal session namespace. The harness repeats
 the serial run and executes the same program in Terminal, then checks another
@@ -228,9 +229,10 @@ resize signals remain separate work. Group selectors (`pid == 0` or `< -1`)
 return `ENOSYS`; options other than `WNOHANG` return `EINVAL` without consuming
 a result. General signal delivery remains unsupported.
 
-Descriptor status flags are still per entry: changing `O_NONBLOCK` after `dup`
-does not update its other copies. Mutable status flags beyond nonblocking and
-per-write append semantics need work before broader POSIX claims. Socket
-inheritance, shared open-description flags and job control remain separate
-milestones. Native open and descriptor pipe allocation both use the lowest free
-slot, including closed standard descriptors.
+`O_NONBLOCK` and `O_APPEND` now belong to shared descriptions; socket
+inheritance, cursor serialization and cached per-chunk append selection work.
+Writes larger than the syscall bounce chunk can interleave chunks, uncached
+append needs an atomic backend primitive, and truncate/mapped-write ordering
+needs further work. See the [description contract](FILE_DESCRIPTIONS.md).
+Native open and pipe allocation use the lowest free slot, including closed
+standard descriptors. Job control remains separate work.

@@ -202,11 +202,13 @@ The [process compatibility layer](PROCESS_COMPATIBILITY.md) now supplies real
 descriptor pipes, actual-PID waits, retained exit status and bounded
 `posix_spawn`/`posix_spawnp` with ordered actions, close-on-exec and independent
 starting-directory context. A real multi-child POSIX pipeline witness passes
-inside Terminal; a POSIX shell port and job control remain open.
+inside Terminal. The [initial sh port](POSIX_SHELL.md) now runs scripts and
+interactive pipelines. [Shared descriptions](FILE_DESCRIPTIONS.md) support
+socket inheritance, shared status and cached append. Job control remains open.
 
-1. **Unix shell compatibility:** supply the remaining process/libc semantics for
-   a small POSIX shell, prove scripts and pipelines, then port an interactive
-   shell such as zsh. Preserve the native structured shell alongside it.
+1. **Unix shell compatibility:** expand the initial sh port's language and
+   utility coverage, then assess an interactive shell such as zsh. Preserve
+   the native structured shell alongside it.
 2. **Job control:** process groups, controlling-terminal rules, Ctrl+Z/`fg`/`bg`
    across full pipelines, terminal-access checks and resize notifications. The
    current per-device target is a native handle delegation, not POSIX job control
