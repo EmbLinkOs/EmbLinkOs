@@ -3,14 +3,14 @@
 Input uses serial/QMP; GDB observes only. Keep x86 binaries unchanged while live.
 """
 from pathlib import Path
-import json,re,shutil,socket,tempfile,threading,time
+import os,json,re,shutil,socket,tempfile,threading,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_terminal import TerminalState
 from lock_test import keyname
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='fd-shared-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='fd-shared-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     stop=threading.Event();errors=[];received=bytearray();datagrams=[]
     tcp=socket.socket();tcp.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);tcp.bind(('127.0.0.1',39381));tcp.listen();tcp.settimeout(.2)
     udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.bind(('127.0.0.1',39382));udp.settimeout(.2)

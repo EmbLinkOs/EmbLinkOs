@@ -6,7 +6,7 @@ The host only observes via GDB; interactions use mouse, keyboard and serial.
 Do not rebuild kernel/apps/libembk.so while this guest is active.
 """
 from pathlib import Path
-import argparse,functools,http.server,json,re,subprocess,tempfile,threading,time
+import os,argparse,functools,http.server,json,re,subprocess,tempfile,threading,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_ui import NativeUI
@@ -15,7 +15,7 @@ from lock_test import keyname
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('fixture',type=Path);p.add_argument('--resume-disk',type=Path);args=p.parse_args()
-    out=Path(tempfile.mkdtemp(prefix='update-acceptance-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='update-acceptance-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     handler=functools.partial(http.server.SimpleHTTPRequestHandler,directory=str(args.fixture))
     server=http.server.ThreadingHTTPServer(('0.0.0.0',18080),handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     disk=out/'live.img';subprocess.run(['cp','--sparse=always',str(args.resume_disk or args.fixture/'base.img'),str(disk)],check=True)

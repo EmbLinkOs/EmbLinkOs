@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Observe native custom colours, monochrome silhouettes and power status."""
 from pathlib import Path
-import json,re,shutil,tempfile,time
+import os,json,re,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_ui import NativeUI
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='contour-shell-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='contour-shell-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     fields=re.findall(r'^    X\((\w+),',(ROOT/'user/lib/oscfg.h').read_text(),re.M)

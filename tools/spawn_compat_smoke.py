@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Native POSIX spawn and child/pipe regressions and a real Terminal invocation using QMP input."""
 from pathlib import Path
-import re,shutil,tempfile,time
+import os,re,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_terminal import TerminalState
 from lock_test import keyname
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='spawn-compat-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='spawn-compat-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     def eventually(check,message):
