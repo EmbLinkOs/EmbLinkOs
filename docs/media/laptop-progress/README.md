@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-127 actual EmbLinkOS captures document the original laptop work, its
+137 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O and managed system upgrades. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades and live display configuration. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,77 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: managed system and application updates
+## Latest: live display configuration
+
+Settings changes the actual VirtIO/Bochs scanout, asks for confirmation and
+retains the previous framebuffer for rollback. Timeout, closing the requester
+and locking the session restore the confirmed mode. The desktop, top bar and
+shared app runtime reflow; the Editor’s unsaved document survives. Confirmed
+per-user dimensions return after a new boot and password login. These are
+virtual-device tests; general native laptop modesetting, multiple outputs and
+GPU rendering remain open. See [DISPLAYS.md](../../DISPLAYS.md).
+
+### Display identity and resolution
+
+Settings reports the VirtIO adapter, CPU rendering, validated monitor identity and recommended resolution.
+
+![Display identity and resolution in EmbLinkOS](128-display-identity.png)
+
+### A safe live resolution trial
+
+The actual scanout changes to 800 × 600. Settings remains visible with Keep Changes, Revert and a 30-second confirmation deadline.
+
+![A safe live resolution trial in EmbLinkOS](129-display-trial.png)
+
+### A confirmed resolution
+
+The active 1024 × 768 mode is saved to the authenticated user’s atomic settings file. The top bar, desktop, dock and applications reflow.
+
+![A confirmed resolution in EmbLinkOS](130-display-kept.png)
+
+### An unconfirmed mode stays temporary
+
+A second 800 × 600 trial is intentionally left unconfirmed so the OS must restore the retained previous framebuffer.
+
+![An unconfirmed mode stays temporary in EmbLinkOS](131-display-timeout.png)
+
+### Timeout restores the confirmed mode
+
+The scanout and shared application geometry return to 1024 × 768 after the confirmation deadline.
+
+![Timeout restores the confirmed mode in EmbLinkOS](132-display-timeout-restored.png)
+
+### Closing Settings restores the display
+
+The requester exits during a trial. The OS restores 1024 × 768, and the Editor’s unsaved document remains intact.
+
+![Closing Settings restores the display in EmbLinkOS](133-display-requester-exit.png)
+
+### Locking cancels the display trial
+
+Lock Screen is chosen through the real top-bar menu during an 800 × 600 trial. The session gate locks and the OS restores its confirmed 1024 × 768 mode.
+
+![Locking cancels the display trial in EmbLinkOS](134-display-lock-restored.png)
+
+### The display choice survives a cold boot
+
+After a new UEFI/NVMe boot and password login, the desktop restores the confirmed 1024 × 768 preference and confirms it after presenting a frame.
+
+![The display choice survives a cold boot in EmbLinkOS](135-display-cold-boot.png)
+
+### An independent display backend
+
+The same Settings interface identifies Bochs DISPI, validates firmware monitor identity when available and exposes only modes that fit its VRAM.
+
+![An independent display backend in EmbLinkOS](136-bochs-display.png)
+
+### Bochs applies and saves a new mode
+
+The independent DISPI backend switches from its 1024 × 768 startup mode to 1280 × 800. The same keep, revert, timeout, close, lock and cold-boot checks run on both backends.
+
+![Bochs applies and saves a new mode in EmbLinkOS](137-bochs-display-kept.png)
+
+## Managed system and application updates
 
 Software Update now checks a signed release, streams an OS and paired EFI to
 the inactive system slot, verifies disk readback, and offers an explicit restart.
