@@ -3037,6 +3037,26 @@
       "featured": false,
       "milestone": "The native shell runs any program: text pipes, redirections, scripts",
       "historical": false
+    },
+    {
+      "id": "156-terminal-key-identity",
+      "phase": "A real Terminal",
+      "title": "Keys with identity",
+      "caption": "Up and Ctrl+S are the same byte, and F5 has none; the kernel queue now records which key made each byte. ttyprobe --identity shows what the Terminal sent for keys pressed over QMP: F-keys, modified arrows, Alt as Meta, Backspace against Ctrl+Backspace, and the keypad in application mode -- each as xterm sends it.",
+      "alt": "Keys with identity in EmbLinkOS",
+      "file": "156-terminal-key-identity.png",
+      "capture_date": "2026-10-25",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; keys pressed over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "efa2a824ca6319829aa104fafd1b16eb9c6b9d307b96f8a465cb07682cf3b398",
+      "source_capture": "emblink-keys-wigxx8ql/terminal-key-identity.ppm",
+      "source_sha256": "fbb4f554724d83ab5bad64ca040119927317f8ed826d3e37aec61a3dcb44a473",
+      "source_commit": "107366a",
+      "featured": true,
+      "milestone": "A real Terminal: keys keep their identity",
+      "historical": false
     }
   ]
 }

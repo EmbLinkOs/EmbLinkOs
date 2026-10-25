@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-155 actual EmbLinkOS captures document the original laptop work, its
+156 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition and the native shell running any program. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and the start of a real Terminal. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,17 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: the native shell runs any program
+## Latest: a real Terminal, key by key
+
+The Terminal is being rebuilt into a real one -- then a Powerlevel10k-style prompt system on top (docs/TODO.md has the roadmap). First, keys: the character stream cannot tell Up from Ctrl+S (both 0x13) or Backspace from Ctrl+H, and F1-F12 never arrived at all. The kernel queue now records which key made every byte, USB keyboards are decoded like PS/2 ones, and the Terminal encodes keys exactly as xterm does. See [TERMINAL.md](../../TERMINAL.md#keys).
+
+### Keys with identity
+
+Up and Ctrl+S are the same byte, and F5 has none; the kernel queue now records which key made each byte. ttyprobe --identity shows what the Terminal sent for keys pressed over QMP: F-keys, modified arrows, Alt as Meta, Backspace against Ctrl+Backspace, and the keypad in application mode -- each as xterm sends it.
+
+![Keys with identity in EmbLinkOS](156-terminal-key-identity.png)
+
+## The native shell runs any program
 
 The structured shell used to speak only to programs built with its own SDK. A text program -- sh, a port, a script -- now takes its part in a pipeline: what is piped in arrives as text, what it prints is captured as a string when a later stage wants it, and at the end of a line it keeps the terminal. Redirections are words with the arrow attached (`out>`, `err>`, `in<`), because `>` compares here; scripts run by their `#!` line; `source` loads definitions; arguments that break the kernel's limits are refused by name. These are QEMU captures of the Terminal, typed into over QMP; `test shellio` checks the same behaviour on the OS. See [SHELL.md](../../SHELL.md).
 
