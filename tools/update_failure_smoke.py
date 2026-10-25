@@ -21,10 +21,10 @@ def main():
     disk=out/'live.img';subprocess.run(['cp','--sparse=always',str(args.disk),str(disk)],check=True)
     meta=json.loads((fixture/'base.json').read_text());esp=meta['partitions'][0]['start']*512
     original=(fixture/'current').resolve();private=load_pem_private_key((fixture/'private.pem').read_bytes(),password=None)
-    def release(name,efi=None,bad_signature=False,short_root=False,bad_root=False):
+    def release(name,efi=None,bad_signature=False,short_root=False,bad_root=False,release_id=3):
         path=fixture/name;path.mkdir(exist_ok=False)
         root=original/'os.img';boot=efi or original/'boot.efi'
-        body=descriptor(root,boot,3,'1.2.0','Recovery acceptance fixture')
+        body=descriptor(root,boot,release_id,'1.3.0' if release_id==4 else '1.2.0','Recovery acceptance fixture')
         r,s=decode_dss_signature(private.sign(body,ec.ECDSA(hashes.SHA256())))
         record=body+r.to_bytes(32,'big')+s.to_bytes(32,'big')
         if bad_signature:record=record[:-1]+bytes([record[-1]^1])
@@ -44,6 +44,7 @@ def main():
     invalid_efi=out/'not-an-efi.bin';invalid_efi.write_bytes(b'bad executable'.ljust(512,b'\0'))
     badboot=release('failure-boot-'+out.name,efi=invalid_efi)
     slow=release('failure-interrupted-'+out.name)
+    trial=release('failure-unconfirmed-'+out.name,release_id=4)
     class Handler(http.server.SimpleHTTPRequestHandler):
         def copyfile(self,source,output):
             if self.path.endswith('/os.img') and (fixture/'current').resolve()==slow.resolve():
@@ -60,19 +61,24 @@ def main():
         try:guest.wait(b'home: time zone',240);guest.wait(b'TopBar: first frame presented');guest.pump(1)
         except BaseException:guest.close();raise
         return guest
+    def reap(text):
+        match=re.search(r'\[run\] started .* as pid (\d+)',text);assert match,text
+        pid=match[1]
+        g.command('wait '+pid,('[wait] pid '+pid+' exited with code 0').encode(),60)
     def status():
         text=g.command('run /data/apps/updatectl/updatectl.elf status',b'UPDATE request 0 result 0')
         row=re.search(r'UPDATE phase=(\d+) flags=(\d+) job=(\d+) release=(\d+).*? progress=(\d+) error=(-?\d+)',text)
-        assert row,text;return tuple(map(int,row.groups()))
+        assert row,text;reap(text);return tuple(map(int,row.groups()))
     def request(action):
         text=g.command('run /data/apps/updatectl/updatectl.elf '+action,b'UPDATE request')
         assert re.search(r'UPDATE request \d+ result 0',text),text
+        reap(text)
     def wait_phase(phase,timeout=420):
         end=time.monotonic()+timeout
         while time.monotonic()<end:
             row=status()
             if row[0]==phase and row[2]==0:return row
-            g.pump(.5)
+            g.pump(3)
         raise AssertionError(f'phase {phase} missing; {status()}')
     def journal():
         with disk.open('rb') as f:
@@ -123,6 +129,16 @@ def main():
         assert os_hash(0)==before,'confirmed OS changed during rejected or interrupted updates'
         g.qmp.screendump(str(out/'failed-update-restored.ppm'))
         print('PASS: signed but unloadable trial EFI rejected by real firmware; confirmed OS hash unchanged across all failures',flush=True)
+        select(trial);request('install');wait_phase(7)
+        g.close();g=None
+        g=Guest(out/'unconfirmed-trial',disk,menu=1,boot_nvme=True,resolution=(1280,800),nic='e1000e')
+        g.wait(b'update: managed release 4 1.3.0',240);g.wait(b'EmbLink OS Login: first frame presented')
+        assert b'healthy desktop confirmed' not in g.seen
+        g.p.kill();g.p.wait();g.close();g=None
+        g=boot('unconfirmed-fallback');assert status()[3]==1
+        assert journal()['pending']==255 and journal()['last_error']==1
+        assert os_hash(0)==before
+        print('PASS: a valid but unconfirmed trial gets one attempt, then firmware restores A on the next boot',flush=True)
     finally:
         if g:g.close()
         server.shutdown();server.server_close();select(original)

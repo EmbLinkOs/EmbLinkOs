@@ -735,11 +735,11 @@ static void test_mmap(void) {
     ck("MAP_SHARED is refused, not silently made private",
        sh == MAP_FAILED && errno == ENOTSUP);
 
-    /* ANY fd is refused -- fd 1 rather than a file we open, so this assertion
-     * cannot be skipped by a missing fixture the way a stat() guard would. */
+    /* A console has no file pages. Keep ENODEV distinct from a regular
+     * file descriptor whose access mode does not permit the mapping. */
     errno = 0;
     void *fm = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 1, 0);
-    ck("a file-backed mapping is refused, not faked with zeroes",
+    ck("a console mapping is refused, not faked with zeroes",
        fm == MAP_FAILED && errno == ENODEV);
 
     /* A range that is KNOWN to be unmapped, found by asking rather than by

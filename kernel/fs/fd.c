@@ -490,7 +490,8 @@ static bool fd_writable(int flags);
 int vfs_fd_object(int fd,struct vm_object **out,bool *may_write) {
     struct fd_entry held;int rc=fd_borrow(fd,&held);if(rc)return rc;
     int flags=fd_entry_flags(&held);
-    if(!fd_readable(flags))rc=-EMBK_EACCES;
+    if(held.backing!=FD_BACKING_VNODE)rc=-EMBK_ENODEV;
+    else if(!fd_readable(flags))rc=-EMBK_EACCES;
     else {
         *out=entry_object(&held);*may_write=fd_writable(flags);
         if(!*out)rc=-EMBK_ENODEV;

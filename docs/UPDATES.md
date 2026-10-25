@@ -180,6 +180,11 @@ native shell. Restart remains explicit and uses the existing system power flow.
 - `tools/update_failure_smoke.py`: package regressions, bad signatures, truncated
   and altered assets, hard interruption, unloadable signed EFI, and confirmed
   OS hash preservation across rejection/fallback.
+- `tools/update_install_smoke.py`: recovery-install a managed image onto a
+  disposable NVMe target, verify the source hash is unchanged, and boot the
+  installed target alone with read-only OS and writable account setup.
+- `tools/update_legacy_apps_smoke.py`: import a real legacy signed bundle,
+  update/rollback it, remove its modern and legacy copies, and reinstall.
 - `updateprobe`: native administrator/worker isolation and immutable/file-mapping
   checks. Run on a disposable managed image through the kernel debug console.
 
