@@ -750,6 +750,7 @@ static void anim_start(struct comp_window *w, int kind) {
 
 /* Land the motion: the window becomes real again (or stays parked). */
 static void anim_finish(void) {
+    if(g_anim.kind==ANIM_NONE)return;
     struct comp_window *w = win_by_id(g_anim.win_id);
     int kind = g_anim.kind;
     int last[4]; int had = g_anim.have_last;
@@ -1420,6 +1421,9 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     }
     win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
     ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
+    uint32_t copyw=nw<w->cw?nw:w->cw,copyh=nh<w->ch?nh:w->ch;
+    for(uint32_t row=0;row<copyh;row++)
+        memcpy((uint32_t *)kview+(uint64_t)row*nw,w->content+(uint64_t)row*w->cw,(size_t)copyw*4);
     w->cw = nw; w->ch = nh;
     w->fullscreen = (nw >= fi->width && nh >= fi->height);
     w->content = (uint32_t *)kview;
@@ -1525,7 +1529,7 @@ int64_t compositor_win_damage(int pid, uint32_t id,
     return 0;
 }
 
-int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
+static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int raise) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
@@ -1552,13 +1556,20 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
         if (y > maxy) y = maxy;
     }
     w->x = x; w->y = y;
-    w->z = w->widget ? g_widget_z++ : g_next_z++;   /* raise within its own band */
+    if(raise)w->z = w->widget ? g_widget_z++ : g_next_z++;   /* explicit moves raise */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
     /* repaint the union of old and new footprints in one region */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
-    enforce_focus();   /* moving raises to front; demote whoever was front */
+    if(raise)enforce_focus();   /* automatic reflow preserves focus */
     spin_unlock(&g_comp_lock);
     return 0;
+}
+
+int64_t compositor_win_move(int pid,uint32_t id,int32_t x,int32_t y) {
+    return win_position(pid,id,x,y,1);
+}
+int64_t compositor_win_place(int pid,uint32_t id,int32_t x,int32_t y) {
+    return win_position(pid,id,x,y,0);
 }
 
 int64_t compositor_win_destroy(int pid, uint32_t id) {
@@ -2514,4 +2525,30 @@ int compositor_desktop_healthy(void) {
         if(!strcmp(w->title,"TopBar"))strip=1;
     }
     spin_unlock(&g_comp_lock);return desktop && strip;
+}
+
+void compositor_display_lock(void) {spin_lock(&g_comp_lock);}
+void compositor_display_unlock(void) {spin_unlock(&g_comp_lock);}
+struct fb_surface *compositor_select_display(struct fb_surface *next) {
+    spin_lock(&g_comp_lock);
+    struct fb_surface *old=fb_select_surface(next);
+    if(old) {
+        const fb_info_t *fi=fb_get_info();
+        g_cursor_under_valid=0;g_cursor_valid=0;
+        g_cap_pid=0;g_cap_win=0;g_dragging=0;g_drag_on=0;g_ptr_buttons=0;g_buttons_suppressed=1;
+        anim_finish();
+        for(unsigned i=0;i<COMP_MAX_WINDOWS;i++) {
+            struct comp_window *w=&g_wins[i];if(!w->used)continue;
+            w->pend_count=w->pend_phase=0;
+            if(w->desktop){w->x=0;w->y=0;}
+            else {
+                if(w->x>(int)fi->width-120)w->x=(int)fi->width-120;
+                if(w->y>(int)fi->height-60)w->y=(int)fi->height-60;
+                if(w->x<0)w->x=0;if(w->y<(int)g_desktop.top)w->y=g_desktop.top;
+            }
+        }
+        mouse_set_bounds(fi->width,fi->height);
+        paint_region(0,0,fi->width,fi->height);
+    }
+    spin_unlock(&g_comp_lock);return old;
 }

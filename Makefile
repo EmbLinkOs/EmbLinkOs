@@ -291,7 +291,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/crc32c.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
-             kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c \
+             kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c kernel/display/control.c kernel/display/edid.c \
              kernel/fs/vfs.c \
              kernel/fs/automount.c \
              kernel/fs/ninep.c \

@@ -49,6 +49,10 @@ allocations are rejected instead of advertising a usable controller.
 
 ## Displays and power
 
+Live resolution changes on VirtIO/Bochs, safe confirmation, monitor identity and
+application reflow are described in [DISPLAYS.md](DISPLAYS.md). Physical adapters
+without native modesetting retain the firmware resolution.
+
 ACPI video discovery requires `_BCL`, `_BCM` and `_BQC`. It validates, deduplicates
 and sorts at most 32 brightness levels. Slider changes choose the nearest level
 and queue `_BCM` on the firmware worker. UI snapshots read cached `_BQC` values,
@@ -106,7 +110,9 @@ replacing existing user preferences.
 Physical AX200, laptop HDA routing, panel brightness, EC/battery and I2C touchpad
 acceptance remain outstanding. [DAILY_USE.md](DAILY_USE.md) covers the initial
 recovery installer, authenticated default boot, session lock/logout, file
-operations and power policies added subsequently. Broader drivers, suspend/resume,
+operations and power policies added subsequently. Broader drivers and
+suspend/resume remain open.
+
 Managed UEFI system updates now stage an inactive OS slot, verify disk readback,
 confirm a healthy desktop boot and retain a local rollback system. Accounts and
 files live on shared Data. Settings uses a supervised signed-release worker;

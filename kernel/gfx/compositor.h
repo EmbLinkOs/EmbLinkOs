@@ -217,6 +217,8 @@ int64_t compositor_win_damage(int pid, uint32_t id,
 /* Move the window's frame top-left to screen (x,y) and raise it to the front.
  * Repaints the union of the old and new footprints. */
 int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y);
+/* Automatic placement preserves z-order and keyboard focus. */
+int64_t compositor_win_place(int pid,uint32_t id,int32_t x,int32_t y);
 
 /* Destroy a window: free its buffer, erase it (repaint the exposed region). */
 int64_t compositor_win_destroy(int pid, uint32_t id);
@@ -235,4 +237,8 @@ void    compositor_pointer_tick(void);
 void compositor_session_changed(void);
 
 int compositor_desktop_healthy(void);
+struct fb_surface;
+struct fb_surface *compositor_select_display(struct fb_surface *);
+void compositor_display_lock(void);
+void compositor_display_unlock(void);
 #endif /* __GFX_COMPOSITOR_H__ */

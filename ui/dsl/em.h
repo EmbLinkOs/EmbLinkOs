@@ -795,6 +795,8 @@ int em_widget_run(const EmWidget *wg);
 /* Runs the app until its CloseButton/ESC quits. Defined in em_app.c, which is
  * only linked on-target (it speaks the EmbLink SDK); host tests never call it. */
 int em_app_run(const EmApp *app);
+/* Opt a system strip into width tracking without changing the EmApp ABI. */
+void em_app_follow_display_width(int enabled);
 /* Ask the EM_APPLICATION runtime to close cleanly after the current UI pass.
  * Unlike calling exit() from a view callback, this destroys the compositor
  * window first, so the next screen never inherits stale pixels. */

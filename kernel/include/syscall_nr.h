@@ -348,6 +348,8 @@
 #define SYS_spawn_cwd 151
 #define SYS_spawn_pid 152
 #define SYS_update 153
+#define SYS_monitor 154
+#define SYS_win_place 155
 
 
 

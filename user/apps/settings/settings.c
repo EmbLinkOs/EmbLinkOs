@@ -34,6 +34,10 @@ static char g_update_action_error[96];
 static struct embk_audio_info g_audio;
 static struct embk_display_info g_display;
 static struct embk_gpu_info g_graphics;
+static struct embk_monitor_info g_monitor;
+static int g_monitor_rc,g_mode_pick=-1;
+static unsigned g_mode_generation;
+static char g_mode_message[128];
 static struct embk_power_info g_power;
 static struct embk_policy g_policy;
 static int g_audio_rc,g_display_rc,g_power_rc;
@@ -75,6 +79,7 @@ static void sample_system(void) {
         g_sample_next=ms+1000;
         g_wifi_rc=embk_wifi_get(&g_wifi);
         g_update_rc=embk_update(EMBK_UPDATE_STATUS,&g_update,sizeof g_update);
+        g_monitor_rc=embk_monitor(EMBK_MONITOR_GET,&g_monitor,sizeof g_monitor);
         g_audio_rc=embk_audio_get(&g_audio);g_display_rc=embk_display_get(&g_display);
         g_power_rc=embk_power_get(&g_power);embk_gpu_get(&g_graphics);embk_policy_get(&g_policy);
         if(!g_wifi_rc && g_wifi_pending && g_wifi.completed_id &&
@@ -453,11 +458,51 @@ static void pane_sound(void) {
     }
     Section("Input") {Text("Microphone recording is not available yet.").caption().secondary();}
 }
+static int monitor_action(unsigned action) {
+    struct embk_monitor_request r={.version=EMBK_MONITOR_VERSION,.generation=g_monitor.generation,.token=action==EMBK_MONITOR_APPLY?0:g_monitor.token};
+    if(action==EMBK_MONITOR_APPLY && g_mode_pick>=0 && (unsigned)g_mode_pick<g_monitor.mode_count) {
+        r.width=g_monitor.modes[g_mode_pick].width;r.height=g_monitor.modes[g_mode_pick].height;
+    }
+    int rc=embk_monitor(action,&r,sizeof r);
+    if(rc)snprintf(g_mode_message,sizeof g_mode_message,"Could not change the display (%d).",rc);else g_mode_message[0]=0;
+    g_sample_next=0;em_request_frame();return rc;
+}
+
 static void pane_display(void) {
-    Section("Display") {
+    Section("Graphics") {
         ListRow(IconGrid,"Resolution",g_res);
         ListRow(IconInfo,"Graphics",g_graphics.driver);
         ListRow(IconInfo,"Rendering","Software");
+    }
+    Section("Display") {
+        if(!g_monitor_rc) {
+            Text(g_monitor.name).heading();
+            if(g_monitor.flags&EMBK_MONITOR_EDID) {
+                char detail[96];snprintf(detail,sizeof detail,"%s · %u × %u mm",g_monitor.manufacturer,g_monitor.width_mm,g_monitor.height_mm);
+                Text(detail).caption().secondary();
+            }
+            ListRow(IconDisplay,"Active resolution",g_res);
+            if(g_monitor.generation!=g_mode_generation || g_mode_pick<0) {
+                g_mode_generation=g_monitor.generation;g_mode_pick=0;
+                for(unsigned i=0;i<g_monitor.mode_count;i++)if(g_monitor.modes[i].flags&EMBK_MONITOR_CURRENT)g_mode_pick=(int)i;
+            }
+            if((g_monitor.flags&EMBK_MONITOR_MODESET) && g_monitor.mode_count && g_monitor.mode_count<=EMBK_MONITOR_MAX_MODES) {
+                const char *names[EMBK_MONITOR_MAX_MODES];char labels[EMBK_MONITOR_MAX_MODES][48];
+                for(unsigned i=0;i<g_monitor.mode_count;i++) {
+                    snprintf(labels[i],sizeof labels[i],"%u × %u%s",g_monitor.modes[i].width,g_monitor.modes[i].height,(g_monitor.modes[i].flags&EMBK_MONITOR_PREFERRED)?" · Recommended":"");names[i]=labels[i];
+                }
+                HStack(.spacing=16,.align=Center) {setting_label("Resolution","Changes apply live. Keep the setting to save it; otherwise the previous mode returns.");}
+                Dropdown(names,(int)g_monitor.mode_count,&g_mode_pick);Sync();
+                if(g_monitor.phase==EMBK_MONITOR_QUEUED || g_monitor.phase==EMBK_MONITOR_APPLYING || g_monitor.phase==EMBK_MONITOR_REVERTING)
+                    Text("Changing the display…").caption().secondary();
+                else if(g_monitor.phase!=EMBK_MONITOR_TRIAL && g_mode_pick>=0 && (unsigned)g_mode_pick<g_monitor.mode_count &&
+                    !(g_monitor.modes[g_mode_pick].flags&EMBK_MONITOR_CURRENT)) {
+                    HStack(.spacing=10) {if(Button("Apply Resolution").primary().clicked())monitor_action(EMBK_MONITOR_APPLY);}
+                }
+            }else Text("This adapter uses the firmware's resolution. Live resolution changes are unavailable.").body().secondary();
+            if(g_monitor.last_error)Text("The requested display mode could not be applied.").caption().secondary();
+            if(g_mode_message[0])Text(g_mode_message).caption().secondary();
+        }else Text("Display configuration is unavailable.").body().secondary();
     }
     Section("Brightness") {
         if(g_display.flags&EMBK_DISPLAY_NATIVE)Text("Native panel brightness").caption().secondary();
@@ -783,6 +828,23 @@ static void app(void) {
                     }
                 }
             }
+        }
+        if(!g_monitor_rc && g_monitor.phase==EMBK_MONITOR_TRIAL && (g_monitor.flags&EMBK_MONITOR_OWN_TRIAL)) {
+          Overlay() {
+            Dialog(.width=400,.padding=22,.spacing=14) {
+                Text("Keep this display setting?").title();
+                char countdown[120];snprintf(countdown,sizeof countdown,"The previous resolution returns in %u seconds unless you keep this setting.",(g_monitor.remaining_ms+999)/1000);
+                Text(countdown).body().secondary();
+                HStack(.spacing=10) {
+                    Spacer();if(Button("Revert").secondary().clicked())monitor_action(EMBK_MONITOR_REVERT);
+                    if(Button("Keep Changes").primary().clicked()) {
+                        unsigned w=g_monitor.width,h=g_monitor.height;
+                        if(!monitor_action(EMBK_MONITOR_KEEP)){g_cfg.display_width=w;g_cfg.display_height=h;commit();}
+                    }
+                }
+            }
+          }
+          if(OverlayDismissed())monitor_action(EMBK_MONITOR_REVERT);
         }
         if(g_update_confirm) {
           Overlay() {

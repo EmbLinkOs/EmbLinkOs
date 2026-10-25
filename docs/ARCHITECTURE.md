@@ -1,3 +1,19 @@
+## Live display configuration (2026-10-25)
+
+The single-output display controller stages an independent framebuffer before
+switching scanout, retains the old surface through a 30-second trial and releases
+it only after confirmation. This keeps timeout/session/process-exit rollback
+independent of another allocation succeeding. VirtIO resources are acknowledged
+before backing memory is released; failed device ownership stays quarantined.
+The compositor publishes a mode under its drawing lock. Shared apps reflow with
+placement that preserves z-order/focus and retain their previous window pixels
+until the next frame. EDID identity comes from the active VirtIO scanout or the
+same UEFI handle as GOP, through an appended boot-protocol v5 block. ABI 154
+provides monitor control; ABI 155 provides placement without raising. Existing
+call numbers and v1–v4 boot offsets are preserved. There are 155 native calls.
+[DISPLAYS.md](DISPLAYS.md) records capabilities, failure paths and native-driver
+limitations. The CPU compositor and one active output remain the architecture.
+
 # EmbLinkOS — Architecture
 
 ## Private terminal sessions (2026-10-24)

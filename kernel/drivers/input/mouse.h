@@ -12,6 +12,7 @@
 
 /* Set the clamp bounds + start the cursor at the centre, then bring the PS/2
  * aux device up (enable, IRQ12, data reporting) and register the handler. */
+void mouse_set_bounds(uint32_t screen_w,uint32_t screen_h);
 void mouse_init(uint32_t screen_w, uint32_t screen_h);
 
 /* Current cursor position + button bitmask (a snapshot; safe to poll). */

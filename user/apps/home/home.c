@@ -1778,8 +1778,42 @@ int main(int argc, char **argv, char **envp) {
     spawn_app("/system/bin/notifyd.elf", NULL);
     embk_puts(1, "home: desktop ready\n");
 
+    uint64_t screen_next=0,restore_token=0;int restore_attempted=0,restore_presented=0;
     for (;;) {
-        cfg_poll();            /* dock size / indicator, as Settings left them */
+        cfg_poll(); /* Load saved preferences before deciding whether to restore a mode. */
+        if(embk_uptime_ms()>=screen_next) {
+            screen_next=embk_uptime_ms()+200;uint32_t nw=0,nh=0;embk_screen_size(&nw,&nh);
+            if(nw && nh && (nw!=sw || nh!=sh)) {
+                void *next=NULL;
+                if(embk_win_resize(win,nw,nh,&next)>=0 && next) {
+                    restore_presented=0;pixels=next;sw=nw;sh=nh;g_sw=nw;g_sh=nh;em_set_viewport(nw,nh);
+                    rt=(struct render_target){(uint32_t *)pixels,nw,nh,nw*4,EMBK_PIXFMT_BGRA8888_PRE};
+                    scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());
+                    for(int i=0;i<g_desk_n;i++)desk_clamp(&g_desk[i]);
+                    g_invalidate=2;g_full_present=2;em_structure_changed();
+                }
+            }
+        }
+        if(!restore_attempted || restore_token) {
+            struct embk_monitor_info monitor;
+            if(!embk_monitor(EMBK_MONITOR_GET,&monitor,sizeof monitor)) {
+                if(restore_token) {
+                    if(monitor.token!=restore_token || !(monitor.flags&EMBK_MONITOR_OWN_TRIAL))restore_token=0;
+                    else if(restore_presented && monitor.phase==EMBK_MONITOR_TRIAL && sw==monitor.width && sh==monitor.height) {
+                        struct embk_monitor_request req={.version=1,.token=restore_token};
+                        if(!embk_monitor(EMBK_MONITOR_KEEP,&req,sizeof req))restore_token=0;
+                    }
+                }else if(g_cfg.display_width && g_cfg.display_height && (monitor.flags&EMBK_MONITOR_MODESET)) {
+                    if(monitor.width==(unsigned)g_cfg.display_width && monitor.height==(unsigned)g_cfg.display_height)restore_attempted=1;
+                    else if(monitor.phase==EMBK_MONITOR_IDLE || monitor.phase==EMBK_MONITOR_ERROR) {
+                        struct embk_monitor_request req={1,monitor.generation,g_cfg.display_width,g_cfg.display_height,0};
+                        int rc=embk_monitor(EMBK_MONITOR_APPLY,&req,sizeof req);
+                        if(!rc) {restore_attempted=1;embk_monitor(EMBK_MONITOR_GET,&monitor,sizeof monitor);restore_token=monitor.token;}
+                        else if(rc!=-1)restore_attempted=1;
+                    }
+                }else restore_attempted=1;
+            }
+        }
         /* TAKEN HERE, a frame after the menu item was chosen and a frame after
          * the menu closed -- a screenshot of the menu you used to ask for a
          * screenshot is a screenshot of the wrong thing. */
@@ -1863,7 +1897,7 @@ int main(int argc, char **argv, char **envp) {
 
         if (r.full || r.n_dirty == 0 || g_full_present > 0) {
             if (g_full_present > 0) g_full_present--;
-            embk_win_present(win, pixels, sw, sh);
+            if(embk_win_present(win, pixels, sw, sh)>=0)restore_presented=1;
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
             if (r.has_scroll_present) {           /* a scroll blit moved pixels */

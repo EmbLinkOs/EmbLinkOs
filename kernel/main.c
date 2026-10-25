@@ -6,6 +6,7 @@
 #include "include/kstring.h"
 #include "update/storage.h"
 #include "update/service.h"
+#include "display/control.h"
 
 #include "drivers/char/serial.h"
 #include "drivers/video/framebuffer.h"
@@ -2298,6 +2299,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // title-bar drag. Runs here (schedulable shell-process context) so the
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
+        monitor_tick();
         compositor_pointer_tick();
         /* SYSTEM KEY SHORTCUTS, performed here rather than where they were
          * pressed: the keyboard decides them in IRQ context and the compositor

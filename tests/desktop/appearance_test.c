@@ -17,6 +17,13 @@ int main(void) {
     char out[2048];int n=oscfg_format(&c,out,sizeof out);CHECK(n>640 && n<(int)sizeof out);
     oscfg_defaults(&copy);oscfg_parse(&copy,out);oscfg_clamp(&copy);CHECK(!memcmp(&copy,&c,sizeof c));
     CHECK(oscfg_format(&c,out,20)<0);
+    c.display_width=1920;c.display_height=1080;
+    n=oscfg_format(&c,out,sizeof out);CHECK(n>0);
+    oscfg_defaults(&copy);oscfg_parse(&copy,out);oscfg_clamp(&copy);
+    CHECK(copy.display_width==1920 && copy.display_height==1080);
+    for(int i=0;i<OSCFG_PRESETS;i++){oscfg_preset(&copy,i);CHECK(copy.display_width==1920 && copy.display_height==1080);}
+    copy.display_width=INT_MAX;oscfg_clamp(&copy);CHECK(!copy.display_width && !copy.display_height);
+    copy.display_width=1280;copy.display_height=0;oscfg_clamp(&copy);CHECK(!copy.display_width && !copy.display_height);
     #define SET_MAX(name,value,lo,hi) c.name=INT_MAX;
     OSCFG_CONTOUR_FIELDS(SET_MAX)
     #undef SET_MAX

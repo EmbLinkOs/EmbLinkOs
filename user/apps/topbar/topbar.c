@@ -471,6 +471,7 @@ static EmApp em_app_spec_ = {
 };
 
 int main(void) {
+    em_app_follow_display_width(1);
     uint32_t sw = 0, sh = 0;
     embk_screen_size(&sw, &sh);
     if (sw) em_app_spec_.size.w = (int)sw;    /* a menu bar spans the display */
