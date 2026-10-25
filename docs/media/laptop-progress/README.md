@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-116 actual EmbLinkOS captures document the original laptop work, its
+127 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh and shared descriptor I/O. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O and managed system upgrades. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,90 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: shared descriptions and socket I/O
+## Latest: managed system and application updates
+
+Software Update now checks a signed release, streams an OS and paired EFI to
+the inactive system slot, verifies disk readback, and offers an explicit restart.
+A real administrator logged in before and after upgrade and rollback. The
+account, appearance preferences and a pre-existing document survived the cold
+boots. The paired kernel's update authority and mapping checks pass natively;
+package installation publishes synced immutable versions through CURRENT.
+
+These are original-pixel QMP captures using a temporary local signing key and
+release server. The versions are acceptance fixtures, not a public release feed.
+No production signing key or public OS/application registry is configured by
+default. See [the update contract](../../UPDATES.md) for supported layouts and
+remaining work. Captures 01–116 and their metadata are preserved.
+
+### Software Update in Settings
+
+A real administrator account opens Software Update on managed UEFI/NVMe. The pane reports release 1.0.0 from the boot journal; the independent application registry is explicitly unconfigured.
+
+![Software Update in Settings in EmbLinkOS](117-software-update-settings.png)
+
+### A verified release is available
+
+The native worker checked an ECDSA-P256 signed release from a local acceptance fixture. Version and release notes come from the verified descriptor. These are test releases, not a configured public update channel.
+
+![A verified release is available in EmbLinkOS](118-signed-release-available.png)
+
+### Installing the next system
+
+The running desktop remains in the confirmed system while the native worker streams the signed OS and paired EFI into the inactive deployment. The progress is read from the actual update engine.
+
+![Installing the next system in EmbLinkOS](119-background-system-install.png)
+
+### Verifying the installed bytes
+
+The kernel reads the inactive deployment back from NVMe and verifies both image digests before publishing a trial boot. Settings navigation was exercised during this bounded verification phase.
+
+![Verifying the installed bytes in EmbLinkOS](120-system-readback-verification.png)
+
+### Restart when ready
+
+Both payloads passed readback verification and the trial journal was flushed. Restart is an explicit user action, with a save-your-work confirmation.
+
+![Restart when ready in EmbLinkOS](121-system-update-ready.png)
+
+### The upgraded system is confirmed
+
+After a cold boot into OS-B, the actual desktop/top-bar frames and live supervised service remained healthy for five seconds. The engine confirmed release 1.1.0 and retained OS-A for rollback. The account and saved appearance preferences survived.
+
+![The upgraded system is confirmed in EmbLinkOS](122-upgraded-desktop.png)
+
+### Choose the previous system
+
+Settings selected the retained local deployment for the next restart. The test then cold-booted OS-A and confirmed it through the same real desktop health path.
+
+![Choose the previous system in EmbLinkOS](123-previous-system-selected.png)
+
+### Personal files survive upgrade and rollback
+
+Terminal reads the document created before installation, after upgrade to OS-B and rollback to OS-A. A real administrator authenticated across all three boots; saved appearance preferences also matched. No host filesystem or physical laptop was used.
+
+![Personal files survive upgrade and rollback in EmbLinkOS](124-files-survive-system-rollback.png)
+
+## Managed recovery and installation acceptance
+
+### The confirmed desktop is restored
+
+The real firmware rejected a signed but unloadable trial EFI and booted confirmed OS-A instead. This is the restored live desktop; the boot journal and serial acceptance log establish the failure and fallback. The confirmed OS hash stayed unchanged across rejected catalogs, short/altered payloads, hard interruption and firmware fallback.
+
+![The confirmed desktop is restored in EmbLinkOS](125-failed-update-restored.png)
+
+### Installing the managed system
+
+The recovery console copied and read back a managed ESP, OS-A, OS-B and shared Data onto a separate disposable NVMe disk. It rewrote boot identities and expanded Data while preserving the source hash. This operation never selected a host disk.
+
+![Installing the managed system in EmbLinkOS](126-managed-recovery-install.png)
+
+### The installed system boots alone
+
+The newly installed NVMe disk booted without the source media. The selected OS mounted read-only, shared Data mounted writable, the update engine recognized its rewritten identities, and real first-account setup presented its frame.
+
+![The installed system boots alone in EmbLinkOS](127-installed-managed-first-boot.png)
+
+## Earlier: shared descriptions and socket I/O
 
 The native witness passes 223 checks in Terminal, including concurrent file
 records, append, shared status and socket ownership. Through sh, 83 network
