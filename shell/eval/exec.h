@@ -51,6 +51,11 @@ void exec_set_interrupt_check(bool (*fn)(void));
  * (the definition still works; the caller should report it). */
 bool exec_retain_program(struct block *b);
 
+/* Run program text in `env` -- the caller's scope, so its lets and defs stay
+ * -- printing through the session's sink. Null, or the error that stopped
+ * it. What the `source` builtin runs a file with. */
+struct value exec_source_text(const char *src, struct scope *env);
+
 /* --- background jobs -------------------------------------------------------
  *
  * `pipeline &` spawns ANOTHER SHELL to run that pipeline's source text and

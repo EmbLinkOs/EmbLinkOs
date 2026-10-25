@@ -15,6 +15,8 @@
  *   - filesize literals (1mb, 512kb) are recognized HERE, pre-parsed to bytes.
  *   - `# ` to end of line is a comment.
  *   - keywords (and or not true false let) are their own token types.
+ *   - redirections are words with an arrow attached (out> in< ...), never a
+ *     bare `>`, which compares.
  * ========================================================================== */
 #ifndef __EMBK_LEX_H__
 #define __EMBK_LEX_H__
@@ -67,7 +69,26 @@ enum tok_type {
     TOK_DEF,            /* def name(a, b) { ... } -- a user-defined command */
     TOK_BREAK, TOK_CONTINUE, TOK_RETURN,
 
+    /* --- redirection: where a command's streams go -----------------------
+     * `>` is a comparison here (`where size > 1mb`), so a redirection cannot
+     * be spelled with it alone. It is a WORD with the arrow attached --
+     * out> out>> err> err>> out+err> out+err>> in< -- and only at the start
+     * of a word: `out>` written with no space is a redirection, `out > 3`
+     * with spaces is still a comparison against a column called out. The
+     * token's int_val is the enum redirect_kind below. */
+    TOK_REDIRECT,
+
     TOK_ERROR,          /* malformed input; lexeme = the message */
+};
+
+enum redirect_kind {
+    REDIR_OUT = 1,          /* out>      stdout to a file, replacing it */
+    REDIR_OUT_APPEND,       /* out>>     ... appended                    */
+    REDIR_ERR,              /* err>      stderr to a file                */
+    REDIR_ERR_APPEND,       /* err>>                                    */
+    REDIR_BOTH,             /* out+err>  both to one file                */
+    REDIR_BOTH_APPEND,      /* out+err>>                                */
+    REDIR_IN,               /* in<       stdin from a file               */
 };
 
 struct token {

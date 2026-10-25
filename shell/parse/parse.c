@@ -67,6 +67,8 @@ static void command_free(struct command *c) {
     free(c->name);
     for (size_t i = 0; i < c->nargs; i++) expr_free(c->args[i]);
     free(c->args);
+    for (size_t i = 0; i < c->nredirs; i++) expr_free(c->redirs[i].target);
+    free(c->redirs);
     free(c);
 }
 
@@ -337,8 +339,42 @@ static struct expr *parse_expr(struct parser *P, int min_bp) {
 }
 
 /* -------------------------------------------------------------------------
- * command := IDENT expr*    (args stop at '|', ')' or EOF)
+ * command := IDENT ( expr | redirect )*    (args stop at '|', ')' or EOF)
+ * redirect := ( out> | out>> | err> | err>> | out+err> | out+err>> | in< ) expr
+ *
+ * A redirection may sit anywhere among the arguments; each stream may be
+ * redirected once (stdout and stderr both count `out+err>`).
  * ------------------------------------------------------------------------- */
+static int add_redirect(struct parser *P, struct command *cmd, const struct token *at) {
+    int kind = (int)at->int_val;
+    adv(P);
+    unsigned want = kind == REDIR_IN ? 1u : (kind == REDIR_ERR || kind == REDIR_ERR_APPEND) ? 4u
+                  : (kind == REDIR_BOTH || kind == REDIR_BOTH_APPEND) ? 6u : 2u;   /* stdin 1, stdout 2, stderr 4 */
+    unsigned have = 0;
+    for (size_t i = 0; i < cmd->nredirs; i++) {
+        int k = cmd->redirs[i].kind;
+        have |= k == REDIR_IN ? 1u : (k == REDIR_ERR || k == REDIR_ERR_APPEND) ? 4u
+              : (k == REDIR_BOTH || k == REDIR_BOTH_APPEND) ? 6u : 2u;
+    }
+    if (have & want) { perr(P, at, "a stream redirected twice"); return -1; }
+    const struct token *t = pk(P);
+    if (t->type == TOK_PIPE || t->type == TOK_EOF || t->type == TOK_NEWLINE || t->type == TOK_SEMI ||
+        t->type == TOK_RBRACE || t->type == TOK_LBRACE || t->type == TOK_RPAREN || t->type == TOK_AMP ||
+        t->type == TOK_REDIRECT) {
+        perr(P, t, "expected a file after the redirection");
+        return -1;
+    }
+    struct expr *target = parse_expr(P, BP_NONE);
+    if (!target) return -1;
+    struct redirect *nr = (struct redirect *)realloc(cmd->redirs, (cmd->nredirs + 1) * sizeof(*nr));
+    if (!nr) { perr(P, at, "out of memory"); expr_free(target); return -1; }
+    cmd->redirs = nr;
+    cmd->redirs[cmd->nredirs].kind = kind;
+    cmd->redirs[cmd->nredirs].target = target;
+    cmd->nredirs++;
+    return 0;
+}
+
 static struct command *parse_command(struct parser *P) {
     const struct token *name = pk(P);
     if (name->type != TOK_IDENT) {
@@ -363,6 +399,10 @@ static struct command *parse_command(struct parser *P) {
            pk(P)->type != TOK_RPAREN && pk(P)->type != TOK_NEWLINE &&
            pk(P)->type != TOK_SEMI   && pk(P)->type != TOK_LBRACE &&
            pk(P)->type != TOK_RBRACE && pk(P)->type != TOK_AMP) {
+        if (pk(P)->type == TOK_REDIRECT) {
+            if (add_redirect(P, cmd, pk(P))) { command_free(cmd); return NULL; }
+            continue;
+        }
         struct expr *arg = parse_expr(P, BP_NONE);
         if (!arg) { command_free(cmd); return NULL; }
         if (cmd->nargs == cap) {

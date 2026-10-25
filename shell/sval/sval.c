@@ -19,6 +19,26 @@
  * the newlib _fstat stub already fills. */
 
 /* ==========================================================================
+ * The mark of a program that speaks the wire.
+ *
+ * A pipe on fd 0 tells a program that structured input MAY be arriving; it
+ * cannot tell the SHELL whether the program will understand it. Most programs
+ * on the machine are ordinary text programs -- sh, a port, a script -- which
+ * would read a wire frame on stdin as garbage and print to fd 1 where the
+ * pipeline never sees it. So a program that links this SDK carries a named
+ * section, and the shell reads a program file's section table for it before
+ * deciding how to plumb a stage (eval_extern.c). It is referenced from the
+ * mode checks below, which every structured program calls, so no linker
+ * that keeps code drops it.
+ * ========================================================================== */
+#if defined(__APPLE__)                         /* the host tests' Mach-O spells sections segment,name */
+__attribute__((used, section("__DATA,__embk_sval")))
+#else
+__attribute__((used, section(SVAL_WIRE_SECTION)))
+#endif
+const char sval_wire_marker[] = "EMBK-SVAL 1";
+
+/* ==========================================================================
  * Mode detection
  * ========================================================================== */
 static bool fd_is_fifo(int fd) {
@@ -26,8 +46,8 @@ static bool fd_is_fifo(int fd) {
     if (fstat(fd, &st) != 0) return false;   /* EBADF (unopened fd 3) -> not structured */
     return S_ISFIFO(st.st_mode);
 }
-bool sval_structured_out(void) { return fd_is_fifo(SVAL_FD_OUT); }
-bool sval_structured_in(void)  { return fd_is_fifo(SVAL_FD_IN); }
+bool sval_structured_out(void) { (void)*(volatile const char *)sval_wire_marker; return fd_is_fifo(SVAL_FD_OUT); }
+bool sval_structured_in(void)  { (void)*(volatile const char *)sval_wire_marker; return fd_is_fifo(SVAL_FD_IN); }
 
 /* ==========================================================================
  * Emit
@@ -194,16 +214,33 @@ static const char *cell_colour(const struct record *row, const char *col,
     return NULL;
 }
 
-static int puts_fd(int fd, const char *s) {
-    size_t n = strlen(s);
-    return write_all(fd, (const uint8_t *)s, n);
+/* Where text goes: an fd (the screen, a file), or memory (a program's stdin
+ * being prepared, sval_render). */
+struct text_out { int fd; struct wire_buf *buf; };
+
+static int out_write(struct text_out *o, const void *p, size_t n) {
+    if (!o->buf) return write_all(o->fd, (const uint8_t *)p, n);
+    if (o->buf->len + n > o->buf->cap) {
+        size_t nc = o->buf->cap ? o->buf->cap : 256;
+        while (nc < o->buf->len + n) nc *= 2;
+        uint8_t *nd = (uint8_t *)realloc(o->buf->data, nc);
+        if (!nd) return -1;
+        o->buf->data = nd; o->buf->cap = nc;
+    }
+    memcpy(o->buf->data + o->buf->len, p, n);
+    o->buf->len += n;
+    return 0;
+}
+
+static int puts_fd(struct text_out *o, const char *s) {
+    return out_write(o, s, strlen(s));
 }
 
 /* Table renderer: two passes over the rows -- pass 1 measures the max text
  * width of each column (across all rows + the header name), pass 2 prints an
  * aligned grid. Columns are the union of the first row's field names (rows are
  * assumed homogeneous for rendering; a missing field prints blank). */
-static int print_table(const struct table *t, int fd) {
+static int print_table(const struct table *t, struct text_out *fd) {
     if (t->count == 0) { return puts_fd(fd, "(empty table)\n"); }
 
     struct record *hdr = &t->rows[0];
@@ -264,30 +301,60 @@ static int print_table(const struct table *t, int fd) {
     return 0;
 }
 
-int sval_print(const struct value *v, int fd) {
+/* Text, as a person reads it. A string is written WHOLE -- a program's output
+ * or a file's contents can be any length, and a line cut at a cell width is a
+ * line that lies -- with a newline added only if it lacks one. */
+static int print_text(struct text_out *o, const struct value *v) {
+    if (v->u.s.len && out_write(o, v->u.s.bytes, v->u.s.len)) return -1;
+    if (v->u.s.len && v->u.s.bytes[v->u.s.len - 1] == '\n') return 0;
+    return puts_fd(o, "\n");
+}
+
+static int print_value(const struct value *v, struct text_out *fd) {
     char cell[128];
     switch (v->type) {
     case VAL_LIST:
         for (size_t i = 0; i < v->u.list.count; i++) {
-            if (sval_print(&v->u.list.items[i], fd)) return -1;   /* one per line;
-                                                                   * scalars add \n below */
+            if (print_value(&v->u.list.items[i], fd)) return -1;   /* one per line;
+                                                                    * scalars add \n below */
         }
         return 0;
     case VAL_RECORD: {
         struct record *r = v->u.record;
         for (size_t i = 0; i < r->count; i++) {
-            char line[256];
-            sval_format_scalar(&r->values[i], cell, sizeof cell);
-            snprintf(line, sizeof line, "%s: %s\n", r->names[i], cell);
-            if (puts_fd(fd, line)) return -1;
+            if (puts_fd(fd, r->names[i]) || puts_fd(fd, ": ")) return -1;
+            const struct value *f = &r->values[i];
+            if (f->type == VAL_STRING || f->type == VAL_PATH) {
+                if (print_text(fd, f)) return -1;
+            } else {
+                sval_format_scalar(f, cell, sizeof cell);
+                if (puts_fd(fd, cell) || puts_fd(fd, "\n")) return -1;
+            }
         }
         return 0;
     }
     case VAL_TABLE:
         return print_table(v->u.table, fd);
+    case VAL_STRING:
+    case VAL_PATH:
+        return print_text(fd, v);
     default:
         sval_format_scalar(v, cell, sizeof cell);
         if (puts_fd(fd, cell)) return -1;
         return puts_fd(fd, "\n");
     }
+}
+
+int sval_print(const struct value *v, int fd) {
+    struct text_out o = { fd, NULL };
+    return print_value(v, &o);
+}
+
+int sval_render(const struct value *v, struct wire_buf *out) {
+    struct text_out o = { -1, out };
+    int colour = g_colour;
+    g_colour = 0;                              /* text for a program, never a display */
+    int rc = print_value(v, &o);
+    g_colour = colour;
+    return rc;
 }

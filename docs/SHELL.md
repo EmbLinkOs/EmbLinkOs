@@ -1,9 +1,12 @@
 # The EmbLink Shell — Structured Pipelines, Native to the OS
 
-**Status:** v1 shipped and live-verified (`make shell-test` = 38 host checks;
+**Status:** v1 shipped and live-verified (`make shell-test` = 116 host checks;
 `test shell` at the kernel debug console = expression eval + a real
 `ls / | where … | sort-by … | select …` pipeline over EMBKFS + the error
-path, all on smp=4).
+path, all on smp=4; `test shellio` = 26 programs that check themselves with
+`assert`: text programs in pipelines, every redirection, arguments and their
+limits, `#!` scripts, `source`, `which` -- `python3 tools/console_test.py
+"test shellio"`).
 
 The EmbLink shell is **not** a POSIX shell. It is a structured-pipeline
 shell in the Nushell/PowerShell lineage, built on EmbLink's own primitives:
@@ -90,9 +93,16 @@ stmt     := "let" IDENT "=" expr
           | pipeline
 block    := "{" program "}"
 pipeline := command ("|" command)*
-command  := IDENT expr*      (args end at '|', ')', '{', '}', ';', newline, EOF)
+command  := IDENT ( expr | redirect )*   (args end at '|', ')', '{', '}', ';', newline, EOF)
+redirect := ( "out>" | "out>>" | "err>" | "err>>" | "out+err>" | "out+err>>" | "in<" ) expr
 expr     := ... | "$(" pipeline ")"      -- command substitution
 ```
+
+**A word that starts with `-` before a letter is a flag** -- `sh -c`,
+`ls -la`, `--width=80` -- and a command receives it as its text. Before this
+`-c` lexed as a unary minus applied to `c`, so no program taking a flag could
+be run. `-3` is still a negative number and `a - b`, with spaces, still
+subtraction.
 
 **A NEWLINE IS A TOKEN, not whitespace.** It separates statements everywhere
 except the three places a statement obviously continues: after a `|`, inside
@@ -160,13 +170,32 @@ that `def` genuinely extends the system.
 ### Scripts
 
 ```
-shell.elf path.esh        run a script file
-shell.elf -c "program"    run one program from the command line
+shell.elf path.esh [arg...]        run a script file
+shell.elf -c "program" [arg...]    run one program from the command line
+./path.esh [arg...]                a script whose first line is #!/system/bin/shell.elf
+source lib.esh                     run a file HERE: its lets and defs stay
+assert <condition> [message]       stop the program unless the condition holds
 ```
 
 A script is read and parsed **whole**, not line by line: a block spans lines
-and a line-at-a-time reader cannot see the end of one. A leading `#!` is
-skipped (and `#` already starts a comment, so it costs nothing).
+and a line-at-a-time reader cannot see the end of one. Its arguments are the
+list **`$args`**.
+
+**`#!` is the kernel's.** A file whose first line is `#!/path/to/interpreter`
+(optionally with one argument after it) runs that interpreter with the
+script's path in front of the original arguments -- `./build.esh fast` is
+`/system/bin/shell.elf ./build.esh fast`, `./hi.sh` with `#!/system/bin/sh`
+is `sh ./hi.sh`. The interpreter is an absolute path and may not itself be a
+script (one level, so scripts naming each other cannot recurse the kernel).
+To this shell the line is a comment.
+
+**`source`** runs a file's program in the current scope, so a file can be a
+library of `def`s a session or another script loads. A script started by
+name runs in its own shell and leaves nothing behind.
+
+**`assert`** is how a script checks its own work: `assert $n == 3 "three
+lines"` fails the program (exit status 1) with the message, and passes its
+input through when the condition holds. The condition is strict, like `if`'s.
 
 ### File selection: `glob`
 
@@ -345,22 +374,82 @@ the one visible place it happens:
 
 ## 7. External programs in a pipeline
 
-A stage whose name isn't a builtin spawns `/name.elf` (or an absolute path
-as-is) with the Piece-0 kernel plumbing:
-- a pipe's write end INSTALL_OBJ'd as the child's **fd 3**;
-- if the stage has input, a second pipe's read end as the child's **fd 0**,
-  the serialized input written in by the shell, then closed (EOF);
-- the shell self-installs its read end (`SYS_fd_install_obj`), collects
-  frames until EOF (0 → null, 1 → the value, n → a list), and reaps the
-  child. COPY semantics throughout: the shell closes its own handle copies
-  or nobody ever sees EOF.
-- args are evaluated then passed as text argv; a child that exits non-zero
-  with no structured output becomes an error value.
+A stage whose name is not a builtin or a defined command runs a program.
+A name with a `/` is a path, relative to the working directory (`./x.esh`,
+`../bin/tool`); a bare name is looked for as `/system/bin/NAME.elf`,
+`/system/bin/NAME`, then `/data/apps/NAME/NAME.elf`. `which NAME` says what a
+name runs: `builtin`, `defined`, `structured program`, `text program`, or a
+script of either kind, with its path.
 
-*Known limitation (materialize v1):* the shell writes all input before
-reading output. A streaming child + input larger than the pipe buffer could
-deadlock; materialize-shaped tools (read all, then emit) cannot. Streaming
-stages are v2.
+**Two kinds of program.** One that links the shell SDK (`sval`) speaks the
+wire, and carries a section saying so (`.embk_sval`, sval.c); the shell reads
+a program file's section table -- for a `#!` script, its interpreter's --
+before it plumbs the stage:
+
+- a **structured** program gets a pipe as **fd 3** for its output (frames,
+  collected: 0 → null, 1 → the value, n → a list) and, when the stage has
+  input, the previous value as wire frames on **fd 0**;
+- a **text** program -- sh, a port, anything that just prints -- gets the
+  previous value **as text** on fd 0 (what a person would see: strings as
+  they are, a list one item per line, a table as its grid) and has its
+  **stdout captured as one string** when something consumes it: a later
+  stage, or `$(...)`. At the **end of a statement** nothing does, and it keeps
+  the terminal -- `sh`, an editor, anything interactive, works from this
+  prompt, exactly as it would from any shell.
+
+```
+sh -c "printf 'a\nb\n'" | lines | count        2: sh's output, captured, split
+range 4 | sh -c cat                           text in, and to the terminal
+let x = $(sh -c "echo hi")                    "hi\n"
+```
+
+A text program that exits non-zero having printed nothing is an error; what
+it did print is its value whatever its exit, because output a program
+produced is real. A structured program that exits non-zero with no frames is
+an error, as before. The captured text of one stage is kept up to 16 MB.
+
+The shell writes input and reads output in one **streaming pump**: it feeds
+fd 0 as the pipe has room and drains the output as it arrives, so a child
+that emits while its stdin is still arriving cannot deadlock it.
+
+**Arguments** are evaluated, then passed as text: strings as they are,
+numbers and dates as they print, a **list as one argument per item**, a
+**table as one per row** (its `path` column, else its `name` -- so
+`cat $(glob "*.txt")` works). A record has no one obvious text and is an
+error. The kernel's limits are checked before anything is spawned and the
+error names them: at most 126 arguments, and the arguments, the environment
+and their pointers together in the 4 KiB page a program's stack starts with
+(`sh: the arguments (6921 bytes in 4) and the environment (29 bytes) need
+7062 bytes; a program starts with 4096 for all of them`). Nothing is ever
+silently shortened -- which is what an eight-slot argument array of 96-byte
+strings did here before.
+
+### Redirections
+
+`>` compares (`where size > 1mb`), so a redirection is a **word with the
+arrow attached**, written at the start of a word anywhere among a command's
+arguments:
+
+| | |
+|---|---|
+| `out> f` / `out>> f` | stdout to a file, replacing / appending |
+| `err> f` / `err>> f` | stderr to a file |
+| `out+err> f` / `out+err>> f` | both, to one file |
+| `in< f` | stdin from a file |
+
+On a **program** these are its fds 0-2 (spawn actions); a structured program
+whose output is redirected gets no fd 3, so what it prints for a person is
+what lands in the file. On a **builtin or a defined command**, `out>` writes
+the stage's value as text and leaves null behind, `in<` makes the file's
+contents the stage's input, and `err>` writes an error's message to the file
+instead of failing the pipeline. A stream may be redirected once, and piped
+input and `in<` together are an error.
+
+```
+sysinfo out> sysinfo.txt
+sh -c "make 2>&1" out+err> build.log
+range 3 out> numbers.txt;  lines in< numbers.txt | count
+```
 
 **PROVEN LIVE by two reference tools** (shell/tools/, packed on the image,
 `test extern` = 4 assertions green):
@@ -548,7 +637,9 @@ Three gaps closed in one pass, all `test fd`-asserted live:
   today a top-level `return` sets the exit status and stops that block only.
 - **cwd / relative paths, env vars, Ctrl-C** — tracked in the libc/OS
   roadmap, not shell-local.
-- ~~**dup2-style fd aliasing**~~ — the kernel has it now (`dup`, `dup2`,
-  `fcntl(F_DUPFD)` over a real shared open file description); the shell has
-  not yet grown the `<`/`>` syntax that would use it, because `save` and `cat`
-  already cover the cases and `>` is a comparison operator here.
+- ~~**dup2-style fd aliasing / redirection syntax**~~ — done: `out>`, `err>`,
+  `out+err>`, `in<` and the appending forms (§7, Redirections). POSIX spellings
+  (`2>&1`, `<<EOF`) are sh's; here-documents are not in this shell.
+- **Text stages stream into memory.** A text program's output is captured
+  whole (to 16 MB) before the next stage starts, like every stage here;
+  `tail -f` shapes need streaming stages.

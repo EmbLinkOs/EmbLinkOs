@@ -1586,11 +1586,21 @@ done when the laptop shows it, not when a host test passes.
         queue and Gen9 a cursor plane; neither is used.
   - [ ] **No GPU rendering for applications.** The 3D context is the
         compositor's; EmUI apps still rasterise on the CPU.
-- [ ] **Then the shell**: interactive commands, scripts, pipes and
-      redirections in the native structured shell -- text-program fallback
-      in pipes, a redirection syntax that does not collide with `>`, argument
-      limits that fail loudly, `#!` and `source`. (`sh` already has POSIX
-      pipes and redirections; docs/POSIX_SHELL.md.)
+- [x] ~~**Then the shell**~~ -- done (docs/SHELL.md §3 Scripts, §7): text
+      programs in pipelines (input as text, stdout captured unless the
+      program ends a statement, where it keeps the terminal -- interactive
+      programs work), `out>`/`err>`/`out+err>`/`in<` and their appending forms
+      on programs and builtins, flags (`-c`, `--x`) as words, arguments
+      expanded from lists and tables with the kernel's limits named when
+      broken, `#!` in the kernel with `$args`, `source`, `assert`, `which`
+      saying what kind a command is. `test shellio` checks all of it on the OS.
+      Remaining:
+  - [ ] Here-documents and POSIX's `2>&1` spelling in the native shell (sh
+        has both).
+  - [ ] Streaming text stages: a text program's output is captured whole
+        (to 16 MB) before the next stage runs.
+  - [ ] A larger argument budget: argv and the environment share one 4 KiB
+        page at a program's start (kernel/process/process.c).
 
 ### Keyboard
 

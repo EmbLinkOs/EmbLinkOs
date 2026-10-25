@@ -78,16 +78,43 @@ const char *expr_as_word(const struct expr *e);
  * Pipeline evaluation. `top` is the driver's persistent scope (lets live
  * there across REPL lines). Returns the final OWNED value -- VAL_ERROR if
  * any stage failed (remaining stages are skipped).
+ *
+ * `to_terminal`: the pipeline is a statement, so whatever its LAST stage
+ * prints is for a person -- a text program there keeps the terminal (an
+ * editor, `sh`, anything interactive works). False for `$(...)`, whose value
+ * is the point: a text program at its end has its output captured.
  * ------------------------------------------------------------------------- */
-struct value pipeline_run(const struct pipeline *pl, struct scope *top);
+struct value pipeline_run(const struct pipeline *pl, struct scope *top, bool to_terminal);
 
-/* One external stage: spawn /name.elf with the pipe plumbing (fd 3 out,
- * fd 0 structured in when there's input), collect its frames, reap it.
+/* One external stage: resolve the program, spawn it with the plumbing its
+ * kind wants -- a program that speaks the wire (it links the shell SDK, see
+ * sval.h) gets fd 3 for structured output and frames on fd 0; a text program
+ * gets the input as text and, unless it ends a statement, has its stdout
+ * captured as a string -- apply its redirections, reap it.
  * Implemented in eval_extern.c ON TARGET; the host test build links a stub
  * that returns an error ("external programs need the OS"). Takes ownership
  * of `input`. */
 struct value extern_stage_run(const struct command *cmd, struct value input,
-                              struct scope *env);
+                              struct scope *env, bool to_terminal);
+
+/* What a command name runs (eval_extern.c, target only): 0 and the program's
+ * absolute path, or -1 when there is none. A name with a '/' is a path, made
+ * absolute against the cwd; a bare name is looked for as
+ * /system/bin/NAME.elf, /system/bin/NAME, then /data/apps/NAME/NAME.elf. */
+int shell_resolve_program(const char *name, char *path, size_t cap);
+/* What kind of program a file is: an ELF that carries the SDK's mark speaks
+ * the wire; any other ELF is a text program; a `#!` script is the kind of
+ * its interpreter. */
+enum { PROGRAM_TEXT = 0, PROGRAM_WIRE, PROGRAM_SCRIPT, PROGRAM_SCRIPT_WIRE };
+int shell_program_kind(const char *path);
+
+/* Redirections of a builtin or a defined command (eval_extern.c on target):
+ * `in<` turns a file into the stage's input (a string); after the stage,
+ * `out>`/`out>>` write its value as text to a file and leave null behind,
+ * `err>`/`err>>` write an error's message instead of failing the pipeline.
+ * Both take ownership of the value they are given. */
+struct value stage_redirect_input(const struct command *cmd, struct value input, struct scope *env);
+struct value stage_redirect_output(const struct command *cmd, struct value result, struct scope *env);
 
 /* -------------------------------------------------------------------------
  * USER-DEFINED COMMANDS, reached through a hook rather than a direct call.

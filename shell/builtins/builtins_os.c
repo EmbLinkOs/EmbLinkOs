@@ -100,6 +100,45 @@ static struct value err_os(const char *what, const char *path, int rc) {
     return value_error(msg);
 }
 
+void shell_path_resolve(const char *in, char *out, size_t cap) {
+    path_resolve(in, out, cap);
+}
+
+/* A whole file, as a string: what `cat`, `source` and `in<` all read. */
+#define READ_FILE_MAX (16u << 20)
+struct value shell_read_file(const char *path, const char *who) {
+    int fd = (int)embk_open(path, 0 /* O_RDONLY */, 0);
+    if (fd < 0) {
+        char what[64];
+        snprintf(what, sizeof what, "%s: can't open", who);
+        return err_os(what, path, fd);
+    }
+    size_t cap = 4096, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { embk_close(fd); return value_error("out of memory"); }
+    for (;;) {
+        if (n + 1024 > cap) {
+            if (cap >= READ_FILE_MAX) {
+                free(buf); embk_close(fd);
+                char msg[288];
+                snprintf(msg, sizeof msg, "%s: '%s' is larger than 16 MB", who, path);
+                return value_error(msg);
+            }
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) { free(buf); embk_close(fd); return value_error("out of memory"); }
+            buf = nb;
+        }
+        int64_t got = embk_read(fd, buf + n, 1024);
+        if (got <= 0) break;
+        n += (size_t)got;
+    }
+    embk_close(fd);
+    struct value out = value_string_n(buf, n);
+    free(buf);
+    return out.type == VAL_NULL ? value_error("out of memory") : out;
+}
+
 /* -------------------------------------------------------------------------
  * ls [path] -> Table {name, type, size}
  * ------------------------------------------------------------------------- */
@@ -233,28 +272,23 @@ static struct value bi_cat(const struct command *cmd, struct value input,
     char path[PATH_MAX_LEN];
     if (cmd->nargs < 1 || arg_path(cmd, 0, NULL, path, sizeof path) != 0)
         return value_error("cat: takes a file path");
+    return shell_read_file(path, "cat");
+}
 
-    int fd = (int)embk_open(path, 0 /* O_RDONLY */, 0);
-    if (fd < 0) return err_os("cat: can't open", path, fd);
-
-    size_t cap = 4096, n = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) { embk_close(fd); return value_error("out of memory"); }
-    for (;;) {
-        if (n + 1024 > cap) {
-            cap *= 2;
-            char *nb = (char *)realloc(buf, cap);
-            if (!nb) { free(buf); embk_close(fd); return value_error("out of memory"); }
-            buf = nb;
-        }
-        int64_t got = embk_read(fd, buf + n, 1024);
-        if (got <= 0) break;
-        n += (size_t)got;
-    }
-    embk_close(fd);
-    struct value out = value_string_n(buf, n);
-    free(buf);
-    return out;
+/* source <file> -- run a file's program HERE: its lets and defs stay in this
+ * scope afterwards (exec_source_text). How a session or a script loads a
+ * library of its own commands. */
+static struct value bi_source(const struct command *cmd, struct value input,
+                              struct scope *env) {
+    value_free(&input);
+    char path[PATH_MAX_LEN];
+    if (cmd->nargs != 1 || arg_path(cmd, 0, NULL, path, sizeof path) != 0)
+        return value_error("source: source <file>");
+    struct value text = shell_read_file(path, "source");
+    if (text.type == VAL_ERROR) return text;
+    struct value r = exec_source_text(text.u.s.bytes, env);
+    value_free(&text);
+    return r;
 }
 
 /* -------------------------------------------------------------------------
@@ -581,22 +615,40 @@ static struct value bi_history(const struct command *cmd, struct value input,
 /* which <name>: answer the question the way the shell itself would resolve it
  * -- builtins first (both dispatch tables), then the extern search order
  * eval_extern actually uses. Guessing differently would be lying. */
+/* which <command> -- how a name resolves, and what it is: a builtin, a
+ * command defined in this session, or a program -- one that speaks the
+ * wire (structured stages) or a text program (its text is piped) -- with
+ * the file that would run. Resolution is eval_extern.c's own. */
 static struct value bi_which(const struct command *cmd, struct value input,
                              struct scope *env) {
     (void)env; value_free(&input);
     const char *name = cmd->nargs > 0 ? expr_as_word(cmd->args[0]) : NULL;
     if (!name) return value_error("which: which <command>");
-    if (builtin_lookup(name) || builtin_lookup_os(name))
-        return value_string("shell builtin");
+    struct value r = value_record();
+    value_record_set(&r, "command", value_string(name));
+    if (builtin_lookup(name) || builtin_lookup_os(name)) {
+        value_record_set(&r, "kind", value_string("builtin"));
+        value_record_set(&r, "path", value_null());
+        return r;
+    }
+    if (exec_is_user_command(name)) {
+        value_record_set(&r, "kind", value_string("defined"));
+        value_record_set(&r, "path", value_null());
+        return r;
+    }
     char path[256];
-    struct embk_stat st;
-    snprintf(path, sizeof path, "/system/bin/%s.elf", name);
-    if (embk_stat(path, &st) == 0) return value_string(path);
-    snprintf(path, sizeof path, "/data/apps/%s/%s.elf", name, name);
-    if (embk_stat(path, &st) == 0) return value_string(path);
-    char msg[128];
-    snprintf(msg, sizeof msg, "which: %s: not found", name);
-    return value_error(msg);
+    if (shell_resolve_program(name, path, sizeof path) != 0) {
+        value_free(&r);
+        char msg[160];
+        snprintf(msg, sizeof msg, "which: %s: not found", name);
+        return value_error(msg);
+    }
+    int kind = shell_program_kind(path);
+    value_record_set(&r, "kind", value_string(kind == PROGRAM_WIRE ? "structured program"
+                                              : kind == PROGRAM_SCRIPT_WIRE ? "structured script"
+                                              : kind == PROGRAM_SCRIPT ? "text script" : "text program"));
+    value_record_set(&r, "path", value_path(path));
+    return r;
 }
 
 /* clip: the piped value's text goes to the SYSTEM clipboard, so the shell's
@@ -1113,6 +1165,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "whoami", bi_whoami }, { "hostname", bi_hostname },
         { "session", bi_session },
         { "history", bi_history }, { "which", bi_which },
+        { "source",  bi_source  },
         { "clip",    bi_clip    },
         { "clear",  bi_clear  },
         { "jobs",   bi_jobs   }, { "fg",     bi_fg     },

@@ -6384,6 +6384,74 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* TEXT PROGRAMS, REDIRECTIONS, ARGUMENTS, SCRIPTS -- the shell beyond its
+     * own builtins, end to end on the OS. Each line is one `shell.elf -c` run
+     * whose program checks its own results with `assert`, so an exit code of
+     * 0 is a pass and the serial log carries every message; the lines that
+     * must FAIL (argument limits) expect 1. sh is the text program: it links
+     * no shell SDK, so the shell pipes it text and captures what it prints. */
+    if (strcmp(cmd, "test shellio") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test shellio: VFS not registered\n");
+            return 1;
+        }
+        static const struct { const char *line; int want; } t[] = {
+            /* a text program's output, captured into a pipeline */
+            { "let n = $(sh -c \"printf 'a\\nb\\nc\\n'\" | lines | count); assert $n == 3 \"three lines from sh\"", 0 },
+            /* values piped INTO a text program arrive as text */
+            { "let t = $(range 4 | sh -c cat); assert $t == \"0\\n1\\n2\\n3\\n\" \"a list as lines on stdin\"", 0 },
+            { "assert $(ls /system | sh -c cat | lines | count) > 2 \"a table as its grid\"", 0 },
+            /* a text program at the END of a statement keeps the terminal */
+            { "sh -c \"echo shellio: sh wrote this to the console itself\"", 0 },
+            /* redirections of text programs */
+            { "sh -c \"printf hello\" out> /shio-a.txt; assert $(cat /shio-a.txt) == \"hello\" \"out>\"", 0 },
+            { "sh -c \"printf more\" out>> /shio-a.txt; assert $(cat /shio-a.txt) == \"hellomore\" \"out>>\"", 0 },
+            { "sh -c \"printf oops >&2\" err> /shio-e.txt; assert $(cat /shio-e.txt) == \"oops\" \"err>\"", 0 },
+            { "sh -c \"printf o; printf e >&2\" out+err> /shio-b.txt; assert $(cat /shio-b.txt) == \"oe\" \"out+err>\"", 0 },
+            { "let x = $(sh -c cat in< /shio-a.txt); assert $x == \"hellomore\" \"in<\"", 0 },
+            /* redirections of builtins */
+            { "range 3 out> /shio-r.txt; assert $(cat /shio-r.txt) == \"0\\n1\\n2\\n\" \"a builtin's value as text\"", 0 },
+            { "assert $(lines in< /shio-r.txt | count) == 3 \"in< feeds a builtin\"", 0 },
+            { "cat /shio-none err> /shio-ce.txt; assert ($(cat /shio-ce.txt) =~ \"can't open\") \"err> holds the error\"", 0 },
+            /* arguments: many, expanded from lists, and limits that fail loudly */
+            { "assert $(sh -c 'echo $#' sh a b c d e f g h i j k l | trim) == \"12\" \"twelve arguments\"", 0 },
+            { "assert $(sh -c 'echo $#' sh $(range 40) | trim) == \"40\" \"a list is one argument per item\"", 0 },
+            { "assert $(sh -c 'for f in \"$@\"; do echo \"$f\"; done' sh $(ls /system) | lines | count) == $(ls /system | count) \"a table is one per row\"", 0 },
+            { "assert $(sh -c 'echo \"$1\"' sh $(range 300 | join \"\") | wc | get bytes) == 791 \"a long argument whole\"", 0 },
+            { "sh -c 'echo $#' $(range 200)", 1 },                                        /* > 126 arguments */
+            { "sh -c 'echo $#' $(range 2000 | join \"\")", 1 },                           /* past the 4 KiB page */
+            { "sh -c 'echo $#' $(sysinfo)", 1 },                                          /* a record has no one text */
+            /* scripts: #! through the kernel, $args, relative paths */
+            { "echo \"#!/system/bin/shell.elf\\nassert $(echo $args | count) == 2 \\\"two args\\\"\\necho $args | join \\\",\\\"\\n\" | save /shio-s.esh; "
+              "assert $(/shio-s.esh one two) == \"one,two\" \"a native script run by its #! line\"", 0 },
+            { "echo \"#!/system/bin/sh\\necho sh-$1\\n\" | save /shio-p.sh; assert $(/shio-p.sh x | trim) == \"sh-x\" \"an sh script\"", 0 },
+            { "cd /; assert $(./shio-s.esh first second) == \"first,second\" \"a relative path\"", 0 },
+            /* source: a file's definitions stay */
+            { "echo \"def twice(x) { echo ($x * 2) }\\nlet loaded = 1\\n\" | save /shio-lib.esh; source /shio-lib.esh; "
+              "assert $(twice 21) == 42 \"source keeps defs\"; assert $loaded == 1 \"and lets\"", 0 },
+            /* which says what kind a command is */
+            { "assert $(which sh | get kind) == \"text program\"; assert $(which sysinfo | get kind) == \"structured program\"; "
+              "assert $(which where | get kind) == \"builtin\"; assert $(which /shio-s.esh | get kind) == \"structured script\"", 0 },
+            /* structured programs are plumbed as before */
+            { "assert $(sysinfo | get processes) > 0 \"sysinfo\"; assert $(ls / | tally | get rows) == $(ls / | count) \"tally\"", 0 },
+            { "rm /shio-a.txt | rm /shio-e.txt | rm /shio-b.txt | rm /shio-r.txt | rm /shio-ce.txt | rm /shio-s.esh | "
+              "rm /shio-p.sh | rm /shio-lib.esh", 0 },
+        };
+        char *senv[] = { "HOME=/", "TMPDIR=/", NULL };
+        int pass = 0, n = (int)(sizeof t / sizeof t[0]);
+        kprintf("\n[shellio]\n");
+        for (int i = 0; i < n; i++) {
+            char *a[] = { "/system/bin/shell.elf", "-c", (char *)t[i].line, NULL };
+            int pid = process_create_env("/system/bin/shell.elf", a, 3, senv, NULL, 0);
+            int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            int ok = code == t[i].want;
+            pass += ok;
+            kprintf("  [%s] %d: exit %d (want %d)\n", ok ? "ok" : "FAIL", i + 1, code, t[i].want);
+        }
+        kprintf("[cmd] test shellio: %d/%d -> %s\n", pass, n, pass == n ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* INTERRUPTION -- ^C that a process SURVIVES.
      *
      * The claim is specific and was untrue until now: a runaway script can be

@@ -304,7 +304,7 @@ struct value expr_eval(const struct expr *e, struct scope *env) {
          * Running it in the current scope is what makes `$(where size > $n)`
          * see `n`; a fresh scope would make command substitution the one
          * place in the language where bindings stop being visible. */
-        return pipeline_run(e->u.capture, env);
+        return pipeline_run(e->u.capture, env, false);
 
     case EXPR_UNARY: {
         struct value v = expr_eval(e->u.unary.operand, env);
@@ -371,19 +371,24 @@ struct value (*eval_user_command_call)(const struct command *cmd,
                                        struct value input,
                                        struct scope *env) = NULL;
 
-struct value pipeline_run(const struct pipeline *pl, struct scope *top) {
+struct value pipeline_run(const struct pipeline *pl, struct scope *top, bool to_terminal) {
     struct value cur = value_null();   /* first stage gets NULL as input */
 
     for (size_t i = 0; i < pl->nstages; i++) {
         const struct command *cmd = pl->stages[i];
         builtin_fn fn = builtin_lookup(cmd->name);
+        bool user = !fn && eval_user_command_exists && eval_user_command_exists(cmd->name);
         struct value next;
-        if (fn) {
-            next = fn(cmd, cur, top);           /* stage takes ownership of cur */
-        } else if (eval_user_command_exists && eval_user_command_exists(cmd->name)) {
-            next = eval_user_command_call(cmd, cur, top);
+        if (fn || user) {
+            if (cmd->nredirs) {
+                cur = stage_redirect_input(cmd, cur, top);
+                if (cur.type == VAL_ERROR) break;
+            }
+            next = fn ? fn(cmd, cur, top)           /* stage takes ownership of cur */
+                      : eval_user_command_call(cmd, cur, top);
+            if (cmd->nredirs) next = stage_redirect_output(cmd, next, top);
         } else {
-            next = extern_stage_run(cmd, cur, top);
+            next = extern_stage_run(cmd, cur, top, to_terminal && i + 1 == pl->nstages);
         }
         cur = next;
         if (cur.type == VAL_ERROR) break;       /* abort remaining stages */

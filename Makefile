@@ -2973,6 +2973,13 @@ test-root-mirror: $(IMG) $(EMBKFS_MASTER)
 test-ro-fallback: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/ro_fallback_test.py || exit 1
 
+# The native shell on the OS (docs/SHELL.md): the original pipeline checks,
+# external structured tools, and test shellio -- text programs in pipelines,
+# redirections, arguments and their limits, #! scripts, source, which.
+.PHONY: test-shell-os
+test-shell-os: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py "test shell" "test extern" "test shellio" || exit 1
+
 # GPU composition (docs/DISPLAYS.md, "GPU composition"). test-virgl-compose
 # runs the compositor's virgl streams on the host's libvirglrenderer and checks
 # every operation in pixels; test-virgl-smoke boots uefi-usb.img on QEMU's
