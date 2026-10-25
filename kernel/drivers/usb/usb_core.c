@@ -149,34 +149,6 @@ static int usb_clear_halt(struct usb_device *dev, uint8_t ep_addr) {
 // HID boot keyboard
 // ---------------------------------------------------------------------------
 
-// USB HID usage-ID → ASCII (US-QWERTY printable subset, boot protocol).
-static const char g_usb_hid_ascii[128] = {
-    0,    0,    0,    0,    'a',  'b',  'c',  'd',
-    'e',  'f',  'g',  'h',  'i',  'j',  'k',  'l',
-    'm',  'n',  'o',  'p',  'q',  'r',  's',  't',
-    'u',  'v',  'w',  'x',  'y',  'z',  '1',  '2',
-    '3',  '4',  '5',  '6',  '7',  '8',  '9',  '0',
-    '\n', 0x1B, '\b', '\t', ' ',  '-',  '=',  '[',
-    ']',  '\\', 0,    ';',  '\'', '`',  ',',  '.',
-    '/',  0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    '/',  '*',  '-',  '+',
-    '\n', '1',  '2',  '3',  '4',  '5',  '6',  '7',
-    '8',  '9',  '0',  '.',
-};
-
-static const char g_usb_hid_ascii_shift[128] = {
-    0,    0,    0,    0,    'A',  'B',  'C',  'D',
-    'E',  'F',  'G',  'H',  'I',  'J',  'K',  'L',
-    'M',  'N',  'O',  'P',  'Q',  'R',  'S',  'T',
-    'U',  'V',  'W',  'X',  'Y',  'Z',  '!',  '@',
-    '#',  '$',  '%',  '^',  '&',  '*',  '(',  ')',
-    '\n', 0x1B, '\b', '\t', ' ',  '_',  '+',  '{',
-    '}',  '|',  0,    ':',  '"',  '~',  '<',  '>',
-    '?',  0,    0,    0,    0,    0,    0,    0,
-};
-
 /* QEMU usb-tablet report (report protocol, 6 bytes): [buttons][X lo/hi][Y lo/hi]
  * [wheel]. X/Y are absolute in [0, 0x7FFF]; buttons bit0/1/2 = left/right/middle
  * (same layout as MOUSE_BTN_*). Fed straight into the absolute cursor, so it
@@ -194,26 +166,7 @@ static void usb_hid_process_report(struct usb_device *dev,
                                    const uint8_t *report, int len) {
     if (dev->hid_kind == USB_HID_TABLET) { usb_tablet_process_report(report, len); return; }
     if (len < 3) return;
-    uint8_t modifiers = report[0];
-    bool shift = (modifiers & 0x22) != 0;   // L/R shift
-
-    // Edge-detect: inject only keys not present in the previous report.
-    for (int i = 2; i < 8 && i < len; i++) {
-        uint8_t usage = report[i];
-        if (usage == 0 || usage >= 128) continue;
-        bool was_down = false;
-        for (int j = 0; j < 6; j++) {
-            if (dev->prev_keys[j] == usage) { was_down = true; break; }
-        }
-        if (was_down) continue;
-        char ch = shift ? g_usb_hid_ascii_shift[usage] : g_usb_hid_ascii[usage];
-        if (!ch) ch = g_usb_hid_ascii[usage];
-        if (ch) keyboard_inject_char(ch);
-    }
-
-    for (int j = 0; j < 6; j++) {
-        dev->prev_keys[j] = (2 + j < len) ? report[2 + j] : 0;
-    }
+    keyboard_hid_boot_report(dev->prev_report, report, (unsigned)len);
 }
 
 static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
@@ -551,6 +504,10 @@ void usb_device_gone(struct usb_device *dev) {
             (unsigned)dev->vid, (unsigned)dev->pid, (unsigned)dev->port);
     usb_msc_detach(dev);
     usb_uas_detach(dev);
+    if (dev->hid_active && dev->hid_kind != USB_HID_TABLET) {   /* no key left held */
+        static const uint8_t none[8];
+        keyboard_hid_boot_report(dev->prev_report, none, 8);
+    }
     dev->hid_active = false;
     usb_free_device(dev);
 }

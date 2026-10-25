@@ -9196,6 +9196,10 @@ int selftests_handle_command(const char *cmd)
         kprintf("[cmd] test input snapshot: queued Ctrl+S and Up retain distinct modifiers: %s\n",
                 keyboard_input_snapshot_selftest()?"OK":"FAIL");return 1;
     }
+    if(!strcmp(cmd,"test kbd ring")) {
+        kprintf("[cmd] test kbd ring: keys keep their identity in order with the text: %s\n",
+                keyboard_key_ring_selftest()?"OK":"FAIL");return 1;
+    }
     if(!strcmp(cmd,"test document sync")) {document_sync_test();return 1;}
     const char *device_mode=NULL;
     if(!strcmp(cmd,"test devices fixture"))device_mode="--fixture";

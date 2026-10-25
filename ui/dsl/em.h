@@ -745,6 +745,16 @@ float em_viewport_height(void);
 void em_set_key_hook(int (*fn)(int ch));
 /* Modifier snapshot of the character currently delivered to a key hook. */
 int em_key_modifiers(void);
+/* WHICH KEY that character came from (EMBK_KC_* or the key's unshifted ASCII;
+ * 0 on a multi-byte character's later bytes) and its EMBK_KEYF_* flags -- so a
+ * hook can tell Up from Ctrl+S, which are the same byte. */
+int em_key_code(void);
+int em_key_flags(void);
+/* Keys with no character (F1-F12, Insert, Menu) reach the key hook as
+ * EM_KEY_ONLY|code only after an app asks for them: a hook written for
+ * characters must never see a value it would misread as one. */
+#define EM_KEY_ONLY 0x10000
+void em_key_hook_wants_key_only(int on);
 /* All ordinary exits (Escape, window controls, GUI+W, request_exit) call this.
  * Return 1 to close, 0 to defer and show a dialog. A deferral acknowledges the
  * compositor request, so waiting for the user has no forced-kill deadline.

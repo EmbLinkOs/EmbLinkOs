@@ -34,6 +34,30 @@ static int child(const char *mode) {
         if (memcmp(bytes,expected,sizeof bytes)) return 32;
         printf("Raw key sequence verified.\r\n"); return 0;
     }
+    if (!strcmp(mode,"--identity")) {
+        /* Keys whose bytes say WHICH key: before the kernel queue carried key
+         * identity, Ctrl+Up was Ctrl+S and F5 never arrived at all. */
+        static const struct { const char *name, *want; } keys[] = {
+            {"F5","\033[15~"},{"Ctrl+Up","\033[1;5A"},{"Shift+F3","\033[1;2R"},{"Alt+x","\033x"},
+            {"Insert","\033[2~"},{"Ctrl+Left","\033[1;5D"},{"Backspace","\177"},{"Ctrl+Backspace","\b"},
+            {"Keypad 5 (application)","\033Ou"},{"Keypad Enter (application)","\033OM"},
+        };
+        cfmakeraw(&t); if (tcsetattr(0,TCSANOW,&t)) return 35;
+        printf("Key identity check: F5, Ctrl+Up, Shift+F3, Alt+x, Insert, Ctrl+Left, Backspace, Ctrl+Backspace.\r\n");
+        printf("%-28s %-22s %s\r\n","Key","Terminal sent","");fflush(stdout);
+        for (unsigned i=0;i<sizeof keys/sizeof keys[0];i++) {
+            if (i==8) {printf("\033=Keypad check: Num Lock, keypad 5, keypad Enter.\r\n");fflush(stdout);}
+            size_t want=strlen(keys[i].want),got=0;unsigned char bytes[16];
+            while (got<want) {ssize_t n=read(0,bytes+got,want-got);if(n<=0)return 36;got+=(size_t)n;}
+            char shown[64];size_t k=0;
+            for (size_t j=0;j<got && k+5<sizeof shown;j++)
+                k+=(size_t)snprintf(shown+k,sizeof shown-k,bytes[j]==27?"ESC ":bytes[j]<32 || bytes[j]==127?"0x%02x ":"%c ",bytes[j]);
+            bool ok=!memcmp(bytes,keys[i].want,want);
+            printf("%-28s %-22s %s\r\n",keys[i].name,shown,ok?"ok":"WRONG");fflush(stdout);
+            if (!ok) return 37;
+        }
+        printf("\033>Key identity verified.\r\n");return 0;
+    }
     if (!strcmp(mode,"--echo")) {
         cfmakeraw(&t); if (tcsetattr(0,TCSANOW,&t)) return 23;
         if (write(1,"ready",5)!=5) return 24;

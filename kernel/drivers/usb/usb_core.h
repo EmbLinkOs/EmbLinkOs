@@ -98,7 +98,7 @@ struct usb_device {
     uint8_t hid_kind;      // 0 = boot keyboard, 1 = absolute pointer (tablet)
     uint8_t hid_ep;
     uint16_t hid_mps;
-    uint8_t prev_keys[6];
+    uint8_t prev_report[8];   /* last boot-keyboard report: edges for keyboard_hid_boot_report */
 };
 
 #define USB_HID_KEYBOARD 0

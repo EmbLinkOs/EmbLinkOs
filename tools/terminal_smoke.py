@@ -33,7 +33,7 @@ def main():
         eventually(lambda:prompt(w),'command did not finish')
     try:
         d.g.wait(b'TopBar: first frame presented');d.g.wait(b'home: time zone')
-        for cmd in ['test terminal','test tty','test posix','test channel']:
+        for cmd in ['test terminal','test tty','test posix','test channel','test kbd ring']:
             result=d.g.command(cmd,('[cmd] '+cmd+':').encode(),timeout=120)
             assert re.search(r'\[cmd\] '+re.escape(cmd)+r':[^\r\n]*OK',result),result
             print(result[result.rfind('[cmd]'):].strip(),flush=True)
@@ -65,6 +65,15 @@ def main():
         for key in ['ctrl-b','ctrl-s','ctrl-h','ret','left']:d.key(key)
         eventually(lambda:text(w,'Raw key sequence verified.'),'control keys were mistaken for navigation')
         eventually(lambda:prompt(w),'raw key witness did not finish')
+        # Which key, not just which byte: F-keys, modified arrows, Alt as Meta,
+        # Backspace against Ctrl+Backspace, and the application keypad.
+        type_text('/data/apps/ttyprobe/ttyprobe.elf "--identity"\n')
+        eventually(lambda:text(w,'Key identity check:'),'key identity witness did not start')
+        for key in ['f5','ctrl-up','shift-f3','alt-x','insert','ctrl-left','backspace','ctrl-backspace']:d.key(key)
+        eventually(lambda:text(w,'Keypad check:'),'function and modified keys were not encoded as xterm encodes them')
+        for key in ['num_lock','kp_5','kp_enter','num_lock']:d.key(key)
+        eventually(lambda:text(w,'Key identity verified.'),'the application keypad was not encoded')
+        eventually(lambda:prompt(w),'key identity witness did not finish');d.snap('terminal-key-identity')
         command(w,'echo 98317','98317')
         type_text('/data/apps/ttyprobe/ttyprobe.elf\n')
         # A second invocation has no raw-mode transition until a line is read.
@@ -100,7 +109,7 @@ def main():
         d.key('ctrl-d')
         eventually(lambda:probe(w)['dead'],'Ctrl+D at an empty prompt did not close the shell')
         assert b'PANIC' not in d.g.seen
-        print('PASS: native PTY checks, console/POSIX/channel regressions, prompt editing/history, measured dimensions, cooked/raw input, EOF, scoped Ctrl+C, independent terminals and active-close hangup',flush=True)
+        print('PASS: native PTY checks, console/POSIX/channel regressions, prompt editing/history, measured dimensions, cooked/raw input, key identity (F-keys, modified arrows, Meta, keypad), EOF, scoped Ctrl+C, independent terminals and active-close hangup',flush=True)
     except Exception:
         if 'w' in locals():
             print('Failure state: '+str({k:probe(w)[k] for k in ['at_prompt','dead','input','master']}),flush=True)

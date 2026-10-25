@@ -22,13 +22,15 @@ static void init_screen(struct vt_screen *s,int rows) {
 void vt_init(struct vt *v,int cols,int rows,vt_reply_fn reply,void *context) {
     memset(v,0,sizeof *v); v->cols=clamp(cols,2,VT_COLS); v->rows=clamp(rows,2,VT_ROWS);
     init_screen(&v->primary,v->rows); init_screen(&v->alternate,v->rows);
-    v->autowrap=v->cursor_visible=true; v->reply=reply; v->reply_context=context;
+    v->autowrap=v->cursor_visible=v->alt_sends_escape=true; v->reply=reply; v->reply_context=context;
     for (int i=0;i<VT_COLS;i++) v->tabs[i]=i && i%8==0;
     v->revision=1;
 }
 void vt_reset(struct vt *v) {
     int cols=v->cols,rows=v->rows; vt_reply_fn reply=v->reply; void *ctx=v->reply_context;
+    bool bs=v->backspace_sends_bs,meta=v->alt_sends_escape;
     uint64_t revision=v->revision; vt_init(v,cols,rows,reply,ctx); v->revision=revision+1;
+    v->backspace_sends_bs=bs;v->alt_sends_escape=meta;
 }
 uint32_t vt_color(unsigned i) {
     static const uint32_t colors[16]={0x30343b,0xcf666c,0x73bb85,0xdbbf70,0x789fdb,0xb98bcc,0x6abec5,0xd9dfe7,
@@ -323,6 +325,8 @@ again:
         case 'c':vt_reset(v);break;
         case '(':v->state=4;break;
         case ')':v->state=5;break;
+        case '=':v->keypad_application=true;break;
+        case '>':v->keypad_application=false;break;
         default:break;
         }
         return;
@@ -468,20 +472,32 @@ bool vt_resize(struct vt *v,int cols,int rows) {
     v->revision++;return true;
 }
 size_t vt_key_sequence(const struct vt *v,unsigned key,unsigned mods,char out[16]) {
+    unsigned modifier=1+(mods&7);size_t n=0;
     char final=0;
     switch(key) {
     case VT_KEY_UP:final='A';break;case VT_KEY_DOWN:final='B';break;
     case VT_KEY_RIGHT:final='C';break;case VT_KEY_LEFT:final='D';break;
     case VT_KEY_HOME:final='H';break;case VT_KEY_END:final='F';break;
     }
-    unsigned modifier=1+(mods&7);
+    if(key>=VT_KEY_F1 && key<VT_KEY_F1+4)final=(char)('P'+(key-VT_KEY_F1));
     if(final) {
         if(mods)return (size_t)snprintf(out,16,"\033[1;%u%c",modifier,final);
-        out[0]=27;out[1]=v->application_cursor?'O':'[';out[2]=final;return 3;
+        out[0]=27;out[1]=key>=VT_KEY_F1 || v->application_cursor?'O':'[';out[2]=final;return 3;
     }
-    if(key==VT_KEY_TAB) {if(mods&1){memcpy(out,"\033[Z",3);return 3;}out[0]='\t';return 1;}
-    unsigned code=key==VT_KEY_DELETE?3:key==VT_KEY_INSERT?2:key==VT_KEY_PAGEUP?5:key==VT_KEY_PAGEDOWN?6:0;
+    static const unsigned char tilde[]={15,17,18,19,20,21,23,24};
+    unsigned code=key==VT_KEY_DELETE?3:key==VT_KEY_INSERT?2:key==VT_KEY_PAGEUP?5:key==VT_KEY_PAGEDOWN?6:
+                  key==VT_KEY_MENU?29:key>=VT_KEY_F1+4 && key<=VT_KEY_F12?tilde[key-VT_KEY_F1-4]:0;
     if(code)return (size_t)snprintf(out,16,mods?"\033[%u;%u~":"\033[%u~",code,modifier);
-    if(key<256) {size_t n=0;if(mods&2)out[n++]=27;out[n++]=(char)key;return n;}
+    if(key>=VT_KEY_KP_0 && key<=VT_KEY_KP_SLASH) {
+        static const char app[]="pqrstuvwxynMkmjo",num[]="0123456789.\r+-*/";
+        unsigned i=key-VT_KEY_KP_0;
+        if(v->keypad_application){out[0]=27;out[1]='O';out[2]=app[i];return 3;}
+        key=(unsigned char)num[i];
+    }
+    if(key==VT_KEY_TAB) {if(mods&1){memcpy(out,"\033[Z",3);return 3;}key='\t';}
+    else if(key==VT_KEY_BACKSPACE)key=((mods&4)!=0)!=v->backspace_sends_bs?8:127;
+    else if(key==VT_KEY_ENTER)key='\r';
+    else if(key==VT_KEY_ESCAPE)key=27;
+    if(key<256) {if((mods&2) && v->alt_sends_escape)out[n++]=27;out[n++]=(char)key;return n;}
     return 0;
 }

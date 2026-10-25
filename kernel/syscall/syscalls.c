@@ -1572,6 +1572,15 @@ static int64_t sys_key_poll_input(const struct sysargs *a) {
     if(focus && current_process && current_process->pid!=focus)return 0;
     return keyboard_poll_input();
 }
+/* key_poll_input's queue with the key behind each byte: Up is not Ctrl+S, and
+ * F5 is an entry of its own (keyboard.h, keyboard_poll_key). Gated by focus
+ * exactly as key_poll_input is, for the same reason. */
+static int64_t sys_key_poll_key(const struct sysargs *a) {
+    (void)a;
+    uint32_t focus=compositor_focused_pid();
+    if(focus && current_process && current_process->pid!=focus)return 0;
+    return (int64_t)keyboard_poll_key();
+}
 static int64_t sys_key_poll(const struct sysargs *a) {
     (void)a;
     /* Keys belong to the FRONT window's process. The character queue is a
@@ -2889,6 +2898,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_monitor] = sys_monitor,
     [SYS_win_place] = sys_win_place,
     [SYS_win_where] = sys_win_where,
+    [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -3054,7 +3064,7 @@ int64_t syscall_invoke(const struct sysargs *a) {
     if(caller && !session_ui_allowed(caller->pid)) {
         switch(a->nr) {
         case SYS_ui_present:case SYS_ui_present_rect:case SYS_ui_input:
-        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:
+        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:case SYS_key_poll_key:
         case SYS_win_input:case SYS_screen_read:case SYS_clip_set:case SYS_clip_get:
             return -EMBK_EPERM;
         case SYS_read:if(a->arg[0]==0)return -EMBK_EPERM;break;

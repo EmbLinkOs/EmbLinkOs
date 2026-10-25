@@ -156,11 +156,19 @@ static void kbd_event_push(uint16_t code, int pressed) {
 #define KBD_BUFFER_SIZE 128
 static char kbd_buffer[KBD_BUFFER_SIZE];
 static uint8_t kbd_buffer_mods[KBD_BUFFER_SIZE];
+static uint16_t kbd_buffer_code[KBD_BUFFER_SIZE];   /* which key (see keyboard_poll_key) */
+static uint8_t kbd_buffer_flags[KBD_BUFFER_SIZE];   /* KBF_* */
 static volatile uint32_t buf_head = 0;   // write index (IRQ writes here)
 static volatile uint32_t buf_tail = 0;   // read index (kernel reads here)
 
+/* The key being delivered right now, stamped on the FIRST byte it produces and
+ * cleared there, so a multi-byte character's later bytes carry no key. Set
+ * only around a delivery (deliver_key*), never left behind for a later byte. */
+static uint16_t g_key_code;
+static uint8_t g_key_flags;
+
 // Push a character into the circular buffer (called from IRQ handler or USB HID)
-static void buffer_push(char c) {
+static void buffer_push_entry(char c, uint8_t flags) {
     uint32_t next_head = (buf_head + 1) % KBD_BUFFER_SIZE;
     if (next_head == buf_tail) {
         return;
@@ -168,12 +176,22 @@ static void buffer_push(char c) {
     }
     kbd_buffer[buf_head] = c;
     kbd_buffer_mods[buf_head] = g_mods;
+    kbd_buffer_code[buf_head] = g_key_code;
+    kbd_buffer_flags[buf_head] = (uint8_t)(g_key_flags | flags);
+    g_key_code = 0; g_key_flags = 0;
     buf_head = next_head;
 }
+static void buffer_push(char c) { buffer_push_entry(c, 0); }
 
+/* Character readers never see a key that has no character. */
+static void drop_key_only(void) {
+    while (buf_head != buf_tail && (kbd_buffer_flags[buf_tail] & KBF_KEYONLY))
+        buf_tail = (buf_tail + 1) % KBD_BUFFER_SIZE;
+}
 
 // pop a character from the circular buffer, return 0 if buffer is empty (called from keyboard_getchar)
 static int buffer_pop(char *c) {
+    drop_key_only();
     if (buf_head == buf_tail) {
         return 0;
     }
@@ -188,6 +206,12 @@ static int buffer_pop(char *c) {
  * wakeup (the read hangs forever). Defined below; forward-declared so the IRQ
  * handler can reach it. */
 static void keyboard_deliver(char c);
+static void keyboard_deliver_key_only(uint16_t code, uint8_t flags);
+static void deliver_key(uint16_t code, uint8_t flags, char c) {
+    g_key_code = code; g_key_flags = flags;
+    keyboard_deliver(c);
+    g_key_code = 0; g_key_flags = 0;
+}
 
 /* The pending system shortcut, decided in IRQ context and performed by the
  * kernel's main loop -- see SYSKEY_* in keyboard.h. */
@@ -197,6 +221,11 @@ void keyboard_set_shortcut_modifier(unsigned mode){g_shortcut_modifier=mode;}
 int keyboard_take_syskey(void) { int k = g_syskey; g_syskey = SYSKEY_NONE; return k; }
 void        kbd_translate(uint8_t make, int pressed);   /* the testable seam */
 static void keyboard_deliver_cp(uint32_t cp);   /* one codepoint, as UTF-8 */
+static void deliver_key_cp(uint16_t code, uint8_t flags, uint32_t cp) {
+    g_key_code = code; g_key_flags = flags;
+    keyboard_deliver_cp(cp);
+    g_key_code = 0; g_key_flags = 0;
+}
 static uint32_t kbd_compose(uint32_t mark, uint32_t base);
 static uint32_t g_dead;                          /* pending dead-key mark, or 0 */
 
@@ -238,7 +267,10 @@ static void lock_toggle(uint8_t ekm, uint16_t code, int pressed,int leds)
     kbd_event_push(code, pressed);
 }
 
-#if defined(__x86_64__)
+/* Set-1 decoding is logic, not hardware: the 8042 interrupt below feeds it on
+ * x86, and every HID keyboard (USB, I2C) feeds it on both architectures, so a
+ * USB keyboard on a Raspberry Pi gets the same layouts, modifiers and key
+ * identities as a laptop's PS/2 one. */
 static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
     int extended = *prefix;     /* the previous byte was the 0xE0 prefix */
 
@@ -260,7 +292,9 @@ static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
             case 0x38: mod_update(SIDE_RALT,  SIDE_LALT|SIDE_RALT,   EKM_ALT,  EKC_RALT,  pressed); return;
             case 0x5B: mod_update(SIDE_LGUI,  SIDE_LGUI|SIDE_RGUI,   EKM_GUI,  EKC_LWIN,  pressed); return;
             case 0x5C: mod_update(SIDE_RGUI,  SIDE_LGUI|SIDE_RGUI,   EKM_GUI,  EKC_RWIN,  pressed); return;
-            case 0x5D: kbd_event_push(EKC_MENU, pressed); return;
+            case 0x5D: kbd_event_push(EKC_MENU, pressed);
+                       if (pressed) keyboard_deliver_key_only(EKC_MENU, 0);
+                       return;
             default: break;
         }
 
@@ -290,7 +324,9 @@ static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
             default: return;
         }
         kbd_event_push(kc, pressed);
-        if (pressed && ch) keyboard_deliver(ch);
+        uint8_t pad = (make == 0x1C || make == 0x35) ? KBF_KEYPAD : 0;
+        if (pressed && ch) deliver_key(kc, pad, ch);
+        else if (pressed) keyboard_deliver_key_only(kc, 0);
         return;
     }
 
@@ -309,9 +345,15 @@ static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
     /* --- F1-F12: event-only. There is no byte for them (C0 is Ctrl+letter's),
      * and inventing an escape sequence would force every reader to become a
      * state machine. They are exactly what the event stream is for. --- */
-    if (make >= 0x3B && make <= 0x44) { kbd_event_push(EKC_F1 + (make - 0x3B), pressed); return; }
-    if (make == 0x57) { kbd_event_push(EKC_F11, pressed); return; }
-    if (make == 0x58) { kbd_event_push(EKC_F12, pressed); return; }
+    {
+        uint16_t f = make >= 0x3B && make <= 0x44 ? (uint16_t)(EKC_F1 + (make - 0x3B))
+                   : make == 0x57 ? EKC_F11 : make == 0x58 ? EKC_F12 : 0;
+        if (f) {
+            kbd_event_push(f, pressed);
+            if (pressed) keyboard_deliver_key_only(f, 0);    /* in order with the text */
+            return;
+        }
+    }
 
     /* --- the keypad, whose codes COLLIDE with the nav cluster's ---
      * A non-extended 0x47 is keypad-7-or-Home; the real Home arrived above with
@@ -329,22 +371,18 @@ static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
             char c = pad_num[i];
             if (!c) return;
             kbd_event_push((uint16_t)c, pressed);
-            if (pressed) keyboard_deliver(c);
+            if (pressed) deliver_key((uint16_t)c, KBF_KEYPAD, c);
         } else {
             if (!pad_nav[i]) return;
             kbd_event_push(pad_nav[i], pressed);
-            if (pressed && pad_nav_ch[i]) keyboard_deliver(pad_nav_ch[i]);
+            if (pressed && pad_nav_ch[i]) deliver_key(pad_nav[i], KBF_KEYPAD, pad_nav_ch[i]);
+            else if (pressed) keyboard_deliver_key_only(pad_nav[i], KBF_KEYPAD);
         }
         return;
     }
 
     /* --- ordinary keys --- */
     kbd_translate(make, pressed);
-}
-static void keyboard_handler(void) {
-    static int prefix;
-    uint8_t sc=inb(KBD_DATA_PORT);
-    spin_lock(&input_state_lock);keyboard_scancode(sc,&prefix,1);spin_unlock(&input_state_lock);
 }
 static uint16_t hid_scancode(uint16_t usage) {
     static const uint16_t scans[128] = {
@@ -369,12 +407,36 @@ static uint16_t hid_scancode(uint16_t usage) {
     return sc;
 }
 
-void keyboard_inject_hid_usage(uint16_t usage,int down) {
+static void hid_usage_inner(uint16_t usage, int down);
+static void hid_boot_report_inner(uint8_t prev[8], const uint8_t *report, unsigned length, int locked) {
+    void (*usage_fn)(uint16_t, int) = locked ? hid_usage_inner : keyboard_inject_hid_usage;
+    uint8_t now[8] = {0};
+    for (unsigned i = 0; i < 8 && i < length; i++) now[i] = report[i];
+    if (now[2] == 1) return;                  /* phantom state (too many keys): says nothing */
+    for (unsigned bit = 0; bit < 8; bit++)    /* modifiers first, so a chord's key sees them */
+        if (((prev[0] ^ now[0]) >> bit) & 1) usage_fn((uint16_t)(0xE0 + bit), (now[0] >> bit) & 1);
+    for (unsigned pass = 0; pass < 2; pass++) /* releases, then presses */
+        for (unsigned i = 2; i < 8; i++) {
+            uint8_t usage = pass ? now[i] : prev[i];
+            if (usage < 4) continue;
+            int elsewhere = 0;
+            for (unsigned j = 2; j < 8; j++) elsewhere |= (pass ? prev[j] : now[j]) == usage;
+            if (!elsewhere) usage_fn(usage, (int)pass);
+        }
+    for (unsigned i = 0; i < 8; i++) prev[i] = now[i];
+}
+void keyboard_hid_boot_report(uint8_t prev[8], const uint8_t *report, unsigned length) {
+    hid_boot_report_inner(prev, report, length, 0);
+}
+
+static void hid_usage_inner(uint16_t usage,int down) {
     uint16_t scan=hid_scancode(usage);if(!scan)return;
-    int prefix=0;spin_lock(&input_state_lock);
+    int prefix=0;
     if(scan&0xff00)keyboard_scancode(0xe0,&prefix,0);
     keyboard_scancode((scan&127)|(down?0:128),&prefix,0);
-    spin_unlock(&input_state_lock);
+}
+void keyboard_inject_hid_usage(uint16_t usage,int down) {
+    spin_lock(&input_state_lock);hid_usage_inner(usage,down);spin_unlock(&input_state_lock);
 }
 
 /* THE TRANSLATION, AS A FUNCTION YOU CAN CALL. Split out of the interrupt
@@ -392,7 +454,9 @@ void kbd_translate(uint8_t make, int pressed) {
      * carries (´ is EKC-less, so its codepoint is the honest answer to "which
      * key"), and a key above the BMP reports 0 rather than a truncated lie. */
     uint32_t evcp = KEY_BARE(base);
-    kbd_event_push((uint16_t)(evcp <= 0xFFFF ? evcp : 0), pressed);
+    uint16_t key = (uint16_t)(evcp <= 0xFFFF ? evcp : 0);
+    uint8_t pad = make == 0x37 ? KBF_KEYPAD : 0;  /* keypad *; the rest arrive above */
+    kbd_event_push(key, pressed);
     if (!pressed) return;                     /* releases produce no text */
 
     /* THREE LEVELS. AltGr is the right Alt key specifically -- tracked as a
@@ -424,7 +488,7 @@ void kbd_translate(uint8_t make, int pressed) {
         uint32_t composed = kbd_compose(g_dead, cp);
         uint32_t mark = g_dead;
         g_dead = 0;
-        if (composed) { keyboard_deliver_cp(composed); return; }
+        if (composed) { deliver_key_cp(key, 0, composed); return; }
         keyboard_deliver_cp(mark);            /* no such pairing: mark, then key */
     }
 
@@ -498,13 +562,20 @@ void kbd_translate(uint8_t make, int pressed) {
             case 'y': cmd = (char)EK_REDO;    break;
             default: break;
         }
-        if (cmd) { keyboard_deliver(cmd); return; }
+        if (cmd) { deliver_key(key, 0, cmd); return; }
     }
 
-    keyboard_deliver_cp(cp);
+    deliver_key_cp(key, pad, cp);
 }
 
 
+
+#if defined(__x86_64__)
+static void keyboard_handler(void) {
+    static int prefix;
+    uint8_t sc=inb(KBD_DATA_PORT);
+    spin_lock(&input_state_lock);keyboard_scancode(sc,&prefix,1);spin_unlock(&input_state_lock);
+}
 
 /* --- 8042 controller ------------------------------------------------------
  * We used to rely on whatever the BIOS left behind. That worked, but it is a
@@ -712,7 +783,9 @@ static void inject_event_inner(uint16_t code, int pressed, char ascii) {
 
     kbd_event_push(code, pressed);
     if (pressed && ascii)
-        keyboard_deliver(ascii);
+        deliver_key(code, 0, ascii);
+    else if (pressed && ((code >= EKC_F1 && code <= EKC_F12) || code == EKC_INS || code == EKC_MENU))
+        keyboard_deliver_key_only(code, 0);
 }
 void keyboard_inject_event(uint16_t code,int pressed,char ascii) {
     spin_lock(&input_state_lock);inject_event_inner(code,pressed,ascii);spin_unlock(&input_state_lock);
@@ -872,8 +945,9 @@ void kbd_altgr_force(int on)       { if (on) g_side |= SIDE_RALT; else g_side &=
  * can mean one thing on a machine that has both. */
 void keyboard_inject_cp(uint16_t code, int pressed, uint32_t cp) {
     spin_lock(&input_state_lock);
-    inject_event_inner(code, pressed, 0);      /* the event half */
-    if (pressed && cp) keyboard_deliver_cp(cp);   /* the text half, as UTF-8 */
+    if (cp) kbd_event_push(code, pressed);      /* the event half */
+    else inject_event_inner(code, pressed, 0);  /* (a modifier, or a key with no text) */
+    if (pressed && cp) deliver_key_cp(code, 0, cp);   /* the text half, as UTF-8 */
     spin_unlock(&input_state_lock);
 }
 
@@ -923,6 +997,7 @@ char keyboard_getchar(void) {
 uint32_t keyboard_poll_input(void) {
     char c;uint32_t value=0;
     sched_lock();
+    drop_key_only();
     if(buf_head!=buf_tail) {
         uint8_t mods=kbd_buffer_mods[buf_tail];
         if(buffer_pop(&c))value=(uint8_t)c|((uint32_t)mods<<8);
@@ -945,8 +1020,108 @@ int keyboard_input_snapshot_selftest(void) {
     buf_head=head;buf_tail=tail;g_mods=held;
     sched_unlock();spin_unlock(&input_state_lock);return ok;
 }
+/* `test kbd ring`: the key behind each byte survives the queue, keys with no
+ * character queue in order with the text, and character readers still see
+ * exactly the bytes they always saw. Live input, both rings and the modifier
+ * state are saved first and put back after; nothing reaches a window. */
+int keyboard_key_ring_selftest(void) {
+    static char bytes[KBD_BUFFER_SIZE]; static uint8_t mods[KBD_BUFFER_SIZE], flags[KBD_BUFFER_SIZE];
+    static uint16_t codes[KBD_BUFFER_SIZE]; static struct key_event events[KBD_EVENT_RING];
+    spin_lock(&input_state_lock);sched_lock();
+    memcpy(bytes,kbd_buffer,sizeof bytes);memcpy(mods,kbd_buffer_mods,sizeof mods);
+    memcpy(codes,kbd_buffer_code,sizeof codes);memcpy(flags,kbd_buffer_flags,sizeof flags);
+    memcpy(events,ev_ring,sizeof events);
+    uint32_t head=buf_head,tail=buf_tail,eh=ev_head,et=ev_tail;uint8_t held=g_mods,side=g_side;
+    sched_unlock();
+    static const struct { uint8_t byte, mods; uint16_t code; uint8_t flags; } want[] = {
+        { 0x13, EKM_CTRL, 's', 0 },             /* Ctrl+S */
+        { 0x13, EKM_CTRL, EKC_UP, 0 },          /* Ctrl+Up: the same byte, a different key */
+        { 0x13, 0, EKC_UP, 0 },                 /* Up */
+        { 0, 0, EKC_F1 + 4, KBF_KEYONLY },      /* F5: no byte, in order */
+        { 0xC3, 0, 'e', 0 }, { 0xA9, 0, 0, 0 }, /* e-acute: two bytes, one key */
+        { 0, 0, EKC_INS, KBF_KEYONLY },         /* Insert */
+        { 0x08, 0, '\b', 0 },                   /* Backspace, not Ctrl+H */
+        { 0x08, EKM_CTRL, 'h', 0 },             /* Ctrl+H */
+    };
+    int ok=1;
+    for (int pass=0;pass<2;pass++) {
+        buf_head=buf_tail=0;
+        g_mods=EKM_CTRL;g_side=SIDE_LCTRL;inject_event_inner('s',1,0x13);inject_event_inner(EKC_UP,1,EK_UP);
+        g_mods=0;g_side=0;inject_event_inner(EKC_UP,1,EK_UP);inject_event_inner(EKC_F1+4,1,0);
+        deliver_key_cp('e',0,0xE9);inject_event_inner(EKC_INS,1,0);inject_event_inner('\b',1,'\b');
+        g_mods=EKM_CTRL;g_side=SIDE_LCTRL;inject_event_inner('h',1,0x08);g_mods=0;g_side=0;
+        for (unsigned i=0;i<sizeof want/sizeof want[0];i++) {
+            if (pass==0) {
+                uint64_t k=keyboard_poll_key();
+                ok=ok && (k>>40&1) && (uint8_t)k==want[i].byte && (uint8_t)(k>>8)==want[i].mods &&
+                   (uint16_t)(k>>16)==want[i].code && (uint8_t)(k>>32)==want[i].flags;
+            } else if (!(want[i].flags&KBF_KEYONLY)) {
+                uint32_t v=keyboard_poll_input();       /* the legacy reader: bytes only */
+                ok=ok && v==(want[i].byte|(uint32_t)want[i].mods<<8);
+            }
+        }
+        ok=ok && (pass ? keyboard_poll_input()==0 : keyboard_poll_key()==0);
+    }
+    buf_head=buf_tail=0;inject_event_inner(EKC_F1,1,0);
+    ok=ok && !keyboard_has_char();                    /* a lone F1 is not a character */
+    /* A USB boot keyboard's reports, decoded like every other keyboard: its
+     * Ctrl is real, Up is Up, Shift shifts, F5 arrives, and a report with the
+     * keys gone releases them -- modifiers included. Layout-independent keys
+     * only (the live layout is the user's): s/a are the same key on us, azerty. */
+    static const uint8_t reports[][8] = {
+        { 0x01, 0, 0x16 }, { 0 },                     /* LCtrl+s: 0x13 */
+        { 0, 0, 0x52 }, { 0 },                        /* Up: 0x13, from Up */
+        { 0x02, 0, 0x04 }, { 0x02 }, { 0 },           /* LShift+a: A, Shift let go after */
+        { 0, 0, 0x3E }, { 0 },                        /* F5: no byte */
+    };
+    static const struct { uint8_t byte, mods; uint16_t code; uint8_t flags; } usb[] = {
+        { 0x13, EKM_CTRL, 's', 0 }, { 0x13, 0, EKC_UP, 0 }, { 'A', EKM_SHIFT, 'a', 0 }, { 0, 0, EKC_F1 + 4, KBF_KEYONLY },
+    };
+    uint8_t prev[8] = {0};const char *saved_layout = keyboard_layout();
+    keyboard_set_layout("us");buf_head=buf_tail=0;
+    for (unsigned i=0;i<sizeof reports/sizeof reports[0];i++) hid_boot_report_inner(prev, reports[i], 8, 1);
+    for (unsigned i=0;i<sizeof usb/sizeof usb[0];i++) {
+        uint64_t k=keyboard_poll_key();
+        ok=ok && (uint8_t)k==usb[i].byte && (uint8_t)(k>>8)==usb[i].mods &&
+           (uint16_t)(k>>16)==usb[i].code && (uint8_t)(k>>32)==usb[i].flags;
+    }
+    ok=ok && keyboard_poll_key()==0 && !(g_mods&(EKM_CTRL|EKM_SHIFT));
+    keyboard_set_layout(saved_layout);
+    sched_lock();
+    memcpy(kbd_buffer,bytes,sizeof bytes);memcpy(kbd_buffer_mods,mods,sizeof mods);
+    memcpy(kbd_buffer_code,codes,sizeof codes);memcpy(kbd_buffer_flags,flags,sizeof flags);
+    memcpy(ev_ring,events,sizeof events);
+    buf_head=head;buf_tail=tail;ev_head=eh;ev_tail=et;g_mods=held;g_side=side;
+    sched_unlock();spin_unlock(&input_state_lock);
+    return ok;
+}
+
 int keyboard_has_char(void) {
+    drop_key_only();
     return buf_head != buf_tail;
+}
+
+uint64_t keyboard_poll_key(void) {
+    uint64_t value = 0;
+    sched_lock();
+    if (buf_head != buf_tail) {
+        uint32_t t = buf_tail;
+        value = (uint64_t)(uint8_t)kbd_buffer[t] | (uint64_t)kbd_buffer_mods[t] << 8 |
+                (uint64_t)kbd_buffer_code[t] << 16 | (uint64_t)kbd_buffer_flags[t] << 32 | 1ull << 40;
+        buf_tail = (t + 1) % KBD_BUFFER_SIZE;
+    }
+    sched_unlock();
+    return value;
+}
+
+/* A key with no character, queued in order with the text and woken like it. */
+static void keyboard_deliver_key_only(uint16_t code, uint8_t flags) {
+    INPUT_ACTIVITY();
+    sched_lock();
+    g_key_code = code; g_key_flags = 0;
+    buffer_push_entry(0, (uint8_t)(KBF_KEYONLY | flags));
+    wait_queue_wake_one(&kbd_wait_queue);
+    sched_unlock();
 }
 
 /* Every push site goes through here. The lock makes {push -> wake} atomic
@@ -1077,7 +1252,7 @@ void keyboard_release_grab_pid(uint32_t pid) {
 char keyboard_getchar_blocking(void) {
     char c;
     sched_lock();
-    while (buf_head == buf_tail) {                             /* re-check UNDER the lock */
+    while (drop_key_only(), buf_head == buf_tail) {            /* re-check UNDER the lock */
         sched_block_current_locked(&kbd_wait_queue);           /* block until a key is pushed */
         sched_lock();                                          /* re-acquire the lock to re-check the condition */
     }
@@ -1096,7 +1271,7 @@ char keyboard_getchar_blocking(void) {
  * returned even if the process is also cancelled; only BLOCKING is refused. */
 int keyboard_getchar_blocking_cancelable(char *out) {
     sched_lock();
-    while (buf_head == buf_tail) {
+    while (drop_key_only(), buf_head == buf_tail) {
         if (current_process && current_process->cancelled) {
             sched_unlock();
             return -EMBK_ECANCELED;

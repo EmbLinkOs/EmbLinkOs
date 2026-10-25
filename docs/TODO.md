@@ -1,3 +1,22 @@
+## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
+
+The roadmap the user set: the Terminal first, then the customisation system.
+Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
+
+- [x] M0 Test probe (`g_term_probe`) and golden streams from real programs, compared with tmux.
+- [x] M1 Keys with identity: kernel queue, syscall 157, toolkit, xterm encoder; USB keyboards decoded like PS/2.
+- [ ] M2 The shell owns its line: editor, persistent history, completion, OSC 133 A-D, in-band resize.
+- [ ] M3 `sh` on the editor; Terminal's local prompt removed.
+- [ ] M4 Screen model v2 (xterm-compatible, dynamic size, compact scrollback, palette-indexed cells).
+- [ ] M5 Fonts and renderer (cmap 12, fallback, four faces, procedural box/powerline glyphs, damage).
+- [ ] M6 Tabs, mouse selection, find, links, zoom; dynamic PTYs.
+- [ ] M7 Profiles, Preferences and translucency (Clear Dark default).
+- [ ] M8-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
+- [ ] Split panes (after M12).
+- [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
+- [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not
+      generate them (PS/2 typematic repeat works).
+
 ## Development shell (2026-10-24)
 
 - [x] Private descriptor-backed PTYs, canonical/raw modes, echo and nonblocking queues.
@@ -6,7 +25,8 @@
 - [x] VT screen model, alternate screen, basic Unicode widths, colours and live resize.
 - [x] Screen copy, safe native-prompt paste and application bracketed paste.
 - [x] Shared controls receive paste commands without key-queue truncation.
-- [ ] Terminal range selection, complete grapheme rendering and modified-key identity.
+- [x] Modified-key identity: the key behind every byte, F-keys, the keypad, xterm PC-style encoding.
+- [ ] Terminal range selection and complete grapheme rendering.
 - [ ] Terminfo/application compatibility and mouse reporting.
 - [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
 - [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.

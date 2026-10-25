@@ -227,6 +227,26 @@ int keyboard_has_char(void);
 uint32_t keyboard_poll_input(void);
 int keyboard_input_snapshot_selftest(void);
 
+/* THE SAME QUEUE, WITH WHICH KEY EACH BYTE CAME FROM.
+ *
+ * The character ring cannot say which key was pressed: Up and Ctrl+S are both
+ * 0x13, Backspace and Ctrl+H both 0x08, and F1-F12 have no byte at all. The
+ * event ring knows the key but is not ordered with the text and belongs to no
+ * window. So every ring entry now also records the key (an EKC_*, or the key's
+ * unshifted ASCII) on the FIRST byte the key produced, and keys with no
+ * character get an entry of their own, flagged KBF_KEYONLY.
+ *
+ * Every reader that wants characters -- keyboard_getchar*, keyboard_has_char,
+ * keyboard_poll_input, the console -- skips KEYONLY entries and sees exactly
+ * the bytes it always saw. keyboard_poll_key() sees everything:
+ *   bits 0-7 the byte (0 for KEYONLY), 8-15 EKM_* when the key went down,
+ *   16-31 the key (0 on a multi-byte character's later bytes), 32-39 KBF_*,
+ *   bit 40 always set, so a NUL byte is not "empty". Zero means empty. */
+#define KBF_KEYONLY 0x01    /* a key with no character: F1-F12, Insert, Menu */
+#define KBF_KEYPAD  0x02    /* from the numeric keypad (application keypad mode) */
+uint64_t keyboard_poll_key(void);
+int keyboard_key_ring_selftest(void);
+
 /* Ctrl-C routing — docs/INTERRUPTION.md.
  *
  * `pid` receives console interrupts: a ^C cancels it (process_cancel) instead of
@@ -258,6 +278,12 @@ int keyboard_getchar_blocking_cancelable(char *out);
 void keyboard_flush_input(void);
 void keyboard_inject_char(char c);
 void keyboard_inject_hid_usage(uint16_t usage,int down);
+/* A USB boot keyboard's report -- [modifiers][reserved][six key usages] -- as
+ * the presses and releases it means, through keyboard_inject_hid_usage, so a
+ * USB keyboard has Ctrl, Alt, GUI, layouts, F-keys and key identity like every
+ * other keyboard. `prev` is that device's last report and is updated; pass an
+ * all-zero report when the device goes away, or a held modifier stays held. */
+void keyboard_hid_boot_report(uint8_t prev[8], const uint8_t *report, unsigned length);
 
 /* Deliver one DECODED key from any hardware -- the seam every input driver that
  * is not PS/2 comes in through (virtio-input today, and where USB HID belongs).

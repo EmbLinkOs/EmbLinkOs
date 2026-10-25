@@ -1037,6 +1037,17 @@ static inline int embk_desktop_control(unsigned operation,struct embk_desktop *s
 static inline int embk_key_poll_input(void) {
     return (int)embk_syscall0(EMBK_SYS_key_poll_input);
 }
+/* The same queue with WHICH KEY each byte came from (kernel keyboard.h,
+ * keyboard_poll_key): Up is no longer Ctrl+S, and F1-F12/Insert/Menu arrive as
+ * entries of their own, in order with the text. Zero means empty. Otherwise
+ * bits 0-7 are the byte (0 for EMBK_KEYF_ONLY), 8-15 EMBK_KM_*, 16-31 the key
+ * (EMBK_KC_* or unshifted ASCII; 0 on a character's later UTF-8 bytes), 32-39
+ * EMBK_KEYF_*, and bit 40 is always set. */
+#define EMBK_KEYF_ONLY   0x01   /* a key with no character */
+#define EMBK_KEYF_KEYPAD 0x02   /* from the numeric keypad */
+static inline int64_t embk_key_poll_key(void) {
+    return embk_syscall0(EMBK_SYS_key_poll_key);
+}
 static inline int embk_key_mods(void) {
     return (int)embk_syscall0(EMBK_SYS_key_mods);
 }

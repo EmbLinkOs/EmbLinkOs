@@ -40,7 +40,9 @@ struct vt {
     struct vt_line history[VT_HISTORY];
     unsigned history_head,history_count;
     int cols,rows;
-    bool alt,alt_saved,autowrap,cursor_visible,application_cursor,bracketed_paste;
+    bool alt,alt_saved,autowrap,cursor_visible,application_cursor,bracketed_paste,keypad_application;
+    /* Key settings, not terminal state: a reset keeps them. */
+    bool backspace_sends_bs,alt_sends_escape;
     uint8_t cursor_style;
     bool tabs[VT_COLS],graphics[2];
     unsigned charset;
@@ -65,8 +67,19 @@ size_t vt_line_text(const struct vt *,int row,unsigned back,char *dst,size_t cap
 int vt_width(uint32_t rune);
 unsigned vt_encode(uint32_t rune,char out[4]);
 uint32_t vt_color(unsigned index);
-/* Shared terminal key encoder; modifier bits: Shift=1, Alt=2, Ctrl=4. */
+/* Shared terminal key encoder (xterm's PC-style keys); modifier bits: Shift=1,
+ * Alt=2, Ctrl=4. A value below 256 is a byte the keyboard produced -- Alt puts
+ * ESC in front of it when alt_sends_escape is on. The rest are keys:
+ *   cursor keys, Home, End   CSI/SS3 x (application cursor), CSI 1;m x modified
+ *   Insert Delete PgUp PgDn  CSI n ~, CSI n;m ~
+ *   F1-F4                    SS3 P..S, CSI 1;m P..S modified
+ *   F5-F12                   CSI 15 17 18 19 20 21 23 24 ~ (;m)
+ *   Backspace                DEL, or ^H with backspace_sends_bs; Ctrl gives the other
+ *   keypad                   its character, or SS3 p..y n M k m j o in application mode */
 enum vt_key { VT_KEY_UP=256,VT_KEY_DOWN,VT_KEY_RIGHT,VT_KEY_LEFT,VT_KEY_HOME,
-    VT_KEY_END,VT_KEY_DELETE,VT_KEY_INSERT,VT_KEY_PAGEUP,VT_KEY_PAGEDOWN,VT_KEY_TAB };
+    VT_KEY_END,VT_KEY_DELETE,VT_KEY_INSERT,VT_KEY_PAGEUP,VT_KEY_PAGEDOWN,VT_KEY_TAB,
+    VT_KEY_F1,VT_KEY_F12=VT_KEY_F1+11,VT_KEY_BACKSPACE,VT_KEY_ENTER,VT_KEY_ESCAPE,VT_KEY_MENU,
+    VT_KEY_KP_0,VT_KEY_KP_9=VT_KEY_KP_0+9,VT_KEY_KP_DOT,VT_KEY_KP_ENTER,VT_KEY_KP_PLUS,
+    VT_KEY_KP_MINUS,VT_KEY_KP_STAR,VT_KEY_KP_SLASH };
 size_t vt_key_sequence(const struct vt *,unsigned key,unsigned mods,char out[16]);
 #endif

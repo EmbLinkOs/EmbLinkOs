@@ -32,8 +32,11 @@
 static int g_app_exit_requested;
 static int g_app_exit_code;
 static int (*g_em_close_hook)(void);
-static int g_key_modifiers;
+static int g_key_modifiers,g_key_code,g_key_flags,g_key_only_wanted;
 int em_key_modifiers(void) { return g_key_modifiers; }
+int em_key_code(void) { return g_key_code; }
+int em_key_flags(void) { return g_key_flags; }
+void em_key_hook_wants_key_only(int on) { g_key_only_wanted=on; }
 void em_set_close_hook(int (*fn)(void)) { g_em_close_hook=fn; }
 static float g_viewport_w;   /* mirrored into em.c via em_set_viewport */
 static int   g_blur_rect[4] = {0,0,0,0};   /* window-local frost rect (w<=0 = none) */
@@ -753,8 +756,15 @@ int em_app_run(const EmApp *app) {
             g_blur_dirty = 0;
         }
         int had_key = 0;
-        for (int input; (input = embk_key_poll_input()) > 0; ) {
-            int c=input&255;g_key_modifiers=(input>>8)&255;
+        for (int64_t input; (input = embk_key_poll_key()) > 0; ) {
+            int c=(int)(input&255);g_key_modifiers=(int)((input>>8)&255);
+            g_key_code=(int)((input>>16)&0xffff);g_key_flags=(int)((input>>32)&255);
+            /* A key with no character (F5, Insert) reaches only a hook that
+             * asked for one; to everything else it is as if never pressed. */
+            if (g_key_flags&EMBK_KEYF_ONLY) {
+                if (g_em_key_hook && g_key_only_wanted && !ui_focus_scope_active() && g_em_key_hook(EM_KEY_ONLY|g_key_code)) had_key=1;
+                continue;
+            }
             /* Escape first dismisses a menu; it must not quit the application
              * (especially the system bar) that owns an open dropdown. */
             if (em_menu_key(c)) {had_key=1;continue;}

@@ -90,7 +90,7 @@ va={address};left={length};data=bytearray()
 while left:
     n=min(left,4096-(va&4095));data.extend(inf.read_memory(base+phys(va),n));left-=n;va+=n
 print('RESULT '+json.dumps(data.hex()))'''))
-    def click(self,x,y):
+    def hover(self,x,y):
         end=time.monotonic()+30
         while True:
             ax,ay=self.state()['mouse']
@@ -98,6 +98,8 @@ print('RESULT '+json.dumps(data.hex()))'''))
             if time.monotonic()>end:raise TimeoutError('pointer')
             dx=max(-40,min(40,x-ax));dy=max(-40,min(40,y-ay))
             self.g.qmp.cmd('human-monitor-command',**{'command-line':f'mouse_move {dx} {dy}'});self.g.pump(.08)
+    def click(self,x,y):
+        self.hover(x,y)
         self.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});self.g.pump(.8)
         self.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'});self.g.pump(1)
     def snap(self,name):

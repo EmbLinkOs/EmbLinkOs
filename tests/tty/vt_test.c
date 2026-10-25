@@ -107,6 +107,30 @@ static void strings_and_keys(void) {
     n=vt_key_sequence(&v,19,4,b);CHECK(n==1 && b[0]==19);
     n=vt_key_sequence(&v,VT_KEY_TAB,1,b);CHECK(n==3 && !memcmp(b,"\033[Z",3));
     n=vt_key_sequence(&v,'x',2,b);CHECK(n==2 && !memcmp(b,"\033x",2));
+    /* xterm's PC-style keys, each against the bytes xterm sends. */
+    static const struct {unsigned key,mods;const char *want;} keys[]={
+        {VT_KEY_F1,0,"\033OP"},{VT_KEY_F1+3,0,"\033OS"},{VT_KEY_F1+2,1,"\033[1;2R"},{VT_KEY_F1+4,0,"\033[15~"},
+        {VT_KEY_F1+5,0,"\033[17~"},{VT_KEY_F1+9,0,"\033[21~"},{VT_KEY_F1+10,0,"\033[23~"},{VT_KEY_F12,5,"\033[24;6~"},
+        {VT_KEY_LEFT,4,"\033[1;5D"},{VT_KEY_RIGHT,6,"\033[1;7C"},{VT_KEY_HOME,1,"\033[1;2H"},{VT_KEY_END,0,"\033OF"},
+        {VT_KEY_INSERT,0,"\033[2~"},{VT_KEY_DELETE,4,"\033[3;5~"},{VT_KEY_PAGEUP,1,"\033[5;2~"},{VT_KEY_MENU,0,"\033[29~"},
+        {VT_KEY_BACKSPACE,0,"\177"},{VT_KEY_BACKSPACE,4,"\b"},{VT_KEY_BACKSPACE,2,"\033\177"},
+        {VT_KEY_ENTER,0,"\r"},{VT_KEY_ENTER,2,"\033\r"},{VT_KEY_ESCAPE,0,"\033"},{VT_KEY_TAB,0,"\t"},
+        {VT_KEY_KP_0+5,0,"5"},{VT_KEY_KP_ENTER,0,"\r"},{VT_KEY_KP_STAR,0,"*"},
+    };
+    for(unsigned i=0;i<sizeof keys/sizeof keys[0];i++) {
+        n=vt_key_sequence(&v,keys[i].key,keys[i].mods,b);
+        CHECK(n==strlen(keys[i].want) && !memcmp(b,keys[i].want,n));
+    }
+    feed("\033=");CHECK(v.keypad_application);
+    n=vt_key_sequence(&v,VT_KEY_KP_0+5,0,b);CHECK(n==3 && !memcmp(b,"\033Ou",3));
+    n=vt_key_sequence(&v,VT_KEY_KP_ENTER,0,b);CHECK(n==3 && !memcmp(b,"\033OM",3));
+    n=vt_key_sequence(&v,VT_KEY_KP_SLASH,0,b);CHECK(n==3 && !memcmp(b,"\033Oo",3));
+    feed("\033>");CHECK(!v.keypad_application);
+    v.backspace_sends_bs=true;n=vt_key_sequence(&v,VT_KEY_BACKSPACE,0,b);CHECK(n==1 && b[0]==8);
+    n=vt_key_sequence(&v,VT_KEY_BACKSPACE,4,b);CHECK(n==1 && b[0]==127);
+    feed("\033c");CHECK(v.backspace_sends_bs && v.alt_sends_escape);   /* settings survive a reset */
+    v.backspace_sends_bs=false;v.alt_sends_escape=false;n=vt_key_sequence(&v,'x',2,b);CHECK(n==1 && b[0]=='x');
+    v.alt_sends_escape=true;
     feed("\033]133;A;cwd=/home/tester\007");CHECK(v.shell_ready && !strcmp(v.directory,"/home/tester"));
     feed("\033]133;C\007");CHECK(!v.shell_ready && v.prompt_serial==2);
     feed("\033c");CHECK(!v.alt && !v.application_cursor && v.cursor_visible && !v.bracketed_paste && !v.history_count);text(0,"");

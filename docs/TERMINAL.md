@@ -62,10 +62,42 @@ Canonical editing operates on bytes; Unicode-aware erase is still pending.
 At the native shell prompt, Terminal keeps its local history, completion and
 caret editing. Enter submits the command and changes to direct input until
 the shell publishes its next prompt. An interactive program can then read a
-canonical line, disable echo, or select raw mode. Navigation keys use ANSI
-sequences on this direct path; captured modifiers keep Ctrl-letter bytes from
-being mistaken for internal navigation codes. Escape is delivered to the
+canonical line, disable echo, or select raw mode. Escape is delivered to the
 program. Ctrl+D at an empty shell prompt exits the shell.
+
+### Keys
+
+The keyboard queue says which key produced every byte (`embk_key_poll_key`,
+syscall 157): the byte, the modifiers when the key went down, the key itself
+(an `EMBK_KC_*`, or its unshifted character) and flags. Up and Ctrl+S are both
+0x13 in the character stream, and Backspace and Ctrl+H both 0x08; the key tells
+them apart. F1-F12, Insert and Menu have no byte at all and arrive as entries of
+their own, flagged `EMBK_KEYF_ONLY`, in order with the text; keypad keys carry
+`EMBK_KEYF_KEYPAD`. Every reader that wants characters (`key_poll`,
+`key_poll_input`, the console) skips those entries and sees exactly the bytes it
+always saw. The toolkit hands the identity to a key hook through `em_key_code()`
+and `em_key_flags()`, and delivers keys with no character only to an app that
+asked (`em_key_hook_wants_key_only`), as `EM_KEY_ONLY|code`. PS/2, USB (boot
+protocol, directly or behind a hub), I2C HID and virtio keyboards all stamp the
+key; a USB keyboard now goes through the same decoding as the others, so it has
+Ctrl, Alt, GUI shortcuts, layouts and F-keys, and its keys are released when it
+is unplugged.
+
+Terminal encodes keys as xterm does with its PC-style keys:
+
+| Key | Sent |
+| --- | --- |
+| arrows, Home, End | `CSI A`..`D`, `H`, `F` (`SS3` in application cursor mode); `CSI 1;m x` with modifiers |
+| Insert, Delete, PgUp, PgDn | `CSI 2~` `3~` `5~` `6~`; `CSI n;m~` |
+| F1-F4 | `SS3 P`..`S`; `CSI 1;m P`..`S` |
+| F5-F12 | `CSI 15~ 17~ 18~ 19~ 20~ 21~ 23~ 24~`; `CSI n;m~` |
+| Backspace / Ctrl+Backspace | DEL / `^H` (a profile can swap them) |
+| Alt+key | ESC before the key's bytes |
+| Ctrl+Space, 2..8, `[ \ ] ^ _ /` | NUL, ESC, FS, GS, RS, US, DEL as xterm sends them |
+| keypad | its character; `SS3 p`..`y n M k m j o` in application keypad mode (`ESC =`) |
+
+`m` is 1 + Shift(1) + Alt(2) + Ctrl(4). GUI shortcuts never reach a program.
+Keys are written to the PTY as they are pressed, not on the next idle pass.
 
 The emulator master is nonblocking, with a bounded pending-input queue so a
 slow program cannot block the UI thread. Output draining has a per-iteration
@@ -129,11 +161,9 @@ layout are not implemented. Italic attributes are parsed but use the regular
 face. Cursor styles stay static without animation. Basic combining/wide-cell
 support does not promise every glyph is present in the installed fonts.
 
-The current keyboard byte ABI overlaps some navigation and Ctrl-letter codes.
-Captured modifiers distinguish unmodified arrows from Ctrl-letter input, but
-Ctrl+arrow identity remains ambiguous. Shift/Alt arrow encoding is supported;
-complete modified navigation requires physical key identity through the input
-stack. Resize dimensions are queryable; there is no `SIGWINCH` yet.
+Resize dimensions are queryable; there is no `SIGWINCH` yet. Keys follow
+xterm's PC-style encoding; the kitty keyboard protocol and `modifyOtherKeys`
+are not offered.
 
 ## Installed development headers
 
@@ -151,6 +181,7 @@ make shell-test declare-test em-test kit-test
 # Boot the image, then use the serial debug console:
 test terminal
 test tty
+test kbd ring
 # Graphical acceptance with QEMU, GDB and the existing cloud build environment:
 python3 tools/terminal_smoke.py
 python3 tools/terminal_screen_smoke.py

@@ -35,9 +35,16 @@ static bool g_dead=false,g_at_prompt=false;
 static char g_notice[96];
 static unsigned char g_pending[65568];
 static size_t g_pending_n;
+static void term_flush(void) {
+    if (!g_pending_n || g_dead) return;
+    int64_t written=embk_write(g_master,g_pending,g_pending_n);
+    if (written>0) {g_pending_n-=(size_t)written;memmove(g_pending,g_pending+written,g_pending_n);}
+}
+/* Queued, then written at once: a key reaches the program in the same loop
+ * iteration it was pressed, not on the next idle pass. */
 static bool term_send(const void *data,size_t n) {
     if (n>sizeof g_pending-g_pending_n) {snprintf(g_notice,sizeof g_notice,"Input queue is full; wait for the program to read.");return false;}
-    memcpy(g_pending+g_pending_n,data,n);g_pending_n+=n;return true;
+    memcpy(g_pending+g_pending_n,data,n);g_pending_n+=n;term_flush();return true;
 }
 static void term_reply(void *unused,const char *data,size_t n) {(void)unused;(void)term_send(data,n);}
 
@@ -335,13 +342,7 @@ static void probe_refresh(void) {
  * only when something actually arrived. Also notice the shell dying. */
 static void term_idle(void) {
     bool got = false;
-    if (g_pending_n && !g_dead) {
-        int64_t written=embk_write(g_master,g_pending,g_pending_n);
-        if (written>0) {
-            g_pending_n-=(size_t)written;
-            memmove(g_pending,g_pending+written,g_pending_n);
-        }
-    }
+    term_flush();
     static int last_cols=0,last_rows=0;
     if (g_cols!=last_cols || g_rows!=last_rows) {
         struct embk_terminal_size size={(uint16_t)g_rows,(uint16_t)g_cols,0,0};
@@ -416,56 +417,91 @@ static void term_paste(void) {
     em_request_frame();
 }
 
-/* keys: the full line-editor surface. PgUp/PgDn (and the wheel, in the view)
- * page the scrollback; editing keys work AT the caret; ESC clears the line
- * first and only closes the window when there is nothing to clear. */
+/* --- keys ---------------------------------------------------------------------
+ * The kernel queue says which key produced each byte (em_key_code): Up is not
+ * Ctrl+S here although both are 0x13, Backspace is not Ctrl+H, and F5 arrives
+ * at all. key_identity() names the key the way the screen model's encoder does,
+ * or returns 0 for a byte that is simply text. */
+static unsigned key_identity(int c,unsigned code,unsigned flags) {
+    if(c&EM_KEY_ONLY) {
+        code=(unsigned)c&0xffff;
+        if(code>=EMBK_KC_F1 && code<=EMBK_KC_F12)return VT_KEY_F1+(code-EMBK_KC_F1);
+        return code==EMBK_KC_INS?VT_KEY_INSERT:code==EMBK_KC_MENU?VT_KEY_MENU:0;
+    }
+    switch(code) {
+    case EMBK_KC_UP:return VT_KEY_UP;case EMBK_KC_DOWN:return VT_KEY_DOWN;
+    case EMBK_KC_LEFT:return VT_KEY_LEFT;case EMBK_KC_RIGHT:return VT_KEY_RIGHT;
+    case EMBK_KC_HOME:return VT_KEY_HOME;case EMBK_KC_END:return VT_KEY_END;
+    case EMBK_KC_PGUP:return VT_KEY_PAGEUP;case EMBK_KC_PGDN:return VT_KEY_PAGEDOWN;
+    case EMBK_KC_DEL:return VT_KEY_DELETE;
+    }
+    if(flags&EMBK_KEYF_KEYPAD) {
+        if(code>='0' && code<='9')return VT_KEY_KP_0+(code-'0');
+        switch(code){case '.':return VT_KEY_KP_DOT;case '\n':return VT_KEY_KP_ENTER;case '+':return VT_KEY_KP_PLUS;
+            case '-':return VT_KEY_KP_MINUS;case '*':return VT_KEY_KP_STAR;case '/':return VT_KEY_KP_SLASH;}
+    }
+    switch(code){case '\b':return VT_KEY_BACKSPACE;case '\n':return VT_KEY_ENTER;case 27:return VT_KEY_ESCAPE;case '\t':return VT_KEY_TAB;}
+    return 0;
+}
+/* Ctrl with a key that is not a letter: the C0 bytes xterm sends for them. */
+static int control_byte(unsigned code) {
+    switch(code) {
+    case ' ':case '2':case '@':return 0;case '[':case '3':return 27;case '\\':case '4':return 28;
+    case ']':case '5':return 29;case '^':case '6':return 30;case '-':case '_':case '/':case '7':return 31;
+    case '8':case '?':return 127;
+    }
+    return -1;
+}
+static size_t encode_key(int c,unsigned key,unsigned code,unsigned mods,char out[16]) {
+    unsigned vtmods=((mods&EMBK_KM_SHIFT)?1:0)|((mods&EMBK_KM_ALT)?2:0)|((mods&EMBK_KM_CTRL)?4:0);
+    if(key)return vt_key_sequence(&g_vt,key,vtmods,out);
+    if(c&EM_KEY_ONLY)return 0;
+    if(!code){out[0]=(char)c;return 1;}             /* a character's later UTF-8 byte */
+    int byte=c;
+    if((mods&EMBK_KM_CTRL) && byte>=0x20 && byte<0x7f){int ctl=control_byte(code);if(ctl>=0)byte=ctl;}
+    return vt_key_sequence(&g_vt,(unsigned)byte,vtmods&2,out);
+}
+
+/* At the local prompt the keys edit the line, emacs-style; while a program
+ * runs they are encoded for it. PgUp/PgDn (Shift+ while a program runs) and the
+ * wheel page the scrollback; ESC clears the line first and only closes the
+ * window when there is nothing to clear. GUI shortcuts never reach a program. */
 static int term_key(int c) {
-    unsigned mods=(unsigned)em_key_modifiers();g_notice[0]=0;
+    unsigned mods=(unsigned)em_key_modifiers(),code=(unsigned)em_key_code(),flags=(unsigned)em_key_flags();g_notice[0]=0;
+    unsigned key=key_identity(c,code,flags);
     if(c==EMBK_KEY_COPY || (c==3 && (mods&(EMBK_KM_CTRL|EMBK_KM_SHIFT))==(EMBK_KM_CTRL|EMBK_KM_SHIFT))) {term_copy();return 1;}
     if(c==EMBK_KEY_PASTE || (c==22 && (g_at_prompt || (mods&EMBK_KM_SHIFT)))) {term_paste();return 1;}
-    if((c==EMBK_KEY_PGUP || c==EMBK_KEY_PGDN) && (g_at_prompt || (mods&EMBK_KM_SHIFT))) {
+    if((key==VT_KEY_PAGEUP || key==VT_KEY_PAGEDOWN) && (g_at_prompt || (mods&EMBK_KM_SHIFT))) {
         if(!g_vt.alt) {
-            g_view+=(c==EMBK_KEY_PGUP?1:-1)*(g_rows/2);
+            g_view+=(key==VT_KEY_PAGEUP?1:-1)*(g_rows/2);
             if(g_view<0)g_view=0;
             if(g_view>(int)g_vt.history_count)g_view=(int)g_vt.history_count;
         }
         em_request_frame();return 1;
     }
+    if(mods&EMBK_KM_GUI)return 1;
     if (!g_at_prompt && !g_dead) {
-        unsigned key=(unsigned)c;
-        /* Driver navigation bytes overlap C0 control letters. The captured
-         * modifier snapshot, not the current held keys, distinguishes them. */
-        if (!(mods&EMBK_KM_CTRL)) switch(c) {
-        case EMBK_KEY_UP:key=VT_KEY_UP;break;case EMBK_KEY_DOWN:key=VT_KEY_DOWN;break;
-        case EMBK_KEY_LEFT:case EMBK_KEY_SEL_LEFT:key=VT_KEY_LEFT;break;
-        case EMBK_KEY_RIGHT:case EMBK_KEY_SEL_RIGHT:key=VT_KEY_RIGHT;break;
-        case EMBK_KEY_HOME:case EMBK_KEY_SEL_HOME:key=VT_KEY_HOME;break;
-        case EMBK_KEY_END:case EMBK_KEY_SEL_END:key=VT_KEY_END;break;
-        case EMBK_KEY_DEL:key=VT_KEY_DELETE;break;
-        case EMBK_KEY_PGUP:key=VT_KEY_PAGEUP;break;case EMBK_KEY_PGDN:key=VT_KEY_PAGEDOWN;break;
-        case '\t':key=VT_KEY_TAB;break;case '\n':key='\r';break;case '\b':key=127;break;
-        }
-        unsigned vtmods=((mods&EMBK_KM_SHIFT)?1:0)|((mods&EMBK_KM_ALT)?2:0)|((mods&EMBK_KM_CTRL)?4:0);
-        char sequence[16];size_t n=vt_key_sequence(&g_vt,key,vtmods,sequence);
+        char sequence[16];size_t n=encode_key(c,key,code,mods,sequence);
         if(n)(void)term_send(sequence,n);
         if(g_view)g_view=0;
         em_request_frame();return 1;
     }
-    if (c == 27) {
+    if (key==VT_KEY_ESCAPE) {
         if (g_dead || g_in_n == 0) return 0;     /* nothing to clear -> close */
         g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
         em_request_frame();
         return 1;
     }
     if (g_dead) return 1;
+    if (key>=VT_KEY_KP_0 && key<=VT_KEY_KP_SLASH && key!=VT_KEY_KP_ENTER) key=0;   /* keypad text */
 
-    switch (c) {
-    case EMBK_KEY_UP:    hist_step(-1); break;
-    case EMBK_KEY_DOWN:  hist_step(+1); break;
-    case EMBK_KEY_LEFT: if(g_cur>0){g_cur--;while(g_cur>0 && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur--;}break;
-    case EMBK_KEY_RIGHT: if(g_cur<g_in_n){g_cur++;while(g_cur<g_in_n && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur++;}break;
-    case EMBK_KEY_HOME:  case 0x01: g_cur = 0;      break;   /* Home / Ctrl+A */
-    case EMBK_KEY_END:              g_cur = g_in_n; break;   /* End  / Ctrl+E */
+    switch (key ? key : (unsigned)c) {
+    case VT_KEY_UP:   case 0x10: hist_step(-1); break;   /* Up / Ctrl+P */
+    case VT_KEY_DOWN: case 0x0E: hist_step(+1); break;   /* Down / Ctrl+N */
+    case VT_KEY_LEFT: case 0x02: if(g_cur>0){g_cur--;while(g_cur>0 && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur--;}break;
+    case VT_KEY_RIGHT:case 0x06: if(g_cur<g_in_n){g_cur++;while(g_cur<g_in_n && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur++;}break;
+    case VT_KEY_HOME: case 0x01: g_cur = 0;      break;  /* Home / Ctrl+A */
+    case VT_KEY_END:  case 0x05: g_cur = g_in_n; break;  /* End  / Ctrl+E */
     case 0x03:                                   /* Ctrl+C: abandon the line */
         term_say(prompt_text()); term_putc(' ');
         term_say(g_in); term_say("^C\n");
@@ -480,10 +516,10 @@ static int term_key(int c) {
     case 0x15: in_kill_to_start(); break;        /* Ctrl+U */
     case 0x0B: in_kill_to_end();   break;        /* Ctrl+K */
     case 0x17: in_kill_word();     break;        /* Ctrl+W */
-    case '\t': complete();         break;
-    case '\b': in_backspace();     break;
-    case EMBK_KEY_DEL: in_delete(); break;
-    case '\n': case '\r': {
+    case VT_KEY_TAB: complete();   break;
+    case VT_KEY_BACKSPACE: in_backspace(); break;
+    case VT_KEY_DELETE: in_delete(); break;
+    case VT_KEY_ENTER: case VT_KEY_KP_ENTER: {
         if (g_view != 0) g_view = 0;
         /* Send the whole line at once. The shell echoes it after our written
          * prompt, completing the transcript line into "user@host:~$ ls" ahead
@@ -500,7 +536,7 @@ static int term_key(int c) {
         break;
     }
     default:
-        if (c >= 0x20 && c <= 0xF4) {
+        if (!key && c >= 0x20 && c <= 0xF4) {
             if (g_view != 0) g_view = 0;         /* typing = snap back to live */
             in_insert((char)c);
         }
@@ -694,6 +730,7 @@ int main(void) {
     }
     probe_refresh();
     em_set_key_hook(term_key);
+    em_key_hook_wants_key_only(1);              /* F1-F12, Insert, Menu */
     em_set_idle_hook(term_idle);
 
     static EmApp app = {

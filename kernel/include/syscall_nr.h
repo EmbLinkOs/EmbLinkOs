@@ -351,6 +351,7 @@
 #define SYS_monitor 154
 #define SYS_win_place 155
 #define SYS_win_where 156   /* (id, out) -> 0 | -err: where the caller's window is now */
+#define SYS_key_poll_key 157 /* () -> packed key | 0: key_poll_input plus WHICH key (keyboard.h) */
 
 
 
