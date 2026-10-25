@@ -5,6 +5,7 @@
 #include "drivers/char/serial.h"
 #include "include/spinlock.h"
 #include "boot/boot_protocol.h"
+#include "include/arch_irq.h"   /* arch_cpu_halt_forever */
 
 /* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
  * docs/architecture/process-and-scheduling.md), same "add the lock, don't
@@ -173,7 +174,7 @@ void pmm_init(void) {
         if (!chosen) {
             serial_write_string("\nPMM FATAL: no usable memory below 1 GiB can hold the "
                                 "page bitmap\n");
-            for (;;) { __asm__ volatile ("cli; hlt"); }
+            arch_cpu_halt_forever();
         }
         pmm_bitmap = (uint8_t *)KP2V(chosen);
         if (chosen != kend) {
