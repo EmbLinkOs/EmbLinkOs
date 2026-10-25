@@ -263,7 +263,8 @@ static void appearance_start(const struct oscfg *initial) {
     /* Long-lived services run several windows sequentially in one process. */
     if(!g_appearance_worker_started && embk_thread_create(appearance_worker,0)>=0)g_appearance_worker_started=1;
 }
-static int g_shell_bottom,g_shell_height=34;
+static int g_shell_bottom,g_shell_height=34,g_follow_display_width;
+void em_app_follow_display_width(int enabled){g_follow_display_width=!!enabled;}
 void em_shell_band(int bottom,int height){g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
 static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
     if(!old)return NULL;
@@ -466,7 +467,7 @@ int em_app_run(const EmApp *app) {
                 minh=app->min_size.h>0?app->min_size.h:160;
                 if(minw>(int)sw-inset_l-inset_r)minw=(int)sw-inset_l-inset_r;
                 if(minh>(int)sh-inset_t-inset_b-bar)minh=(int)sh-inset_t-inset_b-bar;
-                if(app->fullscreen || app->follow_display_width) {
+                if(app->fullscreen || g_follow_display_width) {
                     int nw=(int)sw,nh=app->fullscreen?(int)sh:menu_expanded==2?(int)sh:winh;
                     if(nh>(int)sh)nh=(int)sh;
                     uint32_t *npx=NULL;
@@ -474,7 +475,7 @@ int em_app_run(const EmApp *app) {
                         px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);
                         rt.pixels=back?back:px;rt.width=nw;rt.height=nh;rt.stride=nw*4;
                         g_viewport_w=nw;g_viewport_h=nh;em_set_viewport(nw,nh);
-                        int ny=app->follow_display_width && g_shell_bottom && !menu_expanded?(int)sh-nh:0;
+                        int ny=g_follow_display_width && g_shell_bottom && !menu_expanded?(int)sh-nh:0;
                         embk_win_place(win,0,ny);if(chromeless)em_window_bind(win,0,ny);
                         scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());em_structure_changed();em_request_frame();
                     }else display_pending=1;

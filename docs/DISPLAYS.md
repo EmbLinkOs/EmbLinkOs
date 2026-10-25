@@ -70,9 +70,21 @@ confirmation, rollback, shell reflow, document preservation and cold-boot
 preferences. `--graphics bochs` selects the independent DISPI backend. Build with
 `FB_W=1280 FB_H=800 images uefi-usb.img` before running; keep kernel/app binaries
 unchanged while the guest is running. Screenshots are unmodified guest pixels.
+Runtime acceptance is x86-64; ARM64 is compile-checked only. Its existing
+screen-session isolation remains unported. The strip-width opt-in is a function
+so the public EmApp descriptor keeps its existing binary layout.
 
 This milestone does not implement multiple outputs, connector hotplug, native
 Intel/AMD/NVIDIA modesetting, DisplayPort/HDMI link training, accelerated rendering,
 refresh-rate selection, rotation, HDR/color profiles or suspend restoration.
 Physical laptop display testing is still required. These are follow-up graphics
 milestones, not capabilities inferred from successful virtual-device tests.
+
+Verified on 2026-10-25: both x86-64 backends completed the native display suite,
+including actual scanout dimensions, visible confirmation, explicit/timeout/exit/
+lock rollback, unsaved Editor contents and restoration after password login on
+a cold boot. The 32 driver protocol suites pass ASan/UBSan; appearance has 1,446
+passing checks. Native ABI verification reports 155 unique calls and 14 matching
+capabilities. The EmApp descriptor matches master (72 bytes, final field at 64).
+BIOS POSIX and UEFI/NVMe device, preferences, files, IPC, session, compositor and
+POSIX regressions pass. The ARM64 kernel links; runtime acceptance is outstanding.

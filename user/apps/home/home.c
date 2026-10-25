@@ -1780,6 +1780,7 @@ int main(int argc, char **argv, char **envp) {
 
     uint64_t screen_next=0,restore_token=0;int restore_attempted=0,restore_presented=0;
     for (;;) {
+        cfg_poll(); /* Load saved preferences before deciding whether to restore a mode. */
         if(embk_uptime_ms()>=screen_next) {
             screen_next=embk_uptime_ms()+200;uint32_t nw=0,nh=0;embk_screen_size(&nw,&nh);
             if(nw && nh && (nw!=sw || nh!=sh)) {
@@ -1813,7 +1814,6 @@ int main(int argc, char **argv, char **envp) {
                 }else restore_attempted=1;
             }
         }
-        cfg_poll();            /* dock size / indicator, as Settings left them */
         /* TAKEN HERE, a frame after the menu item was chosen and a frame after
          * the menu closed -- a screenshot of the menu you used to ask for a
          * screenshot is a screenshot of the wrong thing. */
