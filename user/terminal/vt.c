@@ -1,4 +1,5 @@
 #include "vt.h"
+#include "../../shell/edit/wcwidth.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@ void vt_init(struct vt *v,int cols,int rows,vt_reply_fn reply,void *context) {
     memset(v,0,sizeof *v); v->cols=clamp(cols,2,VT_COLS); v->rows=clamp(rows,2,VT_ROWS);
     init_screen(&v->primary,v->rows); init_screen(&v->alternate,v->rows);
     v->autowrap=v->cursor_visible=v->alt_sends_escape=true; v->reply=reply; v->reply_context=context;
+    v->prompt_row=-1;
     for (int i=0;i<VT_COLS;i++) v->tabs[i]=i && i%8==0;
     v->revision=1;
 }
@@ -39,17 +41,9 @@ uint32_t vt_color(unsigned i) {
     if (i<232) { i-=16; unsigned r=i/36,g=(i/6)%6,b=i%6; return ((r?55+r*40:0)<<16)|((g?55+g*40:0)<<8)|(b?55+b*40:0); }
     unsigned g=8+(i<256?i-232:23)*10; return (g<<16)|(g<<8)|g;
 }
-int vt_width(uint32_t c) {
-    if (!c || c<32 || (c>=0x7f && c<0xa0)) return -1;
-    if ((c>=0x300 && c<=0x36f) || (c>=0x1ab0 && c<=0x1aff) || (c>=0x1dc0 && c<=0x1dff) ||
-        (c>=0x20d0 && c<=0x20ff) || (c>=0xfe00 && c<=0xfe0f) || (c>=0xfe20 && c<=0xfe2f) || c==0x200d ||
-        (c>=0xe0100 && c<=0xe01ef)) return 0;
-    if ((c>=0x1100 && c<=0x115f) || c==0x2329 || c==0x232a || (c>=0x2e80 && c<=0xa4cf && c!=0x303f) ||
-        (c>=0xac00 && c<=0xd7a3) || (c>=0xf900 && c<=0xfaff) || (c>=0xfe10 && c<=0xfe19) ||
-        (c>=0xfe30 && c<=0xfe6f) || (c>=0xff00 && c<=0xff60) || (c>=0xffe0 && c<=0xffe6) ||
-        (c>=0x1f300 && c<=0x1faff) || (c>=0x20000 && c<=0x3fffd)) return 2;
-    return 1;
-}
+/* The one width table, shared with the shell's line editor (wcwidth.h): the
+ * editor counts cells to place its cursor, so the two must never disagree. */
+int vt_width(uint32_t c) { return wcwidth_cp(c); }
 unsigned vt_encode(uint32_t c,char out[4]) {
     if (c<0x80) {out[0]=(char)c;return 1;}
     if (c<0x800) {out[0]=(char)(0xc0|(c>>6));out[1]=(char)(0x80|(c&63));return 2;}
@@ -214,6 +208,10 @@ static void mode(struct vt *v,bool on) {
         else if (p==1048) {if(on)save_cursor(v);else restore_cursor(v);}
         else if (p==1049)alternate(v,on,true,on);
         else if (p==2004)v->bracketed_paste=on;
+        else if (p==2048) {
+            v->inband_resize=on;
+            if (on && v->reply) {char r[48];size_t n=vt_size_report(v,r);v->reply(v->reply_context,r,n);}
+        }
     }
     v->revision++;
 }
@@ -284,11 +282,27 @@ static void start_csi(struct vt *v) {
 static void finish_string(struct vt *v) {
     if (v->string_kind==']') {
         v->string[v->string_length]=0;
-        if (!strncmp(v->string,"133;A;cwd=",10)) {
-            size_t n=v->string_length-10;
-            memcpy(v->directory,v->string+10,n);v->directory[n]=0;v->prompt_serial++;v->shell_ready=true;
+        if (!strncmp(v->string,"133;A",5) && (!v->string[5] || v->string[5]==';')) {
+            /* Fields are key=value after ';'. cwd= is last and runs to the
+             * end, so a directory may contain ';'. */
+            v->edit_shell=false;v->directory[0]=0;
+            for (char *f=v->string+5;*f==';';) {
+                f++;
+                if (!strncmp(f,"cwd=",4)) {size_t n=strlen(f+4);memcpy(v->directory,f+4,n+1);break;}
+                char *end=strchr(f,';');size_t n=end?(size_t)(end-f):strlen(f);
+                if (n==10 && !strncmp(f,"edit=shell",10))v->edit_shell=true;
+                f+=n;
+            }
+            v->prompt_row=(int64_t)v->scrolls+vt_active(v)->cursor.y;
+            v->prompt_serial++;v->shell_ready=true;
         }
         if (!strcmp(v->string,"133;C")) {v->prompt_serial++;v->shell_ready=false;}
+        if (!strcmp(v->string,"133;R") && !v->alt && v->prompt_row>=0) {
+            int64_t y=v->prompt_row-(int64_t)v->scrolls;
+            struct vt_cursor *c=&v->primary.cursor;
+            c->x=0;c->y=(int)(y<0?0:y>=v->rows?v->rows-1:y);c->wrap=false;v->revision++;
+        }
+        if (!strncmp(v->string,"133;D",5)) v->last_status=v->string[5]==';'?atoi(v->string+6):0;
         if ((v->string[0]=='0' || v->string[0]=='2') && v->string[1]==';') {
             memcpy(v->title,v->string+2,v->string_length>=2?v->string_length-2:0);
             v->title[v->string_length>=2?v->string_length-2:0]=0;v->revision++;
@@ -371,6 +385,25 @@ void vt_feed(struct vt *v,const void *data,size_t length) {
     const unsigned char *p=data;for(size_t i=0;i<length;i++)byte(v,p[i]);
 }
 void vt_clear_history(struct vt *v) {v->history_head=v->history_count=0;v->revision++;}
+bool vt_prompt_erase(struct vt *v) {
+    if (v->alt || !v->shell_ready || !v->edit_shell || !v->inband_resize || v->prompt_row<0) return false;
+    int64_t y=v->prompt_row-(int64_t)v->scrolls;
+    if (y<0) y=0;
+    if (y>=v->rows) return false;
+    struct vt_screen *s=&v->primary;
+    struct vt_cursor plain={0};plain.fg=plain.bg=VT_DEFAULT;
+    for (int r=(int)y;r<v->rows;r++) clear_line(line_at(s,r),&plain);
+    s->cursor.x=0;s->cursor.y=(int)y;s->cursor.wrap=false;
+    v->revision++;
+    return true;
+}
+void vt_prompt_here(struct vt *v) {
+    if (!v->alt) v->prompt_row=(int64_t)v->scrolls+v->primary.cursor.y;
+}
+size_t vt_size_report(const struct vt *v,char out[48]) {
+    int n=snprintf(out,48,"\033[48;%d;%d;%d;%dt",v->rows,v->cols,v->pixel_height,v->pixel_width);
+    return n>0?(size_t)n:0;
+}
 void vt_prompt_room(struct vt *v,unsigned extra) {
     if (v->alt) return;
     extra=(unsigned)clamp((int)extra,0,v->rows-1);

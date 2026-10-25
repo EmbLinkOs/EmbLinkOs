@@ -5,7 +5,13 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 
 - [x] M0 Test probe (`g_term_probe`) and golden streams from real programs, compared with tmux.
 - [x] M1 Keys with identity: kernel queue, syscall 157, toolkit, xterm encoder; USB keyboards decoded like PS/2.
-- [ ] M2 The shell owns its line: editor, persistent history, completion, OSC 133 A-D, in-band resize.
+- [x] M2 The shell owns its line: editor, persistent history, completion, OSC 133 A-D (+R), in-band resize.
+- [ ] `$status` is 0/1/130: an external program's own exit code does not reach it yet (M8 carries
+      the real code and the extended states into the prompt).
+- [ ] History is read once per session: lines run in another tab appear after the next start
+      (bash's default; zsh's share_history is not offered).
+- [ ] On the kernel console the editor works line by line: a multi-line program's earlier lines
+      cannot be edited there, and Ctrl+Q/R/S/T/B/E are the console's arrows and Home/End.
 - [ ] M3 `sh` on the editor; Terminal's local prompt removed.
 - [ ] M4 Screen model v2 (xterm-compatible, dynamic size, compact scrollback, palette-indexed cells).
 - [ ] M5 Fonts and renderer (cmap 12, fallback, four faces, procedural box/powerline glyphs, damage).

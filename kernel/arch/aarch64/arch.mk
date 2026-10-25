@@ -396,6 +396,7 @@ ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
                  shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
                  shell/eval/exec.c \
                  shell/builtins/builtins.c shell/hist/hist.c \
+                 shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c \
                  shell/eval/eval_extern.c shell/builtins/builtins_os.c
 ARM_SHELL_SDK := shell/value/value.c shell/wire/wire.c shell/sval/sval.c
 
@@ -428,7 +429,7 @@ ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
                  $(wildcard user/audio/mp3/*.c)) \
                user/audio/resample.c
 
-ARM_XSRC_term     := user/terminal/vt.c
+ARM_XSRC_term     := user/terminal/vt.c shell/edit/wcwidth.c
 $(ARM_USER)/term.o: user/terminal/vt.h
 
 ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \

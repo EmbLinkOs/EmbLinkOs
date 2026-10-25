@@ -9,7 +9,7 @@ that moved while it was being read) is read again.
 """
 import struct
 
-MAGIC, VERSION = 0x504d5254, 1
+MAGIC, VERSION = 0x504d5254, 2
 TEXT, PRIMARY, CELLS, CELL = 1368, 66904, 132440, 16
 HEADER = struct.Struct('<4I4i4B5i3I2i3I')
 
@@ -26,7 +26,7 @@ class TerminalState:
             head = self._raw(w, 88 + 256 + 1024)
             (magic, version, size, serial, cols, rows, cx, cy, at_prompt, dead, alt, visible,
              view, shell, master, session, sessions, prompt_serial, history, frames,
-             input_len, caret, text_len, primary_len, _) = HEADER.unpack_from(head)
+             input_len, caret, text_len, primary_len, flags) = HEADER.unpack_from(head)
             if magic != MAGIC or version != VERSION:
                 raise RuntimeError(f'Terminal probe magic/version {magic:#x}/{version}, expected {MAGIC:#x}/{VERSION}')
             if serial & 1:
@@ -37,6 +37,7 @@ class TerminalState:
                  'shell': shell, 'master': master, 'session': session, 'sessions': sessions,
                  'prompt_serial': prompt_serial, 'history_count': history, 'frames': frames,
                  'input': head[344:344 + max(0, input_len)].decode('utf-8', 'replace'), 'caret': caret,
+                 'local_edit': bool(flags & 1), 'edit_shell': bool(flags & 2), 'inband_size': bool(flags & 4),
                  'cwd': head[88:344].split(b'\0', 1)[0].decode('utf-8', 'replace')}
             if text:
                 p['text'] = self._raw(w, text_len, TEXT).decode('utf-8', 'replace').split('\n') if text_len else ['']

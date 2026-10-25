@@ -835,8 +835,12 @@ build/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_sy
 # Cross-built here (both are just as/C); shipped to /system/abi by mkfs.
 build/emlink_dynstubs.o: user/lib/emlink_dynstubs.s | $(BUILD)
 	$(ASM_GAS) $< -o $@
-build/libtcc1.o: $(TCC_SRC)/lib/libtcc1.c | $(BUILD)
-	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $< -o $@
+# va_list.c too: on x86-64 tcc turns va_start into a call to __va_start, so a
+# program with a varargs function (the shell's editor has one) needs it at link.
+build/libtcc1.o: $(TCC_SRC)/lib/libtcc1.c $(TCC_SRC)/lib/va_list.c | $(BUILD)
+	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $(TCC_SRC)/lib/libtcc1.c -o $(BUILD)/libtcc1_core.o
+	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $(TCC_SRC)/lib/va_list.c -o $(BUILD)/libtcc1_va.o
+	$(USER_CC) -r -nostdlib $(BUILD)/libtcc1_core.o $(BUILD)/libtcc1_va.o -o $@
 
 # hello.elf, posixdemo.elf, ioracer.elf and crasher.elf are built by
 # NEWLIB_SIMPLE_PROG above -- one source file each, so each is a PIE when a PIC
@@ -1481,7 +1485,8 @@ build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o $(NEWLIB_LDSCRIPT)
 SHELL_INC = -Ishell
 SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
-             shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h
+             shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h \
+             shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h
 
 $(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1501,6 +1506,12 @@ $(BUILD)/shobj_builtins.o: shell/builtins/builtins.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_hist.o: shell/hist/hist.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_edit.o: shell/edit/edit.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wcwidth.o: shell/edit/wcwidth.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_complete.o: shell/complete/complete.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_eval_extern.o: shell/eval/eval_extern.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
@@ -1508,10 +1519,16 @@ $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/li
 $(BUILD)/shobj_main.o: shell/main.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 
+# The shell's own sources ride in the image (/data/src/shell) for `test embbuild
+# shell` to rebuild it with tcc, so a change to any of them -- or to a manifest
+# -- has to remake the image even when shell.elf itself did not change.
+SHELL_SELFBUILD_SRC = $(wildcard shell/*.c shell/*/*.c shell/*/*.h) shell/build.ebm $(wildcard shell/tools/*.ebm)
+
 SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o \
              $(BUILD)/shobj_lex.o $(BUILD)/shobj_parse.o $(BUILD)/shobj_eval.o \
              $(BUILD)/shobj_exec.o \
              $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
+             $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o \
              $(BUILD)/shobj_eval_extern.o \
              $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
 
@@ -1680,11 +1697,14 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Terminal's screen parser/model is pure userspace and separately host-tested.
-build/vt.o: user/terminal/vt.c user/terminal/vt.h | $(BUILD)
+build/vt.o: user/terminal/vt.c user/terminal/vt.h shell/edit/wcwidth.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
+# The cell width table the shell's editor uses too: one table, both sides.
+build/wcwidth.o: shell/edit/wcwidth.c shell/edit/wcwidth.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/term.o: user/terminal/vt.h
-build/term.elf: build/term.o build/vt.o build/crt0.o build/syscalls.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o build/vt.o \
+build/term.elf: build/term.o build/vt.o build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o build/vt.o build/wcwidth.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Photos -- the picture viewer. Like vellum it needs more than one object, so
@@ -2105,7 +2125,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(SHELL_SELFBUILD_SRC) $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -2682,14 +2702,14 @@ compile-commands:
 
 .PHONY: terminal-screen-test
 terminal-screen-test: | $(BUILD)
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_test.c -o $(BUILD)/vt_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test
 	$(BUILD)/vt_test
 
 .PHONY: terminal-golden-test
 # Real programs' output (tests/tty/golden, made by tools/record_golden.py on a
 # Mac) replayed into the screen model and compared with tmux, cell by cell.
 terminal-golden-test: | $(BUILD)
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_dump.c -o $(BUILD)/vt_dump
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c shell/edit/wcwidth.c tests/tty/vt_dump.c -o $(BUILD)/vt_dump
 	python3 tools/golden_terminal.py $(BUILD)/vt_dump
 
 .PHONY: terminal-test
@@ -2709,6 +2729,17 @@ shell-test:
 	    shell/builtins/builtins.c shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/test/host_test.c -o $(BUILD)/shell_test
 	$(BUILD)/shell_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/hist/hist.c user/terminal/vt.c \
+	    shell/test/edit_test.c -o $(BUILD)/edit_test
+	$(BUILD)/edit_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell \
+	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+	    shell/builtins/builtins.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c \
+	    shell/test/complete_test.c -o $(BUILD)/complete_test
+	$(BUILD)/complete_test
 
 scene-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene \

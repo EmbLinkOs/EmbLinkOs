@@ -27,7 +27,9 @@ def main():
         d.g.wait(b'TopBar: first frame presented');d.g.wait(b'home: time zone')
         d.g.qmp.cmd('human-monitor-command',**{'command-line':f'gdbserver unix:{d.sock},server=on,wait=off'})
         screen=TerminalState(d);w=d.launch('Terminal','Terminal');eventually(lambda:prompt(w),'initial prompt')
-        initial=screen.state(w);assert initial['cursor']==(0,1) and initial['text'][0].startswith('EmbLink shell'),initial['text']
+        initial=screen.state(w)
+        assert initial['text'][0].startswith('EmbLink shell') and initial['text'][1].endswith('$'),initial['text']
+        assert initial['cursor']==(len(initial['text'][1])+1,1),initial['cursor']   # after the shell's own prompt
         type_text('echo 48126\n');eventually(lambda:prompt(w) and '48126' in screen.text(w).splitlines(),'native command result')
         d.snap('screen-native-prompt')
         type_text('/data/apps/ttyprobe/ttyprobe.elf "--screen"\n')
@@ -67,8 +69,12 @@ def main():
         state=screen.state(w);assert '48126' in '\n'.join(state['text']) and 'Alternate screen restored.' in '\n'.join(state['text'])
         assert 'EmbLink terminal screen check' not in '\n'.join(state['text']),'alternate pixels escaped into primary output'
         d.snap('screen-primary-restored')
-        d.key('meta_l-v');d.g.pump(1)
-        assert prompt(w) and screen.probe(w,text=False)['input']=='','oversized paste executed or partially inserted'
+        # A paste at the prompt arrives bracketed: text in the shell's line,
+        # never a command run (no new prompt follows it).
+        before=screen.probe(w,text=False)['prompt_serial']
+        d.key('meta_l-v');d.g.pump(2)
+        assert prompt(w) and screen.probe(w,text=False)['prompt_serial']==before,'a paste at the prompt ran as a command'
+        d.key('ctrl-c');d.g.pump(1)
         # Build a >8 KiB clipboard using real editor commands, then exercise
         # Note++'s custom hook as well as the shared TextEditor paste path.
         d.key('meta_l-tab');eventually(lambda:focus_id()==editor['id'],'focus Editor for long clipboard')

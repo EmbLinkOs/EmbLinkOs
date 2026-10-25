@@ -96,10 +96,18 @@ fi
 #                        and EmbLink has no async signal delivery, so it could
 #                        never fire. Vacuously correct, not a workaround.
 cd "$TCC_SRC"
+# tcc's configure takes the TARGET from `uname` -- there is no flag for it -- so
+# on a Mac it configures a Mach-O ARM compiler (and links with -flat_namespace,
+# which the cross gcc rejects). The target is x86-64 with ELF output whatever
+# machine builds it; a `uname` that says so is put first on PATH for configure.
+UNAME_SHIM=$(mktemp -d)
+trap 'rm -rf "$UNAME_SHIM"' EXIT
+printf '#!/bin/sh\ncase "$1" in -m) echo x86_64 ;; *) echo Linux ;; esac\n' > "$UNAME_SHIM/uname"
+chmod +x "$UNAME_SHIM/uname"
     # NOTE: --cross-prefix ALREADY makes CC "${CROSS}gcc". Passing --cc as well
     # gets them concatenated into `x86_64-elf-x86_64-elf-gcc`. Do not "helpfully"
     # add --cc back.
-./configure \
+PATH="$UNAME_SHIM:$PATH" ./configure \
     --cross-prefix="$CROSS" \
     --prefix=/ \
     --sysincludepaths="/system/abi/include:/data/apps/tcc/include" \

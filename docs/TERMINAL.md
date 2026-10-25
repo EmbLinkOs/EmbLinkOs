@@ -59,11 +59,36 @@ Canonical editing operates on bytes; Unicode-aware erase is still pending.
 
 ## Terminal application
 
-At the native shell prompt, Terminal keeps its local history, completion and
-caret editing. Enter submits the command and changes to direct input until
-the shell publishes its next prompt. An interactive program can then read a
-canonical line, disable echo, or select raw mode. Escape is delivered to the
-program. Ctrl+D at an empty shell prompt exits the shell.
+The native shell edits its own line ([SHELL.md](SHELL.md#10-the-line--the-shell-edits-its-own)):
+it draws the prompt, reads every key in raw mode, and recalls, searches and
+completes itself. Terminal is a screen for it, as for any program: keys are
+encoded and sent, output is drawn. A shell says so in its prompt mark --
+`OSC 133;A` carrying `edit=shell` -- and only a prompt WITHOUT it (the `sh`
+port, until it moves onto the shell's editor) gets Terminal's older local
+editing: a 255-byte line with its own history and completion, sent whole on
+Enter. Shift+PgUp/PgDn and the wheel page the scrollback; Escape and Ctrl+D go
+to the program. An interactive program can read a canonical line, disable
+echo, or select raw mode.
+
+**Resizing a prompt.** A shell that edits its own line turns on DECSET 2048
+while it does. When the window is resized during such a prompt, Terminal first
+erases from the prompt's first row (recorded at the A mark, as rows scrolled
+plus row, so it stays right while the screen scrolls) to the end of the
+screen, puts the cursor there, resizes, and after the kernel has the new size
+sends `CSI 48;rows;cols;height;width t`. The shell redraws its prompt and line
+from that row at the new width. Without the erase, the old wrapped prompt
+would be reflowed into a duplicate above the redrawn one. Turning 2048 on
+also reports the current size at once, and a resize from before reports were
+on is not reported later -- nothing was erased for it.
+
+**Returning to the prompt (OSC 133;R).** EmbLink's own addition to the marks:
+`ESC ] 133;R BEL` puts the cursor at the start of the row where the current
+prompt began (kept as rows scrolled plus row, and re-marked after a prompt
+resize). The shell's editor starts every redraw with it when `TERM_PROGRAM` is
+`EmbLinkTerminal`, instead of counting rows back up, so a redraw that was
+already on its way when the window changed still lands on the prompt. Other
+terminals ignore an OSC they do not know, and the editor falls back to
+relative motion there.
 
 ### Keys
 
@@ -139,10 +164,10 @@ ordinary Ctrl-letter input continues to the running program. Shift+PageUp/Down
 and the wheel view primary history; the alternate screen has no history view.
 **Clear** and the shell's `clear` builtin clear the screen and history.
 
-Native shell integration uses opt-in `EMBLINK_PROMPT=1` with OSC 133 prompt and
-command markers, rather than overloading ordinary control bytes. The native
-prompt keeps its existing 255-byte command limit and local history/completion.
-The pending program-input queue holds 65,568 bytes, independently of the smaller
+Shell integration uses the OSC 133 marks: `A` (prompt start; `edit=shell`,
+`cwd=` last), `B` (input start), `C` (command start) and `D;status`
+(command end). The `sh` port still opts in with `EMBLINK_PROMPT=1` and uses
+the local prompt. The pending program-input queue holds 65,568 bytes, independently of the smaller
 kernel device queues, and reports pressure in the app bar.
 
 Shared text controls now receive a single paste command after the app hook gets
@@ -177,7 +202,7 @@ SDK paths even when upstream headers with the same names are present.
 
 ```
 make terminal-test terminal-screen-test terminal-golden-test
-make shell-test declare-test em-test kit-test
+make shell-test declare-test em-test kit-test     # shell-test includes the line editor on the screen model
 # Boot the image, then use the serial debug console:
 test terminal
 test tty

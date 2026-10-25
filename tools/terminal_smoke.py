@@ -43,7 +43,8 @@ def main():
         assert '\r' not in probe(w)['cwd']
         type_text('echo 123');d.key('backspace');type_text('4\n')
         eventually(lambda:prompt(w) and text(w,'echo 124'),'native prompt editing')
-        d.key('up');assert probe(w)['input']=='echo 124'
+        # The shell owns the line: Up recalls into its prompt, on the screen.
+        d.key('up');eventually(lambda:[l for l in transcript(w).splitlines() if l][-1].endswith('$ echo 124'),'Up did not recall the last command')
         d.key('ctrl-u');command(w,'echo 73421','73421');d.snap('terminal-prompt')
         type_text('/data/apps/ttyprobe/ttyprobe.elf\n')
         eventually(lambda:text(w,'Canonical input: type a line'),'canonical program start')

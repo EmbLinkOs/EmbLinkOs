@@ -8599,7 +8599,7 @@ int selftests_handle_command(const char *cmd)
 
 /* V2 -- THE SHELL REBUILDS THE SHELL, and the FIRST ADOPTION EVENT
  * (docs/BUILD.md §3). Four movements:
- *   (1) BUILD: EmbBuild walks /data/src/shell/build.ebm -- eleven TCC
+ *   (1) BUILD: EmbBuild walks /data/src/shell/build.ebm -- fifteen TCC
  *       compiles and a link, STAGED ONLY (the manifest has no install
  *       stanza; /system/bin is sealed and EmbBuild will not cross it).
  *   (2) VERIFY THE STAGED ARTIFACT: the TCC-built shell runs the shell-test
@@ -8616,7 +8616,9 @@ int selftests_handle_command(const char *cmd)
  *       system built for itself. */
     if (strcmp(cmd, "test embbuild shell") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild shell: VFS not registered\n"); return 1; }
-        static char cap[4096];
+        /* Room for every unit's compiler chatter: the verdict is the LAST
+         * line, and sixteen tcc runs overflowed 4 KiB before reaching it. */
+        static char cap[65536];
         int ok = 1, rc;
         char *bb = "/data/apps/embbuild/embbuild.elf";
         static const char *oracle[3] = {
@@ -8629,7 +8631,7 @@ int selftests_handle_command(const char *cmd)
         kprintf("[v2] (1) building the shell from /data/src/shell\n");
         char *a1[] = { bb, "/data/src/shell/build.ebm", NULL };
         rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
-        if (rc != 0 || !emb_find(cap, "12 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }
+        if (rc != 0 || !emb_find(cap, "16 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }   /* 15 units + the link */
 
         /* (2) verify the staged shell BEFORE adoption */
         if (ok) {

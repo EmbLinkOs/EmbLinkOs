@@ -930,33 +930,39 @@ static struct value bi_help(const struct command *cmd, struct value input,
  * Registry: the PURE half; builtin_lookup_os() (builtins_os.c / host stub)
  * carries everything that needs a syscall.
  * ------------------------------------------------------------------------- */
+static const struct { const char *name; builtin_fn fn; } g_pure[] = {
+    { "echo",    bi_echo    },
+    { "assert",  bi_assert  },
+    { "where",   bi_where   },
+    { "select",  bi_select  },
+    { "sort-by", bi_sort_by },
+    { "first",   bi_first   },
+    { "head",    bi_first   },   /* the standard name, same stage */
+    { "last",    bi_last    },
+    { "tail",    bi_last    },
+    { "reverse", bi_reverse },
+    { "get",     bi_get     },
+    { "count",   bi_count   },
+    { "wc",      bi_wc      },
+    { "history", bi_history },
+    { "help",    bi_help    },
+    { "sum",     bi_sum     }, { "avg",     bi_avg     },
+    { "min",     bi_min     }, { "max",     bi_max     },
+    { "range",   bi_range   }, { "skip",    bi_skip    },
+    { "uniq",    bi_uniq    },
+    { "split",   bi_split   }, { "join",    bi_join    },
+    { "lines",   bi_lines   }, { "trim",    bi_trim    },
+    { "upper",   bi_upper   }, { "lower",   bi_lower   },
+    { "replace", bi_replace },
+};
+
 builtin_fn builtin_lookup(const char *name) {
-    static const struct { const char *name; builtin_fn fn; } tab[] = {
-        { "echo",    bi_echo    },
-        { "assert",  bi_assert  },
-        { "where",   bi_where   },
-        { "select",  bi_select  },
-        { "sort-by", bi_sort_by },
-        { "first",   bi_first   },
-        { "head",    bi_first   },   /* the standard name, same stage */
-        { "last",    bi_last    },
-        { "tail",    bi_last    },
-        { "reverse", bi_reverse },
-        { "get",     bi_get     },
-        { "count",   bi_count   },
-        { "wc",      bi_wc      },
-        { "history", bi_history },
-        { "help",    bi_help    },
-        { "sum",     bi_sum     }, { "avg",     bi_avg     },
-        { "min",     bi_min     }, { "max",     bi_max     },
-        { "range",   bi_range   }, { "skip",    bi_skip    },
-        { "uniq",    bi_uniq    },
-        { "split",   bi_split   }, { "join",    bi_join    },
-        { "lines",   bi_lines   }, { "trim",    bi_trim    },
-        { "upper",   bi_upper   }, { "lower",   bi_lower   },
-        { "replace", bi_replace },
-    };
-    for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
-        if (strcmp(tab[i].name, name) == 0) return tab[i].fn;
+    for (size_t i = 0; i < sizeof g_pure / sizeof g_pure[0]; i++)
+        if (strcmp(g_pure[i].name, name) == 0) return g_pure[i].fn;
     return builtin_lookup_os(name);
+}
+
+const char *builtin_name(size_t i) {
+    if (i < sizeof g_pure / sizeof g_pure[0]) return g_pure[i].name;
+    return builtin_os_name(i - sizeof g_pure / sizeof g_pure[0]);
 }

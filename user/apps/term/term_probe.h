@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 #define TERM_PROBE_MAGIC   0x504d5254u          /* "TRMP" */
-#define TERM_PROBE_VERSION 1u
+#define TERM_PROBE_VERSION 2u
 #define TERM_PROBE_LINE    1024                 /* the local prompt line */
 #define TERM_PROBE_TEXT    65536                /* one screen as UTF-8 */
 #define TERM_PROBE_CELLS   16384                /* cols*rows of the shown screen */
@@ -27,6 +27,11 @@ struct term_probe_cell {
     uint8_t width, flags, pad[2];
 };
 
+/* flags: how the line is being edited right now. */
+#define TERM_PROBE_LOCAL_EDIT   1u   /* Terminal edits the line itself (a shell without edit=shell) */
+#define TERM_PROBE_EDIT_SHELL   2u   /* the prompt mark said the shell edits its own line */
+#define TERM_PROBE_INBAND_SIZE  4u   /* DECSET 2048: size reports go in-band */
+
 struct term_probe {
     uint32_t magic, version, size, serial;
     int32_t cols, rows, cursor_x, cursor_y;
@@ -34,7 +39,7 @@ struct term_probe {
     int32_t view, shell, master, session, sessions;
     uint32_t prompt_serial, history_count, frames;
     int32_t input_len, caret;
-    uint32_t text_len, primary_len, pad;
+    uint32_t text_len, primary_len, flags;      /* TERM_PROBE_LOCAL_EDIT ... */
     char cwd[256];
     char input[TERM_PROBE_LINE];
     char text[TERM_PROBE_TEXT];                 /* rows joined by '\n', trailing blanks dropped */

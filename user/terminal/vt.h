@@ -52,6 +52,14 @@ struct vt {
     unsigned intermediate,string_kind,string_escape,string_length;
     char string[256],title[256],directory[256];
     unsigned prompt_serial; bool shell_ready;
+    /* Shell integration (OSC 133): the prompt's first row, as scrolls+row so
+     * it stays right while the screen scrolls; whether the shell edits its own
+     * line (A carried edit=shell); the last command's status (D). OSC 133;R,
+     * EmbLink's own, returns the cursor to that row's start: a shell redraws
+     * from there, wherever a resize or anything else has moved things. */
+    bool edit_shell; int64_t prompt_row; int last_status;
+    /* DECSET 2048: report the size in-band, now and after every resize. */
+    bool inband_resize; int pixel_width,pixel_height;
     uint32_t utf8,utf8_min; unsigned utf8_left;
     vt_reply_fn reply; void *reply_context;
 };
@@ -61,6 +69,15 @@ void vt_feed(struct vt *,const void *,size_t);
 bool vt_resize(struct vt *,int cols,int rows);
 void vt_clear_history(struct vt *);
 void vt_prompt_room(struct vt *,unsigned extra_rows);
+/* Before a resize: when a shell that edits its own line is at its prompt,
+ * erase from the prompt's first row down and leave the cursor there. The
+ * shell redraws when the size report arrives, so the old prompt is never
+ * reflowed into a duplicate. Nothing happens otherwise. */
+bool vt_prompt_erase(struct vt *);
+/* After that resize: the prompt starts where the cursor was left. */
+void vt_prompt_here(struct vt *);
+/* CSI 48;rows;cols;height;width t -- DECSET 2048's report. */
+size_t vt_size_report(const struct vt *,char out[48]);
 struct vt_screen *vt_active(struct vt *);
 const struct vt_cell *vt_view_cell(const struct vt *,int row,int col,unsigned back);
 size_t vt_line_text(const struct vt *,int row,unsigned back,char *dst,size_t capacity);

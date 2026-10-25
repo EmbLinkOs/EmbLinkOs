@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int g_fail = 0;
 #define CHECK(cond, name) do { \
@@ -372,6 +373,49 @@ static void test_hist(void) {
     CHECK(hist_get(hist_count()) == NULL, "out-of-range index is NULL");
 }
 
+/* --- history on disk ------------------------------------------------------- */
+static size_t file_lines(const char *path) {
+    FILE *f = fopen(path, "r");
+    size_t n = 0;
+    for (int c; f && (c = fgetc(f)) != EOF;) n += c == '\n';
+    if (f) fclose(f);
+    return n;
+}
+static void test_hist_file(void) {
+    printf("history file:\n");
+    char path[] = "/tmp/emblink-hist-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "a scratch file");
+    if (fd < 0) return;
+    close(fd);
+    remove(path);
+    hist_reset();
+    CHECK(hist_open(path) == 0 && hist_count() == 0, "a missing file is an empty history");
+    hist_push("one");
+    hist_push("if x {\n  echo \"a\\b\"\n}");
+    hist_push("if x {\n  echo \"a\\b\"\n}");
+    CHECK(file_lines(path) == 2, "accepted lines are appended, one file line each; a repeat is not");
+    hist_reset();
+    CHECK(hist_open(path) == 2 && hist_count() == 2, "a new session reads them back");
+    CHECK(!strcmp(hist_get(0), "one"), "in order");
+    CHECK(!strcmp(hist_get(1), "if x {\n  echo \"a\\b\"\n}"), "a multi-line entry with a backslash survives the file");
+    hist_push("two");
+    CHECK(file_lines(path) == 3, "the reopened history appends to the same file");
+    /* Years of appends: the file is trimmed to what the ring holds. */
+    FILE *f = fopen(path, "a");
+    for (int i = 0; f && i < 2 * HIST_MAX; i++) fprintf(f, "line%d\n", i);
+    if (f) fclose(f);
+    hist_reset();
+    hist_open(path);
+    CHECK(hist_count() == HIST_MAX, "the ring holds HIST_MAX");
+    CHECK(file_lines(path) == HIST_MAX, "and the file is rewritten to the same");
+    char want[32];
+    snprintf(want, sizeof want, "line%d", 2 * HIST_MAX - 1);
+    CHECK(!strcmp(hist_get(HIST_MAX - 1), want), "keeping the newest");
+    hist_reset();
+    remove(path);
+}
+
 /* ---------------------------------------------------------------------------
  * The PROGRAM grammar: statements, blocks, control flow, definitions.
  *
@@ -399,6 +443,21 @@ static bool prog_fails(const char *src) {
     lex_free_tokens(t, n);
     if (b) { block_free(b); return false; }
     return true;
+}
+
+/* Unfinished is not wrong: what the line editor asks before Enter runs. */
+static void test_incomplete(void) {
+    printf("unfinished programs:\n");
+    CHECK(program_incomplete("if x {"), "an open block is unfinished");
+    CHECK(program_incomplete("ls |"), "a trailing pipe is unfinished");
+    CHECK(program_incomplete("echo \"abc"), "a string that runs off the end is unfinished");
+    CHECK(program_incomplete("echo $(ls"), "an open command substitution is unfinished");
+    CHECK(program_incomplete("def f(a,"), "a parameter list is unfinished");
+    CHECK(!program_incomplete("echo hi"), "a whole statement is finished");
+    CHECK(!program_incomplete("if x {\n echo 1\n}"), "a closed block is finished");
+    CHECK(!program_incomplete("echo }"), "a stray '}' is an error, not unfinished");
+    CHECK(!program_incomplete("ls | | count"), "an error before the end is an error");
+    CHECK(!program_incomplete(""), "nothing is finished");
 }
 
 static void test_program(void) {
@@ -732,6 +791,8 @@ int main(void) {
     test_eval();
     test_vocabulary();
     test_hist();
+    test_hist_file();
+    test_incomplete();
     test_redirect_text();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);
     return g_fail;

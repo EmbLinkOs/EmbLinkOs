@@ -32,6 +32,14 @@ static int g_cols=80,g_rows=20,g_view=0,g_master=-1,g_shell=-1;
 #define FD_SHELL_IN g_master
 #define FD_SHELL_OUT g_master
 static bool g_dead=false,g_at_prompt=false;
+/* The terminal edits the line itself only for a shell that does not (an A
+ * mark without edit=shell -- the sh port, until it has the editor too). */
+static bool g_local=false;
+/* A resize happened while the program wanted in-band size reports (and the
+ * prompt was erased for it): report once the kernel knows the size. A resize
+ * from before reports were on is not reported -- the program learned the size
+ * when it turned them on, and nothing was erased for it to redraw. */
+static bool g_size_report=false;
 static char g_notice[96];
 static unsigned char g_pending[65568];
 static size_t g_pending_n;
@@ -325,6 +333,7 @@ static void probe_refresh(void) {
     p->view=g_view;p->shell=g_shell;p->master=g_master;p->session=0;p->sessions=1;
     p->prompt_serial=g_vt.prompt_serial;p->history_count=g_vt.history_count;p->frames=g_frames;
     p->input_len=g_in_n;p->caret=g_cur;memcpy(p->input,g_in,sizeof g_in);
+    p->flags=(g_local?TERM_PROBE_LOCAL_EDIT:0)|(g_vt.edit_shell?TERM_PROBE_EDIT_SHELL:0)|(g_vt.inband_resize?TERM_PROBE_INBAND_SIZE:0);
     snprintf(p->cwd,sizeof p->cwd,"%s",g_cwd);
     p->text_len=probe_screen(s,p->text);p->primary_len=probe_screen(&g_vt.primary,p->primary);
     size_t cells=0;
@@ -346,7 +355,11 @@ static void term_idle(void) {
     static int last_cols=0,last_rows=0;
     if (g_cols!=last_cols || g_rows!=last_rows) {
         struct embk_terminal_size size={(uint16_t)g_rows,(uint16_t)g_cols,0,0};
-        if (embk_terminal_control(g_master,EMBK_TERMINAL_SET_SIZE,&size,sizeof size)==0) { last_cols=g_cols; last_rows=g_rows; }
+        if (embk_terminal_control(g_master,EMBK_TERMINAL_SET_SIZE,&size,sizeof size)==0) {
+            last_cols=g_cols; last_rows=g_rows;
+            if (g_size_report && g_vt.inband_resize) {char r[48];size_t n=vt_size_report(&g_vt,r);(void)term_send(r,n);}
+            g_size_report=false;
+        }
     }
     size_t budget=16384;
     while (budget) {
@@ -364,7 +377,7 @@ static void term_idle(void) {
     }
     static unsigned prompt_serial;
     if(prompt_serial!=g_vt.prompt_serial) {
-        prompt_serial=g_vt.prompt_serial;g_at_prompt=g_vt.shell_ready;
+        prompt_serial=g_vt.prompt_serial;g_at_prompt=g_vt.shell_ready;g_local=g_at_prompt && !g_vt.edit_shell;
         snprintf(g_cwd,sizeof g_cwd,"%.*s",(int)sizeof g_cwd-1,g_vt.directory);got=true;
     }
     if (!g_dead && g_shell >= 0 && !embk_proc_alive(g_shell)) {
@@ -378,7 +391,7 @@ static void term_idle(void) {
 static void term_copy(void) {
     static char copy[65536];size_t n=0;
     struct vt *snapshot=NULL;const struct vt *source=&g_vt;
-    if(g_at_prompt && !g_view) {
+    if(g_local && !g_view) {
         snapshot=malloc(sizeof *snapshot);
         if(!snapshot){snprintf(g_notice,sizeof g_notice,"Screen text could not be copied.");em_request_frame();return;}
         *snapshot=g_vt;snapshot->reply=NULL;source=snapshot;
@@ -400,7 +413,7 @@ static void term_paste(void) {
     int64_t held=embk_clip_get(clipboard,sizeof clipboard);
     if(held<=0)return;
     if(held>(int64_t)sizeof clipboard){snprintf(g_notice,sizeof g_notice,"Clipboard text is too large to paste.");em_request_frame();return;}
-    bool bracketed=!g_at_prompt && g_vt.bracketed_paste;
+    bool bracketed=!g_local && g_vt.bracketed_paste;
     size_t n=0;if(bracketed){memcpy(paste,"\033[200~",6);n=6;}
     for(int64_t i=0;i<held;i++) {
         unsigned char c=(unsigned char)clipboard[i];
@@ -410,7 +423,7 @@ static void term_paste(void) {
         paste[n++]=(char)c;
     }
     if(bracketed){memcpy(paste+n,"\033[201~",6);n+=6;}
-    if(g_at_prompt) {
+    if(g_local) {
         if(n>IN_MAX-1-(size_t)g_in_n)snprintf(g_notice,sizeof g_notice,"Pasted text exceeds the command line limit.");
         else {memmove(g_in+g_cur+n,g_in+g_cur,(size_t)(g_in_n-g_cur)+1);memcpy(g_in+g_cur,paste,n);g_cur+=(int)n;g_in_n+=(int)n;}
     } else (void)term_send(paste,n);
@@ -470,8 +483,8 @@ static int term_key(int c) {
     unsigned mods=(unsigned)em_key_modifiers(),code=(unsigned)em_key_code(),flags=(unsigned)em_key_flags();g_notice[0]=0;
     unsigned key=key_identity(c,code,flags);
     if(c==EMBK_KEY_COPY || (c==3 && (mods&(EMBK_KM_CTRL|EMBK_KM_SHIFT))==(EMBK_KM_CTRL|EMBK_KM_SHIFT))) {term_copy();return 1;}
-    if(c==EMBK_KEY_PASTE || (c==22 && (g_at_prompt || (mods&EMBK_KM_SHIFT)))) {term_paste();return 1;}
-    if((key==VT_KEY_PAGEUP || key==VT_KEY_PAGEDOWN) && (g_at_prompt || (mods&EMBK_KM_SHIFT))) {
+    if(c==EMBK_KEY_PASTE || (c==22 && (g_local || (mods&EMBK_KM_SHIFT)))) {term_paste();return 1;}
+    if((key==VT_KEY_PAGEUP || key==VT_KEY_PAGEDOWN) && (g_local || (mods&EMBK_KM_SHIFT))) {
         if(!g_vt.alt) {
             g_view+=(key==VT_KEY_PAGEUP?1:-1)*(g_rows/2);
             if(g_view<0)g_view=0;
@@ -480,7 +493,7 @@ static int term_key(int c) {
         em_request_frame();return 1;
     }
     if(mods&EMBK_KM_GUI)return 1;
-    if (!g_at_prompt && !g_dead) {
+    if (!g_local && !g_dead) {
         char sequence[16];size_t n=encode_key(c,key,code,mods,sequence);
         if(n)(void)term_send(sequence,n);
         if(g_view)g_view=0;
@@ -508,7 +521,7 @@ static int term_key(int c) {
         g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
         break;
     case 0x04:
-        if (!g_in_n && term_send("\004",1)) g_at_prompt=false;
+        if (!g_in_n && term_send("\004",1)) g_at_prompt=g_local=false;
         break;
     case 0x0C:                                   /* Ctrl+L: clear the screen */
         term_clear();
@@ -531,7 +544,7 @@ static int term_key(int c) {
         char command[IN_MAX+1];
         memcpy(command,g_in,(size_t)g_in_n); command[g_in_n]='\n';
         if (!term_send(command,(size_t)g_in_n+1)) return 1;
-        g_at_prompt=false;
+        g_at_prompt=g_local=false;
         g_in[0] = 0; g_in_n = 0; g_cur = 0;
         break;
     }
@@ -575,7 +588,7 @@ static bool term_spawn_shell(void) {
     char user_env[64];
     snprintf(user_env, sizeof user_env, "USER=%s",
              getenv("USER") ? getenv("USER") : "user");
-    char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", "EMBLINK_PROMPT=1", NULL };
+    char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", "TERM_PROGRAM=EmbLinkTerminal", "EMBLINK_PROMPT=1", NULL };
     int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, senv, acts, 3);
 
     close(pair[1]);
@@ -633,7 +646,7 @@ static void overlay_text(struct render_target *rt,const char *text,int *x,int *y
 }
 static void paint_cursor(struct render_target *rt,int x,int y,uint32_t color) {
     if(x>=g_cols){x=0;y++;}if(y>=g_rows)return;
-    int style=g_at_prompt?5:g_vt.cursor_style;
+    int style=g_local?5:g_vt.cursor_style;
     if(style==3 || style==4)fill(rt->pixels,x*g_cell_width,(y+1)*g_cell_height-2,g_cell_width,2,color);
     else if(style==5 || style==6)fill(rt->pixels,x*g_cell_width,y*g_cell_height,2,g_cell_height,color);
     else {
@@ -665,20 +678,24 @@ static bool screen_bitmap(void) {
     if(w!=g_pixel_width || h!=g_pixel_height) {
         uint32_t *a=malloc((size_t)w*h*4),*b=malloc((size_t)w*h*4);
         if(!a || !b){free(a);free(b);return false;}
+        bool erased=g_vt.inband_resize && vt_prompt_erase(&g_vt);   /* the shell redraws on the report */
+        if(g_vt.inband_resize)g_size_report=true;
         if(!vt_resize(&g_vt,cols,rows)){free(a);free(b);return false;}
+        if(erased)vt_prompt_here(&g_vt);
+        g_vt.pixel_width=w;g_vt.pixel_height=h;
         free(g_pixels[0]);free(g_pixels[1]);g_pixels[0]=a;g_pixels[1]=b;g_pixel_width=w;g_pixel_height=h;g_bitmap_valid=false;
     }
     g_cols=cols;g_rows=rows;g_cell_width=cw;g_cell_height=ch;
     if(g_view>(int)g_vt.history_count)g_view=(int)g_vt.history_count;
     if(g_vt.alt)g_view=0;
-    if(g_at_prompt && !g_view) {
+    if(g_local && !g_view) {
         unsigned cells=(unsigned)(strlen(prompt_text())+1+strlen(g_in));
         unsigned offset=g_vt.primary.cursor.wrap?(unsigned)g_cols:(unsigned)g_vt.primary.cursor.x;
         vt_prompt_room(&g_vt,(offset+cells)/(unsigned)g_cols);
     }
     uint32_t bg=rgb(t->bg),fg=rgb(t->text),accent=rgb(t->accent);
     uint64_t hash=signature(g_in,g_vt.revision*1099511628211ull);
-    hash=signature(prompt_text(),hash);hash^=(uint64_t)g_cur<<32;hash^=(uint64_t)(g_at_prompt+2*g_dead+4*g_view)<<24;
+    hash=signature(prompt_text(),hash);hash^=(uint64_t)g_cur<<32;hash^=(uint64_t)(g_local+2*g_dead+4*g_view)<<24;
     hash^=(uint64_t)bg<<16;hash^=(uint64_t)fg;hash^=(uint64_t)accent<<32;
     hash^=(uint64_t)w<<40;hash^=(uint64_t)h<<48;hash^=(uint64_t)font<<8;hash^=(uint64_t)(size*4);
     if(!g_bitmap_valid || hash!=g_painted_signature) {
@@ -688,8 +705,8 @@ static bool screen_bitmap(void) {
         for(int y=0;y<rows;y++)for(int x=0;x<cols;x++)paint_cell(&rt,x,y,vt_view_cell(&g_vt,y,x,(unsigned)g_view),fg,bg,font,bold,size);
         struct vt_cursor *cursor=&vt_active(&g_vt)->cursor;
         int x=cursor->x,y=cursor->y;
-        if(g_at_prompt && cursor->wrap){x=0;y++;}
-        if(g_at_prompt && !g_view) {
+        if(g_local && cursor->wrap){x=0;y++;}
+        if(g_local && !g_view) {
             overlay_text(&rt,prompt_text(),&x,&y,accent,bg,bold,bold,size);overlay_text(&rt," ",&x,&y,fg,bg,font,bold,size);
             int caret_x=x,caret_y=y;
             for(int i=0;i<g_cur;) {
@@ -698,7 +715,7 @@ static bool screen_bitmap(void) {
             }
             overlay_text(&rt,g_in,&x,&y,fg,bg,font,bold,size);x=caret_x;y=caret_y;
         }
-        if(!g_view && !g_dead && (g_at_prompt || g_vt.cursor_visible))paint_cursor(&rt,x,y,accent);
+        if(!g_view && !g_dead && (g_local || g_vt.cursor_visible))paint_cursor(&rt,x,y,accent);
         cpu_clip_restore(&clip);g_painted_signature=hash;g_bitmap_valid=true;
         g_frames++;probe_refresh();
     }

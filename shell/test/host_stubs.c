@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE   /* DIR, readdir on the host */
 /* Host-build stand-ins for the OS-backed pieces (builtins_os.c and
  * eval_extern.c are target-only: embk syscalls). The pure pipeline is fully
  * testable without them; OS command names simply don't resolve here and
@@ -5,10 +6,31 @@
 #include "builtins/builtins.h"
 #include "eval/eval.h"
 #include <stdio.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 builtin_fn builtin_lookup_os(const char *name) {
     (void)name;
     return NULL;   /* ls/cat/ps/... : not on the host */
+}
+
+const char *builtin_os_name(size_t i) {
+    (void)i;
+    return NULL;
+}
+
+int shell_list_dir(const char *path, void (*each)(void *ctx, const char *name, bool dir), void *ctx) {
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int n = 0;
+    for (struct dirent *de; (de = readdir(d)); n++) {
+        char full[1024];
+        struct stat st;
+        snprintf(full, sizeof full, "%s/%s", path, de->d_name);
+        each(ctx, de->d_name, stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+    }
+    closedir(d);
+    return n;
 }
 
 struct value extern_stage_run(const struct command *cmd, struct value input,

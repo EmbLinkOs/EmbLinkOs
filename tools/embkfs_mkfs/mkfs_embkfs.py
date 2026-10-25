@@ -1299,6 +1299,9 @@ def discover_userland_objects(build_dir="build"):
                   "lex/lex.c", "lex/lex.h",
                   "parse/parse.c", "parse/parse.h",
                   "eval/eval.c", "eval/eval_extern.c", "eval/eval.h",
+                  "eval/exec.c", "eval/exec.h",
+                  "edit/edit.c", "edit/edit.h", "edit/wcwidth.c", "edit/wcwidth.h",
+                  "complete/complete.c", "complete/complete.h",
                   "builtins/builtins.c", "builtins/builtins_os.c",
                   "builtins/builtins.h",
                   "hist/hist.c", "hist/hist.h",
@@ -1330,17 +1333,21 @@ def discover_userland_objects(build_dir="build"):
                         # -- sysinfo.c and embbuild.c #include them, so
                         # declaring the ABI joins the ABI (BUILD.md's rule).
                         ("user/lib/document.h",            b"system/abi/include/document.h"),
-                        ("user/lib/embk_desktop.h",        b"system/abi/include/embk_desktop.h"),
-                        ("user/lib/embk_terminal.h",       b"system/abi/include/embk_terminal.h"),
-                        ("user/lib/embk_child.h",          b"system/abi/include/embk_child.h"),
                         ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
                         ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
-                        ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),
-                        ("user/lib/embk.h",                b"system/abi/include/embk.h"),
-                        ("user/lib/embk_syscall.h",        b"system/abi/include/embk_syscall.h")):
+                        ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h")):
         blob = _read_file(host)
         if blob is not None:
             objects.append((image, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+    # embk.h and EVERY embk_*.h it includes: a program built on the OS includes
+    # embk.h, and embk.h includes the rest (wifi, power, gpu, session, ...).
+    # Listing them by hand fell behind as the ABI grew -- `test embbuild shell`
+    # stopped at a missing embk_wifi.h -- so the whole family is installed.
+    for header in sorted(Path("user/lib").glob("embk*.h")):
+        rel = f"user/lib/{header.name}"
+        blob = _read_file(rel)
+        if blob is not None:
+            objects.append((b"system/abi/include/" + header.name.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
     # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
     # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the

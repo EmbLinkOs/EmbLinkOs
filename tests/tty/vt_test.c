@@ -134,6 +134,16 @@ static void strings_and_keys(void) {
     feed("\033]133;A;cwd=/home/tester\007");CHECK(v.shell_ready && !strcmp(v.directory,"/home/tester"));
     feed("\033]133;C\007");CHECK(!v.shell_ready && v.prompt_serial==2);
     feed("\033c");CHECK(!v.alt && !v.application_cursor && v.cursor_visible && !v.bracketed_paste && !v.history_count);text(0,"");
+    /* Shell integration: A's fields (cwd runs to the end, so it may hold
+     * ';'), D's status, the in-band size report, and the prompt erase. */
+    start(20,6);feed("x\r\n\033]133;A;edit=shell;cwd=/a;b\007$ typed");
+    CHECK(v.shell_ready && v.edit_shell && !strcmp(v.directory,"/a;b") && v.prompt_row==1);
+    feed("\033]133;A;cwd=/plain\007");CHECK(!v.edit_shell && !strcmp(v.directory,"/plain"));
+    feed("\033]133;A;edit=shell;cwd=/\007\033]133;C\007\033]133;D;3\007");CHECK(!v.shell_ready && v.last_status==3);
+    reply_length=0;feed("\033[?2048h");CHECK(v.inband_resize && !strcmp(replies,"\033[48;6;20;0;0t"));
+    start(20,6);feed("out\r\n\033]133;A;edit=shell;cwd=/\007$ long line");vt_prompt_erase(&v);
+    text(1,"$ long line");                       /* reports off: the shell would not redraw */
+    feed("\033[?2048h");vt_prompt_erase(&v);text(0,"out");text(1,"");CHECK(v.primary.cursor.x==0 && v.primary.cursor.y==1);
 }
 static void conceal(void) {
     start(20,3);feed("\033[8msecret\033[28m ok");text(0,"       ok");
