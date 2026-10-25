@@ -3137,6 +3137,26 @@
       "featured": false,
       "milestone": "A real Terminal: the shell owns its line",
       "historical": false
+    },
+    {
+      "id": "161-sh-edit",
+      "phase": "A real Terminal",
+      "title": "sh on the same editor",
+      "caption": "The POSIX sh port edits its line with the native shell's editor: a loop typed one line at a time continues under '...' until done closes it, and Tab completes from sh's builtins and the programs on the system.",
+      "alt": "sh on the same editor in EmbLinkOS",
+      "file": "161-sh-edit.png",
+      "capture_date": "2026-10-25",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; the Terminal, typed into over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "b9482d867dacf5459348a4465e0c6b271c3ea2047a8b73555358fcd05c9d342b",
+      "source_capture": "emblink-edit-ff84tl6l/sh-edit.ppm",
+      "source_sha256": "bb8ddecdd3c49adba4e12c6785973f9c3815abd932c8ab06c721cf91994e1438",
+      "source_commit": "86af90f",
+      "featured": false,
+      "milestone": "A real Terminal: both shells edit their own lines",
+      "historical": false
     }
   ]
 }

@@ -1,6 +1,6 @@
 # Laptop progress captures
 
-160 actual EmbLinkOS captures document the original laptop work, its
+161 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
 interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and the start of a real Terminal. PNG exports preserve
@@ -49,6 +49,12 @@ Enter on an open brace adds a line under a '...' prompt instead of reporting an 
 The Terminal was closed and a new one opened: its shell lists what the first one ran from ~/.local/share/shell/history, and Up recalls the multi-line program whole.
 
 ![History that outlives the window in EmbLinkOS](160-shell-edit-history.png)
+
+### sh on the same editor
+
+With both shells editing their own lines, the Terminal's own line editor is gone: it is a screen. The POSIX sh port edits its line with the native shell's editor: a loop typed one line at a time continues under '...' until done closes it, and Tab completes from sh's builtins and the programs on the system.
+
+![sh on the same editor in EmbLinkOS](161-sh-edit.png)
 
 ## The native shell runs any program
 
