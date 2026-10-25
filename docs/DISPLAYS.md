@@ -65,11 +65,15 @@ measured on the laptop, and each one leaves its evidence on the boot stick.
 
 | Step | What it delivers | State |
 |---|---|---|
-| 1. Capture | `/EMBKDISP.BIN`: a read-only record of the laptop's display, and a decoder | **Built and host-tested; waiting for the laptop's capture** |
-| 2. Reproduce | From the capture: compute the native mode's complete register state and check it against what the firmware programmed | Open |
-| 3. eDP modeset | Disable the firmware pipe and light the panel natively at its native mode | Open |
-| 4. Other modes | Lower resolutions through the pipe scaler; Settings → Displays with keep/revert | Open |
-| 5. External outputs | HDMI (GMBUS EDID, WRPLL, TMDS) and DP over USB-C if the VBT says it is wired | Open |
+| 1. Capture | `/EMBKDISP.BIN`: a read-only record of the laptop's display, and a decoder | Built, host-tested |
+| 2. Arithmetic | Link choice, M/N, HDMI PLL, CDCLK, DDB, watermarks, panel fitter (`intel_config.c`) | Built, checked against hand-worked values |
+| 3. eDP modeset | The whole pipeline programmed natively (`intel_hw.c`), the policy around it (`intel_native.c`) | Built, checked against a register model |
+| 4. Other modes | Lower resolutions on the panel through the pipe scaler, behind Settings → Displays | Built, checked against a register model |
+| 5. External outputs | DP and HDMI enable paths exist in `intel_hw.c`; driving a second output is the multiple-monitor work | Hardware layer built; outputs not yet offered |
+
+None of steps 2-5 has run on Intel silicon yet: QEMU has no Intel display
+engine. The laptop's capture (step 1) and a boot of the stick on the ProBook
+are what turn "checked against a model" into "works on the machine".
 
 ### Step 1: the capture
 
@@ -117,6 +121,55 @@ file, and asserts the capture never writes a register outside those
 protocols. `tests/drivers/intel_capture_decode_test.py` then decodes that
 file and checks every value the simulation holds. Both run from
 `tests/drivers/run.sh`.
+
+### How native modesetting works
+
+At boot the driver reads the VBT from the OpRegion, the panel's DPCD (with
+the eDP 1.4 link-rate table) and EDID over AUX A, the DRAM latencies from
+pcode, and the firmware's live pipe. **When the firmware's mode is already
+the panel's native mode, nothing is reprogrammed** -- the boot keeps the
+firmware's picture, flicker-free. When it is not (a firmware that left
+1024x768 scaled onto a 1920x1080 panel, or nothing lit), the boot sets the
+panel's own mode natively.
+
+Every later change is a real modeset through the gpu_driver hooks Settings →
+Displays already uses (`prepare`, `select`, `release`, `describe`):
+
+- **prepare** allocates a framebuffer in system RAM, maps it into the GGTT at
+  a 256 KiB-aligned range of the aperture that never overlaps the firmware's
+  framebuffer, and clears it through the aperture. Rows are padded to
+  64 bytes, so a 1366-pixel-wide mode works (`gpu_driver.pitch`).
+- **select** computes the full configuration: the panel's native timing on
+  the transcoder, the panel fitter for anything smaller (aspect kept,
+  centred), the link from the panel's capabilities and the VBT's fast-link
+  parameters, the DDB split and watermarks from the pcode latencies. If only
+  the surface changed it is a plane flip; otherwise the pipe is turned off
+  (panel kept powered, so no 500 ms power cycle), and turned on again with
+  link training. **If the new mode fails, the previous one is put back.**
+- **release** clears the GGTT entries and frees the pages, and refuses a
+  framebuffer still on screen.
+- **describe** reports the panel's EDID identity and only the resolutions it
+  can show -- nothing larger than the panel -- with its native mode preferred.
+
+Safety rules: a port's buffer-translation table as the firmware programmed
+it is kept rather than replaced with the built-in one; the firmware's panel
+power-sequencing delays are kept; the brightness the user set survives a
+modeset; DPLL0 (which feeds CDCLK) is never turned off. **Recovery and
+Diagnostics boots never use native modesetting** -- they keep the firmware's
+display, which is the way out if this driver ever fails a machine. The boot
+log says which path it took: `intel-native: the firmware's mode is the
+panel's own; keeping it`, `intel-native: eDP WxH on a WxH panel, R Gbps xL`,
+or why native modesetting declined.
+
+Tests (all in `tests/drivers/run.sh`): `intel_vbt_test.c` (VBT parsing,
+including corrupt and overrunning VBTs), `display_modes_test.c` (EDID mode
+lists), `intel_config_test.c` (the arithmetic, against values worked by hand:
+the 148.5 MHz HDMI PLL, 1080p M/N, every watermark level), `intel_hw_test.c`
+(a register model with a DP sink that demands a particular swing and
+pre-emphasis: values and write ordering for eDP, DP with link fallback, HDMI
+with AVI infoframes, failure undone), and `intel_native_test.c` (inherit,
+prepare/select/release, panel fitter, plane flips, a failed modeset restored,
+boot modesets, a 1366-wide panel).
 
 ## Protocol references
 

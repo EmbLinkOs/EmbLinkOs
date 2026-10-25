@@ -1,7 +1,10 @@
-/* Gen9 display handoff and native PCH PWM. Preserve the firmware's trained
- * link, timings and GTT. This is not a render engine or a general modesetter.
- * Register definitions checked against Intel's Gen9 display layout and Linux
- * 6.12 intel_backlight_regs.h / skl_universal_plane_regs.h. */
+/* Gen9 display: the firmware handoff, native PCH PWM, and the entry to
+ * native modesetting (intel_native.c). The handoff checks that the firmware's
+ * plane really is the boot framebuffer before anything is trusted; native
+ * modesetting then takes over unless this is a Recovery or Diagnostics boot,
+ * which keep the firmware's display as the way out. Register definitions
+ * checked against Intel's Gen9 display layout and Linux 6.12
+ * intel_backlight_regs.h / skl_universal_plane_regs.h. */
 #include "drivers/video/intel_display.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/bus/pci.h"
@@ -10,8 +13,9 @@
 #include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
+#include "drivers/video/intel_native.h"
 
-#define REGS_SIZE 0x100000u
+#define REGS_SIZE INTEL_NATIVE_REGS   /* all of the register half of BAR0: pcode and the GGTT flush live above 1 MiB */
 #define PWM_CTL 0xc8250u
 #define PWM_FREQ 0xc8254u
 #define PWM_DUTY 0xc8258u
@@ -82,6 +86,16 @@ int intel_backlight_set(unsigned percent) {
 }
 static bool get_mode(struct gpu_mode *out) {*out=current;return true;}
 static const struct gpu_driver driver={.name="Intel Gen9 display (firmware mode)",.get_mode=get_mode};
+/* Native: the boot keeps the firmware's mode when it is the panel's own, and
+ * every later change is a real modeset. */
+static bool native_get_mode(struct gpu_mode *out) {
+    struct gpu_mode m;
+    if(intel_native_boot_mode(&m)==1)current=m;
+    *out=current;return true;
+}
+static const struct gpu_driver native_driver={.name="Intel Gen9 display (native)",.get_mode=native_get_mode,
+    .prepare=intel_native_prepare,.select=intel_native_select,.release=intel_native_release,
+    .describe=intel_native_describe,.resource_id=intel_native_resource_id,.pitch=intel_native_pitch};
 const struct gpu_driver *intel_display_probe(void) {
     const struct boot_protocol *bp=boot_protocol_get();
     registers=NULL;pwm_kind=0;
@@ -119,6 +133,14 @@ const struct gpu_driver *intel_display_probe(void) {
         if(intel_backlight_get(&percent))pwm_kind=0;
         kprintf("intel-display: %04x firmware scanout verified, %ux%u, %u pipe(s), PWM %s\n",
             d->device_id,current.width,current.height,matches,pwm_kind?"available":"unavailable");
+        if(boot_recovery_mode()) {
+            kprintf("intel-display: Recovery/Diagnostics boot: the firmware's display is kept, no native modesetting\n");
+            return &driver;
+        }
+        struct intel_native_probe np={d->bus,d->device,d->function,d->device_id,pwm_kind,registers,
+            mmio.address,mmio.size,aperture.address,aperture.size,&current,0};
+        if(!intel_native_init(&np))return &native_driver;
+        kprintf("intel-display: native modesetting unavailable; the firmware's mode stays\n");
         return &driver;
     }
     return NULL;

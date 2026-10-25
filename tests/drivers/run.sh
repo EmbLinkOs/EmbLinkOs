@@ -34,9 +34,14 @@ compile_and_run session tests/drivers/session_test.c
 compile_and_run authentication tests/drivers/auth_test.c
 compile_and_run fileops -DEMBK_FILEOPS_HOST tests/drivers/fileops_test.c user/lib/fileops.c -Wl,--wrap=read,--wrap=write,--wrap=fsync
 compile_and_run intel-display tests/drivers/intel_display_test.c
-compile_and_run intel-capture -DINTEL_CAPTURE_HOST tests/drivers/intel_capture_test.c kernel/drivers/video/intel_dpaux.c kernel/drivers/video/intel_gmbus.c kernel/drivers/video/intel_capture.c
+compile_and_run intel-capture -DINTEL_CAPTURE_HOST -Itests/drivers tests/drivers/intel_capture_test.c kernel/drivers/video/intel_dpaux.c kernel/drivers/video/intel_gmbus.c kernel/drivers/video/intel_capture.c
 INTEL_CAPTURE_OUT="$build_dir/capture.bin" "$build_dir/intel-capture" >/dev/null
 python3 tests/drivers/intel_capture_decode_test.py "$build_dir/capture.bin"
+compile_and_run intel-vbt -Itests/drivers tests/drivers/intel_vbt_test.c kernel/drivers/video/intel_vbt.c kernel/display/edid_modes.c
+compile_and_run display-modes -Itests/drivers tests/drivers/display_modes_test.c kernel/display/edid_modes.c
+compile_and_run intel-config tests/drivers/intel_config_test.c kernel/drivers/video/intel_config.c kernel/display/edid_modes.c
+compile_and_run intel-hw -Itests/drivers tests/drivers/intel_hw_test.c kernel/drivers/video/intel_hw.c kernel/drivers/video/intel_config.c kernel/drivers/video/intel_dpaux.c kernel/display/edid_modes.c
+compile_and_run intel-native -Itests/drivers tests/drivers/intel_native_test.c kernel/drivers/video/intel_native.c kernel/drivers/video/intel_hw.c kernel/drivers/video/intel_config.c kernel/drivers/video/intel_dpaux.c kernel/drivers/video/intel_vbt.c kernel/display/edid_modes.c kernel/display/edid.c
 compile_and_run cpu-power tests/drivers/cpu_power_test.c
 compile_and_run power-policy tests/drivers/policy_test.c
 compile_and_run notifications tests/drivers/notify_test.c

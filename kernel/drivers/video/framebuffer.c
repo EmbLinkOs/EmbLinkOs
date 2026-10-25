@@ -807,13 +807,15 @@ struct fb_surface *fb_prepare_mode(uint32_t w,uint32_t h) {
     const struct gpu_driver *gpu=gpu_active();
     if(!gpu || !gpu->prepare || !gpu->select || !gpu->release ||
        w<640 || h<480 || w>4096 || h>2160 || (uint64_t)w*h>8388608)return NULL;
+    uint32_t pitch=gpu->pitch?gpu->pitch(w):w*4;
+    if(pitch<w*4)return NULL;
     struct fb_surface *s=kcalloc(1,sizeof *s);if(!s)return NULL;
-    s->bytes=(uint64_t)w*h*4;s->allocation=kmalloc(s->bytes+PAGE_SIZE);
+    s->bytes=(uint64_t)pitch*h;s->allocation=kmalloc(s->bytes+PAGE_SIZE);
     if(!s->allocation){kfree(s);return NULL;}
     s->back=(uint8_t *)(((uintptr_t)s->allocation+PAGE_SIZE-1)&~(uintptr_t)(PAGE_SIZE-1));
     memset(s->back,0,s->bytes);
     if(!gpu->prepare(&s->gpu,s->back,s->bytes,w,h)){fb_release_surface(s);return NULL;}
-    if(s->gpu.mode.width!=w || s->gpu.mode.height!=h || s->gpu.mode.pitch!=w*4 ||
+    if(s->gpu.mode.width!=w || s->gpu.mode.height!=h || s->gpu.mode.pitch!=pitch ||
        s->gpu.mode.bpp!=32 || s->gpu.mode.format>FB_FORMAT_BGR) {fb_release_surface(s);return NULL;}
     if(s->gpu.mode.phys_addr) {
         s->front=(uint8_t *)vmm_map_mmio_wc(s->gpu.mode.phys_addr,s->bytes);

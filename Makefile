@@ -199,6 +199,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/video/intel_display.c \
              kernel/drivers/video/intel_mmio.c kernel/drivers/video/intel_dpaux.c \
              kernel/drivers/video/intel_gmbus.c kernel/drivers/video/intel_capture.c \
+             kernel/drivers/video/intel_vbt.c kernel/drivers/video/intel_config.c \
+             kernel/drivers/video/intel_hw.c kernel/drivers/video/intel_native.c kernel/display/edid_modes.c \
              kernel/acpi/display.c kernel/acpi/power.c \
              kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
              kernel/drivers/i2c/designware.c kernel/drivers/i2c/designware_protocol.c \

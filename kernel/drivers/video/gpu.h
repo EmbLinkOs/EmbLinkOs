@@ -61,6 +61,10 @@ struct gpu_driver {
     bool (*copy_rect)(uint32_t dst_x, uint32_t dst_y,
                       uint32_t src_x, uint32_t src_y,
                       uint32_t w, uint32_t h);
+
+    // Optional: the row pitch (bytes) a surface of this width needs. Absent:
+    // width * 4. Intel planes need multiples of 64 bytes, which 1366 * 4 is not.
+    uint32_t (*pitch)(uint32_t width);
 };
 
 // Probe PCI for a supported display device and select the best driver.

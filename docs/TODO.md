@@ -1505,21 +1505,38 @@ done when the laptop shows it, not when a host test passes.
       and a few milliseconds of AUX traffic. Once native modesetting is
       verified it should become something asked for, not something always
       done.
-- [ ] **Step 2, reproduce the firmware's mode** from the capture: CDCLK,
-      DPLL0 link rate, transcoder timings and M/N, DDI buffer translations,
-      plane, DDB and watermarks (from the pcode latencies), panel power
-      delays -- computed by the driver's own code and compared with the
-      registers the firmware programmed.
-- [ ] **Step 3, eDP modeset**: disable the firmware pipe in order, then
-      PLL, DDI, link training over AUX (clock recovery, channel
-      equalisation, the panel's link-rate table), transcoder, plane,
-      watermarks, panel power sequencing and backlight -- native, at the
-      panel's native mode. GGTT-mapped framebuffer of the driver's own.
-- [ ] **Step 4, other modes on the panel** through the pipe scaler, behind
-      the gpu_driver prepare/select/release hooks Settings → Displays uses.
-- [ ] **Step 5, external outputs**: HDMI (GMBUS EDID, WRPLL, HDMI buffer
-      translations, AVI infoframe, hotplug) and DP over USB-C if the VBT
-      lists it.
+- [x] **Step 2, the arithmetic** (`intel_config.c`): DP link choice and
+      fallback, M/N, HDMI WRPLL, CDCLK, DDB split, watermarks from the pcode
+      latencies, panel fitter -- checked against values worked by hand.
+- [x] **Step 3, eDP modeset** (`intel_hw.c`, `intel_native.c`): power wells,
+      CDCLK with the pcode handshake, DPLLs, DDI clocks and buffers, link
+      training (CR/EQ, TPS3, the eDP rate table, fallback), transcoder,
+      plane, DDB and watermarks, panel power sequencing, backlight, GGTT
+      framebuffers. Inherits the firmware's mode when it is the panel's own.
+      Checked against a register model (`intel_hw_test.c`, `intel_native_test.c`).
+- [x] **Step 4, other modes on the panel** through the pipe scaler, behind
+      Settings → Displays, with the previous mode restored when one fails.
+- [ ] **None of it has run on Intel silicon.** QEMU has no Intel display
+      engine. The ProBook's capture and one boot of the stick are the test.
+- [ ] **The built-in DDI buffer translation tables are transcribed from
+      i915** (`intel_trans_dp`, `intel_trans_hdmi` in `intel_hw.c`). A port
+      the firmware programmed keeps the firmware's table, so the eDP panel
+      never depends on them; HDMI and an unlit DP port do. Compare them with
+      the capture's DDI B-D tables once a monitor was lit by the firmware.
+- [ ] **Step 5, external outputs.** The DP and HDMI enable/disable paths
+      exist and are tested; offering them -- hotplug polling, a second pipe,
+      the desktop on two outputs -- is the multiple-monitor item below.
+- [ ] **DP++ adaptors** (HDMI through a level shifter on a DP port): the
+      adaptor's TMDS-output enable over DDC is not written.
+- [ ] **CDCLK's VCO never changes.** eDP rates that need the other VCO
+      (2.16/4.32 Gbps under 8100 MHz, or 1.62/2.7/5.4 under 8640) are vetoed
+      rather than reached by re-clocking DPLL0, which would need every pipe
+      off.
+- [ ] **SAGV is left as the firmware set it.** i915 disables it through pcode
+      when a pipe's watermarks cannot ride out the SAGV block time; this
+      driver does not, so a configuration that needs it could underrun.
+- [ ] **An underrun is only reported** (`intel-native: pipe X underran`),
+      not acted on.
 - [ ] **Multiple monitors**: more than one output in the gpu and compositor
       layers -- per-output framebuffer and mode, a desktop that spans them,
       windows that move between them, Settings arranging them. Verifiable in

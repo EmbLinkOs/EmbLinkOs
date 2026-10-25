@@ -68,7 +68,10 @@ class Regs:
 
 
 # ---- EDID ------------------------------------------------------------------
-def decode_dtd(d):
+def decode_dtd(d, vbt=False):
+    """An EDID detailed timing; vbt=True for VBT block 42's lvds_dvo_timing,
+    whose last byte means something else: bit 7 is NON-interlaced, and the
+    sync polarities are bits 6 (H) and 5 (V)."""
     clock = u16(d, 0) * 10                                  # kHz
     if not clock:
         return None
@@ -81,12 +84,16 @@ def decode_dtd(d):
     vso = (d[10] >> 4) | ((d[11] >> 2) & 3) << 4
     vsw = (d[10] & 0xf) | (d[11] & 3) << 4
     flags = d[17]
+    if vbt:
+        hpos, vpos, inter = bool(flags & 0x40), bool(flags & 0x20), False
+    else:
+        hpos, vpos, inter = bool(flags & 2), bool(flags & 4), bool(flags & 0x80)
     htotal, vtotal = hact + hbl, vact + vbl
     return {
         "clock_khz": clock, "hactive": hact, "hsync_start": hact + hso, "hsync_end": hact + hso + hsw,
         "htotal": htotal, "vactive": vact, "vsync_start": vact + vso, "vsync_end": vact + vso + vsw,
         "vtotal": vtotal, "refresh_hz": round(clock * 1000.0 / (htotal * vtotal), 3) if htotal and vtotal else 0,
-        "hsync_positive": bool(flags & 2), "vsync_positive": bool(flags & 4), "interlaced": bool(flags & 0x80),
+        "hsync_positive": hpos, "vsync_positive": vpos, "interlaced": inter,
         "width_mm": d[12] | (d[14] >> 4) << 8, "height_mm": d[13] | (d[14] & 0xf) << 8,
     }
 
@@ -284,7 +291,7 @@ def decode_vbt(v):
             if len(p) >= base + 9:
                 dvo_off, dvo_size = u16(p, base + 3), p[base + 5]
                 if dvo_size >= 18 and dvo_off + 18 <= len(bdb):
-                    out["lfp_timing"] = decode_dtd(bdb[dvo_off:dvo_off + 18])
+                    out["lfp_timing"] = decode_dtd(bdb[dvo_off:dvo_off + 18], vbt=True)
     return out, blocks
 
 

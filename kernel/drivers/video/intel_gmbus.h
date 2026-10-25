@@ -9,11 +9,13 @@
 #include <stdint.h>
 #include "drivers/video/intel_regs.h"
 
-/* Cannon/Comet Point (CNP/CMP) DDC pins. */
+/* Cannon/Comet Point (CNP/CMP) DDC pins. Pin 3 is the "misc" pair, which the
+ * VBT uses for DDI F, and DDI D is on pin 4 -- i915's cnp_ddc_pin_map calls
+ * both "sic", and so does this. */
 #define GMBUS_PIN_CNP_DDI_B 1u
 #define GMBUS_PIN_CNP_DDI_C 2u
-#define GMBUS_PIN_CNP_DDI_D 3u
-#define GMBUS_PIN_CNP_DDI_F 4u
+#define GMBUS_PIN_CNP_MISC  3u
+#define GMBUS_PIN_CNP_DDI_D 4u
 /* Sunrise/Kaby Point (SPT/KBP) DDC pins. */
 #define GMBUS_PIN_SPT_DDI_C 4u
 #define GMBUS_PIN_SPT_DDI_B 5u
