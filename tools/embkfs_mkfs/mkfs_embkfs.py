@@ -798,7 +798,7 @@ _SYSTEM_BIN = {"sh.elf", "init.elf", "primtest.elf", "shell.elf", "home.elf",
                # never by a user: it is the only program in reach of a session
                # that can read /etc/shadow, so it belongs with the system's
                # own, not among the applications.
-               "authd.elf"}   # -> /system/bin/
+               "authd.elf", "updateworker.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -862,6 +862,8 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf" or name in NOT_AUTO_STAGED:
             continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+        if name in ("pkg.elf", "gitclone.elf", "wget.elf"):
+            objects.append((b"system/bin/" + name.encode(), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         if name == "sh.elf":
             objects.append((b"system/bin/sh", L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
@@ -1363,6 +1365,28 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink.\n\nThis is your home directory.\n"))
+    # OS update trust is an explicit publisher input, never the public dev key.
+    objects.append((b"system/update", L.DT_DIR, L.S_IFDIR | 0o755, None))
+    update_key = os.environ.get("EMBK_UPDATE_KEY")
+    update_source = os.environ.get("EMBK_UPDATE_SOURCE")
+    if bool(update_key) != bool(update_source):
+        raise SystemExit("mkfs: EMBK_UPDATE_KEY and EMBK_UPDATE_SOURCE must be configured together")
+    if update_key:
+        public = open(update_key, "rb").read()
+        if len(public) != 64:
+            raise SystemExit("mkfs: update public key must be raw P-256 X||Y (64 bytes)")
+        source = update_source.encode("ascii")
+        if len(source) > 254 or any(c <= 32 or c >= 127 for c in source):
+            raise SystemExit("mkfs: invalid update source")
+        objects.append((b"system/update/key", L.DT_REG, L.S_IFREG | 0o644, public))
+        objects.append((b"system/update/source", L.DT_REG, L.S_IFREG | 0o644, source + b"\n"))
+        apps_source = os.environ.get("EMBK_UPDATE_APPS_SOURCE")
+        if apps_source:
+            app_url = apps_source.encode("ascii")
+            if not app_url.startswith(b"https://") or len(app_url)>254 or any(c<=32 or c>=127 for c in app_url):
+                raise SystemExit("mkfs: application registry must be a bounded HTTPS URL")
+            objects.append((b"system/update/apps-source", L.DT_REG, L.S_IFREG | 0o644, app_url + b"\n"))
+
     objects.append((b"etc",      L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
     objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))

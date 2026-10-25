@@ -84,6 +84,7 @@
 #define EMBK_SPAWN_ACTION_INHERIT_FD 9    /* src_obj_handle names a parent fd */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
+#define EMBK_SPAWN_SESSION_ADMIN 2u
 #define EMBK_SPAWN_SESSION_LIVE 1u
 #define EMBK_SPAWN_ACTION_NEW_SESSION 8   /* child leads a new session for user `path` */
 
@@ -1887,4 +1888,8 @@ static inline void embk_cond_broadcast(embk_cond *c) {
     (void)embk_futex(&c->seq, EMBK_FUTEX_WAKE, 0x7FFFFFFF);
 }
 
+#include "embk_update.h"
+static inline int embk_update(unsigned op,void *data,uint64_t bytes) {
+    return (int)embk_syscall3(EMBK_SYS_update,op,(uint64_t)(uintptr_t)data,bytes);
+}
 #endif /* __EMBK_H__ */

@@ -226,6 +226,7 @@ uint64_t vmo_reclaim(uint64_t want);
  * `vmo_page_phys` answers "which frame backs this index, if any" WITHOUT
  * faulting or pinning -- what munmap uses to tell a pinned cache page from a
  * private copy-on-write copy it has to free itself. */
+int vmo_check_write(struct vm_object *o);
 uint64_t vmo_wire_page(struct vm_object *o, uint64_t index);
 void     vmo_unwire_page(struct vm_object *o, uint64_t index);
 uint64_t vmo_page_phys(struct vm_object *o, uint64_t index);

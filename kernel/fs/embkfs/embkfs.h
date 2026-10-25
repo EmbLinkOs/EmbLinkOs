@@ -741,6 +741,7 @@ void embkfs_lockstat_reset(void);
  * ONE call, and the volume is usable. EIO if the superblock is fine and the
  * volume behind it is not. */
 int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol);
+int embkfs_mount_readonly(struct embk_block_device *dev,struct embkfs_volume *vol);
 /* The superblock half only: verify it and fill `vol` from it. NOT a usable
  * volume -- for tests that probe superblock acceptance on a live device
  * through a scratch descriptor and must not allocate or sweep on its behalf. */

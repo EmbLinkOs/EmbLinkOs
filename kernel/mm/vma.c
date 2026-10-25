@@ -223,6 +223,13 @@ static bool vm_fault_resolve(struct process *proc, uint64_t addr, bool write, bo
                     (v->file_off + (page - v->start)) / PAGE_SIZE == idx &&
                     vmm_get_phys_in(proc->pml4_phys, page) == already;
         bool copied = false;
+        if(same && already!=shared) {
+            /* mprotect may have removed write access from an existing private
+             * copy. Restore it without ever making a cache frame writable. */
+            if(vmm_protect_in(proc->pml4_phys,page,prot_to_vmm(v->prot))!=0) {
+                spin_unlock(&vma_lock);vmo_put(obj);return false;
+            }
+        }
         if (same && already == shared) {
             uint64_t copy = pmm_alloc_page();
             if (!copy) {
@@ -403,9 +410,18 @@ static struct vm_object *anon_object_for(struct process *proc, uint64_t start, u
 }
 
 int64_t vma_mmap_file(struct process *proc, uint64_t len, uint32_t prot,
-                      uint32_t flags, struct vm_object *obj, uint64_t file_off) {
+                      uint32_t flags, struct vm_object *obj, uint64_t file_off, bool may_write) {
+    if (flags & VMA_NO_SHARED_WRITE) return -EMBK_EINVAL;
+    if (!may_write && (flags & MAP_SHARED)) {
+        if (prot & PROT_WRITE) return -EMBK_EACCES;
+        flags |= VMA_NO_SHARED_WRITE;
+    }
     if (!obj)
         return -EMBK_EINVAL;
+    if ((flags & MAP_SHARED) && (prot & PROT_WRITE)) {
+        int rc = vmo_check_write(obj);
+        if (rc) return rc;
+    }
     /* A mapping is made of PAGES; an unaligned file offset has no page to
      * correspond to. Rounding it silently would map the wrong bytes. */
     if (file_off & (PAGE_SIZE - 1))
@@ -654,6 +670,11 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
             continue;
         if (v->start > covered || (v->flags & VMA_DYING))
             break;                      /* a hole (a mapping being unmapped is one) */
+        if ((prot & PROT_WRITE) && (v->flags & VMA_NO_SHARED_WRITE)) return -EMBK_EACCES;
+        if ((prot & PROT_WRITE) && (v->flags & MAP_SHARED) && v->obj) {
+            int rc = vmo_check_write(v->obj);
+            if (rc) return rc;
+        }
         covered = v->end;
     }
     if (covered < end)
@@ -674,8 +695,10 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
         if (v->end <= addr || v->start >= end || (v->flags & VMA_DYING))
             continue;
 
+        uint64_t effective=vmm_flags;
+        if(v->obj && !v->obj->anon && (v->flags&MAP_PRIVATE))effective&=~VMM_WRITABLE;
         for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE)
-            if (vmm_protect_in(proc->pml4_phys, va, vmm_flags) != 0)
+            if (vmm_protect_in(proc->pml4_phys, va, effective) != 0)
                 /* The VMA says the page is there and the page tables disagree.
                  * That is a kernel bug, not a caller error, and it is worth a
                  * line rather than a silent skip. */

@@ -204,7 +204,7 @@ int vfs_fd_fsync(int fd);    /* push this file's dirty pages to the device NOW *
 /* The page object behind an open fd, with a NEW reference taken for the
  * caller (mmap holds one for the life of the mapping). NULL if the fd is not
  * a cached file -- a pipe, a socket, the console. */
-struct vm_object *vfs_fd_object(int fd);
+int vfs_fd_object(int fd,struct vm_object **out,bool *may_write);
 
 /* Symbolic links, by path. `target` is stored verbatim and never validated --
  * a link may name something that does not exist, which is the normal case in

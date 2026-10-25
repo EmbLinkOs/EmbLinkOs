@@ -26,7 +26,7 @@
  * and check `size` before reading anything new. Never reorder. */
 
 #define BOOT_PROTOCOL_MAGIC    0x4F52504B4E494C45ULL  /* "ELINKPRO" */
-#define BOOT_PROTOCOL_VERSION  3
+#define BOOT_PROTOCOL_VERSION  4
 
 /* Which firmware built this record. The kernel should need this for almost
  * nothing -- if a subsystem starts branching on it, that is a sign the
@@ -102,7 +102,16 @@ struct boot_protocol {
     uint8_t boot_partition_guid[16]; /* +0x58 */
     uint8_t boot_mode;               /* +0x68 BOOT_MODE_* */
     uint8_t _reserved4[7];
-};                           /*  size  0x70                                  */
+    /* v4: a managed OS slot and a separate persistent-data partition.
+     * Zero flags retain legacy boot layout; GUIDs are raw GPT wire bytes. */
+    uint8_t update_root_guid[16];    /* +0x70 */
+    uint8_t update_data_guid[16];    /* +0x80 */
+    uint64_t update_revision;        /* +0x90 */
+    uint64_t update_release;         /* +0x98 */
+    uint32_t update_flags;           /* +0xA0: managed/trial/reverted/recovery */
+    uint8_t update_slot;             /* +0xA4: 0=A, 1=B */
+    uint8_t _reserved5[3];
+};                           /*  size  0xA8                                  */
 
 /* What the firmware's SecureBoot variable said. UNKNOWN is not "off": a BIOS
  * machine has no such variable and neither does a UEFI one whose firmware
@@ -134,8 +143,14 @@ _Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry is 24 bytes");
  * the kernel still boots it; that only works if the kernel knows how short a
  * record is allowed to be. v1 ended at acpi_rsdp. */
 #define BOOT_PROTOCOL_SIZE_V1  0x50
+#define BOOT_PROTOCOL_SIZE_V2  0x58
+#define BOOT_PROTOCOL_SIZE_V3  0x70
+#define BOOT_PROTOCOL_SIZE_V4  0xA8
 
-_Static_assert(sizeof(struct boot_protocol)   == 0x70, "boot_protocol is 0x70");
+_Static_assert(sizeof(struct boot_protocol)   == BOOT_PROTOCOL_SIZE_V4, "boot_protocol v4 size");
+_Static_assert(offsetof(struct boot_protocol,update_root_guid)==0x70,"v4 root offset");
+_Static_assert(offsetof(struct boot_protocol,update_data_guid)==0x80,"v4 data offset");
+_Static_assert(offsetof(struct boot_protocol,update_flags)==0xA0,"v4 flags offset");
 _Static_assert(offsetof(struct boot_protocol, boot_partition_guid) == 0x58, "off");
 _Static_assert(offsetof(struct boot_protocol, boot_mode) == 0x68, "off");
 _Static_assert(offsetof(struct boot_protocol, secure_boot)   == 0x50, "off");
@@ -165,6 +180,7 @@ void boot_protocol_capture(uint64_t phys);
 const struct boot_protocol *boot_protocol_get(void);
 void boot_protocol_dump(void);
 bool boot_recovery_mode(void);
+void boot_protocol_force_recovery(void);
 
 /* Memory map access.
  *

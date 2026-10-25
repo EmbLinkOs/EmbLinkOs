@@ -484,9 +484,18 @@ static struct vm_object *entry_object(struct fd_entry *e)
     return vmo_get(of->vn);          /* same object, one more holder */
 }
 
-struct vm_object *vfs_fd_object(int fd) {
-    struct fd_entry held;if(fd_borrow(fd,&held))return NULL;
-    struct vm_object *o=entry_object(&held);fd_return(&held);return o;
+static bool fd_readable(int flags);
+static bool fd_writable(int flags);
+
+int vfs_fd_object(int fd,struct vm_object **out,bool *may_write) {
+    struct fd_entry held;int rc=fd_borrow(fd,&held);if(rc)return rc;
+    int flags=fd_entry_flags(&held);
+    if(!fd_readable(flags))rc=-EMBK_EACCES;
+    else {
+        *out=entry_object(&held);*may_write=fd_writable(flags);
+        if(!*out)rc=-EMBK_ENODEV;
+    }
+    fd_return(&held);return rc;
 }
 
 int fd_sync_entry(struct fd_entry *e)
@@ -684,6 +693,11 @@ int vfs_open(const char *path, int flags, uint32_t mode)
             return err;
     } else {
         return err;
+    }
+
+    if (fd_writable(flags) && vn.mnt && vn.mnt->ops && vn.mnt->ops->check_write) {
+        err = vn.mnt->ops->check_write(&vn);
+        if (err) return err;
     }
 
     /* O_TRUNC has teeth now (was reserved): shrink to zero through the
@@ -1023,6 +1037,11 @@ int vfs_fd_fstat(int fd,struct vfs_stat *out) {
         return err;
     }
 
+    if (fd_writable(flags) && vn.mnt && vn.mnt->ops && vn.mnt->ops->check_write) {
+        err = vn.mnt->ops->check_write(&vn);
+        if (err) return err;
+    }
+
     /* Same O_TRUNC hook as vfs_open() -- this is the spawn-file-action /
      * redirect path, where a shell's `> file` shape lands. */
     if ((flags & O_TRUNC) && vn.type != VFS_DT_DIR) {
@@ -1119,6 +1138,9 @@ static int vnode_fd_write(struct fd_entry *e,const void *buf,size_t len,size_t *
     if (!fd_writable(fd_entry_flags(e)))return -EMBK_EBADF;
     struct open_file *of=e->u.file.of;
     if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->write)return -EMBK_ENOSYS;
+    if (of->vn.mnt->ops->check_write) {
+        int rc=of->vn.mnt->ops->check_write(&of->vn); if(rc)return rc;
+    }
     if(!len){*out=0;return 0;}
     mutex_lock(&e->shared->io_lock);
     uint64_t start=of->pos,done=0;size_t bytes=0;int rc;

@@ -1,3 +1,4 @@
+#include "update/service.h"
 /* The system call handlers -- 88 of them, and not one is architecture-specific.
  * (Seven more live in kernel/process/debug.c, next to the debugger state they
  * manipulate; they take the same struct sysargs.)
@@ -2288,11 +2289,10 @@ static int64_t sys_mmap(const struct sysargs *a) {
     /* A FILE. The object comes from the descriptor and the mapping holds a
      * reference for its whole life -- so `mmap(fd); close(fd);` keeps working,
      * which is the one behaviour every caller of mmap relies on. */
-    struct vm_object *obj = vfs_fd_object(fd);
-    if (!obj)
-        return -EMBK_ENODEV;          /* a pipe/socket/console has no pages */
+    struct vm_object *obj=NULL;bool may_write=false;
+    int access=vfs_fd_object(fd,&obj,&may_write);if(access)return access;
 
-    int64_t rc = vma_mmap_file(p, len, prot, flags, obj, off);
+    int64_t rc = vma_mmap_file(p, len, prot, flags, obj, off, may_write);
     if (rc < 0)
         vmo_put(obj);                 /* the mapping never took the reference */
     return rc;
@@ -2822,7 +2822,23 @@ static int64_t sys_wifi_request(const struct sysargs *a) {
 #endif
 }
 
+/* The update engine never dereferences userspace and never accepts device
+ * names. Its only write targets come from this boot's validated slot journal. */
+static int64_t sys_update(const struct sysargs *a) {
+    unsigned op=a->arg[0];uint64_t n=a->arg[2];
+    if(n>EMBK_UPDATE_CHUNK)return -EMBK_EINVAL;
+    if(op==EMBK_UPDATE_STATUS && n!=sizeof(struct embk_update_info))return -EMBK_EINVAL;
+    void *buffer=n?kmalloc((size_t)n):NULL;
+    if(n && !buffer)return -EMBK_ENOMEM;
+    int rc=0;
+    if(n && op!=EMBK_UPDATE_STATUS)rc=copy_from_user(buffer,(void *)(uintptr_t)a->arg[1],n)?-EMBK_EFAULT:0;
+    if(!rc)rc=update_service_control(op,buffer,n);
+    if(!rc && op==EMBK_UPDATE_STATUS)rc=copy_to_user((void *)(uintptr_t)a->arg[1],buffer,n)?-EMBK_EFAULT:0;
+    kfree(buffer);return rc;
+}
+
 static syscall_handler_t syscall_table[] = {
+    [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
     [SYS_yield]   = sys_yield_syscall,

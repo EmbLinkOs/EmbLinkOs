@@ -190,4 +190,5 @@ void boot_protocol_dump(void)
     fdt_dump_summary();
 }
 
-bool boot_recovery_mode(void) {return false;}
+bool boot_recovery_mode(void) {return proto.boot_mode==BOOT_MODE_RECOVERY || proto.boot_mode==BOOT_MODE_DIAGNOSTICS;}
+void boot_protocol_force_recovery(void) {proto.boot_mode=BOOT_MODE_RECOVERY;}

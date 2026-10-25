@@ -447,3 +447,22 @@ struct embk_block_device *embk_partition_boot_disk(void) {
     }
     return NULL;
 }
+
+struct embk_block_device *embk_partition_by_guid(const uint8_t guid[16],struct embk_block_device *parent) {
+    if(!guid)return NULL;
+    uint8_t any=0;for(unsigned i=0;i<16;i++)any|=guid[i];if(!any)return NULL;
+    struct embk_block_device *found=NULL;
+    for(unsigned i=0;i<BLOCK_MAX_DEVICES;i++)if(partitions[i].in_use &&
+       (!parent || partitions[i].parent==parent) && !memcmp(partitions[i].guid,guid,16)) {
+        if(found)return NULL;
+        found=&partitions[i].dev;
+    }
+    return found;
+}
+int embk_partition_guid(struct embk_block_device *dev,uint8_t out[16]) {
+    if(!dev || !out)return -EMBK_EINVAL;
+    for(unsigned i=0;i<BLOCK_MAX_DEVICES;i++)if(partitions[i].in_use && &partitions[i].dev==dev) {
+        memcpy(out,partitions[i].guid,16);return 0;
+    }
+    return -EMBK_ENODEV;
+}

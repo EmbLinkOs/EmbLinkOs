@@ -9,7 +9,7 @@
 ; PT_LOAD segments down to their higher-half homes. It MUST be above 1 MB: the
 ; kernel ELF outgrew the low sub-640 KB window (staged at 0x10000 it ran past
 ; 0xA0000, the VGA memory hole, and through the stage2 boot stack at 0x80000).
-; 16 MB is clear of the VGA hole, the final kernel image (~0x100000..~0x200000)
+; 16 MB is clear of the VGA hole, the final kernel image (linked at 32 MB)
 ; and the page tables, and is within the first 1 GB the loader identity-maps.
 %define KERNEL_STAGE_PHYS 0x1000000
 ; Transient stack for stage2 ITSELF (used while parsing/copying the kernel ELF).

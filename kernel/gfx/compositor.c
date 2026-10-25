@@ -1,4 +1,5 @@
 #include "process/session.h"
+#include "include/kstring.h"
 #include "../../user/lib/embk_desktop.h"
 /* kernel/gfx/compositor.c -- the window compositor (see compositor.h). */
 
@@ -2500,4 +2501,17 @@ int compositor_workspace_key(int target,int move) {
     state.workspace=(unsigned)next;spin_unlock(&g_comp_lock);
     if(!pid)return -EMBK_ENOENT;
     return compositor_desktop_control(pid,move?EMBK_DESKTOP_MOVE_FRONT:EMBK_DESKTOP_SWITCH,&state);
+}
+
+/* Boot confirmation observes real desktop and top-strip frames. */
+int compositor_desktop_healthy(void) {
+    int desktop=0,strip=0;
+    spin_lock(&g_comp_lock);
+    for(unsigned i=0;i<sizeof g_wins/sizeof g_wins[0];i++) {
+        __typeof__(g_wins[0]) *w=&g_wins[i];
+        if(!w->used || !w->presented || !w->visible)continue;
+        if(w->desktop)desktop=1;
+        if(!strcmp(w->title,"TopBar"))strip=1;
+    }
+    spin_unlock(&g_comp_lock);return desktop && strip;
 }

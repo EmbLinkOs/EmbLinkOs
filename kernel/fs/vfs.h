@@ -194,6 +194,8 @@ struct vfs_ops {
     int (*sync)(struct vnode *vn);
     int (*rename_noreplace)(struct vnode *,const char *,size_t,
                             struct vnode *,const char *,size_t);
+    /* Reject writes before the page cache can dirty an immutable volume. */
+    int (*check_write)(struct vnode *);
 };
 
 /* ---- a mounted filesystem instance ---------------------------------- */

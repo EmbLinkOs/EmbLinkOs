@@ -12,6 +12,7 @@ struct vm_object;   /* mm/vm_object.h -- a file's pages */
  * vma_lock is a spinlock taken in the fault path with interrupts off. Set in
  * `flags`, above every MAP_* bit; never visible to userland. */
 #define VMA_DYING 0x80000000u
+#define VMA_NO_SHARED_WRITE 0x40000000u /* descriptor authority retained after close */
 
 /* MEMORY MAPPINGS -- mmap()/munmap() and the per-process record of what is
  * mapped where.
@@ -117,7 +118,7 @@ int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
  * page is mapped read-only from the cache and COPIED on the first write, so
  * two processes reading one file share its pages and only a writer pays. */
 int64_t vma_mmap_file(struct process *proc, uint64_t len, uint32_t prot,
-                      uint32_t flags, struct vm_object *obj, uint64_t file_off);
+                      uint32_t flags, struct vm_object *obj, uint64_t file_off, bool may_write);
 
 /* Unmap a whole mapping, or a page-aligned prefix/suffix/middle of one.
  * Returns 0 or -EMBK_*. Unmapping a range that was never mapped is an error,

@@ -291,6 +291,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/crc32c.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
+             kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c \
              kernel/fs/vfs.c \
              kernel/fs/automount.c \
              kernel/fs/ninep.c \
@@ -1187,6 +1188,23 @@ build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
 build/pkg.o: user/tools/pkg/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
+build/updateprobe.o: user/tests/updateprobe/updateprobe.c user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/updateprobe.elf: build/crt0.o build/syscalls.o build/updateprobe.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/updateprobe.o -lc -lgcc -o $@
+
+build/updatectl.o: user/tools/updatectl/updatectl.c user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/updatectl.elf: build/crt0.o build/syscalls.o build/updatectl.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/updatectl.o -lc -lgcc -o $@
+
+build/update_release.o: user/update/release.c user/update/release.h user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/update -Iuser/lib -c $< -o $@
+build/updateworker.o: user/system/updateworker/updateworker.c user/update/release.h user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/update -Iuser/lib/tls -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
+build/updateworker.elf: build/crt0.o build/syscalls.o build/updateworker.o build/update_release.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/updateworker.o build/update_release.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
 # pkg verifies the manifest signature with ECDSA P-256 (tls_ecdsa + tls_bignum).
 PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
             build/tls_sha256.o build/tls_ecdsa.o build/tls_bignum.o
@@ -1614,7 +1632,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/tests/fdprobe/fdprobe.c user/tests/shprobe/shprobe.c user/tests/spawnprobe/spawnprobe.c user/tests/processprobe/processprobe.c user/tests/ttyprobe/ttyprobe.c user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/updateprobe/updateprobe.c user/tools/updatectl/updatectl.c user/system/updateworker/updateworker.c user/tests/fdprobe/fdprobe.c user/tests/shprobe/shprobe.c user/tests/spawnprobe/spawnprobe.c user/tests/processprobe/processprobe.c user/tests/ttyprobe/ttyprobe.c user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
 EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
 EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
@@ -1988,7 +2006,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf build/spawnprobe.elf build/shprobe.elf build/fdprobe.elf build/sh.elf $(if $(PIE_OK),build/pieprobe.elf,) \
+EMBKFS_APPS := build/updateprobe.elf build/updatectl.elf build/updateworker.elf build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf build/spawnprobe.elf build/shprobe.elf build/fdprobe.elf build/sh.elf $(if $(PIE_OK),build/pieprobe.elf,) \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
@@ -2463,7 +2481,7 @@ build/uefi_kernel_hash.h: $(KERNEL_BIN) | $(BUILD)
 	  print('};')" $(KERNEL_BIN) > $@
 	@echo "  kernel sha256 -> $@"
 
-build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h build/uefi_kernel_hash.h | $(BUILD)
+build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h boot/uefi/update_boot.h kernel/boot/boot_protocol.h kernel/update/protocol.h build/uefi_kernel_hash.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
 build/uefi_console.o: boot/uefi/console.c boot/uefi/console.h boot/uefi/uefi.h | $(BUILD)
@@ -2479,8 +2497,14 @@ build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
 build/uefi_sha256.o: kernel/crypto/sha256.c kernel/crypto/sha256.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
+build/uefi_update_boot.o: boot/uefi/update_boot.c boot/uefi/update_boot.h boot/uefi/uefi.h kernel/update/protocol.h kernel/boot/boot_protocol.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
+build/uefi_update_protocol.o: kernel/update/protocol.c kernel/update/protocol.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
+
 UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
-            build/uefi_menu.o build/uefi_sha256.o build/uefi_kernel_blob.o
+            build/uefi_menu.o build/uefi_sha256.o build/uefi_kernel_blob.o \
+            build/uefi_update_boot.o build/uefi_update_protocol.o
 
 # Forward link options explicitly: bare-metal GCC does not pass its -shared
 # driver flag through like a hosted GCC. Bind local globals and retain separate
@@ -3552,3 +3576,18 @@ process-compat-test: | $(BUILD)
 	$(BUILD)/pipe_host_test
 	python3 tools/check_native_abi.py
 	python3 tests/tty/sdk_staging.py
+
+# Shared publisher/firmware journal and signed release parser checks.
+update-test:
+	python3 tests/update/run.py
+.PHONY: update-test
+
+# A managed release always pairs the newly-built kernel's EFI loader with its
+# userspace filesystem. `images` alone does not produce the UEFI kernel blob.
+UPDATE_RELEASE ?= 1
+UPDATE_VERSION ?= 0.1.0
+UPDATE_DATA_MIB ?= 128
+managed-uefi.img: build/BOOTX64.EFI embkfs.img tools/update/mkdisk.py tools/update/protocol.py tools/mkuefidisk.py
+	python3 tools/update/mkdisk.py build/BOOTX64.EFI embkfs.img $@ --release $(UPDATE_RELEASE) --version $(UPDATE_VERSION) --data-mib $(UPDATE_DATA_MIB)
+managed-image: managed-uefi.img
+.PHONY: managed-image

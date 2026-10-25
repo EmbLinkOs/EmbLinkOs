@@ -20,7 +20,7 @@
  * each mount's root vnode to point back at its own slot (root.mnt = &slot),
  * so the slot's address has to stay valid for the life of the kernel. A static
  * array in BSS gives exactly that — fixed addresses, filled in place. */
-#define VFS_MAX_MOUNTS 8
+#define VFS_MAX_MOUNTS 32
 static struct vfs_mount g_mounts[VFS_MAX_MOUNTS];
 
 /* EmbDBG v2 VFS Explorer. Mounts are immutable after single-threaded boot in v1

@@ -570,6 +570,7 @@ struct process {
     uint32_t session_id;
     char     session_user[32];
     bool     session_leader;
+    bool session_admin;    /* set by trusted init after account authentication */
     bool session_live;     /* spawned with NEW_SESSION: its death ends the session */
 
     /* THE BASENAME OF THE BINARY THIS PROCESS WAS CREATED FROM, and nothing

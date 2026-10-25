@@ -4,6 +4,7 @@
 #include <string.h>
 #include <zlib.h>
 #include "block/install.h"
+#include "update/protocol.h"
 #include "include/errno.h"
 #define SECTORS 8192u
 struct disk {unsigned char *bytes;unsigned writes;int fail,corrupt;};
@@ -40,6 +41,28 @@ static void fixture(struct disk *s) {
     for(unsigned i=0;i<152;i++){sum^=sb[i];for(unsigned j=0;j<8;j++)sum=(sum>>1)^(0x82f63b78u&(0u-(sum&1)));}
     w64(sb+152,~sum);memcpy(s->bytes+3496*512,sb,512);
 }
+static void managed_fixture(struct disk *s) {
+    fixture(s);unsigned char *h=s->bytes+512,*e=s->bytes+1024;
+    memcpy(e+256,e+128,128);memcpy(e+384,e+128,128);
+    e[272]=3;e[400]=4;
+    w64(e+168,2815);w64(e+256+32,2816);w64(e+256+40,3071);
+    w64(e+384+32,3072);w64(e+384+40,4015);
+    memcpy(s->bytes+(3072+128)*512,s->bytes+(2560+128)*512,512);
+    memcpy(s->bytes+(4016-8)*512,s->bytes+(2560+128)*512,512);
+    unsigned char *esp=s->bytes+2048*512;memcpy(esp+3,"EMBUPD1 ",8);esp[14]=128;esp[15]=0;
+    struct update_state state={0};state.revision=1;state.active=0;
+    state.pending=state.previous=UPDATE_NO_SLOT;
+    memcpy(state.esp_guid,e+16,16);memcpy(state.data_guid,e+384+16,16);
+    memcpy(state.slot[0].root_guid,e+128+16,16);memcpy(state.slot[1].root_guid,e+256+16,16);
+    state.slot[0].release=1;state.slot[0].root_bytes=256*512;state.slot[0].efi_bytes=512;
+    strcpy(state.slot[0].version,"1.0.0");memset(state.slot[0].efi_sha256,1,32);memset(state.slot[0].root_sha256,2,32);
+    assert(!update_state_encode(&state,esp+UPDATE_CONTROL0_OFFSET));
+    assert(!update_state_encode(&state,esp+UPDATE_CONTROL1_OFFSET));
+    assert(!update_state_encode(&state,esp+UPDATE_FACTORY_OFFSET));
+    w32(h+88,crc32(0,e,16384));seal(h);memcpy(s->bytes+4063*512,e,16384);
+    unsigned char *backup=s->bytes+4095*512;memcpy(backup,h,512);
+    w64(backup+24,4095);w64(backup+32,1);w64(backup+72,4063);seal(backup);
+}
 int main(void) {
     struct disk s={calloc(SECTORS,512),0,0,0},d={calloc(SECTORS,512),0,0,0};assert(s.bytes&&d.bytes);
     struct install_io src={&s,4096,rd,wr,flush},dst={&d,8192,rd,wr,flush};
@@ -72,6 +95,19 @@ int main(void) {
     assert(r64(d.bytes+8191*512+72)==8159 && !memcmp(d.bytes+8159*512,d.bytes+1024,16384));
     assert(!memcmp(d.bytes+1040,ids+16,16) && !memcmp(d.bytes+1168,ids+32,16));
     assert(!memcmp(d.bytes+440,ids+48,4));
+    managed_fixture(&s);d.writes=0;assert(!install_prepare(&src,&dst,p));assert(p->managed && p->root_start==3072);
+    assert(!install_copy(&src,&dst,p,ids,b,v,65536,NULL));
+    assert(!memcmp(s.bytes+2560*512,d.bytes+2560*512,512*512)); /* both OS slots unchanged */
+    assert(r64(d.bytes+1024+128+40)==2815 && r64(d.bytes+1024+256+40)==3071);
+    assert(r64(d.bytes+1024+384+40)>4015);
+    struct update_state state;unsigned char *record=d.bytes+2048*512+UPDATE_CONTROL0_OFFSET;
+    assert(!update_state_decode(record,512,&state));
+    assert(!memcmp(state.esp_guid,d.bytes+1040,16) && !memcmp(state.data_guid,d.bytes+1024+384+16,16));
+    assert(!memcmp(state.slot[0].root_guid,d.bytes+1024+128+16,16) && !memcmp(state.slot[1].root_guid,d.bytes+1024+256+16,16));
+    assert(!memcmp(record,d.bytes+2048*512+UPDATE_CONTROL1_OFFSET,512) && !memcmp(record,d.bytes+2048*512+UPDATE_FACTORY_OFFSET,512));
+    assert(memcmp(state.slot[0].root_guid,state.slot[1].root_guid,16));
+    managed_fixture(&s);s.bytes[2048*512+UPDATE_CONTROL0_OFFSET]^=1;s.bytes[2048*512+UPDATE_CONTROL1_OFFSET]^=1;
+    assert(install_prepare(&src,&dst,p)<0);
     free(s.bytes);free(d.bytes);free(p);free(b);free(v);
-    puts("installer: GPT/backup bounds, source protection, stale plan, failed writes, verified clone and relocated GPT OK");return 0;
+    puts("installer: GPT/backup bounds, source protection, stale plan, failed writes, verified legacy/managed clones, independent slot/data identities and relocated GPT OK");return 0;
 }

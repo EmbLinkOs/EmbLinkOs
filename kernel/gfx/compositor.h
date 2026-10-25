@@ -234,4 +234,5 @@ void    compositor_pointer_tick(void);
 
 void compositor_session_changed(void);
 
+int compositor_desktop_healthy(void);
 #endif /* __GFX_COMPOSITOR_H__ */

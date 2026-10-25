@@ -1,4 +1,5 @@
 #include "block/install.h"
+#include "update/protocol.h"
 #include "include/errno.h"
 #include "include/kstring.h"
 
@@ -66,13 +67,40 @@ int install_prepare(const struct install_io *src,const struct install_io *dst,st
             return -EMBK_EINVAL;
         if(!memcmp(e,esp,16) && !p->esp_sectors) {p->esp_start=first;p->esp_sectors=last-first+1;}
         else if(!memcmp(e,data,16) && !p->root_sectors) {p->root_start=first;p->root_sectors=last-first+1;}
-        else return -EMBK_EINVAL;
+        else if(memcmp(e,data,16) || used>=4)return -EMBK_EINVAL;
         if(last+1>p->copy_end) p->copy_end=last+1;
         used++;
     }
-    if(used!=2 || !p->esp_sectors || !p->root_sectors ||
-       !(p->esp_start+p->esp_sectors<=p->root_start || p->root_start+p->root_sectors<=p->esp_start))
-        return -EMBK_EINVAL;
+    if(used==4) {
+        /* Managed images have a deliberately fixed order: ESP, OS-A, OS-B,
+         * Data. Only Data grows; neither signed OS partition is rewritten. */
+        for(unsigned i=0;i<4;i++) {
+            const uint8_t *entry=p->entries+i*128;
+            if(memcmp(entry,i?data:esp,16))return -EMBK_EINVAL;
+            for(unsigned j=0;j<i;j++) {
+                const uint8_t *other=p->entries+j*128;
+                if(!(r64(entry+32)>r64(other+40) || r64(other+32)>r64(entry+40)) ||
+                   !memcmp(entry+16,other+16,16))return -EMBK_EINVAL;
+            }
+        }
+        p->managed=1;p->root_start=r64(p->entries+3*128+32);
+        p->root_sectors=r64(p->entries+3*128+40)-p->root_start+1;
+        if(src->read(src->ctx,p->esp_start,1,backup) || memcmp(backup+3,"EMBUPD1 ",8) ||
+           (backup[14]|(unsigned)backup[15]<<8)<128)return -EMBK_EINVAL;
+        uint8_t records[2][512];struct update_state state;
+        if(src->read(src->ctx,p->esp_start+UPDATE_CONTROL0_OFFSET/512,1,records[0]) ||
+           src->read(src->ctx,p->esp_start+UPDATE_CONTROL1_OFFSET/512,1,records[1]) ||
+           update_state_choose(records[0],records[1],&state)<0 ||
+           state.pending!=UPDATE_NO_SLOT || (state.flags&UPDATE_WRITING) ||
+           memcmp(state.esp_guid,p->entries+16,16) || memcmp(state.data_guid,p->entries+3*128+16,16) ||
+           memcmp(state.slot[0].root_guid,p->entries+128+16,16) ||
+           memcmp(state.slot[1].root_guid,p->entries+256+16,16))return -EMBK_EINVAL;
+        /* A freshly installed copy starts at its confirmed source release. */
+        state.revision=1;state.previous=UPDATE_NO_SLOT;state.flags=0;state.last_error=0;
+        if(update_state_encode(&state,p->update_record))return -EMBK_EINVAL;
+    } else if(used!=2)return -EMBK_EINVAL;
+    if(!p->esp_sectors || !p->root_sectors ||
+       !(p->esp_start+p->esp_sectors<=p->root_start || p->root_start+p->root_sectors<=p->esp_start))return -EMBK_EINVAL;
     /* Only the standard trailing root layout can grow into the target's free
      * space. Validate both filesystem superblocks before promising any writes. */
     if(p->root_start<p->esp_start+p->esp_sectors || p->root_sectors<256 ||
@@ -134,9 +162,27 @@ int install_copy(const struct install_io *src,const struct install_io *dst,struc
     w64(b+152,crc32c(b,152));
     if(checked_write(dst,p->root_start+p->target_root_sectors-spb,spb,b,verify) ||
        checked_write(dst,p->root_start+128,spb,b,verify))return -EMBK_EIO;
-    unsigned idx=0;
+    unsigned idx=0;uint8_t identities[4][16];
+    memcpy(identities[0],ids+16,16);memcpy(identities[1],ids+32,16);
+    memcpy(identities[2],ids+32,16);identities[2][15]^=0x40;
+    memcpy(identities[3],ids+32,16);identities[3][15]^=0x80;
+    if(p->managed) {
+        for(unsigned i=0;i<4;i++) {
+            if(zero(identities[i],16))return -EMBK_EINVAL;
+            for(unsigned j=0;j<i;j++)if(!memcmp(identities[i],identities[j],16))return -EMBK_EINVAL;
+        }
+        struct update_state state;if(update_state_decode(p->update_record,512,&state))return -EMBK_EINVAL;
+        memcpy(state.esp_guid,identities[0],16);memcpy(state.slot[0].root_guid,identities[1],16);
+        memcpy(state.slot[1].root_guid,identities[2],16);memcpy(state.data_guid,identities[3],16);
+        if(update_state_encode(&state,p->update_record))return -EMBK_EINVAL;
+        const unsigned offsets[]={UPDATE_CONTROL0_OFFSET,UPDATE_CONTROL1_OFFSET,UPDATE_FACTORY_OFFSET};
+        for(unsigned i=0;i<3;i++) {
+            memset(b,0,4096);memcpy(b,p->update_record,512);
+            if(checked_write(dst,p->esp_start+offsets[i]/512,8,b,verify))return -EMBK_EIO;
+        }
+    }
     for(unsigned i=0;i<128;i++) if(!zero(p->entries+i*128,16)) {
-        memcpy(p->entries+i*128+16,ids+16+16*idx++,16);
+        memcpy(p->entries+i*128+16,identities[idx++],16);
         if(r64(p->entries+i*128+32)==p->root_start)
             w64(p->entries+i*128+40,p->root_start+p->target_root_sectors-1);
     }

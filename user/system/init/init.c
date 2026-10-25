@@ -267,10 +267,28 @@ static int64_t spawn_authd(const char *user) {
     return embk_spawn(AUTHD, argv_, acts, 1);
 }
 
+/* Keep one update service alive independently of login/logout. Each spawn
+ * is attenuated before it runs; no session receives the worker's authority. */
+static void update_supervisor(long unused) {
+    (void)unused;
+    for(;;) {
+        struct embk_spawn_file_action caps;
+        embk_action_set_caps(&caps,EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM)|EMBK_CAP_BIT(EMBK_CAP_NETWORK)|EMBK_CAP_BIT(EMBK_CAP_SESSION));
+        char *argv[]={"/system/bin/updateworker.elf",NULL};
+        int handle=(int)embk_spawn(argv[0],argv,&caps,1);
+        if(handle>=0)(void)embk_wait(handle);
+        else log_line("init: update worker could not start; retrying\n");
+        embk_sleep_ms(2000);
+    }
+}
+
 void _start(long argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     log_line("init: up -- root of EmbLink userspace authority\n");
     ns_selfcheck();
+    struct embk_update_info update_info;
+    if(!embk_update(EMBK_UPDATE_STATUS,&update_info,sizeof update_info) && (update_info.flags&EMBK_UPDATE_MANAGED))
+        (void)embk_thread_create(update_supervisor,0);
 
     int autologin = embk_syscall0(EMBK_SYS_boot_mode)==3;     /* cleared by logout */
 
@@ -342,7 +360,7 @@ void _start(long argc, char **argv, char **envp) {
         char nsdesc[192];
         int is_admin = user_is_admin(user);
         int snacts = load_user_profile(user, is_admin, sacts, NS_ACTS_MAX - 1, nsdesc, sizeof nsdesc);
-        embk_action_new_session(&sacts[snacts], user);sacts[snacts++].flags=autologin?EMBK_SPAWN_SESSION_LIVE:0;
+        embk_action_new_session(&sacts[snacts], user);sacts[snacts++].flags=(autologin?EMBK_SPAWN_SESSION_LIVE:0)|(is_admin?EMBK_SPAWN_SESSION_ADMIN:0);
 
         char home[80], env_user[48], env_home[96], env_pwd[96];
         char *p = home;

@@ -347,6 +347,7 @@
 #define SYS_pipe_fds 150
 #define SYS_spawn_cwd 151
 #define SYS_spawn_pid 152
+#define SYS_update 153
 
 
 

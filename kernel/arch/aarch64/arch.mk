@@ -138,6 +138,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/module/module.c \
                   kernel/module/exports.c \
                   kernel/fs/fd.c \
+                  kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c \
                   kernel/fs/namespace.c \
                   kernel/fs/epfs.c \
                   kernel/fs/embkfs/embkfs.c \
