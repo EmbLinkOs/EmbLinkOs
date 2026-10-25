@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-137 actual EmbLinkOS captures document the original laptop work, its
+145 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades and live display configuration. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration and several monitors. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,59 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: live display configuration
+## Latest: several monitors
+
+The desktop spans every monitor in use. Each monitor shows its own rectangle of one surface and its own wallpaper, and the primary carries the menu bar and the dock. A monitor plugged in extends the desktop. Settings arranges the displays through the same keep-or-revert trial as a resolution change, and a kept arrangement returns for the same monitors after login. These are QEMU captures of a two-head virtio-vga (each head captured separately); native Intel external monitors have only met a register model. See [DISPLAYS.md](../../DISPLAYS.md).
+
+### A second monitor extends the desktop
+
+The second VirtIO head is connected at login and the kernel extends the desktop to 2304 × 800. The 1280 × 800 primary keeps the menu bar, the dock and the desktop icons.
+
+![A second monitor extends the desktop in EmbLinkOS](138-multimonitor-extended.png)
+
+### The second monitor shows its own wallpaper
+
+The 1024 × 768 head to the right shows a whole wallpaper of its own, not a slice of one picture stretched across both.
+
+![The second monitor shows its own wallpaper in EmbLinkOS](139-multimonitor-second-wallpaper.png)
+
+### Fill on the monitor the window is on
+
+The Editor was dragged across the seam with its unsaved text. Fill from the zoom light covers the second monitor exactly.
+
+![Fill on the monitor the window is on in EmbLinkOS](140-multimonitor-window-filled.png)
+
+### Arranging the displays
+
+With two monitors connected, Settings → Displays draws them to scale: Extend or Mirror, and for the selected display Use this display, Resolution, Position and Make Primary.
+
+![Arranging the displays in EmbLinkOS](141-multimonitor-settings.png)
+
+### The second monitor moved to the left
+
+After Apply Arrangement and Keep Changes, the second monitor is left of the panel. The panel keeps the menu bar, and the preferences are saved.
+
+![The second monitor moved to the left in EmbLinkOS](142-multimonitor-arranged-left.png)
+
+### Make Primary moves the menu bar and the dock
+
+The second monitor is now primary: the menu bar and the dock are on it. The Editor kept its place and its text.
+
+![Make Primary moves the menu bar and the dock in EmbLinkOS](143-multimonitor-primary-moved.png)
+
+### A mirror trial
+
+Mirror shows one picture on both monitors at 1024 × 768, the size both can show, with the 30-second confirmation. Revert puts the extended arrangement back.
+
+![A mirror trial in EmbLinkOS](144-multimonitor-mirror-trial.png)
+
+### The arrangement returns after a cold boot
+
+After a new UEFI/NVMe boot and password login, the desktop restores the kept arrangement for these two monitors and confirms it once it has drawn a frame of it.
+
+![The arrangement returns after a cold boot in EmbLinkOS](145-multimonitor-restored.png)
+
+## Live display configuration
 
 Settings changes the actual VirtIO/Bochs scanout, asks for confirmation and
 retains the previous framebuffer for rollback. Timeout, closing the requester
