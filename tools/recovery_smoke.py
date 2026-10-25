@@ -20,7 +20,8 @@ def digest(path):
     return h.hexdigest()
 
 class Guest:
-    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None):
+    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None,graphics="virtio"):
+        if graphics not in ("virtio","bochs"):raise ValueError("unsupported graphics fixture")
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
         shutil.copyfile(firmware/'OVMF_VARS_4M.fd',out/'vars.fd')
@@ -30,6 +31,8 @@ class Guest:
              '-drive',f'if=pflash,format=raw,file={out / "vars.fd"}',
              '-serial',f'unix:{out / "serial.sock"},server=on,wait=off',
              '-qmp',f'unix:{out / "qmp.sock"},server=on,wait=off','-no-reboot','-no-shutdown']
+        if graphics=="bochs":
+            at=cmd.index('-vga');cmd[at:at+4]=['-vga','std']
         if boot_nvme:
             cmd+=['-drive',f'format=raw,file={disk},if=none,id=bootdisk',
                   '-device','nvme,drive=bootdisk,serial=EMBLINKBOOT']

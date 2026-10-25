@@ -38,6 +38,8 @@ compile_and_run cpu-power tests/drivers/cpu_power_test.c
 compile_and_run power-policy tests/drivers/policy_test.c
 compile_and_run notifications tests/drivers/notify_test.c
 compile_and_run display-mode tests/drivers/display_mode_test.c
+compile_and_run display-edid tests/drivers/display_edid_test.c kernel/display/edid.c
+compile_and_run display-control tests/drivers/display_control_test.c kernel/display/edid.c
 compile_and_run live-boot tests/drivers/live_boot_test.c
 compile_and_run recovery-check tests/drivers/recovery_check_test.c
 compile_and_run session-profile -Iuser/lib tests/drivers/session_profile_test.c

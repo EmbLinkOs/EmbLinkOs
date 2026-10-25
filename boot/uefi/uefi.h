@@ -275,7 +275,7 @@ typedef struct {
     void              *CloseProtocol;
     void              *OpenProtocolInformation;
     void              *ProtocolsPerHandle;
-    void              *LocateHandleBuffer;
+    EFI_STATUS (EFIAPI *LocateHandleBuffer)(unsigned,EFI_GUID *,void *,UINTN *,EFI_HANDLE **);
     EFI_LOCATE_PROTOCOL LocateProtocol;
     /* ... remaining members unused ... */
 } EFI_BOOT_SERVICES;

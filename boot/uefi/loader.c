@@ -293,8 +293,22 @@ static void fill_framebuffer(struct boot_protocol *bp) {
     unsigned preferred_w=0,preferred_h=0;
     EFI_GUID edid_guid={0xbd8c1056,0x9f36,0x44ec,{0x92,0xa8,0xa6,0x33,0x7f,0x81,0x79,0x86}};
     struct {uint32_t size;uint8_t *bytes;} *edid=0;
-    if(!EFI_ERROR(ST->BootServices->LocateProtocol(&edid_guid,0,(void **)&edid)) && edid)
-        edid_preferred(edid->bytes,edid->size,&preferred_w,&preferred_h);
+    /* LocateProtocol can return EDID for another output. Match the selected
+     * GOP interface to its handle before reading its active EDID protocol. */
+    EFI_HANDLE *handles=0;UINTN count=0;
+    if(!EFI_ERROR(ST->BootServices->LocateHandleBuffer(2,&gop_guid,0,&count,&handles)) && handles) {
+        for(UINTN i=0;i<count;i++) {
+            EFI_GRAPHICS_OUTPUT_PROTOCOL *candidate=0;
+            if(EFI_ERROR(ST->BootServices->HandleProtocol(handles[i],&gop_guid,(void **)&candidate)) || candidate!=gop)continue;
+            if(!EFI_ERROR(ST->BootServices->HandleProtocol(handles[i],&edid_guid,(void **)&edid)) && edid && edid->bytes && edid->size>=128) {
+                /* The kernel validates the copied block independently. */
+                memcpy(bp->display_edid,edid->bytes,128);bp->display_edid_size=128;
+                edid_preferred(edid->bytes,edid->size,&preferred_w,&preferred_h);
+            }
+            break;
+        }
+        ST->BootServices->FreePool(handles);
+    }
     if(!gop->Mode || !gop->Mode->Info)con_die("GOP has no active mode");
     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = gop->Mode->Info;
     uint32_t selected=gop->Mode->Mode;

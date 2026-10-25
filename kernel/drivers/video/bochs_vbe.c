@@ -6,6 +6,7 @@
 // kernel pick its own resolution at runtime; the LFB itself is PCI BAR0.
 
 #include "drivers/video/gpu.h"
+#include "../../../user/lib/embk_monitor.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/bus/pci.h"
 #include "drivers/char/serial.h"
@@ -73,7 +74,10 @@ static bool bochs_modeset(uint32_t w, uint32_t h, uint32_t bpp) {
     dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
 
     if (dispi_read(VBE_DISPI_INDEX_XRES) != w ||
-        dispi_read(VBE_DISPI_INDEX_YRES) != h) {
+        dispi_read(VBE_DISPI_INDEX_YRES) != h ||
+        dispi_read(VBE_DISPI_INDEX_BPP) != bpp ||
+        dispi_read(VBE_DISPI_INDEX_VIRT_WIDTH) != w ||
+        !(dispi_read(VBE_DISPI_INDEX_ENABLE) & VBE_DISPI_ENABLED)) {
         kprintf("bochs: modeset %ux%u rejected by device\n",
                 (unsigned int)w, (unsigned int)h);
         return false;
@@ -108,8 +112,30 @@ static bool bochs_set_mode(uint32_t w, uint32_t h, struct gpu_mode *out) {
     return true;
 }
 
+static bool bochs_prepare(struct gpu_target *out,void *buffer,uint64_t bytes,uint32_t w,uint32_t h) {
+    (void)buffer;if(bytes!=(uint64_t)w*h*4 || bytes>g_bochs_lfb_size)return false;
+    out->mode=(struct gpu_mode){g_bochs_lfb_phys,w,h,w*4,32,FB_FORMAT_BGR};return true;
+}
+static bool bochs_select(const struct gpu_target *target) {
+    struct gpu_mode old=g_bochs_mode;
+    if(bochs_modeset(target->mode.width,target->mode.height,32))return true;
+    /* A rejected DISPI write may already have disabled scanout. Restore it. */
+    if(old.width && !bochs_modeset(old.width,old.height,old.bpp))g_bochs_mode_set=false;
+    return false;
+}
+static bool bochs_release(const struct gpu_target *target) {(void)target;return true;}
+static void bochs_describe(struct embk_monitor_info *info) {
+    info->flags|=EMBK_MONITOR_CONNECTED;
+    if(g_bochs_mode_set)info->flags|=EMBK_MONITOR_MODESET;
+    for(unsigned i=0;i<info->mode_count;) {
+        if((uint64_t)info->modes[i].width*info->modes[i].height*4>g_bochs_lfb_size) {
+            for(unsigned j=i+1;j<info->mode_count;j++)info->modes[j-1]=info->modes[j];info->mode_count--;
+        }else i++;
+    }
+}
 static const struct gpu_driver g_bochs_driver = {
     .name = "bochs-dispi",
+    .prepare=bochs_prepare,.select=bochs_select,.release=bochs_release,.describe=bochs_describe,
     .get_mode = bochs_get_mode,
     .set_mode = bochs_set_mode,
     // Plain LFB device: no flush/accel hooks needed, memory writes are live.

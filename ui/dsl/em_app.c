@@ -265,6 +265,13 @@ static void appearance_start(const struct oscfg *initial) {
 }
 static int g_shell_bottom,g_shell_height=34;
 void em_shell_band(int bottom,int height){g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
+static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
+    if(!old)return NULL;
+    uint32_t *next=realloc(old,(size_t)w*h*4);
+    if(!next)free(old); /* Direct rendering is safer than an undersized buffer. */
+    return next;
+}
+
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;
@@ -424,6 +431,8 @@ int em_app_run(const EmApp *app) {
     int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
     uint64_t last_app_tick = 0;
+    uint64_t screen_next=0;
+    int display_pending=0;
     struct cadence cad; memset(&cad, 0, sizeof cad);
 
     for (;;) {
@@ -448,6 +457,31 @@ int em_app_run(const EmApp *app) {
         struct embk_win_input in;
         embk_win_input(&in);
 
+        if(em_now_ms()>=screen_next) {
+            screen_next=em_now_ms()+200;uint32_t nsw=0,nsh=0;embk_screen_size(&nsw,&nsh);
+            if(nsw && nsh && (display_pending || nsw!=sw || nsh!=sh)) {
+                display_pending=0;
+                sw=nsw;sh=nsh;
+                minw=app->min_size.w>0?app->min_size.w:200;
+                minh=app->min_size.h>0?app->min_size.h:160;
+                if(minw>(int)sw-inset_l-inset_r)minw=(int)sw-inset_l-inset_r;
+                if(minh>(int)sh-inset_t-inset_b-bar)minh=(int)sh-inset_t-inset_b-bar;
+                if(app->fullscreen || app->follow_display_width) {
+                    int nw=(int)sw,nh=app->fullscreen?(int)sh:menu_expanded==2?(int)sh:winh;
+                    if(nh>(int)sh)nh=(int)sh;
+                    uint32_t *npx=NULL;
+                    if(embk_win_resize(win,nw,nh,(void **)&npx)>=0 && npx) {
+                        px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);
+                        rt.pixels=back?back:px;rt.width=nw;rt.height=nh;rt.stride=nw*4;
+                        g_viewport_w=nw;g_viewport_h=nh;em_set_viewport(nw,nh);
+                        int ny=app->follow_display_width && g_shell_bottom && !menu_expanded?(int)sh-nh:0;
+                        embk_win_place(win,0,ny);if(chromeless)em_window_bind(win,0,ny);
+                        scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());em_structure_changed();em_request_frame();
+                    }else display_pending=1;
+                }else geometry_pending=1;
+            }
+        }
+
         /* WHERE THE WINDOW GOES, from the zoom light's board (the toolkit
          * posts a layout during the view) or from the compositor's own
          * title-bar action. Both arrive here and take the SAME path, so the
@@ -458,6 +492,7 @@ int em_app_run(const EmApp *app) {
          * the new one. */
         EmWinLayout want = EmWinNormal;
         int have_want = em_window_take_layout(&want);
+        int passive_layout=0;
         if(drag_pending && !(in.buttons&EMBK_MOUSE_LEFT)) {
             drag_pending=0;
             if(appearance.snap && app->resize==Resizable && chromeless && !have_want) {
@@ -503,7 +538,7 @@ int em_app_run(const EmApp *app) {
             int rc=embk_desktop_control(EMBK_DESKTOP_GET,&area);
             if(rc<0 || (area.left==(unsigned)inset_l && area.top==(unsigned)inset_t &&
                         area.right==(unsigned)inset_r && area.bottom==(unsigned)inset_b)) {
-                if(!have_want)want=layout_now;
+                if(!have_want){want=layout_now;passive_layout=1;}
                 have_want=1;geometry_pending=0;
             }
         }
@@ -560,11 +595,11 @@ int em_app_run(const EmApp *app) {
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
                 g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
-                if (back) back = (uint32_t *)realloc(back, (size_t)winw * (size_t)winh * 4);
+                if (back) back = resize_render_buffer(back,winw,winh);
                 rt.pixels = back ? back : px;
                 rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
-                embk_win_move(win, nx, ny);
+                if(passive_layout)embk_win_place(win,nx,ny);else embk_win_move(win,nx,ny);
                 if(chromeless)em_window_bind(win,nx,ny);
                 wx_now = nx; wy_now = ny;
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
@@ -595,7 +630,7 @@ int em_app_run(const EmApp *app) {
                 uint32_t *npx = 0;
                 if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                     px = npx; winh = nh;
-                    if (back) back = (uint32_t *)realloc(back, (size_t)winw * (size_t)winh * 4);
+                    if (back) back = resize_render_buffer(back,winw,winh);
                     g_viewport_h = (float)winh;
                     em_set_viewport((float)winw, (float)winh);   /* the menu scrim
                         sizes itself to THIS -- unmirrored, it stayed bar-thin

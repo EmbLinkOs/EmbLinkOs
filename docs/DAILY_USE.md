@@ -140,8 +140,11 @@ are not implemented.
 The UEFI loader validates linear RGB/BGR GOP modes and framebuffer bounds. A
 checksum-valid EDID preferred timing is selected when supported. It rejects
 unsupported pixel layouts instead of treating arbitrary bitmasks as BGR.
-VirtIO mode queries now reuse their existing resource rather than attempting to
-create the same resource twice.
+VirtIO-GPU and Bochs DISPI support live resolution changes, confirmation and
+automatic rollback. Settings persists confirmed dimensions; the desktop and
+shared application runtime reflow without losing documents. Validated EDID
+identity is available from VirtIO and the active UEFI GOP handle. See
+[DISPLAYS.md](DISPLAYS.md) for the controller, resource lifetime and limitations.
 
 The Intel display driver has an explicit Gen9 Skylake/Kaby Lake/Coffee Lake/
 Comet Lake device-ID list. It verifies enabled linear XRGB8888 plane dimensions,

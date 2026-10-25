@@ -27,8 +27,18 @@ struct gpu_mode {
     uint32_t format;      // FB_FORMAT_RGB / FB_FORMAT_BGR
 };
 
+struct gpu_target {struct gpu_mode mode;uint32_t resource_id;};
+struct embk_monitor_info;
+
 struct gpu_driver {
     const char *name;
+    /* A prepared resource is not visible until select succeeds. release must
+     * acknowledge that DMA has stopped before its backing can be freed. */
+    bool (*prepare)(struct gpu_target *,void *,uint64_t,uint32_t,uint32_t);
+    bool (*select)(const struct gpu_target *);
+    bool (*release)(const struct gpu_target *);
+    void (*describe)(struct embk_monitor_info *);
+    uint32_t (*resource_id)(void);
 
     // Bring the display up (modeset) and describe the resulting mode.
     bool (*get_mode)(struct gpu_mode *out);

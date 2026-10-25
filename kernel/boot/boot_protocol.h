@@ -26,7 +26,7 @@
  * and check `size` before reading anything new. Never reorder. */
 
 #define BOOT_PROTOCOL_MAGIC    0x4F52504B4E494C45ULL  /* "ELINKPRO" */
-#define BOOT_PROTOCOL_VERSION  4
+#define BOOT_PROTOCOL_VERSION  5
 
 /* Which firmware built this record. The kernel should need this for almost
  * nothing -- if a subsystem starts branching on it, that is a sign the
@@ -111,7 +111,12 @@ struct boot_protocol {
     uint32_t update_flags;           /* +0xA0: managed/trial/reverted/recovery */
     uint8_t update_slot;             /* +0xA4: 0=A, 1=B */
     uint8_t _reserved5[3];
-};                           /*  size  0xA8                                  */
+    /* v5: EDID base block from the SAME firmware handle as the active GOP.
+     * Zero length means unavailable. No firmware pointers survive handoff. */
+    uint32_t display_edid_size;       /* +0xA8: 0 or 128 */
+    uint8_t display_edid[128];        /* +0xAC */
+    uint8_t _reserved6[4];
+};                           /*  size  0x130                                  */
 
 /* What the firmware's SecureBoot variable said. UNKNOWN is not "off": a BIOS
  * machine has no such variable and neither does a UEFI one whose firmware
@@ -147,7 +152,10 @@ _Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry is 24 bytes");
 #define BOOT_PROTOCOL_SIZE_V3  0x70
 #define BOOT_PROTOCOL_SIZE_V4  0xA8
 
-_Static_assert(sizeof(struct boot_protocol)   == BOOT_PROTOCOL_SIZE_V4, "boot_protocol v4 size");
+#define BOOT_PROTOCOL_SIZE_V5  0x130
+
+_Static_assert(sizeof(struct boot_protocol) == BOOT_PROTOCOL_SIZE_V5, "boot_protocol v5 size");
+_Static_assert(offsetof(struct boot_protocol,display_edid)==0xAC,"v5 EDID offset");
 _Static_assert(offsetof(struct boot_protocol,update_root_guid)==0x70,"v4 root offset");
 _Static_assert(offsetof(struct boot_protocol,update_data_guid)==0x80,"v4 data offset");
 _Static_assert(offsetof(struct boot_protocol,update_flags)==0xA0,"v4 flags offset");

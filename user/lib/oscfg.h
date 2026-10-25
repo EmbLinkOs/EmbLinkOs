@@ -225,6 +225,7 @@ struct oscfg {
     int bar_seconds;   /* show seconds in the clock                       */
     int bar_date;      /* show the date beside the time                   */
     int bar_cpu;       /* show the CPU readout                            */
+    int display_width,display_height; /* confirmed per-user resolution; 0 = boot mode */
 };
 
 /* The screen band the DOCK owns, in pixels, for a given preference.
@@ -314,6 +315,8 @@ static inline void oscfg_preset(struct oscfg *c, int preset) {
  * is a supported way to change these (Settings says so in About), so a typo
  * must yield a working desktop and not a 4000-pixel dock. */
 static inline void oscfg_clamp(struct oscfg *c) {
+    if(c->display_width<640 || c->display_width>4096 || c->display_height<480 || c->display_height>2160 ||
+       (uint64_t)c->display_width*c->display_height>8388608)c->display_width=c->display_height=0;
     #define OSCFG_BOUND(name, value, lo, hi) if(c->name < lo)c->name=lo; if(c->name > hi)c->name=hi;
     OSCFG_CONTOUR_FIELDS(OSCFG_BOUND)
     #undef OSCFG_BOUND
@@ -431,6 +434,8 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
         else if(!strcmp(key,"idle_lock_seconds"))c->idle_lock_seconds=val;
         else if(!strcmp(key,"lid_lock"))c->lid_lock=val;
         else if(!strcmp(key,"power_profile"))c->power_profile=val;
+        else if(!strcmp(key,"display_width"))c->display_width=val;
+        else if(!strcmp(key,"display_height"))c->display_height=val;
         else if(!strcmp(key,"volume"))c->volume=val;
         else if(!strcmp(key,"muted"))c->muted=val;
         else if (!strcmp(key, "accent"))    c->accent    = val;
@@ -465,6 +470,9 @@ static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
     #define OSCFG_PRINT(name, value, lo, hi) { int add=snprintf(out+n,(size_t)(cap-n),#name " %d\n",c->name); if(add<0 || add>=cap-n)return -1; n+=add; }
     OSCFG_CONTOUR_FIELDS(OSCFG_PRINT)
     #undef OSCFG_PRINT
+    int added=snprintf(out+n,(size_t)(cap-n),"display_width %d\ndisplay_height %d\n",c->display_width,c->display_height);
+    if(added<0 || added>=cap-n)return -1;
+    n+=added;
     return n;
 }
 

@@ -1161,6 +1161,11 @@ static inline int embk_win_move(int id, int32_t x, int32_t y) {
     return (int)embk_syscall3(EMBK_SYS_win_move, id, x, y);
 }
 
+/* Place a window after display/work-area changes without raising or focusing it. */
+static inline int embk_win_place(int id,int32_t x,int32_t y) {
+    return (int)embk_syscall3(EMBK_SYS_win_place,id,x,y);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);
@@ -1891,5 +1896,9 @@ static inline void embk_cond_broadcast(embk_cond *c) {
 #include "embk_update.h"
 static inline int embk_update(unsigned op,void *data,uint64_t bytes) {
     return (int)embk_syscall3(EMBK_SYS_update,op,(uint64_t)(uintptr_t)data,bytes);
+}
+#include "embk_monitor.h"
+static inline int embk_monitor(unsigned op,void *data,unsigned bytes) {
+    return (int)embk_syscall3(EMBK_SYS_monitor,op,(uint64_t)(uintptr_t)data,bytes);
 }
 #endif /* __EMBK_H__ */

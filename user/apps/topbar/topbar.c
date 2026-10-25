@@ -462,6 +462,7 @@ static void bar(void) {
  * macro's spec is fixed at compile time. Same runtime, one line of setup. */
 static EmApp em_app_spec_ = {
     .title    = "TopBar",
+    .follow_display_width = 1,
     .size     = { BAR_W, BAR_H },
     .theme    = Dark,
     .chrome   = Chromeless,

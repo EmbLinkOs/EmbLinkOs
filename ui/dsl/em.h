@@ -714,6 +714,7 @@ typedef struct {
                                   * default and right answer for most apps.
                                   * Same meaning as EmWidget's field. */
     struct { int w,h; } min_size; /* zero retains the standard 200x160 floor */
+    int follow_display_width;    /* system strips track live screen changes */
 } EmApp;
 
 void  em_set_viewport(float w, float h);   /* the app runtime feeds this */

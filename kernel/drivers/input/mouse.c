@@ -292,3 +292,12 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     serial_write_string("Mouse registered on IRQ 12\n");
 #endif /* __x86_64__ */
 }
+
+void mouse_set_bounds(uint32_t w,uint32_t h) {
+    if(!w || !h)return;
+    spin_lock(&pointer_state_lock);
+    g_w=(int32_t)w;g_h=(int32_t)h;
+    if(g_x>=g_w)g_x=g_w-1;if(g_y>=g_h)g_y=g_h-1;
+    g_press_head=g_press_n=0;
+    spin_unlock(&pointer_state_lock);
+}

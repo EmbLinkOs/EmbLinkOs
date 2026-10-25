@@ -17,8 +17,8 @@ from lock_test import keyname
 import shell_shot as S
 
 class Desktop:
-    def __init__(self,out,disk):
-        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800))
+    def __init__(self,out,disk,graphics="virtio"):
+        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics)
         self.sock=out/'gdb.sock';self.symbols={}
     def login(self,setup=False):
         g=self.g
@@ -49,7 +49,7 @@ rows=[]
 for i in range(w.type.range()[1]+1):
     a=w[i]
     if int(a['used']):
-        rows.append({k:int(a[k]) for k in ['id','pid','x','y','cw','ch','visible','presented','asked_close_ms','pending_action'] } | {'title':a['title'].string()})
+        rows.append({k:int(a[k]) for k in ['id','pid','x','y','cw','ch','visible','presented','desktop','asked_close_ms','pending_action'] } | {'title':a['title'].string()})
 x=int(gdb.parse_and_eval("'kernel/drivers/input/mouse.c'::g_x"))
 y=int(gdb.parse_and_eval("'kernel/drivers/input/mouse.c'::g_y"))
 print('RESULT '+json.dumps({'windows':rows,'mouse':[x,y]}))''')

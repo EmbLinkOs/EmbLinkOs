@@ -27,6 +27,12 @@ typedef uint32_t fb_color_t;
 /* 0xAARRGGBB for the alpha-blending blit path. */
 #define FB_ARGB(a, r, g, b) ((uint32_t)(((uint32_t)(a) << 24) | FB_RGB(r, g, b)))
 
+bool fb_can_change_mode(void);
+struct fb_surface;
+struct fb_surface *fb_prepare_mode(uint32_t w,uint32_t h);
+/* Called under the compositor lock; returns the retained old surface. */
+struct fb_surface *fb_select_surface(struct fb_surface *);
+void fb_release_surface(struct fb_surface *);
 void fb_init(void);
 void fb_put_pixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b);
 void fb_clear(uint8_t r, uint8_t g, uint8_t b);

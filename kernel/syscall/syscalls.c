@@ -1,4 +1,5 @@
 #include "update/service.h"
+#include "display/control.h"
 /* The system call handlers -- 88 of them, and not one is architecture-specific.
  * (Seven more live in kernel/process/debug.c, next to the debugger state they
  * manipulate; they take the same struct sysargs.)
@@ -1360,10 +1361,12 @@ static int64_t sys_ui_present(const struct sysargs *a) {
             kfree(line);
             return -EMBK_EFAULT;
         }
+        compositor_display_lock();
         fb_blit(x, y + (int32_t)row, (int32_t)w, 1, line, w);
+        compositor_display_unlock();
     }
     kfree(line);
-    fb_present();
+    compositor_display_lock();fb_present();compositor_display_unlock();
     return 0;
 }
 
@@ -1395,10 +1398,12 @@ static int64_t sys_ui_present_rect(const struct sysargs *a) {
             kfree(line);
             return -EMBK_EFAULT;
         }
+        compositor_display_lock();
         fb_blit(x0 + (int32_t)rx, y0 + (int32_t)(ry + row), (int32_t)rw, 1, line, rw);
+        compositor_display_unlock();
     }
     kfree(line);
-    fb_present();
+    compositor_display_lock();fb_present();compositor_display_unlock();
     return 0;
 }
 
@@ -1893,6 +1898,10 @@ static int64_t sys_win_move(const struct sysargs *a) {
     return compositor_win_move(pid, (uint32_t)a->arg[0], (int32_t)a->arg[1], (int32_t)a->arg[2]);
 }
 
+static int64_t sys_win_place(const struct sysargs *a) {
+    return compositor_win_place((int)current_process->pid,(uint32_t)a->arg[0],(int32_t)a->arg[1],(int32_t)a->arg[2]);
+}
+
 /* arg 0=win id. */
 static int64_t sys_win_destroy(const struct sysargs *a) {
     int pid = current_process ? (int)current_process->pid : -1;
@@ -1902,8 +1911,10 @@ static int64_t sys_win_destroy(const struct sysargs *a) {
 /* Report the screen (framebuffer) size so a windowed app can fit itself to it.
  * Writes width to *[arg 0] and height to *[arg 1]. */
 static int64_t sys_screen_size(const struct sysargs *a) {
+    compositor_display_lock();
     const fb_info_t *fi = fb_get_info();
     uint32_t w = fi ? fi->width : 0, h = fi ? fi->height : 0;
+    compositor_display_unlock();
     if ((a->arg[0] && copy_to_user((void *)a->arg[0], &w, sizeof w) != EMBK_OK) ||
         (a->arg[1] && copy_to_user((void *)a->arg[1], &h, sizeof h) != EMBK_OK))
         return -EMBK_EFAULT;
@@ -2729,8 +2740,11 @@ static int64_t sys_gpu_info(const struct sysargs *a) {
     if(a->arg[1]!=sizeof(struct embk_gpu_info))return -EMBK_EINVAL;
     struct embk_gpu_info info;memset(&info,0,sizeof info);info.version=EMBK_GPU_VERSION;
     info.flags=EMBK_GPU_SOFTWARE_RENDERING;
+    compositor_display_lock();
     const fb_info_t *fb=fb_get_info();const struct gpu_driver *gpu=gpu_active();
     if(fb){info.width=fb->width;info.height=fb->height;info.pitch=fb->pitch;info.bpp=fb->bpp;}
+    if(fb_can_change_mode())info.flags|=EMBK_GPU_DRIVER_MODESET;
+    compositor_display_unlock();
     snprintf(info.driver,sizeof info.driver,"%s",gpu?gpu->name:"Firmware framebuffer");
     return copy_to_user((void *)(uintptr_t)a->arg[0],&info,sizeof info);
 }
@@ -2837,7 +2851,24 @@ static int64_t sys_update(const struct sysargs *a) {
     kfree(buffer);return rc;
 }
 
+static int64_t sys_monitor(const struct sysargs *a) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU)))return -EMBK_EPERM;
+    if(a->arg[0]>EMBK_MONITOR_REVERT || a->arg[2]>UINT32_MAX)return -EMBK_EINVAL;
+    unsigned op=a->arg[0],n=a->arg[2];
+    if(op==EMBK_MONITOR_GET) {
+        if(n!=sizeof(struct embk_monitor_info))return -EMBK_EINVAL;
+        struct embk_monitor_info info;int rc=monitor_control(op,&info,n);
+        return rc?rc:copy_to_user((void *)(uintptr_t)a->arg[1],&info,n)?-EMBK_EFAULT:0;
+    }
+    if(n!=sizeof(struct embk_monitor_request))return -EMBK_EINVAL;
+    struct embk_monitor_request request;
+    if(copy_from_user(&request,(void *)(uintptr_t)a->arg[1],n))return -EMBK_EFAULT;
+    return monitor_control(op,&request,n);
+}
+
 static syscall_handler_t syscall_table[] = {
+    [SYS_monitor] = sys_monitor,
+    [SYS_win_place] = sys_win_place,
     [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,

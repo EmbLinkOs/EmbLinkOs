@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include "display/control.h"
 #include "arch/aarch64/board.h"
 #include "arch/aarch64/drivers/pl011.h"
 #include "drivers/video/rawcon.h"
@@ -1645,6 +1646,7 @@ void arch_early_main(uint64_t dtb_phys) {
     for (;;) {
         virtio_input_poll();
         usb_poll();       /* USB keyboard and mouse -- polled here, as on x86 */
+        monitor_tick();
         compositor_pointer_tick();
         /* The system key shortcuts, on this arch too -- GUI+Tab switching
          * windows only on x86 would be a shortcut nobody could rely on. The
