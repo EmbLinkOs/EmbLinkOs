@@ -28,14 +28,14 @@ def main():
             assert 'FAIL' not in result,result
             print(line.group(),flush=True)
         screen=TerminalState(d);w=d.launch('Terminal','Terminal')
-        eventually(lambda:screen.integer(w,'g_at_prompt',1)==1,'native prompt')
+        eventually(lambda:screen.at_prompt(w),'native prompt')
         type_text('/data/apps/spawnprobe/spawnprobe.elf\n')
-        eventually(lambda:'POSIX pipeline: 66049 bytes transformed' in screen.text(w) and screen.integer(w,'g_at_prompt',1)==1,'graphical POSIX spawn checks')
+        eventually(lambda:'POSIX pipeline: 66049 bytes transformed' in screen.text(w) and screen.at_prompt(w),'graphical POSIX spawn checks')
         text=screen.text(w);match=re.search(r'spawnprobe: (\d+)/(\d+) checks passed',text)
         assert match and match[1]==match[2],text
         d.snap('posix-spawn-and-pipeline')
         type_text('echo 73921\n')
-        eventually(lambda:'73921' in screen.text(w).splitlines() and screen.integer(w,'g_at_prompt',1)==1,'shell remains usable')
+        eventually(lambda:'73921' in screen.text(w).splitlines() and screen.at_prompt(w),'shell remains usable')
         assert b'PANIC' not in d.g.seen
         print('PASS: ordered spawn actions, CLOEXEC, cwd/environment, retained child status, PTY/POSIX/channel regressions and graphical POSIX pipeline with a working shell afterward',flush=True)
     finally:

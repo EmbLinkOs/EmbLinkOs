@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <math.h>
 #include "../../terminal/vt.h"
+#include "term_probe.h"
 #include "font.h"
 #include "backend.h"
 
@@ -280,6 +281,54 @@ static void complete(void) {
     term_newline();
 }
 
+/* --- the test probe ----------------------------------------------------------
+ * What the window shows, kept current for the acceptance tools (term_probe.h).
+ * Not static: tools find it by symbol, and a static that is only ever written
+ * is a store the compiler may drop. */
+__attribute__((used)) struct term_probe g_term_probe;
+static uint32_t g_frames;
+
+static size_t probe_line(const struct vt_line *l,char *dst,size_t cap) {
+    size_t n=0;int last=-1;
+    for(int x=0;x<g_vt.cols;x++){const struct vt_cell *c=&l->cells[x];if(c->width && c->rune!=' ' && !(c->flags&VT_HIDDEN))last=x;}
+    for(int x=0;x<=last;x++) {
+        const struct vt_cell *c=&l->cells[x];if(!c->width)continue;
+        uint32_t runes[3]={c->rune,c->combining[0],c->combining[1]};
+        if(c->flags&VT_HIDDEN){runes[0]=' ';runes[1]=runes[2]=0;}
+        for(unsigned j=0;j<3;j++)if(runes[j]){char b[4];unsigned k=vt_encode(runes[j],b);if(n+k>cap)return n;memcpy(dst+n,b,k);n+=k;}
+    }
+    return n;
+}
+static uint32_t probe_screen(const struct vt_screen *s,char *dst) {
+    size_t n=0;
+    for(int y=0;y<g_vt.rows;y++) {
+        if(y){if(n+1>=TERM_PROBE_TEXT)break;dst[n++]='\n';}
+        n+=probe_line(&s->lines[s->order[y]],dst+n,TERM_PROBE_TEXT-1-n);
+    }
+    dst[n]=0;return (uint32_t)n;
+}
+static void probe_refresh(void) {
+    struct term_probe *p=&g_term_probe;
+    __atomic_store_n(&p->serial,p->serial+1,__ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    const struct vt_screen *s=g_vt.alt?&g_vt.alternate:&g_vt.primary;
+    p->magic=TERM_PROBE_MAGIC;p->version=TERM_PROBE_VERSION;p->size=sizeof *p;
+    p->cols=g_vt.cols;p->rows=g_vt.rows;p->cursor_x=s->cursor.x;p->cursor_y=s->cursor.y;
+    p->at_prompt=g_at_prompt;p->dead=g_dead;p->alt=g_vt.alt;p->cursor_visible=g_vt.cursor_visible;
+    p->view=g_view;p->shell=g_shell;p->master=g_master;p->session=0;p->sessions=1;
+    p->prompt_serial=g_vt.prompt_serial;p->history_count=g_vt.history_count;p->frames=g_frames;
+    p->input_len=g_in_n;p->caret=g_cur;memcpy(p->input,g_in,sizeof g_in);
+    snprintf(p->cwd,sizeof p->cwd,"%s",g_cwd);
+    p->text_len=probe_screen(s,p->text);p->primary_len=probe_screen(&g_vt.primary,p->primary);
+    size_t cells=0;
+    for(int y=0;y<g_vt.rows;y++)for(int x=0;x<g_vt.cols && cells<TERM_PROBE_CELLS;x++,cells++) {
+        const struct vt_cell *c=&s->lines[s->order[y]].cells[x];
+        p->cells[cells]=(struct term_probe_cell){c->rune,c->fg,c->bg,c->width,c->flags,{0,0}};
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&p->serial,p->serial+1,__ATOMIC_RELEASE);
+}
+
 /* --- runtime hooks -------------------------------------------------------- */
 
 /* idle: drain the terminal master without blocking; wake the renderer
@@ -322,7 +371,7 @@ static void term_idle(void) {
         term_say("\n[shell exited -- press ESC to close]\n");
         got = true;
     }
-    if (got) em_request_frame();
+    if (got) {probe_refresh();em_request_frame();}
 }
 
 static void term_copy(void) {
@@ -615,6 +664,7 @@ static bool screen_bitmap(void) {
         }
         if(!g_view && !g_dead && (g_at_prompt || g_vt.cursor_visible))paint_cursor(&rt,x,y,accent);
         cpu_clip_restore(&clip);g_painted_signature=hash;g_bitmap_valid=true;
+        g_frames++;probe_refresh();
     }
     return true;
 }
@@ -639,9 +689,10 @@ static void term_view(void) {
 int main(void) {
     vt_init(&g_vt,g_cols,g_rows,term_reply,NULL);
     if (!term_spawn_shell()) {
-        term_say("can't start /shell.elf\n");
+        term_say("can't start /system/bin/shell.elf\n");
         g_dead = true;
     }
+    probe_refresh();
     em_set_key_hook(term_key);
     em_set_idle_hook(term_idle);
 

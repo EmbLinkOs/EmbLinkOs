@@ -28,14 +28,14 @@ def main():
             assert 'FAIL' not in result,result
             print(line.group(),flush=True)
         screen=TerminalState(d);w=d.launch('Terminal','Terminal')
-        eventually(lambda:screen.integer(w,'g_at_prompt',1)==1,'native prompt')
+        eventually(lambda:screen.at_prompt(w),'native prompt')
         type_text('/data/apps/processprobe/processprobe.elf\n')
-        eventually(lambda:'Pipeline: 66049 bytes transformed' in screen.text(w) and screen.integer(w,'g_at_prompt',1)==1,'graphical pipeline and wait checks')
+        eventually(lambda:'Pipeline: 66049 bytes transformed' in screen.text(w) and screen.at_prompt(w),'graphical pipeline and wait checks')
         text=screen.text(w);match=re.search(r'processprobe: (\d+)/(\d+) checks passed',text)
         assert match and match[1]==match[2],text
         d.snap('process-pipeline-and-waits')
         type_text('echo 73921\n')
-        eventually(lambda:'73921' in screen.text(w).splitlines() and screen.integer(w,'g_at_prompt',1)==1,'shell remains usable')
+        eventually(lambda:'73921' in screen.text(w).splitlines() and screen.at_prompt(w),'shell remains usable')
         assert b'PANIC' not in d.g.seen
         print('PASS: native pipe/child lifecycle, repeated slot reuse, PTY/POSIX/channel regressions and graphical two-child pipeline with a working shell afterward',flush=True)
     finally:

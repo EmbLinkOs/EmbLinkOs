@@ -1,0 +1,30 @@
+[38;5;76m❯[39m [32mcd[39m [4m/tmp/emblink-golden-demo[0m 
+[38;5;76m❯[39m [32mls[39m                          
+README.md   history.txt htoprc      log.txt     notes.txt   sgr.py      unicode.txt vt.h                                
+[38;5;76m❯[39m [32mgit[39m status --short          
+ [31mM[39m README.md                  
+[31m??[39m history.txt                
+[31m??[39m htoprc                     
+[31m??[39m notes.txt                  
+[31m??[39m sgr.py                     
+[31m??[39m unicode.txt                
+[38;5;76m❯[39m [32mfalse[39m                       
+[38;5;196m❯[39m [32msleep[39m 4                     
+[38;5;76m❯[39m [32mecho[39m done                   
+done                          
+
+[38;5;238m╭─[30m [38;5;31m/[1m[38;5;39mtmp[0m[38;5;31m/[1m[38;5;39memblink-golden-demo[0m[38;5;31m [38;5;76mmain [38;5;178m!1 [38;5;39m?5[39m                                                                      [38;5;66m10:21:52 PM[39m 
+[38;5;238m╰─[38;5;76m❯[39m [32mgit[39m sta[90mtus --short[39m        
+
+
+
+
+
+
+
+
+
+
+
+
+

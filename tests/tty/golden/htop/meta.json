@@ -1,0 +1,16 @@
+{
+  "cursor_x": 81,
+  "cursor_y": 29,
+  "alternate": 1,
+  "cursor_visible": 0,
+  "cols": 100,
+  "rows": 30,
+  "command": [
+    "sh",
+    "-c",
+    "sleep 100000 & HTOPRC=htoprc exec htop -p $!"
+  ],
+  "frozen": true,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

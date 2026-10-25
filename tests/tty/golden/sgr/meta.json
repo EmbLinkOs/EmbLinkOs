@@ -1,0 +1,15 @@
+{
+  "cursor_x": 0,
+  "cursor_y": 16,
+  "alternate": 0,
+  "cursor_visible": 1,
+  "cols": 100,
+  "rows": 24,
+  "command": [
+    "python3",
+    "sgr.py"
+  ],
+  "frozen": false,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

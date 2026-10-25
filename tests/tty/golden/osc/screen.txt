@@ -1,0 +1,12 @@
+before ]8;;https://example.invalid/doc\link text]8;;\ after                  
+prompt$ command     
+output              
+query answered      
+done                
+
+
+
+
+
+
+

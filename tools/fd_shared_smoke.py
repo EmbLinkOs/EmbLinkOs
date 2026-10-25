@@ -61,7 +61,7 @@ def main():
         d.g.qmp.cmd('human-monitor-command',**{'command-line':f'gdbserver unix:{d.sock},server=on,wait=off'})
         for value in ['test fd-sharing','test fd-sharing','test dhcp','test fd-network','test spawn-compat','test process-compat','test terminal','test handle reap','test sched wait','test tty','test posix','test channel','test capgate','test posix-shell']:
             command(value)
-        screen=TerminalState(d);w=d.launch('Terminal','Terminal');prompt=lambda:screen.integer(w,'g_at_prompt',1)==1
+        screen=TerminalState(d);w=d.launch('Terminal','Terminal');prompt=lambda:screen.at_prompt(w)
         eventually(prompt,'native prompt')
         type_text('/data/apps/fdprobe/fdprobe.elf\n')
         eventually(lambda:'fdprobe:' in screen.text(w) and prompt(),'graphical descriptor checks')

@@ -146,7 +146,7 @@ SDK paths even when upstream headers with the same names are present.
 ## Verification
 
 ```
-make terminal-test terminal-screen-test
+make terminal-test terminal-screen-test terminal-golden-test
 make shell-test declare-test em-test kit-test
 # Boot the image, then use the serial debug console:
 test terminal
@@ -186,6 +186,42 @@ primary/alternate isolation, streaming Unicode, wide-cell resize, replies, key
 modes, split-input equivalence and randomized parser/resize invariants. Run it
 with AddressSanitizer/UBSan by compiling `vt.c` and `tests/tty/vt_test.c` with
 `-Iuser/terminal -fsanitize=address,undefined -fno-omit-frame-pointer`.
+
+### Golden streams
+
+`tests/tty/golden/` holds what real programs write and what a mature emulator
+shows for it: a p10k-themed zsh session, vim (mid-edit and after `:q!`),
+`less -R`, htop, `git log --graph --stat`, an SGR matrix (attributes,
+underline styles, 16/256/RGB colours in both separator forms), Unicode (wide,
+combining, emoji, box drawing, powerline) and the OSC family (titles, OSC 7,
+hyperlinks, 133 marks, colour queries, DCS/PM). `tools/record_golden.py`
+records each one on a Mac: the program runs inside a private tmux server
+(TERM=xterm-256color) under `script`, is frozen with SIGSTOP at its moment so
+nothing more is written, and tmux's screen is captured with its attributes,
+cursor, screen mode and, where set, title. The recorder replaces the host in
+OSC 7 payloads (consumed, never shown) and refuses to keep a recording that
+contains the user's name, host or e-mail; the p10k session runs with an empty
+history file and oh-my-zsh's titles off.
+
+`make terminal-golden-test` replays every stream through the screen model
+(`tests/tty/vt_dump.c`) and `tools/golden_terminal.py` compares the shown
+screen with tmux's cell by cell: text, colours resolved through the model's
+palette, attributes, cursor, visibility, screen and title.
+`tests/tty/golden/xfail.txt` names what the model is known to get wrong, with
+the reason; a listed case that starts passing fails the run until it is taken
+off, so the list only shrinks.
+
+### Terminal probe
+
+The acceptance tools never read Terminal's internals. Terminal keeps one
+fixed-layout symbol, `g_term_probe` (`user/apps/term/term_probe.h`), current
+whenever the screen changes: prompt state, size, cursor, cwd, the local input
+line, the shown and primary screens as UTF-8, and every shown cell's colours
+and attributes. `tools/native_terminal.py` reads it through GDB, refuses an
+unknown magic or version, and rereads a probe caught mid-update (its serial is
+odd while Terminal writes it). `ttyprobe --bench [MiB]` writes coloured lines
+as fast as the terminal drains them and reports KiB/s; the probe's frame count
+says how many repaints that took.
 
 The graphical screen acceptance launches native `ttyprobe --screen` in raw mode.
 It checks application-cursor selection, confined log scrolling, Unicode/colour

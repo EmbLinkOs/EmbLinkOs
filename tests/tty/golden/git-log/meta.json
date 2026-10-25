@@ -1,0 +1,22 @@
+{
+  "cursor_x": 0,
+  "cursor_y": 39,
+  "alternate": 0,
+  "cursor_visible": 1,
+  "cols": 100,
+  "rows": 40,
+  "command": [
+    "git",
+    "--no-pager",
+    "log",
+    "--color=always",
+    "--graph",
+    "--decorate",
+    "--stat",
+    "-n",
+    "6"
+  ],
+  "frozen": false,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

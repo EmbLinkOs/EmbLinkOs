@@ -1,0 +1,24 @@
+[31m|[39m     [7mRevision 1[0m9: adjust the log       
+[31m|[39m                   
+[31m|[39m  log.txt | 2 [32m+[31m-[39m   
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)                                
+[31m|[39m                   
+* [33mcommit b488e47a5257b77c160a3e92f6ffe523bed30ab3[39m                               
+[31m|[39m Author: Golden <golden@example.invalid>                                       
+[31m|[39m Date:   Sun Oct 25 22:19:18 2026 +0100                                        
+[31m|[39m                   
+[31m|[39m     [7mRevision 1[0m8: adjust the log       
+[31m|[39m                   
+[31m|[39m  log.txt | 2 [32m+[31m-[39m   
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)                                
+[31m|[39m                   
+* [33mcommit bc50e2273ba2c180181e9b43b544ec04dbbfae71[39m                               
+[31m|[39m Author: Golden <golden@example.invalid>                                       
+[31m|[39m Date:   Sun Oct 25 22:19:18 2026 +0100                                        
+[31m|[39m                   
+[31m|[39m     [7mRevision 1[0m7: adjust the log       
+[31m|[39m                   
+[31m|[39m  log.txt | 2 [32m+[31m-[39m   
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)                                
+[31m|[39m                   
+:                   

@@ -2685,6 +2685,13 @@ terminal-screen-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_test.c -o $(BUILD)/vt_test
 	$(BUILD)/vt_test
 
+.PHONY: terminal-golden-test
+# Real programs' output (tests/tty/golden, made by tools/record_golden.py on a
+# Mac) replayed into the screen model and compared with tmux, cell by cell.
+terminal-golden-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_dump.c -o $(BUILD)/vt_dump
+	python3 tools/golden_terminal.py $(BUILD)/vt_dump
+
 .PHONY: terminal-test
 terminal-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/tty/pty_host.c -o $(BUILD)/pty_host_test

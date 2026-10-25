@@ -1,6 +1,7 @@
 /* A guest-side terminal witness. No mock descriptors or injected kernel state. */
 #include "embk.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <termios.h>
@@ -230,7 +231,24 @@ static int screen_witness(void) {
     if(tcsetattr(0,TCSANOW,&saved))return 42;
     puts("Alternate screen restored.");return 0;
 }
+/* Throughput: the emulator drains a 4 KiB PTY queue, so how fast this loop
+ * finishes is how fast the terminal parses and keeps up. Coloured lines, as
+ * real output is; the frame count to compare with is in Terminal's probe. */
+static int bench(const char *megabytes) {
+    unsigned long want=(megabytes?strtoul(megabytes,NULL,10):4)*1024*1024,sent=0;
+    char line[160];unsigned n=0;
+    uint64_t start=embk_uptime_ms();
+    while (sent<want) {
+        int k=snprintf(line,sizeof line,"\033[3%um%06u\033[0m the quick brown fox jumps over the lazy dog \033[1m%08lu\033[0m\n",1+n%7,n,sent);
+        for (int off=0;off<k;) {ssize_t w=write(1,line+off,(size_t)(k-off));if(w<=0)return 50;off+=(int)w;}
+        sent+=(unsigned long)k;n++;
+    }
+    uint64_t ms=embk_uptime_ms()-start;if(!ms)ms=1;
+    printf("Bench: %lu KiB, %u lines in %llu ms = %llu KiB/s\n",sent/1024,n,(unsigned long long)ms,(unsigned long long)(sent/1024*1000/ms));
+    return 0;
+}
 int main(int argc,char **argv) {
+    if (argc>1 && !strcmp(argv[1],"--bench")) return bench(argc>2?argv[2]:NULL);
     if (argc>1 && !strcmp(argv[1],"--screen")) return screen_witness();
     if (argc>1 && !strcmp(argv[1],"--selftest")) return selftest();
     if (argc>1) return child(argv[1]);

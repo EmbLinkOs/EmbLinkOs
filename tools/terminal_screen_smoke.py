@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """A real full-screen child, driven through Terminal with QMP input only."""
 from pathlib import Path
-import re,shutil,tempfile,time
+import os,re,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_terminal import TerminalState
 from lock_test import keyname
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='terminal-screen-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='terminal-screen-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     def eventually(check,message):
@@ -19,7 +19,7 @@ def main():
     def type_text(value):
         extra={'/':'slash','"':'shift-apostrophe'}
         for c in value:d.key(extra[c] if c in extra else keyname(c))
-    def prompt(w):return screen.integer(w,'g_at_prompt',1)==1
+    def prompt(w):return screen.at_prompt(w)
     def text(w,s):return s in screen.text(w)
     def edit_text(w):return d.read('edit',w['pid'],'g_doc',32768).split(b'\0',1)[0].decode()
     def focus_id():return d.debug("import gdb,json\nprint('RESULT '+json.dumps(int(gdb.parse_and_eval(\"'kernel/gfx/compositor.c'::g_top_id\"))))")
@@ -68,7 +68,7 @@ def main():
         assert 'EmbLink terminal screen check' not in '\n'.join(state['text']),'alternate pixels escaped into primary output'
         d.snap('screen-primary-restored')
         d.key('meta_l-v');d.g.pump(1)
-        assert prompt(w) and screen.integer(w,'g_in_n')==0,'oversized paste executed or partially inserted'
+        assert prompt(w) and screen.probe(w,text=False)['input']=='','oversized paste executed or partially inserted'
         # Build a >8 KiB clipboard using real editor commands, then exercise
         # Note++'s custom hook as well as the shared TextEditor paste path.
         d.key('meta_l-tab');eventually(lambda:focus_id()==editor['id'],'focus Editor for long clipboard')

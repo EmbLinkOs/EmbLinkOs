@@ -1,0 +1,4 @@
+# Cases the screen model is known to show differently from tmux, with why.
+# This list only shrinks: tools/golden_terminal.py fails a listed case that passes.
+htop erased cells keep the cursor's foreground and attributes (vt.c blank()); xterm keeps only the background
+sgr blink, underline styles (4:n, 21), underline colour (58), overline and colon-form colours are not modelled

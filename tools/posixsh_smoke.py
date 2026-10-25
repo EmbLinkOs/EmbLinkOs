@@ -35,7 +35,7 @@ print('RESULT '+json.dumps([int(ps[i]['pid']) for i in range(ps.type.range()[1]+
             assert line and re.search(r'\bOK\b',line.group()) and 'FAIL' not in result,result
             print(line.group(),flush=True)
         screen=TerminalState(d);w=d.launch('Terminal','Terminal')
-        prompt=lambda:screen.integer(w,'g_at_prompt',1)==1
+        prompt=lambda:screen.at_prompt(w)
         eventually(prompt,'native prompt')
         type_text('/data/apps/shprobe/shprobe.elf\n')
         eventually(lambda:'shprobe:' in screen.text(w) and prompt(),'graphical shell script checks')
