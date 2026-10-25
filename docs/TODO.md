@@ -950,6 +950,15 @@ The measurement immediately earned itself twice:
 
 P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in order:
 
+- [ ] **`make ARCH=aarch64 test-arm64-boot` fails A6/A7 (desktop session, home ready,
+      launcher)** -- found 2026-10-25, once arm64 booted again (f2613e7). The kernel,
+      userland witnesses and drivers pass (282 checks); then init finds no account
+      and waits in first-boot setup, because the aarch64 boot protocol never sets a
+      boot mode and nothing seeds an account. x86 tests either log in through the
+      setup screen or pick the live-session mode at the boot menu. The test needs a
+      live-session mode on arm64 (e.g. from the device tree's /chosen) or a seeded
+      account in its root filesystem.
+
 - [ ] **P0 + P0b on the real board** (planned Monday 2026-09-28, on a TV). Only
       QEMU has seen them. `rpi4-sdboot`, HDMI0; the expected screen and the
       triage are docs/RPI4.md §4. Check that the newest-line bar is BLUE.
