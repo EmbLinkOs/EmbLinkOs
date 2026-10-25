@@ -15,18 +15,10 @@
  * flushes stdio then calls _exit()). A mismatch here shows up as an
  * "undefined reference to `read'" style LINK error, not a silent bug.
  *
- * Error convention: the kernel returns a small negative -EMBK_* code on
- * failure (values chosen to match POSIX errno, see kernel/include/errno.h),
- * so a failing stub sets `errno = -ret` and returns -1 with no translation
- * table. embk_is_err() (embk_syscall.h) draws the line at the Linux-style
- * [-4095,-1] error window, so real large results (an sbrk address, a byte
- * count) are never mistaken for error codes.
- *
- * Genuinely-absent operations (fork/execve/wait/link/unlink) fail with
- * ENOSYS rather than pretending: EmbLink's process model is spawn()-based
- * (no fork/exec), and the VFS public surface exposes no unlink/link yet.
- * Programs wanting EmbLink's native primitives (spawn, threads, handles)
- * call them directly, not through this POSIX-shaped layer. */
+ * Error convention: negative native errors are translated to newlib errno.
+ * Real pipe descriptors and handle-authorized child waits are supplied here;
+ * fork and in-place exec remain unsupported. Native spawn callers explicitly
+ * select descriptors, environment and exit-status retention. */
 
 /* newlib's <sys/features.h> only defines _POSIX_TIMERS for targets it knows
  * (RTEMS/Cygwin), never for bare x86_64-elf, so <time.h> hides clock_gettime()
@@ -107,6 +99,8 @@ struct embk_vfs_dirent {
 #define EMBK_O_EXCL    0x0080
 #define EMBK_O_TRUNC   0x0200
 #define EMBK_O_APPEND  0x0400
+#define EMBK_O_NONBLOCK 0x0800
+#define EMBK_O_CLOEXEC 0x100000
 
 /* The environment. newlib requires `environ`; getenv() walks it.
  *
@@ -302,7 +296,7 @@ static char g_cwd[EMBK_PATH_MAX] = "/";
  * untouched, so "/a/../b" reached the kernel verbatim and failed at a ".."
  * component the VFS has no rule for. git walks UP to find a repo root -- ".." is
  * its normal idiom, not an edge case. */
-static int path_abs(const char *in, char *out, size_t out_sz) {
+static int path_abs_from(const char *cwd,const char *in, char *out, size_t out_sz) {
     if (!in) {
         errno = EFAULT;
         return -1;
@@ -321,9 +315,9 @@ static int path_abs(const char *in, char *out, size_t out_sz) {
         if (strlen(in) >= sizeof raw) { errno = ENAMETOOLONG; return -1; }
         strcpy(raw, in);
     } else {
-        size_t cl = strlen(g_cwd);
+        size_t cl = strlen(cwd);
         if (cl + 1 + strlen(in) >= sizeof raw) { errno = ENAMETOOLONG; return -1; }
-        strcpy(raw, g_cwd);
+        strcpy(raw, cwd);
         if (cl > 0 && raw[cl - 1] != '/') strcat(raw, "/");
         strcat(raw, in);
     }
@@ -359,6 +353,20 @@ static int path_abs(const char *in, char *out, size_t out_sz) {
     return 0;
 }
 
+static int path_abs(const char *in,char *out,size_t size) {
+    return path_abs_from(g_cwd,in,out,size);
+}
+static int open_native_flags(int flags) {
+    int out=flags&O_ACCMODE;
+    if(flags&O_CREAT)out|=EMBK_O_CREAT;
+    if(flags&O_EXCL)out|=EMBK_O_EXCL;
+    if(flags&O_TRUNC)out|=EMBK_O_TRUNC;
+    if(flags&O_APPEND)out|=EMBK_O_APPEND;
+    if(flags&O_NONBLOCK)out|=EMBK_O_NONBLOCK;
+    if(flags&O_CLOEXEC)out|=EMBK_O_CLOEXEC;
+    return out;
+}
+
 int open(const char *name, int flags, ...) {
     /* Only consume the variadic mode argument when O_CREAT is set -- reading
      * it unconditionally would be UB for the common open(path, O_RDONLY). */
@@ -371,11 +379,7 @@ int open(const char *name, int flags, ...) {
     }
 
     /* Translate newlib's O_* bit layout to the kernel's (see EMBK_O_* above). */
-    int kflags = flags & 0x3;   /* access mode: identical on both sides */
-    if (flags & O_CREAT)  kflags |= EMBK_O_CREAT;
-    if (flags & O_EXCL)   kflags |= EMBK_O_EXCL;
-    if (flags & O_TRUNC)  kflags |= EMBK_O_TRUNC;
-    if (flags & O_APPEND) kflags |= EMBK_O_APPEND;
+    int kflags = open_native_flags(flags);
 
     char abs[EMBK_PATH_MAX];
     if (path_abs(name, abs, sizeof abs) != 0) return -1;   /* errno set */
@@ -709,7 +713,7 @@ int access(const char *path, int mode) {
 
 /* getcwd/chdir are REAL now: see g_cwd + path_abs above. The cwd is this
  * process's own libc state -- per-process by construction, never shared, never
- * inherited unless a parent names PWD at spawn. */
+ * initialized by explicit spawn context, or legacy PWD startup. */
 char *getcwd(char *buf, size_t size) {
     if (!buf) {
         /* The GNU "allocate it for me" extension is deliberately not offered;
@@ -742,13 +746,17 @@ int chdir(const char *path) {
 
 /* Called by crt0 BEFORE ctors and main, once environ is installed.
  *
- * PWD is how a parent HANDS OVER a starting directory -- the same explicit
+ * Legacy PWD is how a native parent HANDS OVER a starting directory -- the same explicit
  * naming as envp and file-actions, using the mechanism that already exists. No
  * PWD means no inheritance, and we stay at "/", which is the honest default.
  *
  * Best-effort on purpose: a PWD naming somewhere gone must not kill startup, it
  * must leave us at the root. chdir() does the verifying. */
 void embk_cwd_init_from_env(void) {
+    /* An explicit spawn context wins over PWD without mutating environ. */
+    char initial[EMBK_PATH_MAX];
+    int64_t n=embk_syscall2(EMBK_SYS_spawn_cwd,(int64_t)(uintptr_t)initial,sizeof initial);
+    if(n>0){memcpy(g_cwd,initial,(size_t)n);return;}
     const char *pwd = getenv("PWD");
     if (pwd && pwd[0] == '/') (void)chdir(pwd);
 }
@@ -855,21 +863,13 @@ int dup(int fd) {
  * because getpath.py swallows the OSError, leaving only "No module named
  * 'encodings'" as the symptom.
  *
- * F_GETFD/F_SETFD (FD_CLOEXEC) -- ANSWERED, and honestly. FD_CLOEXEC promises
- * "this descriptor will not survive into an exec'd image". EmbLink HAS NO EXEC:
- * the model is spawn() + explicit file-actions, so a child only ever receives
- * descriptors the parent names deliberately, and nothing is implicitly
- * inherited. That promise therefore already holds for every fd, unconditionally
- * -- reporting FD_CLOEXEC set is a true statement about this OS, not a
- * convenient stub. (Should exec ever exist -- it will not, by design -- this
- * must become real state.)
+ * F_GETFD/F_SETFD track real per-descriptor state. The compatibility spawn
+ * policy inherits open descriptors and closes those still marked CLOEXEC
+ * after applying ordered actions. Native explicit-transfer launches retain
+ * their existing policy.
  *
- * F_GETFL reports the TRUE state: O_RDWR, blocking (no O_NONBLOCK) -- every fd
- * here is blocking, so this is a fact, not a stub. F_SETFL accepts a request to
- * (re)assert blocking mode (a no-op: already so) but REFUSES O_NONBLOCK, because
- * a false "non-blocking is set" is the real trap -- the caller would then hang
- * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
- * which reads/sets the flags) work while never lying about non-blocking.
+ * F_GETFL translates access mode and shared append/nonblocking state.
+ * F_SETFL changes those supported status bits without changing access mode.
  * F_DUPFD is real, and routes to the same kernel operation dup() uses -- with
  * the "lowest free descriptor AT OR ABOVE this number" behaviour that is the
  * only thing distinguishing it from dup().
@@ -898,20 +898,20 @@ int fcntl(int fd, int cmd, ...) {
     }
 
     switch (cmd) {
-    case F_GETFD:
-        /* Every fd is effectively close-on-exec here -- see above. */
-        return FD_CLOEXEC;
-    case F_SETFD:
-        /* Accept whatever is asked: with no exec, both "close on exec" and
-         * "stay open across exec" describe the same (unobservable) reality, so
-         * there is nothing to store and nothing that could later disagree. */
-        return 0;
+    case F_GETFD: {
+        int64_t r=embk_syscall3(EMBK_SYS_fcntl,fd,4,0);
+        return r<0?embk_fail(r):(r?FD_CLOEXEC:0);
+    }
+    case F_SETFD: {
+        va_list ap;va_start(ap,cmd);int flags=va_arg(ap,int);va_end(ap);
+        if(flags&~FD_CLOEXEC){errno=EINVAL;return -1;}
+        int64_t r=embk_syscall3(EMBK_SYS_fcntl,fd,5,(flags&FD_CLOEXEC)!=0);
+        return r<0?embk_fail(r):0;
+    }
     case F_GETFL: {
-        /* Access mode is always read/write here; report O_NONBLOCK truthfully
-         * from the kernel fd flag (sockets can now be non-blocking). sys_fcntl
-         * cmd 1 = get non-blocking. */
-        int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
-        return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+        int64_t fl=embk_syscall3(EMBK_SYS_fcntl,fd,3,0);
+        if(fl<0)return embk_fail(fl);
+        return ((int)fl&3)|((fl&4)?O_NONBLOCK:0)|((fl&8)?O_APPEND:0);
     }
     case F_DUPFD: {
         va_list ap; va_start(ap, cmd);
@@ -924,11 +924,10 @@ int fcntl(int fd, int cmd, ...) {
         va_list ap; va_start(ap, cmd);
         int flags = va_arg(ap, int);
         va_end(ap);
-        /* Honor O_NONBLOCK for real now: the kernel supports non-blocking
-         * sockets (connect -> EINPROGRESS, recv -> EAGAIN, select for readiness).
-         * For a non-socket fd the flag is stored but every op stays blocking,
-         * which is correct -- files never block. sys_fcntl cmd 2 = set it. */
-        int64_t r = embk_syscall3(EMBK_SYS_fcntl, fd, 2, (flags & O_NONBLOCK) ? 1 : 0);
+        if (flags&~(O_ACCMODE|O_NONBLOCK|O_APPEND)) { errno=EINVAL;return -1; }
+        /* Stable native wire bits; access mode cannot change after open. */
+        int64_t r = embk_syscall3(EMBK_SYS_fcntl, fd, 6,
+                ((flags&O_NONBLOCK)?4:0)|((flags&O_APPEND)?8:0));
         if (embk_is_err(r)) return embk_fail(r);
         return 0;
     }
@@ -1274,11 +1273,7 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     return -1;
 }
 
-pid_t wait(int *status) {
-    (void)status;
-    errno = ENOSYS;   /* the kernel's wait is handle-based, not wait-any-child */
-    return -1;
-}
+pid_t wait(int *status) { return waitpid((pid_t)-1,status,0); }
 
 int link(const char *oldpath, const char *newpath) {
     /* REAL since SYS_link (112). This stub said "no link op yet" for as long
@@ -1455,20 +1450,17 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
 }
 
 int pipe(int fds[2]) {
-    /* EmbLink HAS pipes (the shell's pipelines run on them) -- what is missing
-     * is only this POSIX veneer, which needs a lowest-free-fd install the SDK
-     * does not expose yet. ENOSYS is literally true ("not implemented"), and
-     * every git caller sits behind a fork/exec that refuses first. */
-    (void)fds;
-    errno = ENOSYS;
-    return -1;
+    if(!fds){errno=EFAULT;return -1;}
+    int rc=embk_pipe_fds(fds);return rc<0?embk_fail(rc):0;
 }
 
-/* Process control that presumes fork/exec/sessions -- the model this OS
- * deliberately does not have (spawn + explicit handles instead). */
-pid_t waitpid(pid_t pid, int *status, int options) {
-    (void)pid; (void)status; (void)options;
-    errno = ENOSYS; return (pid_t)-1;
+pid_t waitpid(pid_t pid,int *status,int options) {
+    if(options & ~WNOHANG){errno=EINVAL;return (pid_t)-1;}
+    if(pid==0 || pid < (pid_t)-1){errno=ENOSYS;return (pid_t)-1;}
+    int64_t rc=embk_syscall5(EMBK_SYS_child,pid,EMBK_CHILD_WAIT_STATUS,
+        (int64_t)(intptr_t)status,status?sizeof *status:0,(options&WNOHANG)?EMBK_CHILD_NOHANG:0);
+    if(rc<0){errno=rc==-125?EINTR:embk_errno_from_kernel(rc);return (pid_t)-1;}
+    return (pid_t)rc;
 }
 /* dup2 -- redirection. `cmd > file` is this call and nothing else: open the
  * file, dup2 it onto fd 1, and every write the program makes to stdout lands
@@ -1513,18 +1505,40 @@ struct passwd *getpwuid(uid_t uid)        { (void)uid;  errno = ENOENT; return N
 struct passwd *getpwnam(const char *name) { (void)name; errno = ENOENT; return NULL; }
 
 char *getpass(const char *prompt) { (void)prompt; errno = ENOTTY; return NULL; }
-int tcgetattr(int fd, struct termios *t) { (void)fd; (void)t; errno = ENOTTY; return -1; }
+int tcgetattr(int fd, struct termios *t) {
+    if (!t) { errno=EFAULT; return -1; }
+    struct embk_terminal_attr a;
+    int rc=embk_terminal_control(fd,EMBK_TERMINAL_GET_ATTR,&a,sizeof a);
+    if (rc<0) return embk_fail(rc);
+    memset(t,0,sizeof *t);
+    t->c_iflag=a.iflag; t->c_oflag=a.oflag; t->c_cflag=a.cflag; t->c_lflag=a.lflag;
+    memcpy(t->c_cc,a.cc,sizeof a.cc); return 0;
+}
 int tcsetattr(int fd, int actions, const struct termios *t) {
-    (void)fd; (void)actions; (void)t; errno = ENOTTY; return -1;
+    if (!t) { errno=EFAULT; return -1; }
+    if (actions!=TCSANOW && actions!=TCSAFLUSH) { errno=actions==TCSADRAIN?ENOTSUP:EINVAL; return -1; }
+    for (unsigned i=EMBK_TCC_COUNT;i<NCCS;i++) if (t->c_cc[i]) { errno=ENOTSUP; return -1; }
+    struct embk_terminal_attr a; memset(&a,0,sizeof a);
+    a.iflag=t->c_iflag; a.oflag=t->c_oflag; a.cflag=t->c_cflag; a.lflag=t->c_lflag;
+    memcpy(a.cc,t->c_cc,sizeof a.cc);
+    int rc=embk_terminal_control(fd,actions==TCSAFLUSH?EMBK_TERMINAL_SET_ATTR_FLUSH:EMBK_TERMINAL_SET_ATTR,&a,sizeof a);
+    return rc<0?embk_fail(rc):0;
+}
+void cfmakeraw(struct termios *t) {
+    t->c_iflag=0; t->c_oflag=0; t->c_lflag=0; t->c_cflag=CS8;
+    t->c_cc[VMIN]=1; t->c_cc[VTIME]=0;
 }
 
 int ioctl(int fd, unsigned long request, ...) {
-    /* TIOCGWINSZ is the caller that matters; the console has no winsize
-     * protocol, and a fabricated 80x24 would be a guess dressed as a
-     * measurement. Callers fall back to their defaults. */
-    (void)fd; (void)request;
-    errno = ENOSYS;
-    return -1;
+    if (request!=TIOCGWINSZ && request!=TIOCSWINSZ) { errno=ENOTSUP; return -1; }
+    va_list ap; va_start(ap,request); struct winsize *w=va_arg(ap,struct winsize *); va_end(ap);
+    if (!w) { errno=EFAULT; return -1; }
+    struct embk_terminal_size s;
+    if (request==TIOCSWINSZ) { s.rows=w->ws_row; s.cols=w->ws_col; s.xpixel=w->ws_xpixel; s.ypixel=w->ws_ypixel; }
+    int rc=embk_terminal_control(fd,request==TIOCGWINSZ?EMBK_TERMINAL_GET_SIZE:EMBK_TERMINAL_SET_SIZE,&s,sizeof s);
+    if (rc<0) return embk_fail(rc);
+    if (request==TIOCGWINSZ) { w->ws_row=s.rows; w->ws_col=s.cols; w->ws_xpixel=s.xpixel; w->ws_ypixel=s.ypixel; }
+    return 0;
 }
 
 /* mmap -- ANONYMOUS PRIVATE ONLY, over the kernel's EMBK_SYS_mmap.
@@ -1652,7 +1666,7 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     if (!dest) return write(fd, buf, len);                     /* connected socket */
     const struct sockaddr_in *in = (const struct sockaddr_in *)dest;
     int r = embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
-    return r < 0 ? embk_fail(r) : (ssize_t)r;
+    return r < 0 ? embk_fail(r) : (ssize_t)len;
 }
 
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
@@ -1879,3 +1893,6 @@ void __malloc_unlock(struct _reent *r) {
     g_depth = 0;
     embk_mutex_unlock(&g_malloc_mtx);
 }
+
+/* Kept in this retargeting object so installed SDK links need no extra object. */
+#include "spawn_compat.inc"

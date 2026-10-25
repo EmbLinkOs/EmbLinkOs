@@ -25,6 +25,7 @@
 
 #include <stddef.h>
 #include "syntax.h"
+#include "../lib/document.h"
 #include "edit.h"   /* struct ed_undo_state: the history lives with the document */
 
 #define DOC_MAX      8               /* documents open at once     */
@@ -38,6 +39,7 @@ struct doc {
     int           open;
     enum syn_lang lang;
     unsigned long saved_hash;          /* of the text as last read/written */
+    struct emdoc_stamp original;      /* conflict stamp from the last load/save */
     int           truncated;           /* the file was larger than DOC_CAP */
     /* THE UNDO HISTORY BELONGS HERE, not to the engine. The engine is re-bound
      * on every tab switch and ed_init clears its arena, so a history kept only
@@ -55,7 +57,8 @@ struct doc *doc_cur(void);
 /* Open `path`, or return an already-open document for it -- opening the same
  * file twice in two tabs is two buffers diverging over one file, and whichever
  * you saved last would silently win. Returns the index, or -1 if there is no
- * room. `read` does the actual I/O and returns bytes read, or -1. */
+ * room, or -2 on an invalid path/read failure. `read` does the actual I/O and
+ * returns bytes read, or a negative error. New empty files use doc_new(). */
 int  doc_open(const char *path, long (*read)(const char *path, char *buf, size_t cap));
 int  doc_new(void);                   /* an empty, unnamed document */
 int  doc_close(int i);                /* returns the index current afterwards */

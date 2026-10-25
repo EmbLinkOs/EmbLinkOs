@@ -15,6 +15,24 @@
 // The registry: pointers to all registered block devices.
 static struct embk_block_device *devices[BLOCK_MAX_DEVICES];
 static uint32_t device_count = 0;
+static struct embk_block_identity identities[BLOCK_MAX_DEVICES];
+static void identity_string(char *out,unsigned cap,const char *in) {
+    unsigned n=0;
+    while(in && in[n] && n+1<cap) {unsigned char c=in[n];out[n]=c>=32 && c<127?(char)c:'?';n++;}
+    while(n && out[n-1]==' ')n--;
+    out[n]=0;
+}
+void embk_block_set_identity(struct embk_block_device *dev,const char *transport,const char *model,const char *serial) {
+    for(unsigned i=0;i<device_count;i++)if(devices[i]==dev) {
+        identity_string(identities[i].transport,sizeof identities[i].transport,transport);
+        identity_string(identities[i].model,sizeof identities[i].model,model);
+        identity_string(identities[i].serial,sizeof identities[i].serial,serial);return;
+    }
+}
+const struct embk_block_identity *embk_block_identity(const struct embk_block_device *dev) {
+    for(unsigned i=0;i<device_count;i++)if(devices[i]==dev)return &identities[i];
+    return NULL;
+}
 
 // Whole-disk letter counter. Only auto-named disks consume a letter (sda, sdb,
 // ...). Partitions name themselves (sda1, sda2, ...) and must NOT advance this,
@@ -115,6 +133,7 @@ int embk_block_register(struct embk_block_device *dev) {
         disk_letters++;
     }
 
+    memset(&identities[device_count], 0, sizeof identities[device_count]);
     devices[device_count++] = dev;
 
     kprintf("block: registered %s (%u blocks x %u bytes = %u KB)\n",
@@ -141,9 +160,13 @@ int embk_block_unregister(struct embk_block_device *dev) {
     if (!dev) return -EMBK_EINVAL;
     for (uint32_t i = 0; i < device_count; i++) {
         if (devices[i] != dev) continue;
-        for (uint32_t j = i; j + 1 < device_count; j++) devices[j] = devices[j + 1];
+        for (uint32_t j = i; j + 1 < device_count; j++) {
+            devices[j] = devices[j + 1];
+            identities[j] = identities[j + 1];
+        }
         device_count--;
         devices[device_count] = NULL;
+        memset(&identities[device_count], 0, sizeof identities[device_count]);
         kprintf("block: unregistered %s\n", dev->name);
         return EMBK_OK;
     }
@@ -178,7 +201,7 @@ int embk_block_read(struct embk_block_device *dev,
     if (!dev || !dev->read) return -EMBK_ENODEV;
     if (!buffer)            return -EMBK_EFAULT;
     if (count == 0)         return EMBK_OK;
-    if (lba + count > dev->block_count) {
+    if (lba > dev->block_count || count > dev->block_count - lba) {
         kprintf("block: %s read out of range\n", dev->name);
         return -EMBK_ERANGE;
     }
@@ -223,7 +246,7 @@ int embk_block_write(struct embk_block_device *dev,
     if (!dev || !dev->write) return -EMBK_ENODEV;
     if (!buffer)             return -EMBK_EFAULT;
     if (count == 0)          return EMBK_OK;
-    if (lba + count > dev->block_count) {
+    if (lba > dev->block_count || count > dev->block_count - lba) {
         kprintf("block: %s write out of range\n", dev->name);
         return -EMBK_ERANGE;
     }

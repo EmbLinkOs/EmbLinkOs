@@ -1,13 +1,12 @@
 #ifndef _EMBBOOT_MENU_H_
 #define _EMBBOOT_MENU_H_
 
-/* The EmbBoot menu entries. Only MENU_BOOT_EMBLINKOS is live in M1; the rest are
- * shown disabled ("(soon)") until their milestones land (see docs/EMBBOOT_Design.md). */
+/* Normal boot and read-only recovery/diagnostics share the embedded kernel. */
 enum menu_entry {
     MENU_BOOT_EMBLINKOS = 0,
     MENU_RECOVERY,
     MENU_DIAGNOSTICS,
-    MENU_FIRMWARE_UPDATE,
+    MENU_LIVE_DESKTOP,
     MENU_BOOT_MANAGER,
     MENU_SECURE_BOOT,
     MENU_ENTRY_COUNT

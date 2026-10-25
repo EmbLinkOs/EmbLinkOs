@@ -92,6 +92,7 @@ struct paint {
 };
 
 struct scene_node {
+    bool hit_passthrough; /* decorative subtree, skipped by UI hit testing */
     struct node_handle self;                       /* for validation/debug; self.index
                                                     * == 0 marks a FREE slot */
     struct node_handle parent;
@@ -163,7 +164,7 @@ struct scene_node {
                   * SELECTION: a highlighted run is a property of the run, not
                   * a separate overlay tree that would have to be kept in sync
                   * with where layout actually put the words. */
-                 struct color bg; } text;
+                 struct color bg; bool no_wrap; } text;
     } data;
 
     bool  dirty;   /* any mutation sets this; lets a caching traversal skip an
@@ -223,6 +224,7 @@ void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf
                     uint32_t font_handle, float size_px, struct color color);
 void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const struct paint *paint);
 /* Paint `bg` behind this run's glyphs; alpha 0 removes it. */
+void scene_set_text_wrap(struct scene_arena *a,struct node_handle h,bool wrap);
 void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg);
 
 /* Force-dirty a node whose (aliased) content was edited in place. */

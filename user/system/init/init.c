@@ -40,21 +40,9 @@
 #define NS_ACTS_MAX  9           /* up to 8 bindings + the NEW_SESSION action */
 #define SESSION_FD   9
 
-/* Development shortcut: authentication is already validated, so UI work can
- * boot straight into this disposable session. Set to 0 to restore the normal
- * first-boot setup + password login flow.
- *
- * It opens the session at BOOT and after a CRASH -- a desktop that dies while
- * UI work is under way comes straight back. It does not survive a LOGOUT: a
- * user who logs out has asked for the login screen, and logging them straight
- * back in would make logging out meaningless. So even a development image
- * reaches the real setup and greeter, which is how they are tested.
- *
- * A PRODUCTION image is built with `make AUTOLOGIN=0`: no session opens
- * without a password, from the first boot on. */
-#ifndef DEV_AUTOLOGIN
-#define DEV_AUTOLOGIN 1
-#endif
+/* Normal boots authenticate. EmbBoot's Live desktop entry (or an explicit
+ * QEMU opt/emblink/live file) opens a disposable session for UI testing.
+ * Logout clears this local choice, so subsequent sessions authenticate. */
 #define DEV_USER      "yves"
 
 /* init links no libc, and the compiler emits calls to these two for struct
@@ -279,18 +267,36 @@ static int64_t spawn_authd(const char *user) {
     return embk_spawn(AUTHD, argv_, acts, 1);
 }
 
+/* Keep one update service alive independently of login/logout. Each spawn
+ * is attenuated before it runs; no session receives the worker's authority. */
+static void update_supervisor(long unused) {
+    (void)unused;
+    for(;;) {
+        struct embk_spawn_file_action caps;
+        embk_action_set_caps(&caps,EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM)|EMBK_CAP_BIT(EMBK_CAP_NETWORK)|EMBK_CAP_BIT(EMBK_CAP_SESSION));
+        char *argv[]={"/system/bin/updateworker.elf",NULL};
+        int handle=(int)embk_spawn(argv[0],argv,&caps,1);
+        if(handle>=0)(void)embk_wait(handle);
+        else log_line("init: update worker could not start; retrying\n");
+        embk_sleep_ms(2000);
+    }
+}
+
 void _start(long argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     log_line("init: up -- root of EmbLink userspace authority\n");
     ns_selfcheck();
+    struct embk_update_info update_info;
+    if(!embk_update(EMBK_UPDATE_STATUS,&update_info,sizeof update_info) && (update_info.flags&EMBK_UPDATE_MANAGED))
+        (void)embk_thread_create(update_supervisor,0);
 
-    int autologin = DEV_AUTOLOGIN;     /* cleared by a logout; see DEV_AUTOLOGIN */
+    int autologin = embk_syscall0(EMBK_SYS_boot_mode)==3;     /* cleared by logout */
 
     for (;;) {
         char user[32];
         if (autologin) {
             char *d = user; d = put_str(d, DEV_USER); *d = 0;
-            log_line("init: DEV auto-login as '" DEV_USER "'\n");
+            log_line("init: explicit live-session auto-login as '" DEV_USER "'\n");
             /* A fresh COW image has no account directories. */
             (void)embk_mkdir("/home/" DEV_USER);
             (void)embk_mkdir("/home/" DEV_USER "/Desktop");
@@ -354,7 +360,7 @@ void _start(long argc, char **argv, char **envp) {
         char nsdesc[192];
         int is_admin = user_is_admin(user);
         int snacts = load_user_profile(user, is_admin, sacts, NS_ACTS_MAX - 1, nsdesc, sizeof nsdesc);
-        embk_action_new_session(&sacts[snacts++], user);
+        embk_action_new_session(&sacts[snacts], user);sacts[snacts++].flags=(autologin?EMBK_SPAWN_SESSION_LIVE:0)|(is_admin?EMBK_SPAWN_SESSION_ADMIN:0);
 
         char home[80], env_user[48], env_home[96], env_pwd[96];
         char *p = home;

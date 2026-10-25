@@ -190,6 +190,12 @@ struct vfs_ops {
     * A fs without unlink-while-open semantics (e.g. FAT32) leaves both NULL - the fd layer then no-ops. */
     int (*obj_get)(struct vfs_mount *mnt, uint64_t ino);
     int (*obj_put)(struct vfs_mount *mnt, uint64_t ino);
+    /* Barrier for direct vnode transactions; fd writers flush their page object first. */
+    int (*sync)(struct vnode *vn);
+    int (*rename_noreplace)(struct vnode *,const char *,size_t,
+                            struct vnode *,const char *,size_t);
+    /* Reject writes before the page cache can dirty an immutable volume. */
+    int (*check_write)(struct vnode *);
 };
 
 /* ---- a mounted filesystem instance ---------------------------------- */

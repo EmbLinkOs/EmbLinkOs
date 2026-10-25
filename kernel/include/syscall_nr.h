@@ -322,4 +322,35 @@
 #define SYS_disk_read     127   /* (idx, lba, count, buf)   -> 0 | -err       */
 #define SYS_disk_write    128   /* (idx, lba, count, buf)   -> 0 | -err       */
 
+/* Wi-Fi station control. Appended after the upstream portable ABI. */
+#define SYS_wifi_info 129
+#define SYS_wifi_request 130
+#define SYS_power_info 131
+#define SYS_display_info 132
+#define SYS_display_set 133
+#define SYS_audio_info 134
+#define SYS_audio_control 135
+#define SYS_gpu_info 136
+#define SYS_rename_noreplace 137
+#define SYS_boot_mode 138
+#define SYS_session_control 139
+#define SYS_notice_post 140
+#define SYS_notice_get 141
+#define SYS_policy_get 142
+#define SYS_policy_set 143
+#define SYS_win_menu 144
+#define SYS_win_close_ack 145
+#define SYS_key_poll_input 146
+#define SYS_desktop_control 147
+#define SYS_terminal 148
+#define SYS_child 149
+#define SYS_pipe_fds 150
+#define SYS_spawn_cwd 151
+#define SYS_spawn_pid 152
+#define SYS_update 153
+#define SYS_monitor 154
+#define SYS_win_place 155
+
+
+
 #endif /* _SYSCALL_NR_H_ */

@@ -189,3 +189,6 @@ void boot_protocol_dump(void)
             (int)proto.version, (int)proto.mmap_count, (int)proto.mmap_stride);
     fdt_dump_summary();
 }
+
+bool boot_recovery_mode(void) {return proto.boot_mode==BOOT_MODE_RECOVERY || proto.boot_mode==BOOT_MODE_DIAGNOSTICS;}
+void boot_protocol_force_recovery(void) {proto.boot_mode=BOOT_MODE_RECOVERY;}

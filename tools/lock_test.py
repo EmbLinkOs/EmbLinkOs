@@ -57,7 +57,7 @@ DOCK_BAND    = (400, 690, 630, 745)   # x0, y0, x1, y1: the dock pill
 # showing the desktop, so this band is checked as well as the dock's.
 ICON_BAND    = (20, 45, 95, 120)
 
-KEYS = {' ': 'spc', '\t': 'tab', '\n': 'ret', '-': 'minus', '_': 'shift-minus', '.': 'dot'}
+KEYS = {' ': 'spc', '\t': 'tab', '\n': 'ret', '-': 'minus', '_': 'shift-minus', '.': 'dot', '+': 'shift-equal'}
 
 
 def keyname(c):
@@ -92,6 +92,7 @@ def main():
     shutil.copyfile(os.path.join(ROOT, "embkfs.img"), disk)
     qmp_port = 4900 + random.randint(0, 400)
     argv = ["qemu-system-x86_64", "-cpu", "max",
+            "-fw_cfg", "name=opt/emblink/live,string=1",
             "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT,
             "-drive", "format=raw,file=%s,if=ide,index=1" % disk,
             "-vga", "none", "-device", "virtio-vga,xres=1024,yres=768",
@@ -180,6 +181,7 @@ def main():
         time.sleep(2)
 
     fails = 0
+    dock_band=DOCK_BAND
 
     def step(ok, what):
         nonlocal fails
@@ -245,6 +247,13 @@ def main():
         during = os.path.join(ROOT, "build", "lock-during.ppm")
         after = os.path.join(ROOT, "build", "lock-after.ppm")
 
+        before=os.path.join(ROOT,"build","lock-before.ppm")
+        q.screendump(before)
+        width,height,_=S.ppm_pixels(before)
+        dock_band=(max(0,width//2-170),height-110,min(width,width//2+170),height-18)
+        step(ink(before,dock_band)>300,"the measured dock region is visible before locking")
+        step(ink(before,ICON_BAND)>100,"the reference desktop icon is visible before locking")
+
         # 2. LOCK.
         since = len(buf)
         click_lock_menu()
@@ -252,7 +261,7 @@ def main():
         locked = saw("home: screen LOCKED", since)
         step(locked, "the menu bar's Lock Screen locked the screen")
         q.screendump(during)
-        b = ink(during, DOCK_BAND)
+        b = ink(during, dock_band)
         i = ink(during, ICON_BAND)
         print("lock_test: while locked, dock band %d lit pixels, desktop icon band %d"
               % (b, i), file=sys.stderr)
@@ -272,7 +281,7 @@ def main():
              "the keystroke reached the kernel and the kernel refused it")
         switched = os.path.join(ROOT, "build", "lock-switch.ppm")
         q.screendump(switched)
-        sw_ink = ink(switched, DOCK_BAND)
+        sw_ink = ink(switched, dock_band)
         print("lock_test: after GUI+Tab, dock band %d lit pixels" % sw_ink, file=sys.stderr)
         step(sw_ink == 0, "GUI+Tab raises nothing over the lock (%d lit pixels)" % sw_ink)
 
@@ -291,7 +300,7 @@ def main():
         step(wait_for("home: screen unlocked", 30), "and the desktop comes back")
         time.sleep(3)
         q.screendump(after)
-        c = ink(after, DOCK_BAND)
+        c = ink(after, dock_band)
         print("lock_test: dock band back to %d lit pixels" % c, file=sys.stderr)
         # The dock is dark chips with bright icons on a dark desktop: a few
         # hundred lit pixels is what it looks like, and zero is what the lock

@@ -71,6 +71,10 @@ struct embk_block_device *embk_block_get(uint32_t index);
 struct embk_block_device *embk_block_get_by_name(const char *name);
 
 
+struct embk_block_identity {char transport[12],model[41],serial[21];};
+void embk_block_set_identity(struct embk_block_device *,const char *,const char *,const char *);
+const struct embk_block_identity *embk_block_identity(const struct embk_block_device *);
+
 // Convenience wrappers with bounds-checking. Higher layers (Filesystem)
 // Call these instead of dev->reqd/write directly - they validate the LBA range
 // against block_count before dispatching to driver.

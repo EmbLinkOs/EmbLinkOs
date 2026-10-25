@@ -137,7 +137,10 @@ uint16_t net_l4_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                          const void *seg, uint32_t seg_len);
 
 /* ---- stack entry points ------------------------------------------------- */
-void net_init(void);                          /* bring up the NIC + static config */
+void net_service_lock(void);
+void net_service_unlock(void);
+void net_init(void);
+void net_address_ready(void);                          /* bring up the NIC + static config */
 void net_rx(const uint8_t *frame, uint32_t len);   /* driver -> stack (one Ethernet frame) */
 
 /* eth: build+send a frame carrying `payload` to `dst_mac` with `ethertype`. */
@@ -160,6 +163,10 @@ int  net_send_udp(uint32_t src_ip, uint16_t src_port,
 /* DHCP: run DISCOVER/OFFER/REQUEST/ACK and, on success, configure g_netif
  * (ip/netmask/gateway/dns) and set g_netif.dhcp. Returns true on a lease. */
 bool net_dhcp(void);
+void net_dhcp_forget_lease(void);
+uint64_t net_dhcp_lease_remaining_ms(void);
+uint64_t net_dhcp_renew_after_ms(void);
+void arp_reset(void);
 
 /* DNS: resolve `name` to an IPv4 address (HOST order) via the DHCP-learned
  * resolver (g_netif.dns), UDP/53. Returns true and fills *out_ip on the first
@@ -186,6 +193,7 @@ int  net_tcp_ready(int conn);
 #define TCP_RDY_WRITE 0x2
 #define TCP_RDY_ERR   0x4
 int  net_tcp_listen(uint16_t port);                         /* passive open -> a listen conn index */
+int  net_tcp_accept_nb(int listen_conn); /* -2 when no queued peer */
 int  net_tcp_accept(int listen_conn);                       /* block for a client -> its conn index */
 int  net_tcp_send(int conn, const void *data, uint32_t len);/* send + wait for ACK */
 int  net_tcp_recv(int conn, void *buf, uint32_t cap);       /* bytes; 0 = peer FIN/EOF; -2 = timed out, still open; -1 = bad conn */
@@ -198,6 +206,8 @@ int  net_udp_open(void);
 int  net_udp_bind(int us, uint16_t port);
 int  net_udp_sendto(int us, uint32_t dst_ip, uint16_t dst_port, const void *data, uint32_t len);
 int  net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port);
+int net_udp_recvfrom_nb(int us,void *buf,uint32_t cap,uint32_t *src_ip,uint16_t *src_port);
+int net_udp_ready(int us); /* -1 invalid, 0 empty, 1 datagram queued */
 void net_udp_close(int us);
 void net_udp_abort(int us);                                 /* lock-free free (fd reap path) */
 
@@ -250,6 +260,7 @@ void icmp_send_unreachable(uint32_t dst_ip, const uint8_t *orig_ip_pkt, uint32_t
 /* UDP single-slot receive capture, driven by DHCP/DNS: arm on a local port,
  * then poll (bounded) for the reply. */
 void udp_arm(uint16_t port);
+void udp_arm_peer(uint16_t port,uint32_t peer,uint16_t peer_port);
 int  udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip);
 
 /* ---- the NIC drivers, and how the stack reaches one ----------------------

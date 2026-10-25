@@ -80,7 +80,7 @@ void pipe_unref_locked(struct pipe *p, int side) {
         p->used = false;    /* free iff BOTH zero -- release order irrelevant */
 }
 
-int pipe_read(struct pipe *p, void *buf, size_t len, size_t *out_read) {
+int pipe_read_flags(struct pipe *p, void *buf, size_t len, size_t *out_read,bool nonblock) {
     if (!buf || !out_read) return -EMBK_EINVAL;
     if (len == 0) { *out_read = 0; return EMBK_OK; }
 
@@ -102,6 +102,7 @@ int pipe_read(struct pipe *p, void *buf, size_t len, size_t *out_read) {
             sched_unlock();
             return -EMBK_ECANCELED;
         }
+        if(nonblock){sched_unlock();return -EMBK_EAGAIN;}
         sched_block_current_locked(&p->read_wait);
         sched_lock();
     }
@@ -118,12 +119,12 @@ int pipe_read(struct pipe *p, void *buf, size_t len, size_t *out_read) {
     return EMBK_OK;
 }
 
-int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written) {
+int pipe_write_flags(struct pipe *p, const void *buf, size_t len, size_t *out_written,bool nonblock,bool atomic_small) {
     if ((!buf && len) || !out_written) return -EMBK_EINVAL;
     if (len == 0) { *out_written = 0; return EMBK_OK; }
 
     sched_lock();
-    while (p->count == PIPE_BUF_SIZE) {
+    while (p->count == PIPE_BUF_SIZE || (atomic_small && len<=PIPE_BUF_SIZE && PIPE_BUF_SIZE-p->count<len)) {
         if (p->n_readers == 0) { sched_unlock(); return -EMBK_EPIPE; }
         /* Cancelled -> stop waiting for space (docs/INTERRUPTION.md). EPIPE
          * still wins above: a vanished reader is a real, permanent answer. */
@@ -131,6 +132,7 @@ int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written)
             sched_unlock();
             return -EMBK_ECANCELED;
         }
+        if(nonblock){sched_unlock();return -EMBK_EAGAIN;}
         sched_block_current_locked(&p->write_wait);
         sched_lock();
     }
@@ -149,6 +151,15 @@ int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written)
     sched_unlock();
     *out_written = n;    /* may be < len: partial write, caller loops */
     return EMBK_OK;
+}
+
+/* Object-handle callers keep their existing partial-write contract. File
+ * descriptors additionally honour O_NONBLOCK and atomic writes <= PIPE_BUF. */
+int pipe_read(struct pipe *p,void *buf,size_t len,size_t *out) {
+    return pipe_read_flags(p,buf,len,out,false);
+}
+int pipe_write(struct pipe *p,const void *buf,size_t len,size_t *out) {
+    return pipe_write_flags(p,buf,len,out,false,false);
 }
 
 /* Non-blocking progress probe, per side -- the fd layer's avail hook.

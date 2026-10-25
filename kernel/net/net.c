@@ -18,6 +18,12 @@
  * so a caller does not depend on the background RX kthread being scheduled. */
 
 #include "net/net.h"
+#include "process/ksync.h"
+#if defined(__x86_64__)
+#include "net/wifi/wifi.h"
+static bool wifi_device_init(uint8_t mac[6]) {return wifi_init(mac)!=0;}
+static int wifi_device_link(void);
+#endif
 #include "net/ntp.h"
 #if defined(__x86_64__)
 #include "net/usb_net.h"
@@ -52,6 +58,10 @@ static struct thread    *g_net_owner = 0;
 static int               g_net_depth = 0;
 static struct wait_queue g_net_wq;         /* threads waiting to ACQUIRE net_lock */
 static struct net_lockstat g_net_stat;
+static struct mutex g_net_service=MUTEX_INIT;
+void net_service_lock(void) {while(!mutex_trylock(&g_net_service)) net_wait();}
+void net_service_unlock(void) {mutex_unlock(&g_net_service);}
+
 
 /* Event-driven RX (replaces busy-polling). The RX kthread sleeps on g_net_rx_wq
  * until the NIC interrupt (or the 10 ms timer tick) wakes it, then delivers and
@@ -227,9 +237,13 @@ static const struct net_driver g_drivers[] = {
      * and neither is anything that calls into it -- the same per-architecture
      * split audio.c's driver table makes, and for the same reason. */
     { "usb-net",    usb_net_drv_init, usb_net_drv_tx, usb_net_drv_poll, usb_net_drv_link },
+    { "AX200 Wi-Fi",wifi_device_init, wifi_tx, wifi_poll, wifi_device_link },
 #endif
 };
 static const struct net_driver *g_dev;
+#if defined(__x86_64__)
+static int wifi_device_link(void) {return g_netif.up?1:0;}
+#endif
 
 int net_dev_tx(const void *frame, uint32_t len) {
     return g_dev ? g_dev->tx(frame, len) : -1;
@@ -254,6 +268,14 @@ static void net_ntp_boot_thread(void) {
     process_exit_self(0);
 }
 
+static unsigned ntp_started;
+void net_address_ready(void) {
+    if(!g_netif.up || !g_netif.ip)return;
+    unsigned expected=0;
+    if(!__atomic_compare_exchange_n(&ntp_started,&expected,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
+    if(!process_create_kthread(net_ntp_boot_thread,0))__atomic_store_n(&ntp_started,0,__ATOMIC_RELEASE);
+}
+
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
     g_dev = 0;
@@ -266,18 +288,21 @@ void net_init(void) {
     }
     kprintf("net: using %s\n", g_dev->name);
     process_create_kthread(net_rx_thread, 0);   /* background RX poller */
+#if defined(__x86_64__)
+    if(g_dev->init==wifi_device_init) {
+        g_netif.up=false;
+        wifi_start_worker();
+        return; /* DHCP follows WPA2 authorization, never radio discovery. */
+    }
+#endif
     g_netif.up = true;
 
-    /* Lease an address (M2). Fall back to the M1 static config so the stack is
-     * still usable if no DHCP server answers. */
+    /* A failed lease leaves the interface unconfigured. */
     if (net_dhcp()) {
         kprintf("net: DHCP lease  ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
                 IP_OCTETS(g_netif.ip), IP_OCTETS(g_netif.gateway), IP_OCTETS(g_netif.dns));
     } else {
-        g_netif.ip      = IPV4(10, 0, 2, 15);
-        g_netif.netmask = IPV4(255, 255, 255, 0);
-        g_netif.gateway = IPV4(10, 0, 2, 2);
-        kprintf("net: DHCP failed -- static 10.0.2.15/24 gw 10.0.2.2\n");
+        kprintf("net: DHCP failed -- interface has no address\n");
     }
 
     /* AND ASK SOMETHING WHAT TIME IT IS. Every timestamp this system writes
@@ -294,5 +319,5 @@ void net_init(void) {
      *
      * Failure is not an error: a machine with no route to a time server keeps
      * the clock it has, which is what it would have had anyway. */
-    process_create_kthread(net_ntp_boot_thread, 0);
+    net_address_ready();
 }

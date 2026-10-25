@@ -33,6 +33,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "manifest.h"
 #include "embxinfo.h"
 #include "embk.h"
@@ -44,8 +45,8 @@
 #define APPS_ROOT "/data/apps"
 #define PKG_ROOT  "/data/pkg"
 #define REGISTRY_DIR "/data/registry"
-#define GITCLONE  "/data/apps/gitclone/gitclone.elf"
-#define WGET      "/data/apps/wget/wget.elf"
+#define GITCLONE  "/system/bin/gitclone.elf"
+#define WGET      "/system/bin/wget.elf"
 
 static char *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
@@ -57,7 +58,9 @@ static char *read_file(const char *path, size_t *len) {
 }
 static int write_file(const char *path, const void *b, size_t n) {
     FILE *f = fopen(path, "wb"); if (!f) return -1;
-    size_t w = n ? fwrite(b, 1, n, f) : 0; fclose(f); return w == n ? 0 : -1;
+    size_t w = n ? fwrite(b, 1, n, f) : 0;
+    int rc=w==n && !fflush(f) && !embk_fsync(fileno(f))?0:-1;
+    if(fclose(f))rc=-1;return rc;
 }
 static int copy_file(const char *src, const char *dst) {
     size_t n; char *b = read_file(src, &n); if (!b) return -1;
@@ -102,7 +105,11 @@ static size_t canonical_len(const uint8_t *t, size_t n) {
 static int verify_sig(const uint8_t *text, size_t len, const uint8_t sig[64]) {
     uint8_t hash[32];
     sha256(text, canonical_len(text, len), hash);
-    return ecdsa_verify(ec_p256(), PKG_SIGN_QX, PKG_SIGN_QY,
+    uint8_t key[64];
+    FILE *f=fopen("/system/update/key","rb");
+    if(f) {int ok=fread(key,1,64,f)==64 && fgetc(f)==EOF;fclose(f);if(!ok)return 0;}
+    else {memcpy(key,PKG_SIGN_QX,32);memcpy(key+32,PKG_SIGN_QY,32);}
+    return ecdsa_verify(ec_p256(), key, key+32,
                         hash, 32, sig, 32, sig + 32, 32);
 }
 
@@ -180,6 +187,10 @@ static int load_bundle(const char *dir, struct pkg_manifest *m, struct embx_info
     free(mtext);
     if (rc != 0) { fprintf(stderr, "pkg: %s: %s\n", mpath, err); return -1; }
 
+    if(m->have_sig && !*sig_ok){fprintf(stderr,"pkg: invalid manifest signature\n");return -1;}
+    char expected[1024];snprintf(expected,sizeof expected,"%s/%s",dir,basename_of(m->provides));
+    struct embk_stat present;
+    if(embk_stat(expected,&present) && !*sig_ok){fprintf(stderr,"pkg: refusing unsigned remote asset fetch\n");return -1;}
     if (fetch_binary(dir, m) != 0) return -1;              /* release-asset fetch, if needed */
     snprintf(binpath, bincap, "%s/%s", dir, basename_of(m->provides));
     if (embx_read_info(binpath, ei, err, sizeof err) != 0) { fprintf(stderr, "pkg: %s\n", err); return -1; }
@@ -242,48 +253,71 @@ static int authority_widens(const struct pkg_manifest *old, const struct pkg_man
     return widen;
 }
 
-/* Place a verified bundle under /data/apps/<name>/: the EMBX, the .ns (from the
- * manifest home enforces), the manifest record, and a registry line. */
-static int adopt(const char *name, const char *provides, const char *src_embx,
-                 const char *src_manifest, const struct pkg_manifest *m) {
-    char appdir[512], dst[1024], mdst[1024];
-    mkdir(APPS_ROOT, 0755);
-    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, name);
-    mkdir(appdir, 0755);
-    snprintf(dst, sizeof dst, "%s/%s", appdir, basename_of(provides));
-    if (copy_file(src_embx, dst) != 0) { fprintf(stderr, "pkg: failed to write %s\n", dst); return -1; }
-    if (write_ns(appdir, m) != 0) { fprintf(stderr, "pkg: failed to write the .ns\n"); return -1; }
-    snprintf(mdst, sizeof mdst, "%s/%s.pkg", appdir, name);
-    copy_file(src_manifest, mdst);
-    mkdir(PKG_ROOT, 0755);
-    char reg[600]; snprintf(reg, sizeof reg, "%s/registry", PKG_ROOT);
-    FILE *rf = fopen(reg, "ab");
-    if (rf) { char bid[65]; for (int i = 0; i < 32; i++) sprintf(bid + 2*i, "%02x", m->build_id[i]);
-              fprintf(rf, "%s\t%s\t%s\n", name, m->version, bid); fclose(rf); }
-    return 0;
+/* A published bundle is immutable. CURRENT changes only after every file and
+ * directory has crossed a storage barrier. Existing handles keep their vnode. */
+static int sync_dir(const char *path) {
+    int fd=(int)embk_open(path,EMBK_O_RDONLY,0);if(fd<0)return -1;
+    int rc=embk_fsync(fd);if(embk_close(fd))rc=-1;return rc;
 }
-
-/* The retained-previous-version dir (the rollback point). */
-static void prev_dir(const char *name, char *out, size_t cap) {
-    snprintf(out, cap, "%s/versions/%s/prev", PKG_ROOT, name);
+static int valid_id(const char *p) {
+    for(unsigned i=0;i<64;i++)if(!((p[i]>='0' && p[i]<='9') || (p[i]>='a' && p[i]<='f')))return 0;
+    return 1;
 }
-
-/* Retain the currently-installed bundle so an update is reversible. Each app is
- * a self-contained bundle (§6), so keeping its 3 files IS the rollback point --
- * no whole-FS snapshot needed (an EMBKFS-snapshot-backed variant is a future
- * optimization once a snapshot syscall exists). */
-static int retain_current(const char *name, const struct pkg_manifest *old) {
-    char appdir[512], prev[600], s[1200], d[1200];
-    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, name);
-    mkdir(PKG_ROOT, 0755);
-    char t[700]; snprintf(t, sizeof t, "%s/versions", PKG_ROOT); mkdir(t, 0755);
-    snprintf(t, sizeof t, "%s/versions/%s", PKG_ROOT, name); mkdir(t, 0755);
-    prev_dir(name, prev, sizeof prev); mkdir(prev, 0755);
-    snprintf(s, sizeof s, "%s/%s", appdir, basename_of(old->provides));
-    snprintf(d, sizeof d, "%s/%s", prev, basename_of(old->provides)); copy_file(s, d);
-    snprintf(s, sizeof s, "%s/%s.pkg", appdir, name); snprintf(d, sizeof d, "%s/%s.pkg", prev, name); copy_file(s, d);
-    snprintf(s, sizeof s, "%s/%s.ns", appdir, name);  snprintf(d, sizeof d, "%s/%s.ns", prev, name);  copy_file(s, d);
-    return 0;
+static void package_dir(const char *name,char *out,size_t n) {snprintf(out,n,"%s/apps/%s",PKG_ROOT,name);}
+static int current_ids(const char *name,char current[65],char previous[65]) {
+    char path[700];package_dir(name,path,sizeof path);strcat(path,"/CURRENT");
+    size_t n;char *p=read_file(path,&n);if(!p)return 0;
+    if((n!=65 && n!=130) || p[64]!='\n' || !valid_id(p) || (n==130 && (p[129]!='\n' || !valid_id(p+65)))){free(p);return -1;}
+    memcpy(current,p,64);current[64]=0;previous[0]=0;
+    if(n==130){memcpy(previous,p+65,64);previous[64]=0;}free(p);return 1;
+}
+static int publish_pointer(const char *name,const char *current,const char *previous) {
+    char dir[600],path[700],temp[760],text[131];package_dir(name,dir,sizeof dir);
+    snprintf(path,sizeof path,"%s/CURRENT",dir);snprintf(temp,sizeof temp,"%s/.CURRENT-%u",dir,(unsigned)embk_getpid());
+    int n=snprintf(text,sizeof text,"%s\n%s%s",current,previous,previous[0]?"\n":"");
+    int fd=(int)embk_open(temp,EMBK_O_WRONLY|EMBK_O_CREAT|EMBK_O_EXCL,0600);if(fd<0)return -1;
+    int rc=embk_write(fd,text,n)==n && !embk_fsync(fd)?0:-1;if(embk_close(fd))rc=-1;
+    if(!rc)rc=(int)embk_syscall2(EMBK_SYS_rename,(int64_t)(uintptr_t)temp,(int64_t)(uintptr_t)path);
+    if(!rc)rc=sync_dir(dir);if(rc)embk_unlink(temp);return rc;
+}
+static int bundle_lock(const char *name,char lock[700]) {
+    mkdir(PKG_ROOT,0755);char store[600];snprintf(store,sizeof store,"%s/apps",PKG_ROOT);mkdir(store,0755);
+    package_dir(name,store,sizeof store);mkdir(store,0755);
+    snprintf(lock,700,"%s/.install-lock",store);
+    int fd=(int)embk_open(lock,EMBK_O_WRONLY|EMBK_O_CREAT|EMBK_O_EXCL,0600);
+    if(fd<0){fprintf(stderr,"pkg: %s is locked; if a previous installer was interrupted, remove %s before retrying\n",name,lock);return -1;}
+    embk_close(fd);return 0;
+}
+static int stage_bundle(const char *name,const char *provides,const char *binary,
+                        const char *manifest,const struct pkg_manifest *m,int local,char id[65]) {
+    char dir[600],versions[700],path[900],dst[1100];package_dir(name,dir,sizeof dir);
+    snprintf(versions,sizeof versions,"%s/versions",dir);mkdir(versions,0755);
+    static unsigned sequence;uint64_t nonce[3]={(uint64_t)embk_getpid(),embk_uptime_ms(),++sequence};
+    struct sha256_ctx hash;uint8_t digest[32];sha256_init(&hash);sha256_update(&hash,m->build_id,32);sha256_update(&hash,nonce,sizeof nonce);sha256_final(&hash,digest);
+    for(unsigned i=0;i<32;i++)sprintf(id+2*i,"%02x",digest[i]);
+    snprintf(path,sizeof path,"%s/%s",versions,id);if(mkdir(path,0755))return -1;
+    snprintf(dst,sizeof dst,"%s/%s",path,basename_of(provides));if(copy_file(binary,dst))return -1;
+    snprintf(dst,sizeof dst,"%s/%s.pkg",path,name);if(copy_file(manifest,dst) || write_ns(path,m))return -1;
+    snprintf(dst,sizeof dst,"%s/LOCAL",path);if(write_file(dst,local?"1\n":"0\n",2))return -1;
+    /* Verify the copied bytes, not just the source we previously checked. */
+    struct pkg_manifest verified;struct embx_info ei;char bin[1100];int signed_ok;
+    if(load_bundle(path,&verified,&ei,bin,sizeof bin,&signed_ok) || cross_check(&verified,&ei,signed_ok,local))return -1;
+    return sync_dir(path) || sync_dir(versions) || sync_dir(dir)?-1:0;
+}
+static int adopt(const char *name,const char *provides,const char *binary,const char *manifest,
+                 const struct pkg_manifest *m,int local,const struct pkg_manifest *old) {
+    char lock[700];if(bundle_lock(name,lock))return -1;
+    char current[65]={0},previous[65]={0},next[65];int rc=current_ids(name,current,previous);
+    if(rc<0)goto done;
+    /* Retain a legacy installation as one complete version before publishing. */
+    if(!rc && old) {
+        char dir[700],bin[1000],mpath[1000];snprintf(dir,sizeof dir,"%s/%s",APPS_ROOT,name);
+        snprintf(bin,sizeof bin,"%s/%s",dir,basename_of(old->provides));snprintf(mpath,sizeof mpath,"%s/%s.pkg",dir,name);
+        if(stage_bundle(name,old->provides,bin,mpath,old,!old->have_sig,current)){rc=-1;goto done;}
+    }
+    rc=stage_bundle(name,provides,binary,manifest,m,local,next);
+    if(!rc)rc=publish_pointer(name,next,current);
+done:embk_unlink(lock);if(rc)fprintf(stderr,"pkg: bundle publication failed; current pointer was not intentionally removed\n");return rc;
 }
 
 static int cmd_install(const char *arg, int allow_widen, int local) {
@@ -318,44 +352,48 @@ static int cmd_install(const char *arg, int allow_widen, int local) {
     }
     present_authority(&m);
 
-    if (updating) retain_current(m.name, &old);        /* the rollback point */
     char msrc[1024]; find_manifest(dir, msrc, sizeof msrc);
-    if (adopt(m.name, m.provides, binpath, msrc, &m) != 0) return 1;
+    if (adopt(m.name, m.provides, binpath, msrc, &m, local, updating?&old:NULL) != 0) return 1;
 
     printf("PKG %s %s -> %s/%s -> OK\n", updating ? "update" : "install", m.name, APPS_ROOT, m.name);
     return 0;
 }
 
 static int cmd_rollback(const char *name) {
-    char prev[600], mpath[900], binprev[1200];
-    prev_dir(name, prev, sizeof prev);
-    snprintf(mpath, sizeof mpath, "%s/%s.pkg", prev, name);
-    size_t n; char *t = read_file(mpath, &n);
-    if (!t) { fprintf(stderr, "pkg: no rollback point for %s (nothing to roll back to)\n", name); return 1; }
-    struct pkg_manifest pm; char err[256]; int rc = pkg_manifest_parse(t, n, &pm, err, sizeof err); free(t);
-    if (rc != 0) { fprintf(stderr, "pkg: retained manifest bad: %s\n", err); return 1; }
-    snprintf(binprev, sizeof binprev, "%s/%s", prev, basename_of(pm.provides));
-    if (adopt(name, pm.provides, binprev, mpath, &pm) != 0) return 1;
-    printf("PKG rollback %s -> %s -> OK\n", name, pm.version);
-    return 0;
+    char lock[700];if(bundle_lock(name,lock))return 1;
+    char current[65]={0},previous[65]={0},dir[800],policy[850];int rc=1;
+    if(current_ids(name,current,previous)!=1 || !previous[0]){fprintf(stderr,"pkg: no retained version for %s\n",name);goto done;}
+    package_dir(name,dir,sizeof dir);strcat(dir,"/versions/");strcat(dir,previous);
+    snprintf(policy,sizeof policy,"%s/LOCAL",dir);size_t n;char *p=read_file(policy,&n);
+    int local=p && n==2 && !memcmp(p,"1\n",2);free(p);
+    struct pkg_manifest m;struct embx_info ei;char binary[1100];int signed_ok;
+    if(load_bundle(dir,&m,&ei,binary,sizeof binary,&signed_ok) || strcmp(m.name,name) || cross_check(&m,&ei,signed_ok,local))goto done;
+    rc=publish_pointer(name,previous,current)?1:0;
+    if(!rc)printf("PKG rollback %s -> %s -> OK\n",name,m.version);
+done:embk_unlink(lock);return rc;
 }
-
 static int cmd_remove(const char *name) {
-    struct pkg_manifest m;
-    if (load_installed(name, &m) != 0) { fprintf(stderr, "pkg: %s is not installed\n", name); return 1; }
-    char appdir[512], p[1200], prev[600];
-    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, name);
-    snprintf(p, sizeof p, "%s/%s", appdir, basename_of(m.provides)); remove(p);
-    snprintf(p, sizeof p, "%s/%s.ns", appdir, name);  remove(p);
-    snprintf(p, sizeof p, "%s/%s.pkg", appdir, name); remove(p);
-    remove(appdir);
-    prev_dir(name, prev, sizeof prev);
-    snprintf(p, sizeof p, "%s/%s", prev, basename_of(m.provides)); remove(p);
-    snprintf(p, sizeof p, "%s/%s.ns", prev, name);  remove(p);
-    snprintf(p, sizeof p, "%s/%s.pkg", prev, name); remove(p);
-    remove(prev);
-    printf("PKG remove %s -> OK\n", name);
-    return 0;
+    char lock[700];if(bundle_lock(name,lock))return 1;
+    char dir[700],pointer[800];package_dir(name,dir,sizeof dir);snprintf(pointer,sizeof pointer,"%s/CURRENT",dir);
+    struct embk_stat st;int modern=embk_stat(pointer,&st)==0;
+    int rc=modern?embk_unlink(pointer):0;
+    if(!rc && modern)rc=sync_dir(dir);
+    /* Remove a legacy writable installation too. A lower OS app remains
+     * protected by its read-only volume and is revealed by deactivation. */
+    struct pkg_manifest old;
+    if(!rc && !load_installed(name,&old)) {
+        char appdir[700],path[1000];snprintf(appdir,sizeof appdir,"%s/%s",APPS_ROOT,name);
+        snprintf(path,sizeof path,"%s/%s.pkg",appdir,name);
+        int remove_rc=embk_unlink(path);
+        if(!remove_rc) {
+            snprintf(path,sizeof path,"%s/%s",appdir,basename_of(old.provides));if(embk_unlink(path))rc=-1;
+            snprintf(path,sizeof path,"%s/%s.ns",appdir,name);if(embk_unlink(path))rc=-1;
+            if(embk_rmdir(appdir))rc=-1;
+        } else if(remove_rc!=-EROFS || !modern)rc=remove_rc;
+    } else if(!rc && !modern)rc=-1;
+    embk_unlink(lock);
+    if(!rc)printf("PKG remove %s -> deactivated; retained versions kept\n",name);
+    return rc?1:0;
 }
 
 static int cmd_info(const char *name) {
@@ -367,10 +405,8 @@ static int cmd_info(const char *name) {
     if (!m.ncaps) printf(" (none)");
     printf("\n  namespace:\n");
     for (int i = 0; i < m.nns; i++) printf("    %s %s\n", m.ns[i].ro ? "ro" : "rw", m.ns[i].prefix);
-    char prev[600], mpath[900]; prev_dir(name, prev, sizeof prev);
-    snprintf(mpath, sizeof mpath, "%s/%s.pkg", prev, name);
-    struct pkg_manifest pm;
-    if (load_manifest_file(mpath, &pm) == 0) printf("  rollback available -> %s\n", pm.version);
+    char current[65]={0},previous[65]={0};
+    if(current_ids(name,current,previous)==1 && previous[0])printf("  rollback available (retained version)\n");
     return 0;
 }
 
@@ -408,11 +444,13 @@ static int cmd_run(const char *name, int argc, char **argv) {
 }
 
 static int cmd_list(void) {
-    char reg[600]; snprintf(reg, sizeof reg, "%s/registry", PKG_ROOT);
-    size_t n; char *t = read_file(reg, &n);
-    if (!t) { printf("PKG list: (none installed)\n"); return 0; }
-    printf("PKG list:\n%s", t); free(t);
-    return 0;
+    DIR *d=opendir(APPS_ROOT);if(!d)return 1;struct dirent *entry;unsigned count=0;
+    printf("PKG list:\n");
+    while((entry=readdir(d))) {
+        struct pkg_manifest m;if(load_installed(entry->d_name,&m))continue;
+        printf("%s\t%s\n",m.name,m.version);count++;
+    }
+    closedir(d);if(!count)printf("(none installed)\n");return 0;
 }
 
 /* Sync the package index by cloning the registry git repo (over our own
@@ -440,6 +478,21 @@ static int cmd_sync(const char *url_arg) {
     return 0;
 }
 
+/* Batch updates keep the existing authority boundary. A package that asks
+ * for broader access is left for explicit review, never silently approved. */
+static int cmd_update_all(void) {
+    DIR *d=opendir(APPS_ROOT);if(!d)return 1;struct dirent *entry;int failed=0;unsigned updated=0;
+    while((entry=readdir(d))) {
+        struct pkg_manifest old,newer;char path[700];
+        if(load_installed(entry->d_name,&old))continue;
+        snprintf(path,sizeof path,"%s/%s/%s.pkg",REGISTRY_DIR,old.name,old.name);
+        if(load_manifest_file(path,&newer))continue;
+        if(!strcmp(newer.version,old.version) && !memcmp(newer.build_id,old.build_id,32))continue;
+        if(cmd_install(old.name,0,0))failed++;else updated++;
+    }
+    closedir(d);printf("PKG update-all: %u updated, %d require attention\n",updated,failed);return failed?1:0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: pkg sync [url] | pkg install [--allow-widen|--local] <dir|name>\n"
@@ -462,6 +515,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "remove")   && argc >= 3) return cmd_remove(argv[2]);
     if (!strcmp(argv[1], "info")     && argc >= 3) return cmd_info(argv[2]);
     if (!strcmp(argv[1], "sync"))                  return cmd_sync(argc >= 3 ? argv[2] : NULL);
+    if (!strcmp(argv[1], "update-all")) return cmd_update_all();
     if (!strcmp(argv[1], "list"))                  return cmd_list();
     fprintf(stderr, "pkg: unknown command '%s'\n", argv[1]);
     return 2;

@@ -79,7 +79,7 @@ def boot(image, extra_drive, log_path):
 
     argv = [
         "qemu-system-x86_64",
-        "-drive", "if=pflash,format=raw,readonly=on,file=%s" % OVMF_CODE,
+        "-fw_cfg", "name=opt/emblink/live,string=1",        "-drive", "if=pflash,format=raw,readonly=on,file=%s" % OVMF_CODE,
         "-drive", "if=pflash,format=raw,file=%s" % vars_copy,
         "-drive", "format=raw,file=%s,if=ide,index=0" % image,
     ]

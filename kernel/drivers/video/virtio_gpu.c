@@ -10,6 +10,9 @@
 // control queue is a split virtqueue polled synchronously.
 
 #include "drivers/video/gpu.h"
+#include "display/edid.h"
+#include "../../../user/lib/embk_monitor.h"
+#include "include/kmalloc.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/bus/pci.h"
 #include "drivers/bus/virtio_pci.h"
@@ -158,7 +161,7 @@ struct virtio_gpu_mem_entry {
 #define VGPU_SCANOUT_RES_ID 1
 // Command staging area: attach_backing for an 8 MB framebuffer needs up to
 // 2048 mem entries (32 KB) plus the header.
-#define VGPU_CMD_BUF_SIZE (40 * 1024)
+#define VGPU_CMD_BUF_SIZE (160 * 1024)
 
 struct virtio_gpu_state {
     struct virtio_pci_dev vp;   /* the shared transport: windows + handshake */
@@ -172,6 +175,9 @@ struct virtio_gpu_state {
     uint16_t free_head;               // next free desc (simple 2-desc usage)
 
     uint32_t width, height;
+    uint32_t active_resource,next_resource;
+    bool failed,edid_supported;
+    struct display_identity identity;
     bool scanout_ready;
 
     struct vring_desc  desc[VQ_SIZE]  __attribute__((aligned(4096)));
@@ -220,6 +226,7 @@ static bool vgpu_submit(const void *cmd, uint32_t cmd_len,
     uint32_t bad_cmd = 0, bad_resp = 0;
 
     spin_lock(&vgpu_lock);
+    if(s->failed || cmd_len>sizeof s->cmd_buf || resp_len>sizeof s->resp_buf) {spin_unlock(&vgpu_lock);return false;}
 
     if (cmd != s->cmd_buf) memcpy(s->cmd_buf, cmd, cmd_len);
     memset(s->resp_buf, 0, resp_len < sizeof(s->resp_buf) ? resp_len : sizeof(s->resp_buf));
@@ -262,6 +269,7 @@ static bool vgpu_submit(const void *cmd, uint32_t cmd_len,
         }
     }
 
+    if(fail==2)s->failed=true;
     spin_unlock(&vgpu_lock);
 
     /* report OUTSIDE the lock (kprintf re-enters this path via the console) */
@@ -290,9 +298,12 @@ static bool vgpu_init_transport(const struct pci_device *dev) {
      * No bank-0 features are requested: this driver uses the 2D control queue
      * only, and every optional virtio-gpu feature (virgl, EDID, resource UUIDs)
      * would add an obligation it does not meet. */
-    if (!virtio_pci_attach(&s->vp, dev, "virtio-gpu", 0, 0))
+    uint32_t features=0;
+    if (!virtio_pci_attach(&s->vp, dev, "virtio-gpu", 1u<<1, &features))
         return false;
 
+    s->edid_supported=(features&(1u<<1))!=0;
+    s->active_resource=1;s->next_resource=2;
     s->common      = s->vp.common;
     s->notify_base = s->vp.notify;
     s->notify_off_multiplier = s->vp.notify_multiplier;
@@ -373,21 +384,20 @@ static bool vgpu_get_mode(struct gpu_mode *out) {
     return true;
 }
 
-static bool vgpu_attach_backing(void *buf, uint64_t size) {
-    struct virtio_gpu_state *s = &g_vgpu;
-
+static bool vgpu_backing(uint32_t resource,void *buf, uint64_t size) {
     // Build the scatter list: walk the buffer page by page, translating to
     // physical addresses and coalescing contiguous runs.
+    uint8_t *command=kmalloc(VGPU_CMD_BUF_SIZE);if(!command)return false;
     struct virtio_gpu_resource_attach_backing *ab =
-        (struct virtio_gpu_resource_attach_backing *)s->cmd_buf;
+        (struct virtio_gpu_resource_attach_backing *)command;
     struct virtio_gpu_mem_entry *entries =
-        (struct virtio_gpu_mem_entry *)(s->cmd_buf + sizeof(*ab));
+        (struct virtio_gpu_mem_entry *)(command + sizeof(*ab));
     uint32_t max_entries =
         (VGPU_CMD_BUF_SIZE - sizeof(*ab)) / sizeof(*entries);
 
     memset(ab, 0, sizeof(*ab));
     ab->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-    ab->resource_id = VGPU_SCANOUT_RES_ID;
+    ab->resource_id = resource;
 
     uint32_t n = 0;
     uint64_t va = (uint64_t)(uintptr_t)buf;
@@ -397,7 +407,7 @@ static bool vgpu_attach_backing(void *buf, uint64_t size) {
         if (!phys) {
             kprintf("virtio-gpu: backbuffer page unmapped at %p\n",
                     (void *)(uintptr_t)va);
-            return false;
+            kfree(command);return false;
         }
         uint64_t chunk = PAGE_SIZE;
         if (va + chunk > end) chunk = end - va;
@@ -408,7 +418,7 @@ static bool vgpu_attach_backing(void *buf, uint64_t size) {
         } else {
             if (n >= max_entries) {
                 kprintf("virtio-gpu: too many backing entries\n");
-                return false;
+                kfree(command);return false;
             }
             entries[n].addr = phys;
             entries[n].length = (uint32_t)chunk;
@@ -421,14 +431,21 @@ static bool vgpu_attach_backing(void *buf, uint64_t size) {
 
     uint32_t cmd_len = sizeof(*ab) + n * sizeof(*entries);
     struct virtio_gpu_ctrl_hdr resp;
-    if (!vgpu_submit(s->cmd_buf, cmd_len, &resp, sizeof(resp),
+    if (!vgpu_submit(command, cmd_len, &resp, sizeof(resp),
                      VIRTIO_GPU_RESP_OK_NODATA)) {
         kprintf("virtio-gpu: ATTACH_BACKING failed\n");
-        return false;
+        kfree(command);return false;
     }
+    kfree(command);
     kprintf("virtio-gpu: backing attached (%u entr%s)\n",
             (unsigned int)n, n == 1 ? "y" : "ies");
 
+    return true;
+}
+
+static bool vgpu_attach_backing(void *buf,uint64_t size) {
+    struct virtio_gpu_state *s=&g_vgpu;
+    if(!vgpu_backing(1,buf,size))return false;
     // Point scanout 0 at the resource.
     struct virtio_gpu_set_scanout sc;
     memset(&sc, 0, sizeof(sc));
@@ -456,7 +473,7 @@ static void vgpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     t.hdr.type    = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     t.r.x = x; t.r.y = y; t.r.width = w; t.r.height = h;
     t.offset      = (uint64_t)y * (s->width * 4) + (uint64_t)x * 4;
-    t.resource_id = VGPU_SCANOUT_RES_ID;
+    t.resource_id = s->active_resource;
     if (!vgpu_simple_cmd(&t, sizeof(t))) return;
 
     // ... and flushes it to the display.
@@ -464,12 +481,50 @@ static void vgpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     memset(&f, 0, sizeof(f));
     f.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     f.r.x = x; f.r.y = y; f.r.width = w; f.r.height = h;
-    f.resource_id = VGPU_SCANOUT_RES_ID;
+    f.resource_id = s->active_resource;
     vgpu_simple_cmd(&f, sizeof(f));
+}
+
+static bool vgpu_prepare(struct gpu_target *out,void *buf,uint64_t bytes,uint32_t w,uint32_t h) {
+    struct virtio_gpu_state *s=&g_vgpu;if(s->failed || bytes!=(uint64_t)w*h*4 || s->next_resource==UINT32_MAX)return false;
+    uint32_t id=s->next_resource++;
+    struct virtio_gpu_resource_create_2d create={0};create.hdr.type=VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create.resource_id=id;create.format=VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;create.width=w;create.height=h;
+    if(!vgpu_simple_cmd(&create,sizeof create))return false;
+    out->resource_id=id;out->mode=(struct gpu_mode){0,w,h,w*4,32,FB_FORMAT_BGR};
+    return vgpu_backing(id,buf,bytes);
+}
+static bool vgpu_select(const struct gpu_target *target) {
+    struct virtio_gpu_set_scanout sc={0};sc.hdr.type=VIRTIO_GPU_CMD_SET_SCANOUT;
+    sc.r.width=target->mode.width;sc.r.height=target->mode.height;sc.resource_id=target->resource_id;
+    if(!vgpu_simple_cmd(&sc,sizeof sc))return false;
+    g_vgpu.width=target->mode.width;g_vgpu.height=target->mode.height;
+    g_vgpu.active_resource=target->resource_id;return true;
+}
+static bool vgpu_release(const struct gpu_target *target) {
+    if(!target->resource_id)return true;
+    struct {struct virtio_gpu_ctrl_hdr header;uint32_t id,padding;} unref={0};
+    unref.header.type=VIRTIO_GPU_CMD_RESOURCE_UNREF;unref.id=target->resource_id;
+    return vgpu_simple_cmd(&unref,sizeof unref);
+}
+static uint32_t vgpu_resource(void) {return g_vgpu.active_resource;}
+static void vgpu_describe(struct embk_monitor_info *info) {
+    struct virtio_gpu_state *s=&g_vgpu;info->flags|=EMBK_MONITOR_CONNECTED;
+    if(!s->failed && s->scanout_ready)info->flags|=EMBK_MONITOR_MODESET;
+    display_identity_describe(&s->identity,info);
+}
+static void vgpu_read_edid(void) {
+    struct virtio_gpu_state *s=&g_vgpu;if(!s->edid_supported)return;
+    struct {struct virtio_gpu_ctrl_hdr header;uint32_t scanout,padding;} request={0};
+    struct {struct virtio_gpu_ctrl_hdr header;uint32_t size,padding;uint8_t bytes[1024];} response;
+    request.header.type=0x010a;
+    if(vgpu_submit(&request,sizeof request,&response,sizeof response,0x1104) && response.size<=1024)
+        (void)display_edid_parse(response.bytes,response.size,&s->identity);
 }
 
 static const struct gpu_driver g_vgpu_driver = {
     .name = "virtio-gpu",
+    .prepare=vgpu_prepare,.select=vgpu_select,.release=vgpu_release,.describe=vgpu_describe,.resource_id=vgpu_resource,
     .get_mode = vgpu_get_mode,
     .flush = vgpu_flush,
     .attach_backing = vgpu_attach_backing,
@@ -497,5 +552,6 @@ const struct gpu_driver *virtio_gpu_probe(void) {
         return 0;
     }
     g_vgpu.present = true;
+    vgpu_read_edid();
     return &g_vgpu_driver;
 }

@@ -25,7 +25,7 @@
  * environment is ambient state a child receives whether or not anyone chose to
  * give it: fork+exec copies it by default. EmbLink's whole position is that a
  * child gets ONLY what the parent names -- that is why there is no exec, why
- * file-actions list every fd, and why FD_CLOEXEC is vacuously true here. An
+ * file-actions list every fd, and why descriptor inheritance requires an explicit policy. An
  * env that leaked in by default would contradict all of it. So: envp==NULL
  * means the child has NO environment, and getenv() honestly returns NULL.
  *
@@ -38,7 +38,7 @@
  * enforces it rather than trusting this arithmetic. */
 #define SPAWN_ENVP_MAX             32          // max envp[] entries INCLUDING the NULL terminator
 #define SPAWN_ENVP_BYTES_MAX       1024        // total bytes of envp[] strings (including NUL terminators)
-#define SPAWN_ACTIONS_MAX           8          // max number of spawn actions (file descriptor remaps, etc.)
+#define SPAWN_ACTIONS_MAX          64          // max number of spawn actions (file descriptor remaps, etc.)
 #define SPAWN_ACTION_PATH_MAX      256         // Deliberately seperate from syscall.c's
                                                // SYSCALL_PATH_MAX -- process.h shouldn't
                                                // depend on a #define private to syscall.c
@@ -56,6 +56,14 @@
                                                // child receives it at its first free slot. The
                                                // bootstrap for two-process channel tests.
 #define SPAWN_ACTION_INSTALL_OBJ     4         // install a byte-stream obj-handle (a pipe end)
+/* Explicit compatibility policy: snapshot first, actions in order, then
+ * close descriptors still marked CLOEXEC. Legacy native launches are unchanged. */
+#define SPAWN_ACTION_FD_SNAPSHOT 11
+#define SPAWN_ACTION_DUP2        12
+#define SPAWN_ACTION_CLOSE       13
+#define SPAWN_ACTION_CWD         14
+#define SPAWN_ACTION_KEEP_STATUS    10        // preserve this child status under handle pressure
+#define SPAWN_ACTION_INHERIT_FD      9         // src_obj_handle is a PARENT fd; target_fd is child's
 #define SPAWN_ACTION_DEBUG           6         // born under debug, stopped before _start
                                                // (EMBDBG_Specification.md §6.2). Needs the
                                                // spawner to hold EMBK_CAP_DEBUG; the child is
@@ -72,6 +80,8 @@
                                                // (absent => inherit the parent's whole view). Reuses
                                                // `path`+`flags`; consumed at creation, skipped by the
                                                // file-action processor.
+#define SPAWN_SESSION_ADMIN 2u
+#define SPAWN_SESSION_LIVE 1u /* init-only, requires explicit live boot */
 #define SPAWN_ACTION_NEW_SESSION     8         // the child LEADS A NEW SESSION for user `path`
                                                 // (a username). Requires the spawner to hold
                                                 // EMBK_CAP_SESSION; the child never does. See

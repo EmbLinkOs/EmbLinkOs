@@ -1,3 +1,80 @@
+## Development shell (2026-10-24)
+
+- [x] Private descriptor-backed PTYs, canonical/raw modes, echo and nonblocking queues.
+- [x] Explicit child descriptor transfer, resize queries, EOF records and reference-safe hangup.
+- [x] Terminal direct input, native prompt preservation and per-session Ctrl+C delegation.
+- [x] VT screen model, alternate screen, basic Unicode widths, colours and live resize.
+- [x] Screen copy, safe native-prompt paste and application bracketed paste.
+- [x] Shared controls receive paste commands without key-queue truncation.
+- [ ] Terminal range selection, complete grapheme rendering and modified-key identity.
+- [ ] Terminfo/application compatibility and mouse reporting.
+- [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
+- [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
+- [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.
+- [x] Bounded posix_spawn/posix_spawnp with ordered actions, CLOEXEC and independent starting-directory context.
+- [x] Shared socket lifetime/status, in-flight I/O loans, serialized cursors and cached per-chunk append.
+- [ ] Large-write atomicity, uncached append primitives and truncate/mapped-write ordering.
+- [x] Initial mrsh-based sh port with explicit workers, pipelines, substitution and scripts.
+- [ ] Broader shell conformance, utility coverage and remaining process/libc compatibility.
+- [ ] Full process-group job control and resize notifications.
+- [ ] Broader developer utilities, Python subprocess and packaged SDK workflows.
+- [ ] SSH, USB serial/debug probes and physical board workflows.
+
+Contract, tests and explicit limitations: [TERMINAL.md](TERMINAL.md).
+
+## Contour follow-up (2026-10-24)
+
+- [x] Shared semantic palette, real regular/bold font families, density and text metrics.
+- [x] Original icon family, command strip, bounded application library and side/bottom docks.
+- [x] Shared work areas, live cursor/chrome/effects and isolated configurable workspaces.
+- [x] Searchable Settings, coordinated presets, live preferences and confirmed reset.
+- [x] Align native application chrome, document/code surfaces and authentication surfaces.
+- [x] Reverse Tab, directional menu navigation, modal focus containment and scroll revelation.
+- [ ] Assistive-technology semantics, labels, announcements and platform integration.
+- [ ] Arbitrary font/icon-pack installation, shortcut recording and free panel-item ordering.
+- [ ] Per-monitor scaling, display profiles and compositor-backed overlay auto-hide.
+- [ ] Validate physical laptop rendering, pointer/input, power and graphics performance.
+
+Scope and current evidence: [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+
+## Desktop menu follow-up (2026-10-23)
+
+## Document workspace follow-up (2026-10-23)
+
+- [x] Shared session Open/Save with actual user places and replacement confirmation.
+- [x] Safe replacement, external-edit detection, whole-window dirty guards and separate recovery drafts.
+- [x] Files document creation and home-scoped Editor launch.
+- [ ] Desktop-wide quit/logout/power negotiation for unsaved documents.
+- [ ] Filesystem compare-and-swap for concurrent-writer conflicts.
+- [ ] Transferable open-file capabilities from the picker.
+- [ ] Large/binary document tools, recovery management UI, persistent undo and PID-reuse-independent recovery leases.
+
+Design and limits: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).
+
+- [x] Live system-menu palette, stable label anchors, one panel surface,
+  Escape dismissal, full-display outside clicks and restored thin bar/input.
+- [ ] Arrow-key menu navigation, type-to-select, keyboard menu activation,
+  accessible menu roles and context-menu Escape behavior.
+- [ ] Consistent focus indication, dialogs and unsaved-document handling across apps.
+
+## Laptop integration follow-up (2026-10-23)
+
+- [x] Preserve master ABI/ARM architecture and integrate laptop services into the current desktop.
+- [x] Native UEFI/NVMe regression batch, standalone recovery installation,
+  account/preferences across reboot, lock/password gates and recorded HDA/AC97 output.
+- [ ] Physical AX200 WPA2/DHCP/DNS/page fetch and broader radio transports.
+- [ ] Physical built-in I2C input, panel, HDA routing and native AML/EC firmware acceptance.
+- [ ] Power transition writer freeze/drain, complete page-writeback failure reporting
+  and physical power-loss tests; current upstream shutdown writes back and flushes.
+- [ ] ARM runtime revalidation and port of x86 screen/policy/history services.
+- [ ] Reconcile incoming PCI configuration accesses with the older serialized,
+  exact-width access path; avoid address/data races and status write-one-to-clear hazards.
+- [ ] Suspend/resume, GPU modesetting/acceleration, multi-monitor management,
+  touchpad gestures, audio capture/mixing and OS-image updates/rollback.
+
+Current evidence: [LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md).
+Older sections below remain the broader roadmap.
+
 ## malloc in userspace: the lock exists now (2026-09-13)
 
 - [x] ~~newlib is linked with no `__malloc_lock`, so two threads in one process
@@ -1734,14 +1811,12 @@ text.
       absence of contention means the lock is unnecessary.
 - [x] ~~O_TRUNC reserved but not honored.~~ **DONE** — `fd.c` shrinks to zero
   through the VFS truncate op at open time.
-- [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
-  stat per write, and a TOCTOU window between the stat and the write. **NOT
-  fixed by the fd_lock above** — that guards the fd TABLE, but two O_APPEND
-  writers (even in different processes, or two fds to one file) race on the
-  file's CONTENTS, not the table. A correct fix is FS-level: an atomic
-  append-at-end op (or a per-object append lock) in the write path, not fd.c.
-  A per-fd lock would give false confidence (misses the two-fds-one-file case).
-  Now genuinely reachable (threads on SMP), so no longer just theoretical.
+- [x] Cached O_APPEND chooses EOF under the same cache lock as its write,
+  including independent opens and processes. Shared cursors serialize read,
+  write and seek. Uncached append refuses with ENOSYS rather than racing.
+- [ ] Append atomicity across multiple syscall bounce chunks, uncached backend
+  primitives and complete ordering with truncate/mapped writes. See
+  [FILE_DESCRIPTIONS.md](FILE_DESCRIPTIONS.md).
 
 ---
 
@@ -7622,6 +7697,9 @@ for them to run against:
       a long sequential run; the rerun passed. The harness missed the verdict
       line rather than the program failing -- but that is an inference, not a
       measurement.
+- [ ] Give the parallel raw key-event stream explicit event-time process/session
+  ownership, including queued-event handling across login/lock transitions;
+  the new character/modifier poll retains the existing focused-reader gate.
 
 **The kernel is not relocatable, and the ceiling is close**
 
@@ -7632,6 +7710,10 @@ for them to run against:
       stacks per core at bring-up would free a megabyte and let MAX_CPUS go
       back up; a relocatable kernel would remove the ceiling altogether. Until
       then the guard fails the build rather than a machine failing to boot.
+      *Since master linked the kernel at 32 MiB (`docs/UPDATES.md`), the 8 MiB
+      reservation no longer bounds it: the guard holds a 32 MiB budget above
+      the link address, which is a budget and not a measurement -- no real
+      machine's memory map above 32 MiB has been read yet.*
 
 **Instruments left behind from the EMBKFS corruption hunt**
 
@@ -7726,9 +7808,16 @@ it was missing the two facts that decide the remaining theories:
 - [x] **The firmware memory map went to the serial port only.** `pmm_print_map`
       was `serial_write_*` throughout; it is `kprintf` now, one line per entry,
       and the kernel states the verdict itself: whether any non-usable region
-      overlaps the image at `[0x100000, kernel_end)`, where every xHCI ring and
-      bounce buffer lives. A firmware that reserves low memory where OVMF does
-      not would corrupt those silently.
+      overlaps the image at `[kernel_start, kernel_end)`, where every xHCI ring
+      and bounce buffer lives. A firmware that reserves low memory where OVMF
+      does not would corrupt those silently.
+- [ ] **The verdict counts the kernel's own pages as the firmware's.** The UEFI
+      loader allocates the image, and the translated map reports exactly that
+      range as Reserved, so every UEFI boot says `SHARED WITH FIRMWARE` --
+      before the move to 32 MiB (`[0x100000, 0x79b000)`) and after it
+      (`[0x2000000, 0x26c0000)`, OVMF, 2026-10-25). The verdict has to tell the
+      loader's reservation of the image from a firmware region inside it
+      before a real machine's `!!!` line can be believed.
 - [x] **No ring may cross a 64 KB line (xHCI 1.2 §4.11.5.1; data buffers, §6.4.1).**
       The rings were 64-byte aligned and placed by the linker; this build had one
       slot's EP0 ring at `0x5afe80-0x5b0080`, across `0x5b0000`. QEMU does not

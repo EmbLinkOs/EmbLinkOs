@@ -69,6 +69,8 @@ struct instance {
 
     struct ui_shadow shadow;
     bool used;
+    bool focus_excluded;
+    uint64_t focus_reveal_seen;
 };
 
 struct instance *instance_resolve(struct instance_handle h);   /* NULL if stale */

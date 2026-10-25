@@ -1,9 +1,13 @@
+#include "process/session.h"
+#include "include/kstring.h"
+#include "../../user/lib/embk_desktop.h"
 /* kernel/gfx/compositor.c -- the window compositor (see compositor.h). */
 
 #include "gfx/compositor.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/console.h"
 #include "drivers/input/mouse.h"
+#include "drivers/input/keyboard.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* struct process (shared_next_va, pml4_phys) for zero-copy */
 #include "mm/pmm.h"            /* pmm_alloc_page / pmm_free_page / PAGE_SIZE */
@@ -16,6 +20,7 @@
 /* ---- window registry ---------------------------------------------------- */
 
 struct comp_window {
+    unsigned  workspace;
     int       used;
     uint32_t  id;
     int       pid;
@@ -23,6 +28,7 @@ struct comp_window {
     uint32_t  cw, ch;       /* content dimensions in px                       */
     int       z;            /* z-order: larger is nearer the front            */
     int       visible;
+    int       menu_keyboard; /* temporary keyboard owner while a bar menu is open */
     int       desktop;      /* 1 = chromeless full-screen back layer (the home) */
     int       chromeless;   /* 1 = floating window with NO kernel chrome: the app
                              * draws its own bar/close (EmUI V4 Window/WindowBar)
@@ -138,32 +144,42 @@ static int        g_widget_z = 1;
 static int        g_active  = 0;   /* desktop has been painted at least once  */
 static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window */
 
+static struct embk_desktop g_desktop={.version=1,.flags=EMBK_DESKTOP_SNAP|EMBK_DESKTOP_WRAP,
+    .top=34,.bottom=84,.background=0x202524,.text=0xecf0ec,.accent=0x71b5aa,
+    .radius=8,.shadows=1,.workspace_count=4,.blur=6,.opacity=209,.danger=0xee887b,.secondary=0x94a29a};
+static int g_desktop_owner;
+static int on_workspace(const struct comp_window *w) {
+    return w->desktop || w->widget || w->translucent || w->workspace==g_desktop.workspace;
+}
+
 /* ---- pointer state (cursor + click-to-focus + title-bar drag) ----------- */
-#define CURSOR_LAYER_W 20
-#define CURSOR_LAYER_H 28
+#define CURSOR_LAYER_W 28
+#define CURSOR_LAYER_H 38
 #define CURSOR_W (CURSOR_LAYER_W + 2)  /* complete footprint, including shadow */
 #define CURSOR_H (CURSOR_LAYER_H + 2)
 #define CURSOR_DAMAGE_PAD 3
-#define GLASS_BLUR 7        /* backdrop blur radius for glass windows */
-#define GLASS_ALPHA 216     /* window opacity over the frosted backdrop (~85%) */
+#define GLASS_BLUR ((int)g_desktop.blur)        /* backdrop blur radius for glass windows */
+#define GLASS_ALPHA ((int)g_desktop.opacity)     /* window opacity over the frosted backdrop (~85%) */
 /* DROP SHADOW (not a halo): black, offset downward, softer when unfocused.
  * This is what lifts a window off the wallpaper instead of leaving it a flat
  * rectangle -- and it carries focus, which the old coloured glow used to do
  * before it was removed for looking like a screenshot artefact. Depth is the
  * signal: the front window casts a deeper, wider shadow than the ones behind
  * it, exactly as stacked paper does. */
-#define SHADOW_W_FOCUS  20  /* band width, focused                          */
+#define SHADOW_W_FOCUS  16  /* band width, focused                          */
 #define SHADOW_W_IDLE   11  /* ...and unfocused: shallower, still grounded  */
-#define SHADOW_A_FOCUS  120 /* peak alpha at the window edge (0-255)        */
-#define SHADOW_A_IDLE    62
-#define SHADOW_DY        5  /* cast DOWNWARD: light comes from above        */
+#define SHADOW_A_FOCUS  74 /* peak alpha at the window edge (0-255)        */
+#define SHADOW_A_IDLE    38
+#define SHADOW_DY        3  /* cast DOWNWARD: light comes from above        */
 #define SHADOW_PAD (SHADOW_W_FOCUS + SHADOW_DY + 2)   /* repaint growth     */
-#define WORK_TOP 32         /* universal system/status bar */
-#define WORK_BOTTOM 64      /* desktop taskbar */
+#define WORK_TOP ((int)g_desktop.top)         /* universal system/status bar */
+#define WORK_BOTTOM ((int)g_desktop.bottom)      /* desktop taskbar */
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
 static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
 static int      g_cursor_under_valid;
 static uint32_t g_prev_buttons;
+static int g_buttons_suppressed; /* ownership/space changes wait for physical release */
+static void reset_pointer_capture_locked(void);
 static int      g_dragging;        /* a title-bar drag is in progress          */
 static uint32_t g_drag_id;         /* which window is being dragged             */
 static int      g_drag_dx, g_drag_dy;  /* pointer offset within the window frame */
@@ -320,27 +336,44 @@ static struct comp_window *win_by_id(uint32_t id) {
 static int top_z(void) {
     int z = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++)
-        if (g_wins[i].used && g_wins[i].visible && g_wins[i].z > z) z = g_wins[i].z;
+        if (g_wins[i].used && g_wins[i].visible && on_workspace(&g_wins[i]) && g_wins[i].z > z) z = g_wins[i].z;
     return z;
 }
 
 static struct comp_window *front_window(void) {
     struct comp_window *top = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible) continue;
+        if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
         if (!top || g_wins[i].z > top->z) top = &g_wins[i];
     }
     return top;
+}
+
+static struct comp_window *front_app_window(void) {
+    struct comp_window *front=0;
+    for(int i=0;i<COMP_MAX_WINDOWS;i++) {
+        struct comp_window *w=&g_wins[i];
+        if(!w->used || !w->visible || w->desktop || w->widget || w->translucent ||
+           !on_workspace(w) || !session_ui_allowed(w->pid))continue;
+        if(!front || w->z>front->z)front=w;
+    }
+    return front;
 }
 
 /* front-most window whose frame contains screen (x,y), or NULL. */
 static struct comp_window *topmost_at(int x, int y) {
     struct comp_window *best = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible) continue;
+        if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
         int fx0, fy0, fx1, fy1; win_frame_rect(&g_wins[i], &fx0, &fy0, &fx1, &fy1);
-        if (x >= fx0 && x < fx1 && y >= fy0 && y < fy1)
-            if (!best || g_wins[i].z > best->z) best = &g_wins[i];
+        if(x>=fx0 && x<fx1 && y>=fy0 && y<fy1) {
+            struct comp_window *w=&g_wins[i];
+            int lx=x-w->x,ly=y-w->y;
+            if(w->translucent && !w->menu_keyboard && w->content &&
+               lx>=0 && ly>=0 && lx<(int)w->cw && ly<(int)w->ch &&
+               !(w->content[(size_t)ly*w->cw+lx]>>24))continue;
+            if(!best || w->z>best->z)best=w;
+        }
     }
     return best;
 }
@@ -350,14 +383,19 @@ static struct comp_window *topmost_at(int x, int y) {
  * drains it and they race; the front window is the one the user is looking at,
  * so it gets them. 0 = no window at all (then nobody is filtered). */
 uint32_t compositor_focused_pid(void) {
+    if(session_input_owner())return session_input_owner();
     uint32_t pid = 0;
     spin_lock(&g_comp_lock);
-    struct comp_window *best = 0, *desk = 0;
+    struct comp_window *best = 0, *desk = 0, *menu = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || !w->visible) continue;
+        if (!w->used || !w->visible || (!session_ui_allowed(w->pid) || !on_workspace(w))) continue;
         if (w->desktop) { desk = w; continue; }     /* the fallback owner */
-        /* CHROME NEVER TAKES THE KEYBOARD. A menu bar or an ambient widget has
+        if (w->translucent && w->menu_keyboard) {
+            if (!menu || w->z > menu->z) menu = w;
+            continue;
+        }
+        /* IDLE CHROME NEVER TAKES THE KEYBOARD. A menu bar or an ambient widget has
          * nothing to type into, so letting one hold focus could only ever steal
          * input from the app you were actually typing in -- clicking a menu
          * would silently kill your terminal's keyboard. */
@@ -366,7 +404,10 @@ uint32_t compositor_focused_pid(void) {
     }
     /* No app window up -> the desktop owns it, so there is ALWAYS exactly one
      * owner and never a free-for-all (that race is the bug this all fixes). */
-    if (!best) best = desk;
+    if(menu && (!best || menu->z>best->z))best=menu;
+    /* A raised launcher is a real modal surface, including for keyboard
+     * input. It must outrank the application it visibly covers. */
+    if(desk && (!best || desk->z>best->z))best=desk;
     if (best) pid = (uint32_t)best->pid;
     spin_unlock(&g_comp_lock);
     return pid;
@@ -423,7 +464,7 @@ static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, 
  * paint path (opaque blit, glass, per-pixel, title bar, border) run untouched,
  * then blend the saved backdrop back in by arc coverage. One carve handles all
  * five paths and none of them needed to learn about radii. */
-#define WIN_RADIUS  9       /* corner radius, px                              */
+#define WIN_RADIUS  ((int)g_desktop.radius)       /* corner radius, px                              */
 #define WIN_R_MAX  16       /* static-buffer bound                            */
 
 struct corner_box {
@@ -495,9 +536,9 @@ static void corners_carve(const struct comp_window *w, int focused) {
     const int r = WIN_RADIUS;
     const int rr8 = (r * 8) * (r * 8);          /* radius^2 in eighth-pixels  */
     int has_border = (!w->desktop && !w->chromeless);
-    fb_color_t bcol = focused ? FB_RGB(0x7c, 0x84, 0xf0) : FB_RGB(0x3a, 0x3f, 0x55);
+    fb_color_t bcol = focused?g_desktop.accent:g_desktop.text;
     int sw = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-    int sa = focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE;
+    int sa = g_desktop.shadows?(focused?SHADOW_A_FOCUS:SHADOW_A_IDLE)*(g_desktop.shadows==2?3:2)/2:0;
 
     for (int i = 0; i < g_corner_n; i++) {
         struct corner_box *c = &g_corner[i];
@@ -656,6 +697,9 @@ static void enforce_focus(void);
 
 static void anim_start(struct comp_window *w, int kind) {
     if (!w || !w->content) return;
+    if(g_desktop.flags&EMBK_DESKTOP_REDUCED_MOTION) {
+        w->visible=(kind==ANIM_OPEN || kind==ANIM_UNPARK);return;
+    }
     if (w->desktop || w->widget || w->translucent) return;  /* chrome doesn't fly */
 
     int full[4], dock[4];
@@ -707,6 +751,7 @@ static void anim_start(struct comp_window *w, int kind) {
 
 /* Land the motion: the window becomes real again (or stays parked). */
 static void anim_finish(void) {
+    if(g_anim.kind==ANIM_NONE)return;
     struct comp_window *w = win_by_id(g_anim.win_id);
     int kind = g_anim.kind;
     int last[4]; int had = g_anim.have_last;
@@ -762,13 +807,13 @@ static void paint_window(struct comp_window *w, int focused,
      * ugliest moment in launching anything. Now that the open animation waits
      * for the first real frame anyway, simply don't draw the window until it
      * has one: the desktop stays whole, and then the window grows in. */
-    if (!w->presented) return;
+    if (!w->presented || (!session_ui_allowed(w->pid) || !on_workspace(w))) return;
 
     /* the drop shadow: drawn first (outside the frame) so the window content
      * lands on top of it, offset downward, and deeper while focused. */
-    if (shadow) {
+    if (shadow && g_desktop.shadows) {
         int sw_  = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-        int sa_  = focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE;
+        int sa_  = (focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE) * (g_desktop.shadows==2?3:2)/2;
         fb_glow_rect(fx0, fy0 + SHADOW_DY, fx1, fy1 + SHADOW_DY, sw_,
                      0, 0, 0, (uint8_t)sa_, rx0, ry0, rx1, ry1);
     }
@@ -786,30 +831,30 @@ static void paint_window(struct comp_window *w, int focused,
     if (!w->desktop && !w->chromeless) {
         int tbx0 = w->x, tby0 = w->y, tbx1 = w->x + (int)w->cw, tby1 = w->y + COMP_TITLEBAR_H;
         if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
-            fb_color_t bar = focused ? FB_RGB(0x24, 0x24, 0x24) : FB_RGB(0x20, 0x20, 0x20);
+            fb_color_t bar = g_desktop.background;
             fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
 
             /* The lights. Dimmed as a set when the window is not focused --
              * one lit corner on screen at a time says which window the
              * keyboard belongs to, which is most of what an unfocused title
              * bar is for. */
-            static const struct { uint8_t r, g, b; } LIT[3] = {
-                { 0xF2, 0x55, 0x5A },   /* close    -- theme danger        */
-                { 0x6A, 0x71, 0x80 },   /* minimize -- theme text_tertiary */
-                { 0x7C, 0x82, 0xFF },   /* zoom     -- theme accent        */
-            };
             for (int i = 0; i < 3; i++) {
                 int lx0, ly0, lx1, ly1;
                 if (!win_light_rect(w, i, &lx0, &ly0, &lx1, &ly1)) break;
                 int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
-                int rr = focused ? LIT[i].r : (LIT[i].r * 45) / 100;
-                int gg = focused ? LIT[i].g : (LIT[i].g * 45) / 100;
-                int bb = focused ? LIT[i].b : (LIT[i].b * 45) / 100;
-                fb_fill_circle(cx, cy, COMP_DOT / 2, FB_RGB(rr, gg, bb));
+                unsigned tone=i==0?g_desktop.danger:i==1?g_desktop.secondary:g_desktop.accent;
+                int factor=focused?100:55;
+                int rr=((tone>>16)&255)*factor/100,gg=((tone>>8)&255)*factor/100,bb=(tone&255)*factor/100;
+                if(g_desktop.decoration==1)fb_fill_circle(cx,cy,COMP_DOT/2,FB_RGB(rr,gg,bb));
+                else if(g_desktop.decoration==2) {
+                    fb_color_t edge=g_desktop.text;
+                    fb_draw_line(cx-6,cy-6,cx+6,cy-6,edge);fb_draw_line(cx-6,cy+6,cx+6,cy+6,edge);
+                    fb_draw_line(cx-6,cy-6,cx-6,cy+6,edge);fb_draw_line(cx+6,cy-6,cx+6,cy+6,edge);
+                }
 
                 /* The glyph, ALWAYS -- the toolkit's rule, for the same
                  * reason: nobody has learned this OS's window controls yet. */
-                fb_color_t ink = FB_RGB(0x1a, 0x1a, 0x1e);
+                fb_color_t ink=g_desktop.decoration==1?FB_RGB(0x1a,0x1a,0x1e):g_desktop.text;
                 if (i == 0) {                       /* close: a cross */
                     fb_draw_line(cx - 3, cy - 3, cx + 3, cy + 3, ink);
                     fb_draw_line(cx + 3, cy - 3, cx - 3, cy + 3, ink);
@@ -828,9 +873,9 @@ static void paint_window(struct comp_window *w, int focused,
             {
                 int lx0, ly0, lx1, ly1;
                 int tx = win_light_rect(w, 2, &lx0, &ly0, &lx1, &ly1) ? lx1 + 8 : tbx0 + 12;
-                int tr = focused ? 0xf2 : 0xa8;
+                unsigned ink=g_desktop.text,bg=g_desktop.background;
                 fb_draw_string(w->title, tx, tby0 + (COMP_TITLEBAR_H - 16) / 2,
-                               tr, tr, tr, 0x24, 0x24, 0x24);
+                               ink>>16,(ink>>8)&255,ink&255,bg>>16,(bg>>8)&255,bg&255);
             }
         }
     }
@@ -848,7 +893,8 @@ static void paint_window(struct comp_window *w, int focused,
              * this window. A glass WIDGET renders a translucent tint -> composite
              * per-pixel so the frosted aurora shows through it; an acrylic app
              * window renders opaque -> lay it over at a uniform translucency. */
-            fb_blur_region(sx0, sy0, sx1 - sx0, sy1 - sy0, GLASS_BLUR);
+            if(GLASS_BLUR>0)fb_blur_region(sx0,sy0,sx1-sx0,sy1-sy0,GLASS_BLUR);
+            if(w->widget && GLASS_ALPHA==255)fill_clip(sx0,sy0,sx1-sx0,sy1-sy0,g_desktop.background,rx0,ry0,rx1,ry1);
             if (w->widget)
                 fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
             else
@@ -861,7 +907,7 @@ static void paint_window(struct comp_window *w, int focused,
              * Where the window DECLARED an opaque sub-rect, frost that part of
              * the backdrop first -- real glass for the bar, sharp desktop
              * everywhere its canvas is empty. */
-            if (w->blur_set) {
+            if (w->blur_set && GLASS_BLUR>0) {
                 int bx0 = imax(sx0, cx0 + w->blur_x);
                 int by0 = imax(sy0, cy0 + w->blur_y);
                 int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w);
@@ -877,7 +923,7 @@ static void paint_window(struct comp_window *w, int focused,
 
     /* --- 1px border ring (not on the desktop, nor app-chromed windows) --- */
     if (!w->desktop && !w->chromeless) {
-        fb_color_t ring = focused ? FB_RGB(0x7c, 0x84, 0xf0) : FB_RGB(0x3a, 0x3f, 0x55);
+        fb_color_t ring = focused?g_desktop.accent:g_desktop.text;
         fill_clip(fx0, fy0, fx1 - fx0, 1, ring, rx0, ry0, rx1, ry1);
         fill_clip(fx0, fy1 - 1, fx1 - fx0, 1, ring, rx0, ry0, rx1, ry1);
         fill_clip(fx0, fy0, 1, fy1 - fy0, ring, rx0, ry0, rx1, ry1);
@@ -927,7 +973,8 @@ static void cursor_polygon_layer(const struct cursor_pt *p, int n,
             int hits = 0;
             for (int sy = 0; sy < 4; sy++)
                 for (int sx = 0; sx < 4; sx++)
-                    hits += cursor_inside(x * 4 + sx, y * 4 + sy, p, n);
+                    hits += cursor_inside((x * 4 + sx)*(g_desktop.cursor_size?3:4)/4,
+                                            (y * 4 + sy)*(g_desktop.cursor_size?3:4)/4,p,n);
             uint8_t a = (uint8_t)((hits * max_alpha + 8) / 16);
             /* fb_blit_blend expects straight (non-premultiplied) ARGB and
              * applies alpha itself. Premultiplying here applies alpha twice,
@@ -942,9 +989,10 @@ static void cursor_prepare_layers(void) {
     if (cursor_layers_ready) return;
     cursor_polygon_layer(cursor_outer, 7, 0x08, 0x0a, 0x10, 72,
                          cursor_shadow);
-    cursor_polygon_layer(cursor_outer, 7, 0x08, 0x0a, 0x10, 255,
+    cursor_polygon_layer(cursor_outer, 7, g_desktop.cursor_style?0xf8:0x08, g_desktop.cursor_style?0xf8:0x0a,g_desktop.cursor_style?0xf5:0x10,255,
                          cursor_outer_layer);
-    cursor_polygon_layer(cursor_inner, 7, 0xf8, 0xf8, 0xf5, 255,
+    unsigned rgb=g_desktop.cursor_style==1?0x283533:g_desktop.cursor_style==2?g_desktop.accent:0xf8f8f5;
+    cursor_polygon_layer(cursor_inner, 7, rgb>>16,(rgb>>8)&255,rgb&255, 255,
                          cursor_inner_layer);
     cursor_layers_ready = 1;
 }
@@ -1048,7 +1096,7 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     while (drawn < COMP_MAX_WINDOWS) {
         int best = -1;
         for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-            if (!g_wins[i].used || !g_wins[i].visible) continue;
+            if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
             if (g_wins[i].z <= last_z) continue;
             if (best < 0 || g_wins[i].z < g_wins[best].z) best = i;
         }
@@ -1168,6 +1216,8 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->cw = cw; w->ch = ch;
     w->z = g_next_z++;
     w->visible = 1;
+    w->workspace=g_desktop.workspace;
+    w->menu_keyboard = 0;
     w->desktop = 0;
     w->chromeless = 0;
     w->widget = 0;
@@ -1261,6 +1311,8 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     struct comp_window *w = &g_wins[slot];
     w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid;
     w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
+    w->workspace=g_desktop.workspace;
+    w->menu_keyboard = 0;
     w->desktop = desktop;
 
     /* THE SCREEN STAYS WITH THE KERNEL UNTIL SOMETHING ELSE ACTUALLY DRAWS.
@@ -1334,7 +1386,15 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
                               uint32_t nw, uint32_t nh, uint64_t *out_client_va) {
     const fb_info_t *fi = fb_get_info();
     if (!fi || !client) return -EMBK_EINVAL;
-    if (nw < 120 || nh < 90 || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
+    /* Translucent system bars are legitimately shorter than app content.
+     * Refusing their original 26px height left an invisible expanded canvas
+     * intercepting clicks after its menu was dismissed. */
+    spin_lock(&g_comp_lock);
+    struct comp_window *owner=win_find((int)client->pid,id);
+    if (!owner || !owner->shared) {spin_unlock(&g_comp_lock);return -EMBK_ENOENT;}
+    uint32_t min_h=owner->translucent ? 24u : 90u;
+    spin_unlock(&g_comp_lock);
+    if (nw < 120 || nh < min_h || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
 
     /* new backing first (outside the lock: pmm/vmm work) */
     uint64_t bytes = (uint64_t)nw * nh * 4;
@@ -1381,6 +1441,9 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     }
     win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
     ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
+    uint32_t copyw=nw<w->cw?nw:w->cw,copyh=nh<w->ch?nh:w->ch;
+    for(uint32_t row=0;row<copyh;row++)
+        memcpy((uint32_t *)kview+(uint64_t)row*nw,w->content+(uint64_t)row*w->cw,(size_t)copyw*4);
     w->cw = nw; w->ch = nh;
     w->fullscreen = (nw >= fi->width && nh >= fi->height);
     w->content = (uint32_t *)kview;
@@ -1486,7 +1549,7 @@ int64_t compositor_win_damage(int pid, uint32_t id,
     return 0;
 }
 
-int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
+static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int raise) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
@@ -1503,23 +1566,30 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
      * exemption: asking for the display and y=0 left the bar untouched,
      * because this clamp put the window back under it. */
     if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi) {
-        int maxx = (int)fi->width - (int)w->cw;
+        int maxx = (int)fi->width - (int)g_desktop.right - (int)w->cw;
         int maxy = (int)fi->height - WORK_BOTTOM - win_titlebar_h(w) - (int)w->ch;
-        if (maxx < 0) maxx = 0;
+        if (maxx < (int)g_desktop.left) maxx = (int)g_desktop.left;
         if (maxy < WORK_TOP) maxy = WORK_TOP;
-        if (x < 0) x = 0;
+        if (x < (int)g_desktop.left) x = (int)g_desktop.left;
         if (x > maxx) x = maxx;
         if (y < WORK_TOP) y = WORK_TOP;
         if (y > maxy) y = maxy;
     }
     w->x = x; w->y = y;
-    w->z = w->widget ? g_widget_z++ : g_next_z++;   /* raise within its own band */
+    if(raise)w->z = w->widget ? g_widget_z++ : g_next_z++;   /* explicit moves raise */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
     /* repaint the union of old and new footprints in one region */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
-    enforce_focus();   /* moving raises to front; demote whoever was front */
+    if(raise)enforce_focus();   /* automatic reflow preserves focus */
     spin_unlock(&g_comp_lock);
     return 0;
+}
+
+int64_t compositor_win_move(int pid,uint32_t id,int32_t x,int32_t y) {
+    return win_position(pid,id,x,y,1);
+}
+int64_t compositor_win_place(int pid,uint32_t id,int32_t x,int32_t y) {
+    return win_position(pid,id,x,y,0);
 }
 
 int64_t compositor_win_destroy(int pid, uint32_t id) {
@@ -1663,7 +1733,7 @@ int compositor_win_list(struct comp_win_info *out, int max) {
     spin_lock(&g_comp_lock);
 
     uint32_t front = 0;
-    { struct comp_window *f = front_window(); if (f) front = (uint32_t)f->pid; }
+    { struct comp_window *f = front_app_window(); if (f) front = (uint32_t)f->pid; }
 
     int n = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS && n < max; i++) {
@@ -1676,7 +1746,7 @@ int compositor_win_list(struct comp_win_info *out, int max) {
 
         out[n].pid   = (uint32_t)w->pid;
         out[n].id    = w->id;
-        out[n].flags = (w->minimized ? COMP_WIN_MINIMIZED : 0u) |
+        out[n].flags = (w->workspace<<8) | (w->minimized ? COMP_WIN_MINIMIZED : 0u) |
                        ((uint32_t)w->pid == front && !w->minimized ? COMP_WIN_FOCUSED : 0u);
         int k = 0;
         while (k < COMP_TITLE_MAX && w->title[k]) { out[n].title[k] = w->title[k]; k++; }
@@ -1725,7 +1795,7 @@ int compositor_cycle_window(void) {
     struct comp_window *front = 0, *next = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || w->desktop || w->widget || w->translucent || !w->title[0]) continue;
+        if (!w->used || !on_workspace(w) || w->desktop || w->widget || w->translucent || !w->title[0]) continue;
         if (!front || w->z > front->z) front = w;
     }
     if (!front) { spin_unlock(&g_comp_lock); return 0; }
@@ -1733,7 +1803,7 @@ int compositor_cycle_window(void) {
     /* The highest z BELOW the front one; with nothing below, the front stays. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || w == front) continue;
+        if (!w->used || w == front || !on_workspace(w)) continue;
         if (w->desktop || w->widget || w->translucent || !w->title[0]) continue;
         if (w->z < front->z && (!next || w->z > next->z)) next = w;
     }
@@ -1844,6 +1914,15 @@ int compositor_quit_front(void) {
 
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
+    if(session_input_owner() || !session_ui_allowed(pid)){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+    for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].pid==pid &&
+       !g_wins[i].desktop && !g_wins[i].widget && !g_wins[i].translucent) {
+        if(g_desktop.workspace!=g_wins[i].workspace) {
+            g_desktop.workspace=g_wins[i].workspace;reset_pointer_capture_locked();
+        }
+        break;
+    }
+
     int changed = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
@@ -1864,6 +1943,8 @@ int compositor_restore_pid(int pid) {
         paint_region(x0, y0, x1, y1);
     }
     if (changed) enforce_focus();
+    const fb_info_t *fi=fb_get_info();
+    if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
     spin_unlock(&g_comp_lock);
     return changed;
 }
@@ -1925,6 +2006,26 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
             out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
     spin_unlock(&g_comp_lock);
     return (int)n;
+}
+
+/* Only the owner can lend an existing translucent window the keyboard.
+ * Session lock ownership is checked before this flag in focused_pid(). The
+ * state lives with the window, so destroy/reap cannot leave a global grab. */
+int compositor_win_close_ack(int pid,uint32_t id) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w=win_find(pid,id);
+    if (!w) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    w->asked_close_ms=0;
+    spin_unlock(&g_comp_lock);return 0;
+}
+
+int compositor_win_menu(int pid,uint32_t id,int active) {
+    if (active != 0 && active != 1) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    struct comp_window *w=win_find(pid,id);
+    if (!w || !w->translucent) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    w->menu_keyboard=active;
+    spin_unlock(&g_comp_lock);return 0;
 }
 
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
@@ -1996,6 +2097,13 @@ void compositor_anim_tick(void) {
  * resolved separately, here, at the release edge. */
 static int      g_drag_on;
 static uint32_t g_drag_pid;
+/* Caller holds g_comp_lock. New ownership must not inherit old press history. */
+static void reset_pointer_capture_locked(void) {
+    mouse_discard_presses();(void)mouse_take_wheel();
+    g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
+    g_drag_on=0;g_drag_pid=0;g_ptr_wheel=0;g_buttons_suppressed=1;
+    for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+}
 void compositor_drag_set(int on, uint32_t pid) {
     spin_lock(&g_comp_lock);
     g_drag_on = on ? 1 : 0;
@@ -2027,6 +2135,11 @@ void compositor_pointer_tick(void) {
     mouse_get_state(&x, &y, &b);
 
     spin_lock(&g_comp_lock);
+    struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
+    if(g_cap_pid && (!captured || !captured->visible || !on_workspace(captured) || !session_ui_allowed(captured->pid)))
+        reset_pointer_capture_locked();
+    int suppressed=g_buttons_suppressed;
+    if(suppressed){if(!b)g_buttons_suppressed=0;b=0;}
     int left = (b & MOUSE_BTN_LEFT) != 0, prev = (g_prev_buttons & MOUSE_BTN_LEFT) != 0;
     /* HOW MANY presses actually happened, which the level cannot say: a whole
      * down-up-down-up between two ticks leaves `left` equal to `prev` and the
@@ -2037,6 +2150,7 @@ void compositor_pointer_tick(void) {
     uint32_t presses = 0, ptime = 0;
     while (presses < COMP_CLICK_Q && mouse_take_press(&ptime))
         press_ev[presses++].t = ptime;
+    if(suppressed)presses=0;
     /* Belt: if the level moved but the driver reported nothing (a device that
      * only ever sets absolute state), still treat it as one press, timed now. */
     if (presses == 0 && left && !prev) press_ev[presses++].t = (uint32_t)timer_uptime_ms();
@@ -2164,10 +2278,10 @@ void compositor_pointer_tick(void) {
                 int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
                 const fb_info_t *fi = fb_get_info();
                 if (fi && !w->widget && !w->translucent) {
-                    int maxx = (int)fi->width - (int)w->cw;
+                    int maxx = (int)fi->width - (int)g_desktop.right - (int)w->cw;
                     int maxy = (int)fi->height - WORK_BOTTOM -
                                win_titlebar_h(w) - (int)w->ch;
-                    if (maxx < 0) maxx = 0;
+                    if (maxx < (int)g_desktop.left) maxx = (int)g_desktop.left;
                     if (maxy < WORK_TOP) maxy = WORK_TOP;
                     if (nx < 0) nx = 0;
                     if (nx > maxx) nx = maxx;
@@ -2253,7 +2367,7 @@ void compositor_pointer_tick(void) {
     }
     /* drain the scroll wheel every tick; route it to the hovered window's app */
     int32_t wheel = mouse_take_wheel();
-    if (wheel && g_ptr_pid) g_ptr_wheel += wheel;
+    if (wheel && g_ptr_pid && !suppressed) g_ptr_wheel += wheel;
 
     g_prev_buttons = b;
     #undef DIRTY
@@ -2340,4 +2454,132 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
     }
     spin_unlock(&g_comp_lock);
     return focused;
+}
+
+void compositor_session_changed(void) {
+    spin_lock(&g_comp_lock);
+    g_drag_id=0;reset_pointer_capture_locked();
+    uint32_t owner=session_input_owner();
+    g_anim.kind=ANIM_NONE;
+    if(owner)for(unsigned i=0;i<COMP_MAX_WINDOWS;i++)
+        if(g_wins[i].used && g_wins[i].pid==owner)g_wins[i].presented=false;
+    const fb_info_t *fi=fb_get_info();
+    if(fi)paint_region(0,0,fi->width,fi->height);
+    spin_unlock(&g_comp_lock);
+}
+
+/* The shell publishes geometry and bounded appearance. Workspace changes only
+ * affect presentation/focus; minimized state and process lifetime are preserved. */
+int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *state) {
+    if(!state || state->version!=EMBK_DESKTOP_VERSION)return -EMBK_EINVAL;
+    if(operation>EMBK_DESKTOP_MOVE_FRONT)return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    /* Session transitions also take this lock before completing. A request
+     * queued before a lock must recheck ownership when it actually runs. */
+    if(operation && (!session_ui_allowed(pid) || session_input_owner())) {
+        spin_unlock(&g_comp_lock);return -EMBK_EPERM;
+    }
+    int reset_capture=0;
+    if(operation==EMBK_DESKTOP_CONFIGURE) {
+        uint32_t owns=0;
+        for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && g_wins[i].pid==pid)owns=g_wins[i].id;
+        const fb_info_t *fi=fb_get_info();
+        if(!owns){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+        if(!fi || state->left+state->right>fi->width/2 || state->top+state->bottom>fi->height/2 ||
+           state->left>256 || state->right>256 || state->top>256 || state->bottom>256 ||
+           state->radius>12 || state->shadows>2 || state->decoration>2 || state->cursor_style>2 ||
+           state->cursor_size>1 || state->shortcut_modifier>1 || state->blur>16 || state->opacity<127 || state->opacity>255 || state->workspace_count<1 || state->workspace_count>6 ||
+           state->flags&~7u || state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
+            spin_unlock(&g_comp_lock);return -EMBK_EINVAL;
+        }
+        if(g_anim.kind!=ANIM_NONE)anim_finish();
+        unsigned before=g_desktop.workspace;
+        int new_owner=g_desktop_owner!=(int)owns;
+        unsigned active=new_owner?0:before;g_desktop_owner=(int)owns;
+        g_desktop=*state;g_desktop.workspace=active<state->workspace_count?active:state->workspace_count-1;
+        reset_capture=new_owner || g_desktop.workspace!=before;
+        for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].workspace>=state->workspace_count)g_wins[i].workspace=state->workspace_count-1;
+        keyboard_set_shortcut_modifier(state->shortcut_modifier);
+        cursor_layers_ready=0;
+    } else if(operation) {
+        if(g_desktop_front){spin_unlock(&g_comp_lock);return -EMBK_EBUSY;}
+        if(state->workspace>=g_desktop.workspace_count){spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+        if(g_anim.kind!=ANIM_NONE)anim_finish();
+        if(operation==EMBK_DESKTOP_MOVE_FRONT) {
+            struct comp_window *front=front_app_window();
+            if(front && !front->desktop && !front->translucent && !front->widget) {
+                reset_capture=front->workspace!=state->workspace;front->workspace=state->workspace;
+            }
+        } else {reset_capture=g_desktop.workspace!=state->workspace;g_desktop.workspace=state->workspace;}
+    }
+    if(operation) {
+        /* Palette/geometry publication must retain a held gesture. Clearing its
+         * button level generated a synthetic second press on the next tick. */
+        if(reset_capture)reset_pointer_capture_locked();
+        enforce_focus();const fb_info_t *fi=fb_get_info();
+        if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
+    }
+    *state=g_desktop;spin_unlock(&g_comp_lock);return 0;
+}
+
+int compositor_request_launcher(void) {
+    spin_lock(&g_comp_lock);
+    if(session_input_owner()){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+    for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && session_ui_allowed(g_wins[i].pid)) {
+        g_wins[i].pending_action=7;spin_unlock(&g_comp_lock);return 0;
+    }
+    spin_unlock(&g_comp_lock);return -EMBK_ENOENT;
+}
+/* target -1/-2 walk backward/forward; nonnegative targets are direct spaces. */
+int compositor_workspace_key(int target,int move) {
+    struct embk_desktop state={.version=1};int pid=0;
+    spin_lock(&g_comp_lock);
+    for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && session_ui_allowed(g_wins[i].pid)){pid=g_wins[i].pid;break;}
+    int next=target;
+    if(target<0) {
+        next=(int)g_desktop.workspace+(target==-1?-1:1);
+        if(g_desktop.flags&EMBK_DESKTOP_WRAP)next=(next+(int)g_desktop.workspace_count)%(int)g_desktop.workspace_count;
+    }
+    state.workspace=(unsigned)next;spin_unlock(&g_comp_lock);
+    if(!pid)return -EMBK_ENOENT;
+    return compositor_desktop_control(pid,move?EMBK_DESKTOP_MOVE_FRONT:EMBK_DESKTOP_SWITCH,&state);
+}
+
+/* Boot confirmation observes real desktop and top-strip frames. */
+int compositor_desktop_healthy(void) {
+    int desktop=0,strip=0;
+    spin_lock(&g_comp_lock);
+    for(unsigned i=0;i<sizeof g_wins/sizeof g_wins[0];i++) {
+        __typeof__(g_wins[0]) *w=&g_wins[i];
+        if(!w->used || !w->presented || !w->visible)continue;
+        if(w->desktop)desktop=1;
+        if(!strcmp(w->title,"TopBar"))strip=1;
+    }
+    spin_unlock(&g_comp_lock);return desktop && strip;
+}
+
+void compositor_display_lock(void) {spin_lock(&g_comp_lock);}
+void compositor_display_unlock(void) {spin_unlock(&g_comp_lock);}
+struct fb_surface *compositor_select_display(struct fb_surface *next) {
+    spin_lock(&g_comp_lock);
+    struct fb_surface *old=fb_select_surface(next);
+    if(old) {
+        const fb_info_t *fi=fb_get_info();
+        g_cursor_under_valid=0;g_cursor_valid=0;
+        g_cap_pid=0;g_cap_win=0;g_dragging=0;g_drag_on=0;g_ptr_buttons=0;g_buttons_suppressed=1;
+        anim_finish();
+        for(unsigned i=0;i<COMP_MAX_WINDOWS;i++) {
+            struct comp_window *w=&g_wins[i];if(!w->used)continue;
+            w->pend_count=w->pend_phase=0;
+            if(w->desktop){w->x=0;w->y=0;}
+            else {
+                if(w->x>(int)fi->width-120)w->x=(int)fi->width-120;
+                if(w->y>(int)fi->height-60)w->y=(int)fi->height-60;
+                if(w->x<0)w->x=0;if(w->y<(int)g_desktop.top)w->y=g_desktop.top;
+            }
+        }
+        mouse_set_bounds(fi->width,fi->height);
+        paint_region(0,0,fi->width,fi->height);
+    }
+    spin_unlock(&g_comp_lock);return old;
 }

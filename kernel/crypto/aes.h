@@ -34,10 +34,10 @@ void aes256_init(struct aes256_ctx *ctx, const uint8_t key[AES256_KEY_SIZE]);
 void aes256_encrypt_block(const struct aes256_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]);
 void aes256_decrypt_block(const struct aes256_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]);
 
-/* AES-128 forward direction only -- GCM (AES-GCM AEAD) never runs the inverse
- * cipher, so no aes128_decrypt_block exists to get subtly wrong. */
+/* AES-128: TLS GCM and WPA2 RFC 3394 key unwrap. */
 void aes128_init(struct aes128_ctx *ctx, const uint8_t key[AES128_KEY_SIZE]);
 void aes128_encrypt_block(const struct aes128_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]);
+void aes128_decrypt_block(const struct aes128_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]);
 
 /* FIPS-197 known-answer vectors (C.3 for AES-256, C.1 for AES-128), cross-
  * checked against Python's `cryptography` package (algorithms.AES + modes.ECB),

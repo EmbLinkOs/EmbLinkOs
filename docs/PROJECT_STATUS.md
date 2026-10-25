@@ -1,5 +1,205 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Shared descriptions and socket I/O (2026-10-25)
+
+Descriptors now share append/nonblocking status, socket identity and regular-file
+cursor serialization across dup and spawn. CLOEXEC stays per descriptor.
+TCP/UDP inheritance preserves other owners through child exit or termination.
+In-flight I/O retains its resolved backing across close/reuse and syscall
+bounce chunks; PTY pins preserve immediate last-master hangup. Cached append
+chooses EOF under the cache write lock rather than seeking only at open time.
+UDP send lengths, oversized-datagram refusal, empty datagrams, nonblocking UDP
+receive and TCP accept are covered by real local fixtures.
+
+Native acceptance passes **223/223 description checks** twice through the
+serial wrapper and again in Terminal; **83/83 network checks** pass via serial
+and through `sh` in Terminal. Concurrent records, parent/child traffic, final
+ownership release and eight pending-read close/reuse cases per invocation are
+checked. Description, pipe and PTY allocations return to baseline. The spawn
+suite now passes **360/360**, alongside 203 process, 108 PTY and 338 shell checks.
+ASan/UBSan/leak checks on production fd code pass 128 barrier-controlled races.
+The existing host shell/SDK/VT suites and wider document/device/IPC/session/
+kill-I/O integration pass; x86 images boot and the AArch64 kernel links.
+
+The [description contract](FILE_DESCRIPTIONS.md) records the native wire ABI,
+reference model and remaining limits. Append is atomic per kernel write chunk,
+not across arbitrary large writes; uncached append and complete ordering with
+truncate/mapped writes remain work. Job control and broad developer utilities
+remain open. This adds no ARM userspace runtime or physical-network validation.
+The [progress gallery](media/laptop-progress/README.md) has 116 actual captures,
+preserving all prior 114 images and metadata.
+
+## Spawn-based sh (2026-10-24)
+
+The image now includes an initial mrsh-based `sh` port. Quoting, parameters,
+arithmetic, loops, functions, conditionals, case, aliases, sourced files,
+subshells, command substitution, pipelines, redirection, here-documents,
+background commands and wait run through explicit spawn workers. The native
+structured shell remains the default; `sh` enters the new shell and `exit`
+returns. Shared host/native scripts cover 83 selected cases, with 79 also
+compared against `/bin/sh`. Host ASan/UBSan and leak checks cover the shell,
+worker startup and bounded typed AST transport.
+
+Native acceptance passes **338/338 checks** twice through the serial wrapper
+and again in Terminal. Desktop input verifies loops, arithmetic, substitution,
+a 66,049-byte three-stage pipeline, single command echo and foreground Ctrl+C
+with a surviving background job, followed by wait and return to the native
+shell. The 357 spawn, 203 process and 108 PTY checks, capability gates and wider
+desktop integration batch pass. x86 images build/boot and the AArch64 kernel
+compiles/links; no ARM shell runtime or physical-hardware acceptance is added.
+The [progress gallery](media/laptop-progress/README.md) contains 114 actual
+captures, preserving all prior 112 images and metadata.
+
+This is a development foundation with explicit limits, not complete POSIX or
+zsh compatibility. General signals, process groups, in-place exec, automatic
+shebang loading, broad Unix utilities and comprehensive shell conformance
+remain open. Worker contexts use immediately unlinked temporary files and need
+a writable home/temp directory. See [POSIX_SHELL.md](POSIX_SHELL.md) for the
+supported flags, native bounds, remaining language gaps and test commands.
+
+Spawn OPEN actions now enforce the caller's filesystem capability, closing a
+gap relative to direct open. Explicit transfer of an already-owned descriptor
+retains the existing capability model.
+
+## Ordered POSIX spawn (2026-10-24)
+
+The newlib adapter now implements bounded `posix_spawn` and `posix_spawnp` on
+native child handles. Ordered open/dup2/close/chdir actions run on the child
+table, while the parent keeps its descriptors and working directory. File and
+pipe inheritance, real close-on-exec flags, PATH lookup and exact environments
+work together. A separate starting-directory context is installed before
+constructors, independently of PWD. The PID-returning native entry publishes
+retained ownership without a second libc lookup. A full handle table fails
+before constructing or running another child.
+
+The adapter supports 61 user actions, 64 descriptors and the existing bounded
+argv/environment startup page. This stage initially refused TCP/UDP inheritance;
+the later shared-description milestone above supplies ownership. Process-group,
+scheduler, identity and signal attribute flags return ENOTSUP. `fork`, in-place
+`exec` and job control remain open. The later sh milestone above uses the
+adapter without fork. The native shell is
+preserved. See [PROCESS_COMPATIBILITY.md](PROCESS_COMPATIBILITY.md) for contracts,
+limits, new syscalls 151/152 and validation commands.
+
+Native acceptance passes **357/357 spawn checks** twice through the serial
+wrapper and again inside Terminal under the normal session namespace. The
+66,049-byte two-child pipeline completes and another shell command succeeds.
+Malformed input, copyout retry, failed-action cleanup, all 32 retained statuses,
+constructor cwd and unchanged environment/parent state are covered. Existing
+203 process checks, 108 PTY checks, handle reclamation, scheduler, console/POSIX
+and channel regressions pass. The host pipe/PTY/SDK/VT/shell suites pass;
+production pipe sanitizer coverage remains green. The wider device, preferences,
+files, document, page-cache, IPC, compositor, session and kill-I/O integration
+batch passes. x86 images build and boot; the AArch64 kernel compiles and links
+without a new ARM runtime or physical-hardware claim. The
+[progress gallery](media/laptop-progress/README.md) has 112 actual captures,
+with all prior images and metadata preserved.
+
+## Process compatibility foundation (2026-10-24)
+
+Newlib now has real descriptor `pipe()`, actual-PID `waitpid()` and `wait()`
+on EmbLink's spawn/handle model. Pipes allocate the lowest free slots, honour
+nonblocking mode and preserve small-write atomicity. File status queries report
+actual access modes. Native typed child results separate negative exit values
+from errors, copy status before collection and retain explicitly requested
+statuses under handle pressure. Competing waiters use the shared parent queue
+without losing another child's wakeup. Failed unpublished spawns are cleaned up.
+
+The original pipe syscall keeps its one-argument object-handle contract; new
+calls 149/150 add owned child control and descriptor pipe creation. All 150
+native syscall IDs match the SDK, and capability IDs are unchanged. The
+[process compatibility contract](PROCESS_COMPATIBILITY.md) records behavior,
+validation commands and the remaining descriptor/signal limitations.
+
+This foundation prepared a Unix shell port. The later spawn milestone above
+adds action translation, directory handoff and a descriptor policy; process-group
+job control and a POSIX shell itself remain open. The native structured shell and
+`TERM=emlink` remain available. Native acceptance passes 203 checks twice through
+the serial wrapper and again inside Terminal, followed by another shell command.
+Pipes return to their allocation baseline. Legacy handle reclamation, scheduler
+waits, 108 terminal checks and the wider kernel integration suite pass. Production
+pipe state-machine tests pass ASan/UBSan; x86 images and the AArch64 kernel link.
+The [progress gallery](media/laptop-progress/README.md) now has 111 actual captures.
+
+## Full-screen terminal milestone (2026-10-24)
+
+Terminal now has a bounded VT parser and cell model, primary/alternate screens,
+cursor and line editing, scroll regions, Unicode widths, SGR colour and live
+resizing. A retained fixed-cell renderer follows desktop appearance and scaling.
+Screen copy, safe prompt paste and application-controlled bracketed paste work
+across applications. The native prompt retains history and completion.
+
+A real ring-3 screen witness passes cursor-key selection, confined scrolling,
+cursor-position reply round trips, live dimensions, cross-app multiline paste,
+plain screen copy and primary-output restoration. Host VT parser/resize tests
+pass AddressSanitizer/UBSan. The private-terminal regression still passes all
+108 guest checks, with zero leaked devices, plus cooked/raw input, interruption,
+independent windows, EOF and close cleanup.
+
+Clipboard commands now reach focused fields/editors without overflowing the
+key queue. Long multiline replacement and undo stay within document bounds;
+retained selection highlights clear after collapse. Note++ validates the full
+clipboard length. Shared control and rendering suites pass sanitizer checks.
+
+This remains `TERM=emlink`, with a native structured shell. Unix process/libc
+compatibility, a POSIX shell port, job control, complete modified navigation,
+range selection and broader VT compatibility remain open. The
+[terminal contract](TERMINAL.md) separates implemented operations from limits.
+The [progress gallery](media/laptop-progress/README.md) includes actual guest
+screenshots; no physical-laptop or upstream shell compatibility is implied.
+
+## Interactive terminal sessions (2026-10-24)
+
+Terminal now launches the native shell on a private pseudo-terminal. Programs
+can choose canonical/raw input, receive keys without Enter, query measured
+window dimensions and use a per-device foreground Ctrl+C route. The native
+prompt retains its local history/completion/editor. Independent terminal
+sessions no longer depend on the global console discipline.
+
+Descriptor transfer, EOF records, nonblocking queue pressure, hangup and
+hard-killed I/O cleanup pass 108 real guest checks. Host state-machine and shell
+suites pass, including PTY AddressSanitizer/UBSan coverage. Native graphical
+acceptance verifies real cooked/raw input, Ctrl-letter/navigation distinction,
+interruptions, separate sessions and active-close cleanup. The ABI has 148
+unique calls; existing syscall and capability IDs retain their values.
+
+Broader VT compatibility, POSIX job control and a Unix shell port remain next.
+Contract and limitations: [TERMINAL.md](TERMINAL.md). Four new original-pixel
+captures extend the [progress gallery](media/laptop-progress/README.md).
+
+## Keyboard interaction milestone (2026-10-24)
+
+Shared fields and controls support Tab/Shift+Tab with queued modifier snapshots,
+focus revelation inside scroll views, nested dialog containment/restoration and
+keyboard menu navigation. Application hooks cannot consume ordinary keys behind
+a modal decision. Context-menu editing returns to the original field/selection.
+The Settings reset cancels with Escape without exiting the app. Native keyboard
+acceptance passes for Settings, system menus and a dirty Editor document; shared
+host suites cover nested scopes, hidden menus, mixed queues and slider input.
+Details and limits: [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md).
+
+## Contour desktop milestone (2026-10-24)
+
+Contour replaces fragmented shell/app styling with shared semantic surfaces,
+real regular/bold type families, original icons and compact native controls.
+The new command strip, searchable library, side docks, live Settings and
+isolated workspaces share a versioned compositor contract (native syscall 147).
+Application chrome, document/code surfaces and authentication screens follow the
+same system. Defaults, curated presets and validated custom colours persist.
+
+The x86 images, shared UI/appearance/document host suites, sanitizer checks,
+native desktop/customization runs, three-boot document workflow and native
+integration batch pass. Layout regressions cover complete wrapped dialog
+explanations, and icon-cache coverage loads both complete shipped families. Current scope, evidence and remaining accessibility,
+customization and hardware work: [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+The [progress gallery](media/laptop-progress/README.md) retains earlier milestones
+and adds original-pixel redesign captures. Browser engine development remains
+with the user; this milestone applies shared native chrome.
+
+## Document workspace milestone (2026-10-23)
+
+Editor and Note++ now share guarded close, Open/Save, conflict detection, synced replacement and recoverable drafts. Files creates documents and passes the authenticated home to Editor. The native ABI now has 146 unique calls; queued keyboard modifier snapshots distinguish document shortcuts from navigation. Details and test commands: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).
+
 *Last updated: 2026-07-19. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical
 version. If you're returning to this after time away, read `ARCHITECTURE.md`
@@ -7,6 +207,29 @@ first (the intended design and the decisions behind it), then this file
 (what's actually built), then `TODO.md` (what's left). The repo and git
 history are ground truth; this file is reconstructed for the design record —
 if it disagrees with the code, the code wins.*
+
+## Desktop menu polish, 2026-10-23
+
+After PR #40, system dropdowns follow live appearance preferences, share a
+legible panel surface and open beneath their labels. Escape dismisses an open
+menu; outside clicks cover the display while open, then dock/app input returns.
+The compositor now supports temporary window-owned menu keyboard focus and
+resizing a translucent bar back to its thin height. See
+[DESKTOP_MENUS.md](DESKTOP_MENUS.md) for scope and acceptance.
+
+## Laptop integration, 2026-10-23
+
+The `laptop-daily-use` branch incorporates master through `a281865` (210 incoming
+commits), retaining portable syscalls, ARM64/RPi4, VM/page-cache work, native
+AML and the newer desktop. Laptop APIs are appended after syscall 128 and
+capabilities 1–12 retain the incoming meanings. See
+[LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md) for current build/native evidence,
+[DAILY_USE.md](DAILY_USE.md) for behavior and limits, and the
+[progress gallery](media/laptop-progress/README.md) for actual captures.
+
+Physical Wi-Fi, laptop input/audio/panel/firmware and suspend/resume remain open.
+The older sections below are a design/handoff record; current test claims are
+recorded separately in LAPTOP_VALIDATION.md.
 
 ## Project Overview
 

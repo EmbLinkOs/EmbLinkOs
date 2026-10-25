@@ -13,12 +13,15 @@
 #define _EMBK_AUDIO_H_
 
 #include <stdint.h>
+#include "../../../user/lib/embk_audio.h"
 #include "include/types.h"
 
 /* Probe every compiled-in sound driver and keep the first that finds its
  * hardware. Once, during device bring-up. False means this machine has no
  * card this kernel knows, which is not a boot failure. */
 bool audio_init(void);
+void audio_snapshot(struct embk_audio_info *out);
+int audio_control(unsigned percent,unsigned mute);
 
 /* Which driver won, or "none". */
 const char *audio_device_name(void);

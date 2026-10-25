@@ -26,6 +26,8 @@ int pipe_create(int *out_read_handle, int *out_write_handle);  /* installs BOTH
                                                                  * as obj-handles in
                                                                  * current_process */
 int pipe_read(struct pipe *p, void *buf, size_t len, size_t *out_read);
+int pipe_read_flags(struct pipe *,void *,size_t,size_t *,bool nonblock);
+int pipe_write_flags(struct pipe *,const void *,size_t,size_t *,bool nonblock,bool atomic_small);
 int pipe_write(struct pipe *p, const void *buf, size_t len, size_t *out_written);
 
 /* _locked variants (caller holds g_sched_lock) -- the channel convention,

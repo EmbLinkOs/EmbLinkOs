@@ -2406,3 +2406,36 @@ int fat32_vfs_register(const char *path, struct fat32_volume *vol)
 
 /* EmbDBG v2 VFS Explorer: ops table address for fs-type naming (see vfs.c). */
 const void *fat32_vfs_ops_ptr(void) { return &fat32_vfs_ops; }
+/* Resolve a fixed allocation without changing FAT or directory metadata.
+ * The updater writes only these data sectors after invalidating the inactive
+ * boot slot. Reject loops, short/overlong chains and unexpected capacities. */
+int fat32_fixed_map(struct fat32_volume *vol,const char *path,uint64_t capacity,
+                    uint64_t **out,uint32_t *count) {
+    struct fat_dir_entry entry;
+    int rc=fat32_find_path(vol,path,&entry);if(rc)return rc;
+    if(entry.attr&(FAT32_ATTR_DIRECTORY|FAT32_ATTR_VOLUME_ID))return -EMBK_EINVAL;
+    if(!entry.file_size || (capacity && entry.file_size!=capacity))return -EMBK_EINVAL;
+    uint32_t sectors=(entry.file_size+511u)/512u,clusters=fat32_cluster_count(vol);
+    if(vol->bytes_per_sector!=512 || sectors>32768)return -EMBK_EINVAL;
+    uint64_t *map=kmalloc((size_t)sectors*sizeof *map);
+    uint8_t *seen=kcalloc((clusters+9u)/8u,1);
+    if(!map || !seen){kfree(map);kfree(seen);return -EMBK_ENOMEM;}
+    uint32_t c=fat32_vfs_entry_first_cluster(&entry),done=0,fat_sector=UINT32_MAX;
+    uint8_t fat_cache[512];
+    while(done<sectors) {
+        if(!fat32_valid_cluster(vol,c) || (seen[c/8]&(1u<<(c%8)))){rc=-EMBK_EIO;break;}
+        seen[c/8]|=1u<<(c%8);
+        for(unsigned i=0;i<vol->sectors_per_cluster && done<sectors;i++)map[done++]=cluster_to_sector(vol,c)+i;
+        uint32_t sector=c/128;
+        if(sector!=fat_sector) {
+            rc=embk_block_read(vol->dev,vol->fat_start_sector+sector,1,fat_cache);if(rc)break;
+            fat_sector=sector;
+        }
+        unsigned offset=(c%128)*4;
+        uint32_t next=(uint32_t)fat_cache[offset]|(uint32_t)fat_cache[offset+1]<<8|
+            (uint32_t)fat_cache[offset+2]<<16|(uint32_t)fat_cache[offset+3]<<24;
+        c=next&0x0fffffff;
+    }
+    if(!rc && c<FAT32_EOC_MIN)rc=-EMBK_EIO;
+    kfree(seen);if(rc){kfree(map);return rc;}*out=map;*count=sectors;return 0;
+}

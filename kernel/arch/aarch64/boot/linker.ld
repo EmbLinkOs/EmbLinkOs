@@ -43,6 +43,7 @@ SECTIONS {
     . = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE;
 
     __kernel_start = .;
+    kernel_start = .;      /* the spelling shared kernel/mm/pmm.c uses */
 
     /* .text.boot first and KEEP'd: _start must be at offset 0 of the flat
      * image, because the arm64 Image path has no entry point and simply

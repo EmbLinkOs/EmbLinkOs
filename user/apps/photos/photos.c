@@ -327,7 +327,7 @@ static void PhotosView(void)
     rebuild(availw, availh);
     labels();
 
-    Window("Photos", .corner = 14, .clip = 1) {
+    Window("Photos", .corner = ui_theme()->radius_lg, .clip = 1) {
         AppBar(g_title) {
             if (Button("−").ghost().clicked()) { zoom_by(1.0f / ZOOM_STEP); }
             Text(g_zoomlbl).caption().secondary();
@@ -368,6 +368,7 @@ static void PhotosView(void)
  * main(void) and this program's whole job is the argument it was given. */
 static EmApp g_spec = {
     .title  = "Photos",
+    .min_size = { 320, 240 },
     .size   = { 900, 640 },
     .theme  = Dark,
     .chrome = Chromeless,

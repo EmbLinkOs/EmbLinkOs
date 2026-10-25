@@ -24,6 +24,8 @@
 #include "testfont.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <dirent.h>
 
 static int g_fail;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  FAIL: %s\n", (msg)); g_fail++; } \
@@ -34,7 +36,7 @@ static struct layout_arena LA;
 
 /* A clipboard of our own -- the kit takes one as two function pointers exactly
  * so that copy and cut can be tested here instead of only in QEMU. */
-static char g_clip[512];
+static char g_clip[65537];
 static unsigned g_clip_n;
 static int clip_set(const char *b, unsigned n) {
     if (n > sizeof g_clip) n = sizeof g_clip;
@@ -45,17 +47,25 @@ static int clip_get(char *b, unsigned cap) {
     memcpy(b, g_clip, n); return (int)n;
 }
 static const char *clip_text(void) {
-    static char out[513];
+    static char out[65538];
     memcpy(out, g_clip, g_clip_n); out[g_clip_n] = 0; return out;
 }
 
-static char DOC[512];
+static char DOC[8192];
 static int  CUR;
 
 /* A clock the test winds by hand -- double-click is a real elapsed time, and
  * sleeping in a test is how a test becomes flaky on a loaded machine. */
 static uint64_t g_ms = 1000;
 static uint64_t fake_clock(void) { return g_ms; }
+
+static int highlights(struct instance_handle h) {
+    struct scene_node *n=scene_resolve(&SA,ui_scene_of(h));
+    int count=n && n->kind==SCENE_NODE_TEXT && n->data.text.bg.a>0;
+    for(struct instance_handle c=ui_first_child(h);c.index;c=ui_next_sibling(c))
+        count+=highlights(c);
+    return count;
+}
 
 static void view(void) { em_text_editor(DOC, sizeof DOC, &CUR, 200); }
 
@@ -165,6 +175,140 @@ static float seg_x_for_change(void) {
     return -1;
 }
 
+static int under_clicked;
+static void under_frame(void) {
+    ui_frame_begin();
+    if(Button("Under").width(100).height(30).clicked())under_clicked++;
+    em_flush();ui_begin_vstack(0xdec047);
+    ui_set_overlay(true);ui_set_layer(3);ui_set_hit_passthrough(true);
+    ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=120},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=40});
+    ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid={1,0,0,1}});
+    ui_end_stack();ui_frame_end();ui_run_layout(400,100);
+}
+
+/* Exercise the shipped EIC path as well as the font fallback: a hover can
+ * change stencil tint on the very frame that captures the image leaf. */
+static uint8_t *icon_asset(const char *path,size_t *len) {
+    if(strncmp(path,"/system/images/",15))return NULL;
+    FILE *f=fopen(path+1,"rb");if(!f)return NULL;
+    fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);
+    uint8_t *p=malloc(n>0?(size_t)n:1);
+    if(n<=0 || !p || fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return NULL;}
+    fclose(f);*len=(size_t)n;return p;
+}
+static bool chrome_closed;
+static void chrome_frame(void) {
+    ui_frame_begin();em_new_frame();
+    Window("Chrome regression"){AppBar("Chrome regression"){} Spacer();}
+    em_flush();em_tooltip_host();chrome_closed=em_window_closed();
+    ui_frame_end();ui_run_layout(400,300);
+}
+
+static char modal_text[32];
+static bool modal_open,nested_open;
+static int accepted;
+static struct instance_handle outside_button;
+static void modal_frame(void) {
+    ui_frame_begin();em_new_frame();
+    VStack(.key="focus-regression") {
+        em_field_autofocus();TextField(modal_text,sizeof modal_text,"Outside");
+        if(Button("Show decision").clicked())modal_open=true;
+        em_flush();
+        outside_button=ui_next_sibling(ui_first_child(ui_first_child(ui_root())));
+        if(modal_open)Overlay() {
+            Dialog(.width=300) {
+                if(Button("Cancel").clicked())modal_open=false;
+                if(Button("More options").clicked())nested_open=true;
+                if(Button("Proceed").clicked()){accepted++;modal_open=false;}
+                if(nested_open)Overlay() {
+                    Dialog(.width=200) {
+                        if(Button("Back").clicked())nested_open=false;
+                        if(Button("Done").clicked())nested_open=false;
+                    }
+                }
+            }
+        }
+    }
+    em_flush();ui_frame_end();ui_run_layout(400,400);
+}
+static int menu_action;
+static float menu_level=.5f;
+static void menu_frame(void) {
+    ui_frame_begin();em_new_frame();
+    VStack(.key="menu-navigation") {
+        MenuBar() {
+            Menu("File") {
+                if(MenuItem("New"))menu_action=1;
+                MenuSeparator();
+                if(MenuItem("Open"))menu_action=2;
+                if(MenuItem("Close"))menu_action=3;
+            }
+            Menu("Edit") {
+                if(MenuItem("Copy"))menu_action=4;
+                if(MenuItem("Paste"))menu_action=5;
+            }
+            Menu("Tools") {if(Button("Hidden action").clicked())menu_action=6;Slider(&menu_level);}
+        }
+    }
+    em_flush();ui_frame_end();ui_run_layout(500,500);
+}
+static char context_text[48]="Clipboard survives focus.";
+static void context_frame(void) {
+    ui_frame_begin();em_new_frame();
+    VStack(.key="context-focus") {em_field_autofocus();TextField(context_text,sizeof context_text,"Context");}
+    em_flush();ui_frame_end();ui_run_layout(500,400);
+}
+static void navigation_regressions(void) {
+    ui_request_focus(INSTANCE_HANDLE_NULL);modal_text[0]=0;modal_open=nested_open=false;accepted=0;
+    modal_frame();modal_frame();ui_input_char('x');ui_input_char('\t');ui_input_char('\n');ui_input_char('!');modal_frame();modal_frame();
+    CHECK(modal_open && !strcmp(modal_text,"x") && accepted==0,"opening a dialog consumes its activation without typing into the background");
+    for(int i=0;i<8;i++){ui_input_char('\t');modal_frame();modal_frame();}
+    ui_input_key('\t',UI_MOD_SHIFT);modal_frame();modal_frame();
+    ui_input_char('q');modal_frame();
+    CHECK(!strcmp(modal_text,"x") && modal_open,"forward and reverse Tab stay inside the dialog");
+    /* Return to the first dialog control, then open its nested decision. */
+    ui_focus_edge(false);modal_frame();ui_input_char('\t');ui_input_char('\n');modal_frame();modal_frame();
+    CHECK(nested_open,"a nested dialog opens from the focused control");
+    ui_input_char('\n');modal_frame();modal_frame();modal_frame();
+    CHECK(!nested_open && modal_open,"Return in a nested dialog activates only its own default control");
+    ui_input_key('\t',UI_MOD_SHIFT);modal_frame();modal_frame();ui_input_char('\n');modal_frame();modal_frame();modal_frame();
+    CHECK(!modal_open && ui_has_focus(outside_button),"closing nested and outer dialogs restores their initiating controls");
+    ui_request_focus(INSTANCE_HANDLE_NULL);menu_action=0;menu_frame();menu_frame();
+    ui_input_char('\t');menu_frame();ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    CHECK(em_menu_any_open(),"Down opens a focused menu from the keyboard");
+    CHECK(em_menu_key(UI_KEY_DOWN),"an open menu consumes Down before app hooks");menu_frame();
+    ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==2 && !em_menu_any_open(),"Down skips separators and Return activates the focused item once");
+    ui_input_char(UI_KEY_UP);menu_frame();menu_frame();ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==3,"Up opens a menu at its final item");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    CHECK(em_menu_key(UI_KEY_RIGHT),"Right walks adjacent menus");menu_frame();menu_frame();
+    ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==4,"switching menus focuses the new menu's first item");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    em_menu_key(UI_KEY_LEFT);ui_input_char('\n');menu_frame();menu_frame();
+    CHECK(menu_action==1 && !em_menu_any_open(),"queued menu switching and Return activate only the new menu");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    CHECK(em_menu_key(27),"Escape dismisses a menu without reaching the application");menu_frame();menu_frame();
+    CHECK(!em_menu_any_open(),"Escape leaves the menu closed");
+    ui_input_char(UI_KEY_DOWN);menu_frame();menu_frame();
+    em_menu_key(UI_KEY_LEFT);menu_frame();menu_frame(); /* File -> Tools */
+    ui_input_char('\t');menu_frame();menu_frame();
+    CHECK(!em_menu_key(UI_KEY_RIGHT),"a focused menu slider retains its horizontal adjustment keys");
+    ui_input_char(UI_KEY_RIGHT);menu_frame();menu_frame();
+    CHECK(menu_level>.54f && menu_level<.56f,"Right adjusts a menu slider without switching menus");
+    em_menu_dismiss();menu_frame();menu_frame();
+    ui_request_focus(INSTANCE_HANDLE_NULL);context_frame();context_frame();
+    ui_input_char(UI_KEY_SEL_ALL);context_frame();
+    em_feed_pointer(50,15,0,1,0,1);context_frame();
+    em_feed_pointer(50,15,0,0,0,1);context_frame();context_frame();
+    CHECK(em_menu_key(UI_KEY_HOME),"a text context menu retains keyboard ownership after field focus moves");context_frame();
+    for(int i=0;i<3;i++){em_menu_key(UI_KEY_DOWN);context_frame();}
+    ui_input_char('\n');context_frame();context_frame();context_frame();context_frame();
+    CHECK(!strcmp(clip_text(),context_text),"context Copy waits for the original field's focus and selection to return");
+
+}
+
 int main(void) {
     printf("=== em-test: the multi-line editor ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -224,6 +368,22 @@ int main(void) {
     frame(PASTE);
     CHECK(!strcmp(DOC, "hello\nhellohello\nhello"),
           "a pasted block keeps its newlines instead of being flattened");
+
+    /* One queued command must carry more than both the 32-key input queue
+     * and the former 2048-byte editor scratch buffer. */
+    memset(g_clip,'x',5000);g_clip[100]='\n';g_clip[2100]='\t';g_clip_n=5000;
+    frame(SALL);CHECK(highlights(ui_root())>0,"select-all paints a highlight");frame(PASTE);
+    CHECK(highlights(ui_root())==0,"paste removes retained selection highlights");
+    CHECK(strlen(DOC)==5000 && DOC[100]=='\n' && DOC[2100]=='\t' && CUR==5000,
+          "one paste replaces selection with a long multiline block");
+    frame("!");
+    CHECK(strlen(DOC)==5001 && DOC[5000]=='!',"paste collapses selection at the new caret");
+    memset(g_clip,'z',9000);g_clip_n=9000;
+    frame(SALL PASTE);
+    CHECK(strlen(DOC)==5001 && DOC[0]=='x',"oversized paste preserves document and selection");
+    frame("Q");CHECK(!strcmp(DOC,"Q"),"failed paste preserves selection for the next edit");
+    clip_set("a\r\nb\tc\033\001",9);frame(SALL PASTE);
+    CHECK(!strcmp(DOC,"a\nb\tc"),"multiline paste normalizes CRLF and filters controls");
 
     DOC[0] = 0; CUR = 0; g_clip_n = 0;
     frame(NULL);
@@ -414,6 +574,76 @@ int main(void) {
         CHECK(seg_applied == 0 && seg_cfg == 0,
               "without it the change is read a flush too early and thrown away");
     }
+
+    char sized_field[16]="value";
+    ui_frame_begin();VStack(.key="sized-field") {TextField(sized_field,sizeof sized_field,"Value").width(112);}
+    em_flush();ui_frame_end();ui_run_layout(400,100);
+    float fx,fy,fw,field_h;
+    CHECK(ui_rect_of(ui_first_child(ui_first_child(ui_root())),&fx,&fy,&fw,&field_h) && fw==112,
+          "a text field honors its authored width");
+
+    char query[32]="";bool submitted=false;
+    /* A search field forwards its own submit edge, exactly once. */
+    for(int pass=0;pass<3;pass++) {
+        if(pass==2){ui_input_char('o');ui_input_char('k');ui_input_char('\n');}
+        ui_frame_begin();VStack(.key="search-submit") {
+            em_field_autofocus();submitted=SearchField(query,sizeof query,"Search").submitted();
+        }
+        em_flush();ui_frame_end();ui_run_layout(400,100);
+    }
+    CHECK(!strcmp(query,"ok") && submitted,"SearchField forwards Return to its submitted binding");
+
+    under_clicked=0;under_frame();under_frame();
+    ui_pointer(20,12,true);under_frame();ui_pointer(20,12,false);under_frame();
+    CHECK(under_clicked==1,"a decorative overlay passes pointer clicks to its underlying control");
+
+    em_set_viewport(400,300);chrome_frame();chrome_frame();
+    em_feed_pointer(84,18,0,0,0,1);chrome_frame();g_ms+=700;chrome_frame();chrome_frame();
+    em_feed_pointer(20,18,1,0,0,1);chrome_frame();
+    CHECK(chrome_closed,"leaving the layout board for Close does not swallow the close press");
+    em_feed_pointer(20,18,0,0,0,1);chrome_frame();
+
+    em_res_set_loader(icon_asset);
+    uint32_t iw=0,ih=0;
+    CHECK(em_image_at("/system/images/ui-close.eic",16,&iw,&ih)!=NULL,
+          "window control regression uses the shipped EIC icon");
+    em_feed_pointer(300,200,0,0,0,1);chrome_frame();chrome_frame();
+    /* No intermediate hovered frame: pointer movement and press arrive in one
+     * compositor sample. The old tint-derived key destroyed the capture. */
+    em_feed_pointer(20,18,1,0,0,1);chrome_frame();
+    CHECK(chrome_closed,"a close press survives the icon's simultaneous hover tint change");
+    em_feed_pointer(20,18,0,0,0,1);chrome_frame();
+
+    /* Switching icon families keeps colour tiles and original line assets in
+     * the same process cache. Exercise every shipped icon, not one fallback. */
+    DIR *images=opendir("system/images");unsigned icons=0,loaded=0;
+    CHECK(images!=NULL,"shipped icon directory is available");
+    if(images) {
+        struct dirent *entry;
+        while((entry=readdir(images))) {
+            size_t n=strlen(entry->d_name);if(n<4 || strcmp(entry->d_name+n-4,".eic"))continue;
+            char path[512];snprintf(path,sizeof path,"/system/images/%s",entry->d_name);
+            icons++;if(em_image_at(path,54,&iw,&ih))loaded++;
+        }
+        closedir(images);
+    }
+    CHECK(icons>24 && loaded==icons,"colour and monochrome families coexist without dropping an icon");
+
+    ui_frame_begin();em_new_frame();Overlay() {Dialog(.width=300) {Text("A readable decision");}}
+    em_flush();ui_frame_end();ui_run_layout(400,300);
+    struct instance_handle overlay=ui_first_child(ui_root());
+    struct scene_node *dialog=scene_resolve(&SA,ui_scene_of(ui_first_child(overlay)));
+    CHECK(dialog && dialog->data.rect.fill.kind==PAINT_SOLID && dialog->data.rect.fill.solid.a==1,
+          "a default Dialog retains an opaque readable surface");
+
+    struct ui_appearance calm={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
+    ui_theme_configure(&calm);em_set_clock(fake_clock);g_ms+=10000;em_toast("Ready",Success);
+    ui_frame_begin();em_new_frame();VStack(.key="calm-toast") {em_toast_host();}
+    em_flush();ui_frame_end();ui_run_layout(400,100);
+    struct scene_node *toast=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+    CHECK(toast && toast->opacity==1,"reduced motion presents a toast without a fade or slide");
+
+    navigation_regressions();
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

@@ -87,6 +87,16 @@ executable format (EMBX) — which it uses to rebuild its userland on itself.
   linked** userland binaries — see [BUILD_SETUP.md](docs/BUILD_SETUP.md#dynamic-linking-how-libembkso-actually-works).
 - IPC: handles, channels, and endpoints for cross-process communication.
 
+**System and application updates**
+- Settings checks signed releases, stages a complete OS and paired EFI loader
+  in an inactive slot, verifies disk readback, and offers a restart. A healthy
+  desktop confirms the new boot; an unconfirmed trial falls back automatically.
+- Accounts, files and preferences live on shared Data. Signed app bundles use
+  atomic current/previous version publication and retained-version rollback.
+- `make managed-image` builds the paired x86-64 UEFI layout. Release hosting and
+  production signing must be configured explicitly; existing legacy disks are
+  not silently repartitioned. See [UPDATES.md](docs/UPDATES.md).
+
 **Storage**
 - **EMBKFS**, a from-scratch filesystem (B-tree-backed, checksummed,
   AES-256-XTS encryption, compression, snapshots, self-heal, provenance,
@@ -101,6 +111,9 @@ executable format (EMBX) — which it uses to rebuild its userland on itself.
 
 **Display & UI**
 - GPU driver with automatic fallback: virtio-gpu → Bochs DISPI → VBE.
+- Live VirtIO/Bochs resolution changes with confirmation, automatic rollback,
+  per-user persistence and desktop/app reflow; validated monitor identity from
+  EDID. Physical native modesetting and accelerated rendering remain open.
 - An in-kernel **window compositor** (`kernel/gfx/compositor.c`): z-ordered
   windows, kernel-drawn or app-owned ("chromeless") chrome, zero-copy
   shared-memory windows, resizable windows, and always-on-desktop widgets in
@@ -188,6 +201,7 @@ KVM acceleration, host-side UI unit tests, ...).
 | [docs/EMUI_GUIDE.md](docs/EMUI_GUIDE.md) | Building a UI app with EmUI, start to finish |
 | [docs/EMUI_INTERNALS.md](docs/EMUI_INTERNALS.md) | How EmUI itself is built, for anyone extending the toolkit |
 | [user/README.md](user/README.md) | The userland SDK layers and newlib port details |
+| [docs/DISPLAYS.md](docs/DISPLAYS.md) | Display configuration, buffer lifetime, validation and remaining native-driver work |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System-wide design decisions and the current stack |
 | [docs/PORTS.md](docs/PORTS.md) | C++, CPython, git and the C compiler on the OS — what works, what honestly can't |
 | [docs/USERSPACE_v2.md](docs/USERSPACE_v2.md) | The userspace model: authority IS the namespace — init, per-process namespaces, capabilities, multi-user (no uid/gid) |

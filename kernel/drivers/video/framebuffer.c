@@ -19,6 +19,13 @@ static uint8_t *fb_back  = 0;   // RAM backbuffer (draw target), may be NULL
 static uint8_t *fb_draw  = 0;   // where primitives write (back if available)
 static uint32_t fb_bypp  = 4;   // bytes per pixel
 
+struct fb_surface {
+    struct gpu_target gpu;
+    uint8_t *allocation,*back,*front;
+    uint64_t bytes;
+};
+static struct fb_surface boot_surface,*current_surface=&boot_surface;
+
 // Accumulated dirty rectangle since the last fb_present(). x1/y1 exclusive.
 // GUARDED by fb_dirty_lock: under SMP, one core's fb_present() raced another
 // core's fb_mark_dirty() between "read the box" and "dirty_any = false" -- the
@@ -216,6 +223,9 @@ void fb_init(void) {
         serial_write_string("FB backbuffer attached as GPU scan-out resource\n");
     }
 
+    boot_surface.gpu.mode=(struct gpu_mode){fb.address,fb.width,fb.height,fb.pitch,fb.bpp,fb.format};
+    boot_surface.gpu.resource_id=gpu && gpu->resource_id?gpu->resource_id():0;
+    boot_surface.allocation=raw;boot_surface.back=fb_back;boot_surface.front=fb_front;boot_surface.bytes=fb_size;
     fb_draw = fb_back ? fb_back : fb_front;
     dirty_any = false;
 
@@ -789,4 +799,49 @@ int fb_run_selftests(void) {
     kprintf("fb_run_selftests: fill_rect/get_pixel/copy_rect round-trip %s\n",
             ok ? "OK" : "FAIL");
     return ok ? 0 : -1;
+}
+
+/* Preparation may allocate or submit commands, so it happens before taking the
+ * compositor's drawing lock. The selected surface stays allocated for revert. */
+struct fb_surface *fb_prepare_mode(uint32_t w,uint32_t h) {
+    const struct gpu_driver *gpu=gpu_active();
+    if(!gpu || !gpu->prepare || !gpu->select || !gpu->release ||
+       w<640 || h<480 || w>4096 || h>2160 || (uint64_t)w*h>8388608)return NULL;
+    struct fb_surface *s=kcalloc(1,sizeof *s);if(!s)return NULL;
+    s->bytes=(uint64_t)w*h*4;s->allocation=kmalloc(s->bytes+PAGE_SIZE);
+    if(!s->allocation){kfree(s);return NULL;}
+    s->back=(uint8_t *)(((uintptr_t)s->allocation+PAGE_SIZE-1)&~(uintptr_t)(PAGE_SIZE-1));
+    memset(s->back,0,s->bytes);
+    if(!gpu->prepare(&s->gpu,s->back,s->bytes,w,h)){fb_release_surface(s);return NULL;}
+    if(s->gpu.mode.width!=w || s->gpu.mode.height!=h || s->gpu.mode.pitch!=w*4 ||
+       s->gpu.mode.bpp!=32 || s->gpu.mode.format>FB_FORMAT_BGR) {fb_release_surface(s);return NULL;}
+    if(s->gpu.mode.phys_addr) {
+        s->front=(uint8_t *)vmm_map_mmio_wc(s->gpu.mode.phys_addr,s->bytes);
+        if(!s->front){fb_release_surface(s);return NULL;}
+    }
+    return s;
+}
+struct fb_surface *fb_select_surface(struct fb_surface *s) {
+    const struct gpu_driver *gpu=gpu_active();
+    if(!s || !gpu || !gpu->select || !gpu->select(&s->gpu))return NULL;
+    struct fb_surface *old=current_surface;current_surface=s;
+    const struct gpu_mode *m=&s->gpu.mode;
+    fb=(fb_info_t){m->phys_addr,m->width,m->height,m->pitch,m->bpp,m->format};
+    fb_front=s->front;fb_back=s->back;fb_draw=s->back;fb_bypp=4;
+    if(fb_front)rawcon_adopt(fb_front,fb.width,fb.height,fb.pitch,fb.bpp,fb.format);
+    spin_lock(&fb_dirty_lock);dirty_any=false;spin_unlock(&fb_dirty_lock);
+    return old;
+}
+void fb_release_surface(struct fb_surface *s) {
+    if(!s || s==current_surface)return;
+    const struct gpu_driver *gpu=gpu_active();
+    /* Quarantine rather than reuse a buffer if a device did not release it. */
+    if(gpu && gpu->release && !gpu->release(&s->gpu))return;
+    if(s->front)vmm_unmap_mmio((uint64_t)(uintptr_t)s->front,s->bytes);
+    kfree(s->allocation);if(s!=&boot_surface)kfree(s);
+}
+
+bool fb_can_change_mode(void) {
+    const struct gpu_driver *g=gpu_active();
+    return current_surface->back && fb.bpp==32 && g && g->prepare && g->select && g->release;
 }

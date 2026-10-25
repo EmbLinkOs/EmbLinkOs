@@ -26,6 +26,7 @@
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
+#include "include/spinlock.h"
 #include "drivers/audio/pcm.h"
 #include "drivers/audio/audio.h"
 
@@ -72,7 +73,7 @@ static const struct pcm_driver *g_dev;   /* NULL until one of them probes OK */
  * queued buffer sits between a program deciding to make a sound and the sound
  * existing. 170 ms is fine for a song and useless for a synth, a game, or
  * anything syncing to picture -- and a writer that KNOWS it will come back in
- * time should be allowed to say so. audio_set_latency() lowers this floor for
+ * time should be allowed to say so. audio_set_latency_locked() lowers this floor for
  * one stream; this stays the default, because a writer that has not thought
  * about it should get the value that works without thinking. */
 #define RING_START_MIN 8
@@ -140,13 +141,40 @@ static struct {
  * and goes out with the front of the next write, and the writer's chunk size
  * stops being audible. The frames are ACCEPTED when they are staged -- the
  * caller must not send them again -- and the only descriptor that is ever
- * padded is the last one of a sound, flushed by audio_drained(), where the
+ * padded is the last one of a sound, flushed by audio_drained_locked(), where the
  * padding is silence at the end of something that has ended.
  *
  * `desc_frames` is the flag, because it is the same property: a driver needs
  * that op exactly when what it plays is not what was put in. */
 #define STAGE_FRAMES 1024
 static int16_t g_stage[STAGE_FRAMES * 2];
+static unsigned volume_control=100;
+static int16_t g_gain[STAGE_FRAMES*2];
+static void audio_snapshot_locked(struct embk_audio_info *out) {
+    memset(out,0,sizeof *out);out->version=EMBK_AUDIO_VERSION;
+    unsigned setting=__atomic_load_n(&volume_control,__ATOMIC_ACQUIRE);
+    out->percent=setting&255;
+    if(setting&256)out->flags|=EMBK_AUDIO_MUTED;
+    if(audio_available()) {
+        out->flags|=EMBK_AUDIO_AVAILABLE;out->sample_rate=g_dev->sample_rate();
+        snprintf(out->output,sizeof out->output,"%s",g_dev->name);
+    }
+    if(g_au.open)out->flags|=EMBK_AUDIO_PLAYING;
+}
+int audio_control(unsigned percent,unsigned mute) {
+    if(percent>100 || mute>1)return -EMBK_EINVAL;
+    if(!audio_available())return -EMBK_ENODEV;
+    __atomic_store_n(&volume_control,percent|(mute<<8),__ATOMIC_RELEASE);return 0;
+}
+static uint32_t fill_volume(int index,const int16_t *frames,uint32_t count) {
+    unsigned setting=__atomic_load_n(&volume_control,__ATOMIC_ACQUIRE);
+    if(setting==100)return g_dev->fill(index,frames,count);
+    if(count>STAGE_FRAMES)count=STAGE_FRAMES;
+    unsigned gain=(setting&256)?0:setting&255;
+    for(unsigned i=0;i<count*2;i++)g_gain[i]=(int16_t)((int32_t)frames[i]*(int32_t)gain/100);
+    return g_dev->fill(index,g_gain,count);
+}
+
 
 static bool device_pads(void)
 {
@@ -198,7 +226,7 @@ const char *audio_device_name(void) { return g_dev ? g_dev->name : "none"; }
 
 bool audio_available(void)
 {
-    return g_dev != NULL;
+    return g_dev && g_dev->sample_rate()!=0;
 }
 
 /* THE DEVICE, NOT THE STREAM. `test audio` plays a tone with no process
@@ -206,7 +234,7 @@ bool audio_available(void)
  * broken stream layer -- so the raw operations stay reachable. */
 uint32_t audio_dev_fill(int i, const int16_t *f, uint32_t n)
 {
-    return g_dev ? g_dev->fill(i, f, n) : 0;
+    return g_dev ? fill_volume(i, f, n) : 0;
 }
 void audio_dev_play(int last) { if (g_dev) g_dev->play(last); }
 bool audio_dev_done(int last) { return g_dev ? g_dev->done(last) : true; }
@@ -222,12 +250,12 @@ uint32_t audio_frames_per_buffer(void)
     return g_dev ? g_dev->frames_per_buffer() : 0;
 }
 
-int audio_open(uint32_t pid)
+static int audio_open_locked(uint32_t pid)
 {
-    if (!g_dev) return -EMBK_ENODEV;
+    if (!audio_available()) return -EMBK_ENODEV;
     /* Re-opening by the SAME process is not an error -- a program that
      * restarts its own playback should not have to know whether it closed. */
-    if (g_au.open && g_au.owner_pid != pid) return -EMBK_EBUSY;
+    if (g_au.open) return g_au.owner_pid==pid?0:-EMBK_EBUSY;
 
     g_au.open = true;
     g_au.owner_pid = pid;
@@ -250,9 +278,9 @@ int audio_open(uint32_t pid)
     return EMBK_OK;
 }
 
-int audio_set_latency(uint32_t pid, uint32_t ms)
+static int audio_set_latency_locked(uint32_t pid, uint32_t ms)
 {
-    if (!g_dev) return -EMBK_ENODEV;
+    if (!audio_available()) return -EMBK_ENODEV;
     if (!g_au.open || g_au.owner_pid != pid) return -EMBK_EPERM;
     /* Only before the device is running. Lowering the prefill of a stream that
      * has already started means nothing (it started), and raising it means
@@ -281,7 +309,7 @@ int audio_set_latency(uint32_t pid, uint32_t ms)
     return (int)((uint64_t)g_au.start_frames * 1000 / rate);
 }
 
-uint64_t audio_position(uint32_t pid)
+static uint64_t audio_position_locked(uint32_t pid)
 {
     if (!g_dev || !g_au.open || g_au.owner_pid != pid) return 0;
     if (!g_au.started) return 0;
@@ -289,7 +317,7 @@ uint64_t audio_position(uint32_t pid)
     return g_au.played;
 }
 
-void audio_stats(uint64_t *underruns, uint64_t *frames, uint64_t *writes)
+static void audio_stats_locked(uint64_t *underruns, uint64_t *frames, uint64_t *writes)
 {
     if (underruns) *underruns = g_dev ? g_dev->underruns() : 0;
     if (frames)    *frames    = g_au.frames_written;
@@ -325,11 +353,11 @@ static int ring_free(void)
     return freed > 0 ? freed : 0;
 }
 
-int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
+static int audio_write_locked(uint32_t pid, const int16_t *frames, uint32_t nframes,
                 uint32_t *accepted)
 {
     if (accepted) *accepted = 0;
-    if (!g_dev) return -EMBK_ENODEV;
+    if (!audio_available()) return -EMBK_ENODEV;
     if (!g_au.open || g_au.owner_pid != pid) return -EMBK_EPERM;
     if (frames == NULL) return -EMBK_EINVAL;
 
@@ -345,7 +373,7 @@ int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
         if (stage) {
             /* Top the held descriptor up from the caller's frames, and hand
              * it over only when it is FULL. A short one goes out only from
-             * audio_drained(), where it is the end of the sound. */
+             * audio_drained_locked(), where it is the end of the sound. */
             uint32_t room = percb - g_au.stage_n;
             uint32_t have = nframes - taken;
             uint32_t cp   = room < have ? room : have;
@@ -354,11 +382,11 @@ int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
             g_au.stage_n += cp;
             taken += cp;
             if (g_au.stage_n < percb) break;      /* accepted, not committed */
-            n = g_dev->fill(g_au.head, g_stage, g_au.stage_n);
+            n = fill_volume(g_au.head, g_stage, g_au.stage_n);
             if (n == 0) { taken -= cp; g_au.stage_n -= cp; break; }
             g_au.stage_n = 0;
         } else {
-            n = g_dev->fill(g_au.head, frames + (size_t)taken * 2,
+            n = fill_volume(g_au.head, frames + (size_t)taken * 2,
                             nframes - taken);
             if (n == 0) break;
             taken += n;
@@ -376,7 +404,7 @@ int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
         if (!g_au.started) {
             /* Hold until there is enough queued to keep the device fed. A
              * writer with less than this in total gets it started by
-             * audio_drained(), which is what "I have finished writing" means
+             * audio_drained_locked(), which is what "I have finished writing" means
              * from out here. */
             /* Two conditions, and the second is not a nicety: `queued` is
              * capped by the ring, so a writer sending very short chunks can
@@ -406,7 +434,7 @@ static bool stage_flush(void)
 {
     if (g_au.stage_n == 0) return true;
     if (ring_free() <= 0) return false;
-    uint32_t n = g_dev->fill(g_au.head, g_stage, g_au.stage_n);
+    uint32_t n = fill_volume(g_au.head, g_stage, g_au.stage_n);
     if (n == 0) return false;
     g_au.stage_n = 0;
     commit(n);
@@ -414,7 +442,7 @@ static bool stage_flush(void)
 }
 
 /* Has the hardware finished everything handed to it? */
-bool audio_drained(uint32_t pid)
+static bool audio_drained_locked(uint32_t pid)
 {
     if (!g_dev || !g_au.open || g_au.owner_pid != pid) return true;
 
@@ -437,7 +465,7 @@ bool audio_drained(uint32_t pid)
     return g_dev->done(g_au.last);
 }
 
-void audio_close(uint32_t pid)
+static void audio_close_locked(uint32_t pid)
 {
     if (!g_au.open || g_au.owner_pid != pid) return;
     /* What the stream actually carried, on the serial log. The WAV says what
@@ -458,10 +486,42 @@ void audio_close(uint32_t pid)
 /* Called when a process dies: a program that exits mid-note must not leave the
  * speaker running and the device claimed. The compositor learned this lesson
  * with windows (compositor_reap_pid); sound is the same shape. */
-void audio_reap_pid(uint32_t pid)
+static void audio_reap_pid_locked(uint32_t pid)
 {
     if (g_au.open && g_au.owner_pid == pid) {
         kprintf("audio: reclaiming the device from pid %u\n", pid);
-        audio_close(pid);
+        audio_close_locked(pid);
     }
+}
+
+/* Lock order: scheduler -> stream -> controller. None of the operations below
+ * sleep or enter the scheduler; death can release DMA before liveness changes
+ * become visible to another core. Keep user copies outside this lock. */
+static spinlock_t stream_lock = SPINLOCK_INIT;
+void audio_snapshot(struct embk_audio_info *out) {
+    spin_lock(&stream_lock); audio_snapshot_locked(out); spin_unlock(&stream_lock);
+}
+int audio_open(uint32_t pid) {
+    spin_lock(&stream_lock); int rc=audio_open_locked(pid); spin_unlock(&stream_lock); return rc;
+}
+int audio_set_latency(uint32_t pid,uint32_t ms) {
+    spin_lock(&stream_lock); int rc=audio_set_latency_locked(pid,ms); spin_unlock(&stream_lock); return rc;
+}
+uint64_t audio_position(uint32_t pid) {
+    spin_lock(&stream_lock); uint64_t n=audio_position_locked(pid); spin_unlock(&stream_lock); return n;
+}
+void audio_stats(uint64_t *underruns,uint64_t *frames,uint64_t *writes) {
+    spin_lock(&stream_lock); audio_stats_locked(underruns,frames,writes); spin_unlock(&stream_lock);
+}
+int audio_write(uint32_t pid,const int16_t *frames,uint32_t nframes,uint32_t *accepted) {
+    spin_lock(&stream_lock); int rc=audio_write_locked(pid,frames,nframes,accepted); spin_unlock(&stream_lock); return rc;
+}
+bool audio_drained(uint32_t pid) {
+    spin_lock(&stream_lock); bool done=audio_drained_locked(pid); spin_unlock(&stream_lock); return done;
+}
+void audio_close(uint32_t pid) {
+    spin_lock(&stream_lock); audio_close_locked(pid); spin_unlock(&stream_lock);
+}
+void audio_reap_pid(uint32_t pid) {
+    spin_lock(&stream_lock); audio_reap_pid_locked(pid); spin_unlock(&stream_lock);
 }

@@ -1,0 +1,29 @@
+image: alpine/edge
+packages:
+  - gcc
+  - clang
+  - meson
+  - dash
+sources:
+  - https://git.sr.ht/~emersion/mrsh
+tasks:
+  - setup: |
+      cd mrsh
+      CC=gcc meson build-gcc -Dreference-shell=dash
+      CC=clang meson build-clang -Dreference-shell=dash
+  - build-gcc: |
+      cd mrsh
+      ninja -C build-gcc
+  - build-clang: |
+      cd mrsh
+      ninja -C build-clang
+  - test-gcc: |
+      cd mrsh
+      ninja -C build-gcc test
+  - test-clang: |
+      cd mrsh
+      ninja -C build-clang test
+triggers:
+  - action: email
+    condition: failure
+    to: "<contact@emersion.fr>"

@@ -35,24 +35,22 @@
 
 struct note {
     int      used;
+    uint64_t sequence;
     uint32_t level;
     char     title[64];
     char     body[160];
     uint64_t at;                /* when it went up, ms */
 };
 
-/* THE HAND-OFF between the accept thread and the drawing one.
- *
- * One producer, one consumer, and a slot is only ever published by setting
- * `used` LAST -- after the text is fully written. The reader sees either a
- * slot it must ignore or one that is complete; it can never see half a
- * message. That is the whole synchronisation, deliberately: a mutex here would
- * be a mutex the drawing loop can block on, and a notifier that can hang the
- * thing it is decorating is worse than no notifier. */
-static volatile struct note g_notes[NOTE_MAX];
+/* The accept thread and system-warning poller copy notices under one short
+ * mutex. Rendering uses a snapshot, so no UI or IPC work runs under it. */
+static embk_mutex note_lock=EMBK_MUTEX_INIT;
+static uint64_t note_sequence;
+static struct note g_notes[NOTE_MAX];
 static volatile int         g_arrived;      /* bumped per accepted message */
 
 static void note_push(uint32_t level, const char *title, const char *body) {
+    embk_mutex_lock(&note_lock);
     /* Oldest slot wins when full: the newest message is the one worth showing,
      * and dropping IT to preserve something six seconds old would be backwards. */
     int slot = -1;
@@ -68,21 +66,38 @@ static void note_push(uint32_t level, const char *title, const char *body) {
     snprintf((char *)g_notes[slot].title, sizeof g_notes[slot].title, "%s", title);
     snprintf((char *)g_notes[slot].body,  sizeof g_notes[slot].body,  "%s", body);
     g_notes[slot].at = embk_uptime_ms();
+    g_notes[slot].sequence=++note_sequence;
     g_notes[slot].used = 1;                  /* published, last */
     g_arrived++;
+    embk_mutex_unlock(&note_lock);
 }
 
+/* Mirror system warnings without posting them back into the history. */
+static void system_notices(void) {
+    static uint64_t seen;
+    struct embk_notice_info info;
+    if(embk_notify_get(&info,0))return;
+    for(unsigned i=info.count;i>0;i--) {
+        const struct embk_notice *n=&info.entries[i-1];
+        if(n->sequence>seen && !n->source_pid)note_push(n->severity,n->title,n->body);
+    }
+    if(info.latest>seen)seen=info.latest;
+}
 static int note_count(void) {
+    embk_mutex_lock(&note_lock);
     int n = 0;
     for (int i = 0; i < NOTE_MAX; i++) if (g_notes[i].used) n++;
+    embk_mutex_unlock(&note_lock);
     return n;
 }
 
 /* Retire anything that has had its time. */
 static void note_expire(void) {
+    embk_mutex_lock(&note_lock);
     uint64_t now = embk_uptime_ms();
     for (int i = 0; i < NOTE_MAX; i++)
         if (g_notes[i].used && now - g_notes[i].at > NOTE_MS) g_notes[i].used = 0;
+    embk_mutex_unlock(&note_lock);
 }
 
 /* ---- the accept thread -------------------------------------------------- */
@@ -99,7 +114,8 @@ static void accept_thread(long arg) {
         if (ch < 0) continue;
 
         struct emnote_rep r = { 0 };
-        if (type == EMSVC_T_NOTIFY && len >= sizeof q) {
+        if (type == EMSVC_T_NOTIFY && len >= sizeof q && q.level<=EMNOTE_FAIL) {
+            q.title[sizeof q.title-1]=0;q.body[sizeof q.body-1]=0;
             note_push(q.level, q.title, q.body);
             r.taken = 1;
         }
@@ -117,6 +133,7 @@ static void placed_reset(void) { g_placed = 0; }
 
 static void banners(void) {
     const struct ui_theme *t = ui_theme();
+    system_notices();
     note_expire();
     if (note_count() == 0) { placed_reset(); em_app_request_exit(0); return; }
     em_request_frame();                      /* they expire on a clock, not on input */
@@ -125,15 +142,20 @@ static void banners(void) {
      * mover acts on the BOUND window, which only exists once the runtime has
      * created it -- and re-asserted on the first frame of each appearance,
      * since every burst of banners is a new window. */
-    if (!g_placed) { g_placed = 1; em_window_move_to(g_place_x, 34); }
+    if(!g_placed) {
+        g_placed=1;struct embk_desktop desktop={.version=1};embk_desktop_control(EMBK_DESKTOP_GET,&desktop);
+        em_window_move_to(g_place_x,(int)desktop.top+8);
+    }
 
+    struct note notes[NOTE_MAX];
+    embk_mutex_lock(&note_lock);memcpy(notes,g_notes,sizeof notes);embk_mutex_unlock(&note_lock);
     VStack(.width = em_viewport_width(), .height = em_viewport_height(),
            .align = Trailing, .spacing = 8, .padding = 10) {
         static const char *KEY[NOTE_MAX] = { "n0", "n1", "n2", "n3" };
         for (int i = 0; i < NOTE_MAX; i++) {
-            if (!g_notes[i].used) continue;
-            Color edge = g_notes[i].level == EMNOTE_FAIL ? t->danger
-                       : g_notes[i].level == EMNOTE_WARN ? t->warning
+            if (!notes[i].used) continue;
+            Color edge = notes[i].level == EMNOTE_FAIL ? t->danger
+                       : notes[i].level == EMNOTE_WARN ? t->warning
                        : t->accent;
             /* THE LEVEL IS A STRIPE, NOT THE BORDER. `.glass` overrides fill
              * AND border (em_apply_box), so a border_color passed alongside it
@@ -145,14 +167,18 @@ static void banners(void) {
                    .corner = t->radius_lg, .glass = 1, .shadow = 3, .key = KEY[i]) {
                 VStack(.width = 4, .background = edge) { }
                 VStack(.grow = 1, .spacing = 3, .px = 14, .py = 11, .align = Leading) {
-                    Text((const char *)g_notes[i].title).bold();
-                    if (g_notes[i].body[0])
-                        Text((const char *)g_notes[i].body).caption().secondary();
+                    Text((const char *)notes[i].title).bold();
+                    if (notes[i].body[0])
+                        Text((const char *)notes[i].body).caption().secondary();
                 }
             }
             /* Click to dismiss: a banner you have read should go when you say
              * so, not when its timer says so. */
-            if (Clicked(KEY[i])) g_notes[i].used = 0;
+            if (Clicked(KEY[i])) {
+                embk_mutex_lock(&note_lock);
+                if(g_notes[i].sequence==notes[i].sequence)g_notes[i].used=0;
+                embk_mutex_unlock(&note_lock);
+            }
         }
     }
 }
@@ -189,7 +215,7 @@ int main(void) {
     for (;;) {
         /* Nothing to show: no window. See the header -- an always-present
          * translucent window would eat every click in that corner. */
-        while (note_count() == 0) embk_sleep_ms(120);
+        while (note_count() == 0) {system_notices();embk_sleep_ms(120);}
 
         g_place_x = (int)sw - (PANEL_W + 20) - 12;
         em_app_run(&g_spec);       /* returns when the last banner has gone */

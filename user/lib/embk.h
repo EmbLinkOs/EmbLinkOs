@@ -22,9 +22,12 @@
 
 #ifndef __EMBK_H__
 #define __EMBK_H__
+#include "embk_terminal.h"
+#include "embk_child.h"
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "embk_syscall.h"
 
 /* ==================================================================== */
@@ -68,10 +71,21 @@
  * struct spawn_file_action (kernel/process/spawn.h) FIELD-FOR-FIELD: the
  * kernel copies this struct raw, so the two must grow together (and every
  * action-passing app rebuilt when they do). */
+#define EMBK_SPAWN_ACTIONS_MAX       64
 #define EMBK_SPAWN_ACTION_OPEN        1
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
+/* Explicit compatibility policy: snapshot first, actions in order, then
+ * close descriptors still marked CLOEXEC. Legacy native launches are unchanged. */
+#define EMBK_SPAWN_ACTION_FD_SNAPSHOT 11
+#define EMBK_SPAWN_ACTION_DUP2        12
+#define EMBK_SPAWN_ACTION_CLOSE       13
+#define EMBK_SPAWN_ACTION_CWD         14
+#define EMBK_SPAWN_ACTION_KEEP_STATUS 10
+#define EMBK_SPAWN_ACTION_INHERIT_FD 9    /* src_obj_handle names a parent fd */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
+#define EMBK_SPAWN_SESSION_ADMIN 2u
+#define EMBK_SPAWN_SESSION_LIVE 1u
 #define EMBK_SPAWN_ACTION_NEW_SESSION 8   /* child leads a new session for user `path` */
 
 /* Coarse resource-class capabilities (kernel capabilities.h, EMBX spec §5.6).
@@ -94,6 +108,7 @@
  * holds it; an application has no business with it. */
 #define EMBK_CAP_POWER      12
 #define EMBK_CAP_SCREEN     13
+#define EMBK_CAP_NETWORK_ADMIN 14
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -147,6 +162,16 @@ static inline int64_t embk_close(int fd) {
 static inline int embk_pipe(int out_handles[2]) {
     return (int)embk_syscall1(EMBK_SYS_pipe, (int64_t)(intptr_t)out_handles);
 }
+/* Descriptor form: lowest available slots, rollback on any allocation/copyout
+ * failure. The object-handle form above keeps its original contract. */
+static inline int embk_pipe_fds(int out_fds[2]) {
+    return (int)embk_syscall1(EMBK_SYS_pipe_fds,(int64_t)(intptr_t)out_fds);
+}
+/* INFO is non-consuming; waits return 1 for a copied result, 0 for NOHANG
+ * with nothing ready, or a negative error. Signed exit codes are data. */
+static inline int embk_child_control(int selector,unsigned op,unsigned flags,struct embk_child_result *out) {
+    return (int)embk_syscall5(EMBK_SYS_child,selector,op,(int64_t)(intptr_t)out,sizeof *out,flags);
+}
 /* Release an obj-handle (pipe end, channel end, surface) via the kernel's
  * generic kind dispatch. For pipes this is what delivers EOF: after
  * installing ends into children, close YOUR copies or the reader hangs. */
@@ -165,6 +190,15 @@ static inline int embk_fd_install_obj(int handle, int target_fd) {
  * the next read() returns immediately. */
 static inline int64_t embk_fd_avail(int fd) {
     return embk_syscall1(EMBK_SYS_fd_avail, fd);
+}
+static inline int embk_terminal_control(int fd,unsigned op,void *data,unsigned bytes) {
+    return (int)embk_syscall4(EMBK_SYS_terminal,fd,op,(int64_t)(uintptr_t)data,bytes);
+}
+static inline int embk_openpty(int pair[2]) {
+    return embk_terminal_control(-1,EMBK_TERMINAL_OPEN,pair,2*sizeof(int));
+}
+static inline int embk_terminal_foreground(int fd,int handle) {
+    return embk_terminal_control(fd,EMBK_TERMINAL_FOREGROUND,&handle,sizeof handle);
 }
 /* Remove a file (the shell's rm). 0 or -EMBK_*. */
 static inline int embk_unlink(const char *path) {
@@ -359,7 +393,18 @@ static inline unsigned long embk_getcaps(void) {
 #define EMBK_POLLHUP  0x0010
 #define EMBK_POLLNVAL 0x0020
 
-/* O_NONBLOCK fd flag: sys_fcntl cmd 1 = get (1/0), 2 = set from arg. */
+/* Shared status flags, independent of the per-descriptor CLOEXEC bit.
+ * Stable wire bits, not native/newlib O_* values. Cmd 1/2 retain the original
+ * nonblocking-only contract; cmd 3/6 query/update the supported status set. */
+#define EMBK_FD_ACCESS_MASK 3
+#define EMBK_FD_NONBLOCK 4
+#define EMBK_FD_APPEND 8
+static inline int embk_fcntl_get_status(int fd) {
+    return (int)embk_syscall3(EMBK_SYS_fcntl,fd,3,0);
+}
+static inline int embk_fcntl_set_status(int fd,int flags) {
+    return (int)embk_syscall3(EMBK_SYS_fcntl,fd,6,flags);
+}
 static inline int embk_fcntl_get_nonblock(int fd) {
     return (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
 }
@@ -488,6 +533,7 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
 #endif
 #ifndef EMBK_E2BIG
 #define EMBK_E2BIG    7
+#define EMBK_ENAMETOOLONG 36
 #endif
 
 /* --- sessions: whose a process is -------------------------------------------
@@ -975,6 +1021,16 @@ static inline int embk_key_event_poll(struct embk_key_event *ev) {
 }
 /* What is held RIGHT NOW (EMBK_KM_*), which events alone cannot tell you if
  * you missed the press. */
+/* Same character queue as key_poll, with modifiers captured when that byte
+ * was produced. Zero means empty; bits 0..7 are the byte, 8..15 EMBK_KM_*.
+ * This distinguishes queued Ctrl+S from Up after Ctrl has been released. */
+#include "embk_desktop.h"
+static inline int embk_desktop_control(unsigned operation,struct embk_desktop *state) {
+    return (int)embk_syscall3(EMBK_SYS_desktop_control,operation,(int64_t)(uintptr_t)state,sizeof *state);
+}
+static inline int embk_key_poll_input(void) {
+    return (int)embk_syscall0(EMBK_SYS_key_poll_input);
+}
 static inline int embk_key_mods(void) {
     return (int)embk_syscall0(EMBK_SYS_key_mods);
 }
@@ -1105,6 +1161,11 @@ static inline int embk_win_move(int id, int32_t x, int32_t y) {
     return (int)embk_syscall3(EMBK_SYS_win_move, id, x, y);
 }
 
+/* Place a window after display/work-area changes without raising or focusing it. */
+static inline int embk_win_place(int id,int32_t x,int32_t y) {
+    return (int)embk_syscall3(EMBK_SYS_win_place,id,x,y);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);
@@ -1184,6 +1245,17 @@ static inline int embk_proc_alive(int handle) {
     return (int)embk_syscall1(EMBK_SYS_proc_alive, handle);
 }
 
+/* Accept a close request without exiting (e.g. an unsaved-changes dialog).
+ * Cancels the compositor grace timer for this caller-owned window only. */
+static inline int embk_win_close_ack(uint32_t win) {
+    return (int)embk_syscall1(EMBK_SYS_win_close_ack,win);
+}
+/* Temporarily give a caller-owned translucent menu window keyboard focus.
+ * Release on dismissal; window destruction/reaping also releases it. */
+static inline int embk_win_menu(uint32_t win,int active) {
+    return (int)embk_syscall2(EMBK_SYS_win_menu,win,active);
+}
+
 /* Screen (framebuffer) size, so a windowed app can size itself to fit -- e.g.
  * clamp a tall window so it isn't rejected on a short display. */
 static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
@@ -1206,6 +1278,7 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * sit in its window unread. The runtime turns this into a frame; the payload
  * still comes from embk_drop_take. */
 #define EMBK_WIN_ACTION_DROP      0x80000003u
+#define EMBK_WIN_ACTION_LAUNCHER  0x80000007u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *
@@ -1380,6 +1453,80 @@ static inline int embk_audio_drained(void) {
 static inline int embk_audio_close(void) {
     return (int)embk_syscall1(EMBK_SYS_audio_close, 0);
 }
+
+/* WPA2 station status contains no passwords or saved keys. Changes require
+ * NETWORK_ADMIN; NETWORK alone only permits reading connection state. */
+#include "embk_wifi.h"
+static inline int embk_wifi_get(struct embk_wifi_info *info) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_info, (int64_t)(intptr_t)info, sizeof *info);
+}
+static inline int embk_wifi_change(const struct embk_wifi_request *request) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_request, (int64_t)(intptr_t)request, sizeof *request);
+}
+
+#include "embk_power.h"
+#include "embk_display.h"
+#include "embk_audio.h"
+#include "embk_gpu.h"
+static inline int embk_power_get(struct embk_power_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_display_get(struct embk_display_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_display_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_audio_get(struct embk_audio_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_audio_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_gpu_get(struct embk_gpu_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_gpu_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_display_brightness(unsigned percent) {
+    return (int)embk_syscall1(EMBK_SYS_display_set,percent);
+}
+static inline int embk_audio_volume(unsigned percent,unsigned mute) {
+    return (int)embk_syscall2(EMBK_SYS_audio_control,percent,mute);
+}
+static inline int embk_power_request(unsigned action) {
+    if(action!=EMBK_POWER_OFF && action!=EMBK_POWER_REBOOT)return -22;
+    return (int)embk_syscall1(EMBK_SYS_power,action==EMBK_POWER_OFF?0:1);
+}
+
+#include "embk_session.h"
+static inline int embk_session(unsigned command,int arg) {
+    return (int)embk_syscall2(EMBK_SYS_session_control,command,arg);
+}
+
+#include "embk_notify.h"
+#include "embk_policy.h"
+static inline void embk_notice_copy(char *out,unsigned cap,const char *source) {
+    unsigned at=0;
+    while(source && source[at]) {
+        unsigned char c=(unsigned char)source[at];
+        unsigned n=c<128?1:c>=0xc2 && c<=0xdf?2:c>=0xe0 && c<=0xef?3:c>=0xf0 && c<=0xf4?4:0;
+        if(!n || at+n>=cap)break;
+        unsigned valid=1;
+        for(unsigned j=1;j<n;j++)if(((unsigned char)source[at+j]&0xc0)!=0x80){valid=0;break;}
+        if(!valid)break;
+        for(unsigned j=0;j<n;j++)out[at+j]=source[at+j];
+        at+=n;
+    }
+    out[at]=0;
+}
+static inline int embk_notify_send(unsigned severity,const char *title,const char *body) {
+    struct embk_notice_request r={.version=EMBK_NOTIFY_VERSION,.severity=severity};
+    embk_notice_copy(r.title,sizeof r.title,title);embk_notice_copy(r.body,sizeof r.body,body);
+    return (int)embk_syscall2(EMBK_SYS_notice_post,(int64_t)(uintptr_t)&r,sizeof r);
+}
+static inline int embk_notify_get(struct embk_notice_info *out,int clear) {
+    return (int)embk_syscall3(EMBK_SYS_notice_get,(int64_t)(uintptr_t)out,sizeof *out,clear);
+}
+static inline int embk_policy_get(struct embk_policy *out) {
+    return (int)embk_syscall2(EMBK_SYS_policy_get,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_policy_set(const struct embk_policy *p) {
+    return (int)embk_syscall2(EMBK_SYS_policy_set,(int64_t)(uintptr_t)p,sizeof *p);
+}
+
 
 /* ---------------------------------------------------------------------------
  * WHERE THE SPEAKER ACTUALLY IS, in frames since this stream started.
@@ -1746,4 +1893,12 @@ static inline void embk_cond_broadcast(embk_cond *c) {
     (void)embk_futex(&c->seq, EMBK_FUTEX_WAKE, 0x7FFFFFFF);
 }
 
+#include "embk_update.h"
+static inline int embk_update(unsigned op,void *data,uint64_t bytes) {
+    return (int)embk_syscall3(EMBK_SYS_update,op,(uint64_t)(uintptr_t)data,bytes);
+}
+#include "embk_monitor.h"
+static inline int embk_monitor(unsigned op,void *data,unsigned bytes) {
+    return (int)embk_syscall3(EMBK_SYS_monitor,op,(uint64_t)(uintptr_t)data,bytes);
+}
 #endif /* __EMBK_H__ */

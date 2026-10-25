@@ -22,6 +22,7 @@ static const char *type_names[] = {
 };
 
 
+extern uint8_t kernel_start[]; // Symbol defined in linker script, marks the start of the kernel in memory
 extern uint8_t kernel_end[]; // Symbol defined in linker script, marks the end of the kernel in memory
 // Bitmap pointer - lives at BITMAP_ADDR and is used to track allocated/free pages. Each bit represents a page (4KB).
 
@@ -53,12 +54,12 @@ static inline int bitmap_test(uint64_t page_index) {
  * wherever the image puts them, and whether the firmware still owns any of
  * that range is a question only this map answers. So the kernel answers it
  * itself, below, in one line a person can search for, rather than leaving
- * 126 entries for someone to cross-check against a symbol table by hand. */
-#define KERNEL_LOAD_PHYS 0x100000ULL   /* both loaders; tools/kernel_fits.py guards it */
-
+ * 126 entries for someone to cross-check against a symbol table by hand.
+ * The range comes from the linker script, not a constant here: the link
+ * address moved from 1 MiB to 32 MiB once, and a copy of it would not have. */
 void pmm_print_map(void) {
     uint32_t count = boot_mmap_count();
-    uint64_t kstart = KERNEL_LOAD_PHYS;
+    uint64_t kstart = KV2P((uint64_t)kernel_start);
     uint64_t kend   = KV2P((uint64_t)kernel_end);
 
     kprintf("\n=== firmware memory map: %u entries ===\n", (unsigned)count);
@@ -443,4 +444,27 @@ bool pmm_add_region(uint64_t phys, uint64_t length) {
             (unsigned long long)((added * PAGE_SIZE) >> 20),
             (unsigned long long)phys, (unsigned long long)free_pages);
     return added > 0;
+}
+
+uint64_t pmm_alloc_contiguous(uint64_t pages,uint64_t alignment) {
+    if(!pages || !alignment || (alignment&(alignment-1))) return 0;
+    spin_lock(&pmm_lock);
+    if(pages>total_pages || alignment>total_pages || pages>free_pages) {
+        spin_unlock(&pmm_lock);return 0;
+    }
+    uint64_t limit=total_pages-pages,first=alignment;
+    while(first<=limit) {
+        uint64_t i=0;
+        while(i<pages) {pmm_scan_bits++;if(bitmap_test(first+i)) break;i++;}
+        if(i==pages) {
+            for(i=0;i<pages;i++) bitmap_set(first+i);
+            free_pages-=pages;used_pages+=pages;pmm_scan_allocs+=pages;
+            pmm_hint=first+pages;if(pmm_hint>=total_pages) pmm_hint=0;
+            spin_unlock(&pmm_lock);return first*PAGE_SIZE;
+        }
+        /* Skip the used page and align the next possible start. This cannot
+         * overflow: first+i is bounded by total_pages (physical pages). */
+        first=(first+i+alignment)&~(alignment-1);
+    }
+    spin_unlock(&pmm_lock);return 0;
 }

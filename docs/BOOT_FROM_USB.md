@@ -4,9 +4,11 @@ EmbLinkOS is a complete, from-scratch operating system — its own bootloader,
 kernel, filesystem (EMBKFS), and graphical desktop (EmUI). This guide covers
 running it **live on real hardware** from a single USB stick.
 
-> **It is completely non-destructive.** The OS runs entirely from the stick. It
-> installs nothing and **never writes to the computer's internal drive**. Remove
-> the stick and reboot, and the machine is exactly as it was.
+Normal/live boot mounts the selected boot root writable and may inspect other
+recognized volumes. Recovery mounts the source read-only; its installer writes
+a different whole disk only after an explicit reviewed erase command. Back up
+important data before physical acceptance and select the intended source/target.
+See [DAILY_USE.md](DAILY_USE.md) for the installation and recovery boundaries.
 
 The stick is a single-device GPT image (`uefi-usb.img`): an EFI System Partition
 holding the loader (with the kernel embedded) at

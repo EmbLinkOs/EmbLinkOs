@@ -1,4 +1,45 @@
+## Live display configuration (2026-10-25)
+
+The single-output display controller stages an independent framebuffer before
+switching scanout, retains the old surface through a 30-second trial and releases
+it only after confirmation. This keeps timeout/session/process-exit rollback
+independent of another allocation succeeding. VirtIO resources are acknowledged
+before backing memory is released; failed device ownership stays quarantined.
+The compositor publishes a mode under its drawing lock. Shared apps reflow with
+placement that preserves z-order/focus and retain their previous window pixels
+until the next frame. EDID identity comes from the active VirtIO scanout or the
+same UEFI handle as GOP, through an appended boot-protocol v5 block. ABI 154
+provides monitor control; ABI 155 provides placement without raising. Existing
+call numbers and v1–v4 boot offsets are preserved. There are 155 native calls.
+[DISPLAYS.md](DISPLAYS.md) records capabilities, failure paths and native-driver
+limitations. The CPU compositor and one active output remain the architecture.
+
 # EmbLinkOS — Architecture
+
+## Private terminal sessions (2026-10-24)
+
+Syscall 148 adds descriptor-scoped master/slave terminal pairs, isolated line
+modes, dimensions, readiness and hangup. Explicit spawn descriptor transfer
+(action 9) gives children real terminal stdio. The native shell delegates
+foreground interruption within its PTY rather than changing the global console
+route. Native spawn remains the process primitive; full POSIX job control and
+Unix shell compatibility are still pending. See [TERMINAL.md](TERMINAL.md).
+
+## Contour desktop contract (2026-10-24)
+
+Shared semantic tokens, original SVG/EIC icons and `oscfg` snapshots now drive
+the shell, native applications and widget runtime. Syscall 147,
+`desktop_control`, publishes a versioned work-area, palette, effects, cursor,
+shortcut and workspace contract. Only the desktop-layer owner can configure it;
+workspace actions respect session locks. Hidden workspaces are excluded from
+rendering and input. The compositor retains its CPU-rendered fallback.
+
+The native ABI has 148 unique calls. Configuration, accessibility boundaries,
+coverage and acceptance are recorded in [CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md).
+
+## Document workspace platform (2026-10-23)
+
+Document saving, shared file dialogs, acknowledged close requests and per-process recovery drafts now share a platform contract. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) for ordering, failure semantics, authority and remaining races.
 
 *Living document — last updated 2026-07-13.*
 
@@ -209,3 +250,21 @@ buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable ker
 - **Verification:** oracle-first — Python formatter/verifier is ground truth; the C reader is validated against it.
 - **Git hygiene:** PR-based workflow, `Teo` branch; after a GitHub-side PR merge, fetch → check log → merge master into `Teo` (not blind force-push). Non-fast-forward rejections from PR merges / CodeQL auto-fix commits are expected.
 - **Hardware:** consult the Intel SDM before coding any hardware-level component.
+
+## Laptop integration boundaries (2026-10-23)
+
+Incoming syscall IDs 1–128 are retained; laptop APIs occupy 129–143. The x86
+screen controller layers on native session IDs and safe process teardown; it
+does not replace the scheduler. Home owns the lock surface and authd supplies
+password proof. Native AML is the sole active interpreter; battery/backlight
+methods run on a worker and UI reads cached snapshots. The old uACPI adapter
+is unlinked reference code. GPT partition identity chooses the actual boot root;
+Recovery mounts it read-only and installs only through an explicit disk plan.
+ARM shared code still cross-links; laptop screen/policy services report ENOTSUP
+there. See DAILY_USE.md and LAPTOP_VALIDATION.md for behavior and evidence.
+
+System-menu focus is window-owned state (`win_menu`, syscall 144). It overrides
+normal app focus only while a translucent menu is open, and cannot override the
+session lock owner. The bar applies asynchronous preference snapshots on its
+render thread. See EMUI_INTERNALS.md and DESKTOP_MENUS.md for the lifecycle and
+native interaction tests.

@@ -2,6 +2,8 @@
 
 
 extern isr_handler
+extern hda_irq_handler
+global hda_irq_stub
 extern irq_handler
 extern lapic_timer_handler
 extern lapic_ipi_handler
@@ -225,3 +227,16 @@ irq_common_lapic:
     add rsp, 16           ; skip the dummy error code + vector number pushed by the stub
     iretq
 
+
+; HDA MSI owns vector 0x53, separate from the shared legacy IRQ slots.
+hda_irq_stub:
+    push qword 0
+    push qword 0x53
+    PUSH_GPRS
+    mov rbx, rsp
+    and rsp, -16
+    call hda_irq_handler
+    mov rsp, rbx
+    POP_GPRS
+    add rsp, 16
+    iretq

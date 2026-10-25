@@ -39,6 +39,7 @@
 #define EMBK_EMFILE       24    // too many open files
 #define EMBK_ENOSPC       28    // no space left on device
 #define EMBK_ESPIPE       29    // illegal seek (e.g. seek on a pipe)
+#define EMBK_ENOTTY       25    // descriptor is not a terminal
 #define EMBK_EROFS        30    // read-only file system
 #define EMBK_EMLINK       31    // too many hard links
 #define EMBK_ERANGE       34    // result/argument out of range

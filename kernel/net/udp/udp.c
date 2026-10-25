@@ -29,6 +29,8 @@ static volatile struct {
     bool     armed;
     uint16_t port;
     uint32_t from_ip;
+    uint32_t peer_ip;
+    uint16_t peer_port;
     uint8_t  buf[UDP_CAP_MAX];
     uint32_t len;
     volatile bool got;
@@ -59,7 +61,7 @@ bool udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
     if (seg_len < sizeof(struct udp_hdr)) return true;   /* malformed: swallow */
     const struct udp_hdr *u = (const struct udp_hdr *)seg;
     uint32_t dlen = ntohs(u->len);
-    if (dlen < sizeof(*u) || dlen > seg_len) dlen = seg_len;
+    if (dlen < sizeof(*u) || dlen > seg_len) return true;
     const uint8_t *data = seg + sizeof(*u);
     uint32_t datalen = dlen - sizeof(*u);
     uint16_t dport = ntohs(u->dst_port);
@@ -81,6 +83,8 @@ bool udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
 
     /* Else the kernel single-slot capture (DHCP/DNS). */
     if (g_udp.armed && dport == g_udp.port) {
+        if((g_udp.peer_ip && g_udp.peer_ip!=src_ip) ||
+           (g_udp.peer_port && g_udp.peer_port!=ntohs(u->src_port))) return true;
         if (!g_udp.got) {
             uint32_t k = datalen < UDP_CAP_MAX ? datalen : UDP_CAP_MAX;
             memcpy((void *)g_udp.buf, data, k);
@@ -131,14 +135,15 @@ int net_udp_sendto(int us, uint32_t dst_ip, uint16_t dst_port, const void *data,
     return rc;
 }
 
-int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port) {
+static int recvfrom_flags(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port,bool nonblock) {
     if (us < 0 || us >= UDP_SOCKS) return -1;
     net_lock();
     if (!udp_socks[us].in_use) { net_unlock(); return -1; }
     struct udp_sock *s = &udp_socks[us];
     int got = -1;
     uint64_t deadline = net_ticks() + NET_TMO_TICKS;
-    while (net_ticks() < deadline) {
+    for (;;) {
+        if (!s->in_use)break;
         if (s->q_n > 0) {
             struct udp_dgram *d = &s->q[s->q_head];
             uint32_t k = d->len < cap ? d->len : cap;
@@ -150,10 +155,23 @@ int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t
             got = (int)k;
             break;
         }
+        if(nonblock){got=-2;break;}
+        if(net_ticks()>=deadline)break;
         net_wait();
     }
     net_unlock();
     return got;
+}
+int net_udp_recvfrom(int us,void *buf,uint32_t cap,uint32_t *ip,uint16_t *port) {
+    return recvfrom_flags(us,buf,cap,ip,port,false);
+}
+int net_udp_recvfrom_nb(int us,void *buf,uint32_t cap,uint32_t *ip,uint16_t *port) {
+    return recvfrom_flags(us,buf,cap,ip,port,true);
+}
+int net_udp_ready(int us) {
+    if(us<0 || us>=UDP_SOCKS)return -1;
+    net_lock();int n=udp_socks[us].in_use?(udp_socks[us].q_n>0):-1;
+    net_unlock();return n;
 }
 
 void net_udp_close(int us) {
@@ -171,6 +189,10 @@ void net_udp_abort(int us) {
 
 void udp_arm(uint16_t port) {
     g_udp.port = port; g_udp.len = 0; g_udp.from_ip = 0; g_udp.got = false; g_udp.armed = true;
+    g_udp.peer_ip=0;g_udp.peer_port=0;
+}
+void udp_arm_peer(uint16_t port,uint32_t ip,uint16_t peer_port) {
+    udp_arm(port);g_udp.peer_ip=ip;g_udp.peer_port=peer_port;
 }
 
 int udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip) {

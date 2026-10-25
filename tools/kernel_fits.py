@@ -2,30 +2,33 @@
 """tools/kernel_fits.py -- does the kernel still fit where it must be loaded?
 
 THE KERNEL IS NOT RELOCATABLE. It is linked for one physical address
-(0x100000) because KP2V hardwires the higher-half window to physical 0, and
-both boot paths -- BIOS stage2 and the UEFI loader -- place it there exactly.
-So the whole image, .bss included, has to land in memory the firmware has left
-free, and firmware reserves low memory wherever it likes: OVMF puts ACPI NVS
-at 0x800000, eight megabytes in.
+(kernel/linker.ld) because KP2V hardwires the higher-half window to physical
+0, and both boot paths -- BIOS stage2 and the UEFI loader -- place it there
+exactly. So the whole image, .bss included, has to land in memory the firmware
+has left free, and firmware reserves memory wherever it likes.
 
 This is what happens when it does not fit, and it is why this check exists:
 the loader asks the firmware for the pages, the firmware refuses, and the
 machine stops before the kernel's first instruction with nothing on screen but
 "EmbBoot FATAL". Measured, on the day the stick was first booted the way a
-laptop boots it -- the image had reached 0x801000, ONE PAGE over.
+laptop boots it: linked at 0x100000, the image had reached 0x801000 -- ONE
+PAGE past the ACPI NVS OVMF puts at 0x800000.
 
-The ceiling is below the lowest reservation seen so far, with room to notice
-the problem before a machine does. Growing past it is not forbidden -- it is a
-decision, and it needs the per-core fault stacks out of .bss (MAX_CPUS in
-kernel/arch/x86_64/cpu/gdt.h) or a relocatable kernel, not a bigger number
-here.
+The link address is 32 MiB now (docs/UPDATES.md), clear of that reservation
+and of the BIOS path's ELF staging buffer at 16 MiB. Above it, OVMF at
+-m 521m leaves 0x900000-0x1E537000 free (measured 2026-10-25), so QEMU has
+room to ~485 MiB. No real machine's map above 32 MiB has been read yet, so the
+ceiling is a BUDGET -- 32 MiB of image above the link address -- not a
+measurement. Growing past it is not forbidden -- it is a decision, made with a
+real machine's memory map (pmm_print_map writes it to the boot log), not a
+bigger number here.
 
 Usage: kernel_fits.py <kernel.elf> [ceiling-bytes]
 """
 import subprocess, sys
 
 KVB = 0xFFFFFFFF80000000
-DEFAULT_CEILING = 0x7C0000          # 7.75 MiB; firmware seen reserving 8.00 MiB
+DEFAULT_CEILING = 0x4000000         # 64 MiB: the 32 MiB link address + a 32 MiB budget
 
 
 def main():
@@ -59,7 +62,7 @@ def main():
         print("*** THE KERNEL NO LONGER FITS WHERE IT IS LOADED", file=sys.stderr)
         print("***   image: 0x%06X..0x%06X  (%.2f MiB, top at %.3f MiB)"
               % (lo, hi, (hi - lo) / 1048576.0, hi / 1048576.0), file=sys.stderr)
-        print("***   ceiling: %.3f MiB -- firmware reserves low memory above it"
+        print("***   ceiling: %.3f MiB -- the budget above the link address"
               % (ceiling / 1048576.0), file=sys.stderr)
         print("***   A machine would stop at \"EmbBoot FATAL\" before the kernel runs.", file=sys.stderr)
         print("***   Shrink the static footprint (x86_64-elf-nm -S --size-sort -td", file=sys.stderr)

@@ -153,6 +153,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
              kernel/arch/x86_64/boot/boot_protocol.c \
+             kernel/arch/x86_64/boot/fw_cfg.c \
+             kernel/block/install.c kernel/block/install_protocol.c kernel/fs/embkfs/check.c \
              kernel/arch/x86_64/syscall/syscall.c \
              kernel/arch/x86_64/syscall/syscall_fast.c \
              kernel/syscall/syscalls.c \
@@ -163,7 +165,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
              kernel/process/debug.c \
-			 kernel/tty/tty.c \
+			 kernel/tty/tty.c kernel/tty/pty.c \
              kernel/acpi/acpi.c \
              kernel/acpi/aml.c \
              kernel/acpi/acpi_dev.c \
@@ -194,6 +196,11 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/i2c/smbus.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
+             kernel/drivers/video/intel_display.c \
+             kernel/acpi/display.c kernel/acpi/power.c \
+             kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
+             kernel/drivers/i2c/designware.c kernel/drivers/i2c/designware_protocol.c \
+             kernel/drivers/i2c/hid_i2c.c kernel/drivers/i2c/hid_protocol.c kernel/drivers/input/hid_report.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
              kernel/drivers/audio/ac97.c \
@@ -214,6 +221,17 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/bus/pci.c \
              kernel/drivers/bus/virtio_pci.c \
              kernel/net/net.c \
+             kernel/crypto/sha1.c \
+             kernel/crypto/hw_random.c \
+             kernel/net/wifi/wpa2_crypto.c \
+             kernel/net/wifi/wpa2.c \
+             kernel/net/wifi/ccmp.c \
+             kernel/net/wifi/station.c \
+             kernel/net/wifi/ax200_protocol.c \
+             kernel/net/wifi/ax200.c \
+             kernel/net/wifi/profile.c \
+             kernel/net/wifi/control.c \
+             kernel/net/wifi/wifi.c \
              kernel/net/virtio_net.c \
              kernel/net/e1000.c \
              kernel/net/igb.c \
@@ -274,6 +292,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/crc32c.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
+             kernel/update/protocol.c kernel/update/storage.c kernel/update/service.c kernel/display/control.c kernel/display/edid.c \
              kernel/fs/vfs.c \
              kernel/fs/automount.c \
              kernel/fs/ninep.c \
@@ -319,7 +338,7 @@ KERNEL_ELF  = kernel/kernel.elf
 # identically. Keep kernel.elf (with symbols) for gdb + the .embdbg producer.
 STRIP       = x86_64-elf-strip
 # The UEFI loader is an x86_64 PE whatever ARCH the rest of the build targets.
-UEFI_OBJCOPY = x86_64-elf-objcopy
+UEFI_OBJCOPY ?= $(shell python3 tools/find_efi_objcopy.py)
 KERNEL_BIN  = kernel/kernel.strip.elf
 
 # The kernel's own .embdbg panic-symbol sidecar (EMBDBG_Specification.md §7),
@@ -414,12 +433,10 @@ USER_INC     = -Iuser/lib
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
-# AUTOLOGIN=0 builds a production init: no session without a password. The
-# default (unset) keeps the development auto-login -- see DEV_AUTOLOGIN in
-# init.c for exactly what it does and does not do. make does not track a
-# variable's value: after changing it, `touch user/system/init/init.c`.
+# Authentication is the default. UI tests select explicit live mode through
+# EmbBoot or QEMU's opt/emblink/live file, without changing the init binary.
 build/init.o: user/system/init/init.c user/lib/session_policy.h | $(BUILD)
-	$(USER_CC) $(USER_CFLAGS) $(if $(AUTOLOGIN),-DDEV_AUTOLOGIN=$(AUTOLOGIN)) -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 build/init.elf: build/init.o user/lib/user.ld
 	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
@@ -625,7 +642,7 @@ endef
 
 # The programs built this way. Adding a name here makes it a PIE; it must have
 # exactly one source file and no non-PIC dependency.
-NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher
+NEWLIB_SIMPLE_PROGS = hello posixdemo ioracer crasher ttyprobe processprobe spawnprobe shprobe fdprobe
 
 .PHONY: pie-check
 pie-check:
@@ -795,7 +812,7 @@ NEWLIB_DYN_WL      = -Wl,--export-dynamic -Wl,--no-dynamic-linker -Wl,--hash-sty
 build/crt0.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
-build/syscalls.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
+build/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
 # --- ON-OS DYNAMIC-LINK ABI (so tcc can build EmUI apps against libembk.so) ---
@@ -823,7 +840,7 @@ $(foreach p,$(NEWLIB_SIMPLE_PROGS),$(eval $(call NEWLIB_SIMPLE_PROG,$(p))))
 build/crt0_pic.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 
-build/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
+build/syscalls_pic.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 
 build/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(BUILD)
@@ -1173,6 +1190,23 @@ build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
 build/pkg.o: user/tools/pkg/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
+build/updateprobe.o: user/tests/updateprobe/updateprobe.c user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/updateprobe.elf: build/crt0.o build/syscalls.o build/updateprobe.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/updateprobe.o -lc -lgcc -o $@
+
+build/updatectl.o: user/tools/updatectl/updatectl.c user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/updatectl.elf: build/crt0.o build/syscalls.o build/updatectl.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/updatectl.o -lc -lgcc -o $@
+
+build/update_release.o: user/update/release.c user/update/release.h user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/update -Iuser/lib -c $< -o $@
+build/updateworker.o: user/system/updateworker/updateworker.c user/update/release.h user/lib/embk_update.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/update -Iuser/lib/tls -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
+build/updateworker.elf: build/crt0.o build/syscalls.o build/updateworker.o build/update_release.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/updateworker.o build/update_release.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
 # pkg verifies the manifest signature with ECDSA P-256 (tls_ecdsa + tls_bignum).
 PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
             build/tls_sha256.o build/tls_ecdsa.o build/tls_bignum.o
@@ -1566,7 +1600,13 @@ $(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+$(BUILD)/picobj_fileops.o: user/lib/fileops.c user/lib/fileops.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_document.o: user/lib/document.c user/lib/document.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_workspace.o: user/lib/workspace.c user/lib/workspace.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_workspace.o  $(BUILD)/picobj_document.o  $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
@@ -1594,7 +1634,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/updateprobe/updateprobe.c user/tools/updatectl/updatectl.c user/system/updateworker/updateworker.c user/tests/fdprobe/fdprobe.c user/tests/shprobe/shprobe.c user/tests/spawnprobe/spawnprobe.c user/tests/processprobe/processprobe.c user/tests/ttyprobe/ttyprobe.c user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
 EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
 EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
@@ -1618,6 +1658,14 @@ $(foreach a,$(EMUI_APP_NAMES),$(eval $(call EMUI_APP_OBJ,$(a))))
 # PT_INTERP); --hash-style=sysv: DT_HASH for symcount.
 build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# Terminal's screen parser/model is pure userspace and separately host-tested.
+build/vt.o: user/terminal/vt.c user/terminal/vt.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
+build/term.o: user/terminal/vt.h
+build/term.elf: build/term.o build/vt.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o build/vt.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Photos -- the picture viewer. Like vellum it needs more than one object, so
@@ -1965,7 +2013,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf $(if $(PIE_OK),build/pieprobe.elf,) \
+EMBKFS_APPS := build/updateprobe.elf build/updatectl.elf build/updateworker.elf build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf build/spawnprobe.elf build/shprobe.elf build/fdprobe.elf build/sh.elf $(if $(PIE_OK),build/pieprobe.elf,) \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
@@ -2444,7 +2492,7 @@ build/uefi_kernel_hash.h: $(KERNEL_BIN) | $(BUILD)
 	  print('};')" $(KERNEL_BIN) > $@
 	@echo "  kernel sha256 -> $@"
 
-build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h build/uefi_kernel_hash.h | $(BUILD)
+build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h boot/uefi/update_boot.h kernel/boot/boot_protocol.h kernel/update/protocol.h build/uefi_kernel_hash.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
 build/uefi_console.o: boot/uefi/console.c boot/uefi/console.h boot/uefi/uefi.h | $(BUILD)
@@ -2460,52 +2508,31 @@ build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
 build/uefi_sha256.o: kernel/crypto/sha256.c kernel/crypto/sha256.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
-UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
-            build/uefi_menu.o build/uefi_sha256.o build/uefi_kernel_blob.o
+build/uefi_update_boot.o: boot/uefi/update_boot.c boot/uefi/update_boot.h boot/uefi/uefi.h kernel/update/protocol.h kernel/boot/boot_protocol.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
+build/uefi_update_protocol.o: kernel/update/protocol.c kernel/update/protocol.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
 
-# -pie, NOT -shared, and that one word is the difference between an EFI
-# application that runs and one that cannot.
-#
-# With this binutils, `-shared` plus an external `-T` script produces an image
-# whose cross-file global accesses are ABSOLUTE -- the linker relaxes the
-# compiler's GOT reference into `mov $0xef030,%rax`, the symbol's LINK-TIME
-# address -- and emits no relocation to correct it. UEFI loads an application
-# wherever it likes, so every such global then reads from low memory that is
-# not the image: the system table pointer came back as ffffffffffffffff and the
-# first console write jumped into nowhere (#UD at 0xB0000). crt0's relocation
-# loop could not save it, because there were no relocations to apply.
-#
-# `-pie` makes the same linker, the same script and the same objects produce
-# RIP-relative accesses (`lea 0xed03d(%rip),%rax`) -- position-independent by
-# construction, nothing to relocate. Checked instruction by instruction, not
-# assumed.
-# -pie, NOT -shared, and the difference is the whole loader.
-#
-# With `-shared` this linker relaxes a cross-file global read into an ABSOLUTE
-# address -- `mov $0xef030,%rax`, the link-time address -- and emits NO
-# relocation to correct it. crt0's fixup loop then has nothing to apply, so
-# every global is read from low memory that is not the image, and the loader
-# dies on its first console call with the firmware's screen still blank. `-pie`
-# makes the same linker, script and objects emit `lea 0x...(%rip)`.
-#
-# THIS RULE DEPENDS ON THE MAKEFILE because that flag lives here: without it,
-# changing it rebuilds nothing and the image on disk is from the old one. That
-# is not hypothetical -- it happened while writing tools/uefi_test.py, and for
-# one run the test reported OK on a binary it had not built.
+UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
+            build/uefi_menu.o build/uefi_sha256.o build/uefi_kernel_blob.o \
+            build/uefi_update_boot.o build/uefi_update_protocol.o
+
+# Forward link options explicitly: bare-metal GCC does not pass its -shared
+# driver flag through like a hosted GCC. Bind local globals and retain separate
+# dynamic metadata sections so the self-relocator sees every required fixup.
 build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds Makefile
-	$(CC) -nostdlib -pie -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
+	$(CC) -nostdlib -Wl,-shared,-Bsymbolic,--no-undefined -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
+
 
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
 # subsystem and PE layout correctly.
 #
-# THE CROSS objcopy, not the host's. The note here used to say the cross one
-# lacked PE support, and the host's was used instead -- which is a build that
-# cannot work on a host whose objcopy is not GNU's (macOS ships none at all).
-# `x86_64-elf-objcopy --info` lists pei-x86-64, so the toolchain this tree
-# already requires can do it, and the build stops depending on what else the
-# machine happens to have.
-$(BOOTX64): build/uefi_loader.so
-	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
+# Prefer the cross objcopy when it supports EFI PE output, otherwise select a
+# compatible GNU host tool. Bare-metal binutils builds may enable only ELF;
+# tools/find_efi_objcopy.py checks actual targets rather than assuming support.
+$(BOOTX64): build/uefi_loader.so tools/check_uefi_elf.py
+	python3 tools/check_uefi_elf.py $<
+	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .rodata -j .data -j .bss -j .got -j .rela -j .reloc $< $@
 
 # DOES IT BOOT THE WAY MACHINES BOOT NOW? Both images, under the real firmware.
 #
@@ -2634,9 +2661,21 @@ compile-commands:
 
 .PHONY: compile-commands
 
+.PHONY: terminal-screen-test
+terminal-screen-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_test.c -o $(BUILD)/vt_test
+	$(BUILD)/vt_test
+
+.PHONY: terminal-test
+terminal-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/tty/pty_host.c -o $(BUILD)/pty_host_test
+	$(BUILD)/pty_host_test
+	python3 tests/tty/sdk_staging.py
+
 # The structured shell's pure pipeline (lexer -> parser -> evaluator ->
 # builtins + the wire round-trip), host-run. The two OS-backed pieces (ls,
 # external spawn) link as stubs; they get exercised live by `test shell`.
+
 shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
@@ -3481,6 +3520,8 @@ build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
 #   * a fragment rather than ifeqs threaded through 2,400 lines of boot image,
 #     EMBKFS packing and userland -- none of which aarch64 has yet. Settles
 #     docs/ARM64.md §6.4.
+include ports/mrsh/sources.mk
+
 ifneq ($(ARCH),x86_64)
 ARCH_MK := kernel/arch/$(ARCH)/arch.mk
 ifeq ($(wildcard $(ARCH_MK)),)
@@ -3546,3 +3587,51 @@ test-tls-crypto:
 	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
 	    tools/tls/test_constraints.c -o /tmp/embk_test_constraints && /tmp/embk_test_constraints
 
+
+.PHONY: document-test
+document-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -DEMDOC_FAULT_TEST -Iuser/lib user/lib/document.c user/lib/document_test.c -Wl,--wrap=write,--wrap=fsync,--wrap=rename -o $(BUILD)/document_test
+	$(BUILD)/document_test
+
+.PHONY: service-test
+service-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/lib user/lib/service_test.c -o $(BUILD)/service_test
+	$(BUILD)/service_test
+
+.PHONY: doc-model-test
+doc-model-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iuser/note user/note/doc.c user/note/syntax.c user/note/doc_test.c -o $(BUILD)/doc_model_test
+	$(BUILD)/doc_model_test
+
+.PHONY: contour-test
+contour-test:
+	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 $(UI_INC) -Iuser/lib \
+	    ui/theme/theme.c tests/desktop/appearance_test.c -lm -o $(BUILD)/contour_test
+	$(BUILD)/contour_test
+
+.PHONY: process-compat-test
+.PHONY: fd-sharing-test
+fd-sharing-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -O1 -g -ffunction-sections -fdata-sections --param asan-globals=0 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -Ikernel tests/process/fd_shared_host.c -Wl,--gc-sections -o $(BUILD)/fd-shared-sanitize
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD)/fd-shared-sanitize
+
+process-compat-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/process/pipe_host.c -o $(BUILD)/pipe_host_test
+	$(BUILD)/pipe_host_test
+	python3 tools/check_native_abi.py
+	python3 tests/tty/sdk_staging.py
+
+# Shared publisher/firmware journal and signed release parser checks.
+update-test:
+	python3 tests/update/run.py
+.PHONY: update-test
+
+# A managed release always pairs the newly-built kernel's EFI loader with its
+# userspace filesystem. `images` alone does not produce the UEFI kernel blob.
+UPDATE_RELEASE ?= 1
+UPDATE_VERSION ?= 0.1.0
+UPDATE_DATA_MIB ?= 128
+managed-uefi.img: build/BOOTX64.EFI embkfs.img tools/update/mkdisk.py tools/update/protocol.py tools/mkuefidisk.py
+	python3 tools/update/mkdisk.py build/BOOTX64.EFI embkfs.img $@ --release $(UPDATE_RELEASE) --version $(UPDATE_VERSION) --data-mib $(UPDATE_DATA_MIB)
+managed-image: managed-uefi.img
+.PHONY: managed-image

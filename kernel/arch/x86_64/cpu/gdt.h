@@ -20,10 +20,12 @@
  * loader could not place it at all. The machine did not boot, and said
  * nothing useful about why.
  *
- * Sixteen covers every laptop this is meant to run on and leaves half a
- * megabyte of headroom. Raising it again means taking those stacks out of
- * .bss and allocating them per core at bring-up (docs/TODO.md), which is the
- * real fix and not one to make in a hurry. percpu_register_cpu() already
+ * Sixteen covers every laptop this is meant to run on. The kernel is linked
+ * at 32 MiB now (docs/UPDATES.md), clear of that reservation, so the ceiling
+ * that forced this is gone; raising it costs image size against
+ * tools/kernel_fits.py's budget instead. Taking those stacks out of .bss and
+ * allocating them per core at bring-up (docs/TODO.md) is still the real fix
+ * and not one to make in a hurry. percpu_register_cpu() already
  * clamps a machine with more cores than this to the first MAX_CPUS and says
  * so out loud. */
 #define MAX_CPUS 16

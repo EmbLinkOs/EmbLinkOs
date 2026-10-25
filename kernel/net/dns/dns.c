@@ -17,7 +17,11 @@ static uint32_t dns_skip_name(const uint8_t *msg, uint32_t len, uint32_t off) {
     while (off < len) {
         uint8_t b = msg[off];
         if (b == 0) return off + 1;
-        if ((b & 0xC0) == 0xC0) return off + 2;   /* a 2-byte pointer ends the name */
+        if ((b & 0xC0) == 0xC0) {
+            if(off+1>=len || (((uint32_t)b&63)*256+msg[off+1])>=len) return 0;
+            return off + 2;   /* a 2-byte pointer ends the name */
+        }
+        if((b&0xc0) || b>63 || b>len-off-1) return 0;
         off += 1 + b;
     }
     return 0;
@@ -51,7 +55,7 @@ static bool dns_resolve_locked(const char *name, uint32_t *out_ip) {
     *p++ = 0; *p++ = 1;                        /* QCLASS = IN */
     uint32_t qlen = (uint32_t)(p - q);
 
-    udp_arm(DNS_EPH_PORT);
+    udp_arm_peer(DNS_EPH_PORT,g_netif.dns,DNS_PORT);
     if (net_send_udp(g_netif.ip, DNS_EPH_PORT, g_netif.dns, DNS_PORT, q, qlen) < 0) return false;
 
     static uint8_t in[1024];
@@ -59,9 +63,9 @@ static bool dns_resolve_locked(const char *name, uint32_t *out_ip) {
     if (r < (int)sizeof(struct dns_hdr)) return false;
     const struct dns_hdr *rh = (const struct dns_hdr *)in;
     if (ntohs(rh->id) != id) return false;
-    if ((ntohs(rh->flags) & 0x000F) != 0) return false;   /* RCODE != 0 */
+    if ((ntohs(rh->flags)&0xfa0f)!=0x8000) return false; /* response, normal opcode, not truncated, success */
     uint16_t qd = ntohs(rh->qdcount), an = ntohs(rh->ancount);
-    if (an == 0) return false;
+    if (qd!=1 || an == 0) return false;
 
     uint32_t off = sizeof(*rh);
     for (uint16_t i = 0; i < qd; i++) {         /* skip the echoed question(s) */
@@ -76,7 +80,7 @@ static bool dns_resolve_locked(const char *name, uint32_t *out_ip) {
         uint16_t rdlen = net_rd16be(in + off + 8);
         off += 10;
         if (off + rdlen > (uint32_t)r) return false;
-        if (type == 1 && rdlen == 4) {
+        if (type == 1 && net_rd16be(in+off-8)==1 && rdlen == 4) {
             *out_ip = net_ip_rd(in + off);
             return true;
         }
@@ -87,7 +91,9 @@ static bool dns_resolve_locked(const char *name, uint32_t *out_ip) {
 
 bool net_resolve(const char *name, uint32_t *out_ip) {
     net_lock();
+    net_service_lock();
     bool ok = dns_resolve_locked(name, out_ip);
+    net_service_unlock();
     net_unlock();
     return ok;
 }

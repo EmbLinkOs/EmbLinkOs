@@ -26,10 +26,14 @@
 #include <stdint.h>
 #include "include/types.h"
 
+struct embk_desktop;
+int compositor_request_launcher(void);
+int compositor_workspace_key(int target,int move);
+int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *state);
 struct process;   /* fwd decl -- compositor.h must not include process.h */
 
-#define COMP_MAX_WINDOWS   8
-#define COMP_TITLEBAR_H    26     /* px; kernel-drawn chrome above the content */
+#define COMP_MAX_WINDOWS   24
+#define COMP_TITLEBAR_H    34     /* px; kernel-drawn chrome above the content */
 #define COMP_BORDER        1      /* px; 1px frame around the whole window     */
 #define COMP_TITLE_MAX     31
 
@@ -49,7 +53,7 @@ int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32
 
 /* Full-screen chromeless HOME/desktop window for `client`: sized to the
  * framebuffer, pinned at the back (z=0), no title bar or border, zero-copy. The
- * screen dimensions are returned via *out_w/*out_h so the app needn't hardcode
+ * screen dimensions are returned via *out_w and *out_h so the app needn't hardcode
  * them. Returns a window id (>0) or -EMBK_*. */
 int64_t compositor_win_create_desktop(struct process *client, uint64_t *out_client_va,
                                       uint32_t *out_w, uint32_t *out_h);
@@ -190,6 +194,8 @@ void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
+int compositor_win_menu(int pid,uint32_t id,int active);
+int compositor_win_close_ack(int pid,uint32_t id);
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 /* `when` is the millisecond the reported button state was MADE, which for a
  * replayed press is when the finger went down and not when this poll happened.
@@ -214,6 +220,8 @@ int64_t compositor_win_damage(int pid, uint32_t id,
 /* Move the window's frame top-left to screen (x,y) and raise it to the front.
  * Repaints the union of the old and new footprints. */
 int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y);
+/* Automatic placement preserves z-order and keyboard focus. */
+int64_t compositor_win_place(int pid,uint32_t id,int32_t x,int32_t y);
 
 /* Destroy a window: free its buffer, erase it (repaint the exposed region). */
 int64_t compositor_win_destroy(int pid, uint32_t id);
@@ -229,4 +237,11 @@ void    compositor_reap_pid(int pid);
  * compositor spinlock is safe -- never call this from an IRQ handler). */
 void    compositor_pointer_tick(void);
 
+void compositor_session_changed(void);
+
+int compositor_desktop_healthy(void);
+struct fb_surface;
+struct fb_surface *compositor_select_display(struct fb_surface *);
+void compositor_display_lock(void);
+void compositor_display_unlock(void);
 #endif /* __GFX_COMPOSITOR_H__ */

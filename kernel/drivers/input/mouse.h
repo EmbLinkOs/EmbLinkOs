@@ -12,6 +12,7 @@
 
 /* Set the clamp bounds + start the cursor at the centre, then bring the PS/2
  * aux device up (enable, IRQ12, data reporting) and register the handler. */
+void mouse_set_bounds(uint32_t screen_w,uint32_t screen_h);
 void mouse_init(uint32_t screen_w, uint32_t screen_h);
 
 /* Current cursor position + button bitmask (a snapshot; safe to poll). */
@@ -31,6 +32,8 @@ int32_t mouse_take_wheel(void);   /* consume accumulated scroll delta (+up/-down
  * ticks are, which on a busy kernel loop is wider than any double-click
  * window. */
 int mouse_take_press(uint32_t *when_ms);
+/* Drop the complete queued press history when input ownership changes. */
+void mouse_discard_presses(void);
 
 /* Set the cursor from an ABSOLUTE pointing device (e.g. a USB tablet): x/y are
  * in [0, range], scaled to the screen. Unlike the relative PS/2 path this maps

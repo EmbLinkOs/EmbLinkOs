@@ -99,7 +99,15 @@
 /* tty_mode(mode) -- set TTY mode; returns old mode. */
 #define EMBK_SYS_tty_mode       67
 #define EMBK_SYS_getcaps        68
-/* (69-75 are the live-debugging contract; see kernel debug_abi.h.) */
+/* Live-debugging wire IDs; request layouts are in kernel/include/debug_abi.h. */
+#define EMBK_SYS_debug_attach 69
+#define EMBK_SYS_debug_wait 70
+#define EMBK_SYS_debug_cont 71
+#define EMBK_SYS_debug_regs 72
+#define EMBK_SYS_debug_mem 73
+#define EMBK_SYS_debug_hwbp 74
+#define EMBK_SYS_debug_detach 75
+
 /* Networking (M4): the ring-3 socket surface, gated on EMBK_CAP_NETWORK. */
 #define EMBK_SYS_net_socket     76
 #define EMBK_SYS_net_connect    77
@@ -173,6 +181,37 @@
 #define EMBK_SYS_disk_info     126
 #define EMBK_SYS_disk_read     127
 #define EMBK_SYS_disk_write    128
+
+/* Wi-Fi station control. Appended after the upstream portable ABI. */
+#define EMBK_SYS_wifi_info 129
+#define EMBK_SYS_wifi_request 130
+#define EMBK_SYS_power_info 131
+#define EMBK_SYS_display_info 132
+#define EMBK_SYS_display_set 133
+#define EMBK_SYS_audio_info 134
+#define EMBK_SYS_audio_control 135
+#define EMBK_SYS_gpu_info 136
+#define EMBK_SYS_rename_noreplace 137
+#define EMBK_SYS_boot_mode 138
+#define EMBK_SYS_session_control 139
+#define EMBK_SYS_notice_post 140
+#define EMBK_SYS_notice_get 141
+#define EMBK_SYS_policy_get 142
+#define EMBK_SYS_policy_set 143
+#define EMBK_SYS_win_menu 144
+#define EMBK_SYS_win_close_ack 145
+#define EMBK_SYS_key_poll_input 146
+#define EMBK_SYS_desktop_control 147
+#define EMBK_SYS_terminal 148
+#define EMBK_SYS_child 149
+#define EMBK_SYS_pipe_fds 150
+#define EMBK_SYS_spawn_cwd 151
+#define EMBK_SYS_spawn_pid 152
+#define EMBK_SYS_update 153
+#define EMBK_SYS_monitor 154
+#define EMBK_SYS_win_place 155
+
+
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

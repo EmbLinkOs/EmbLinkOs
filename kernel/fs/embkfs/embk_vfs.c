@@ -8,6 +8,7 @@
  * every op is a thin locked wrapper around an _impl. */
 
 #include "fs/vfs.h"
+#include "block/partition.h"
 #include "fs/embkfs/embkfs.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
@@ -486,7 +487,7 @@ static int embkfs_vfs_vget(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
     return EMBK_OK;
 }
 
-static int embkfs_vfs_rename(struct vnode *old_dir, const char *old_name, size_t old_len,
+static int rename_impl(struct vnode *old_dir, const char *old_name, size_t old_len,
                              struct vnode *new_dir, const char *new_name, size_t new_len)
 {
     if (!old_dir || !new_dir || !old_name || !new_name ||
@@ -522,6 +523,21 @@ static int embkfs_vfs_rename(struct vnode *old_dir, const char *old_name, size_t
     return rc;
 }
 
+static int embkfs_vfs_rename(struct vnode *old_dir,const char *old_name,size_t old_len,
+                             struct vnode *new_dir,const char *new_name,size_t new_len) {
+    fs_lock();
+    int rc=rename_impl(old_dir,old_name,old_len,new_dir,new_name,new_len);
+    fs_unlock();return rc;
+}
+static int embkfs_vfs_rename_noreplace(struct vnode *old_dir,const char *old_name,size_t old_len,
+                             struct vnode *new_dir,const char *new_name,size_t new_len) {
+    fs_lock();struct vnode existing;
+    int rc=lookup_impl(new_dir,new_name,new_len,&existing);
+    if(!rc)rc=-EMBK_EEXIST;
+    else if(rc==-EMBK_ENOENT)rc=rename_impl(old_dir,old_name,old_len,new_dir,new_name,new_len);
+    fs_unlock();return rc;
+}
+
 static int embkfs_vfs_chmod(struct vnode *vn, uint32_t mode)
 {
     if (!vn || !vn->mnt || !vn->mnt->fs_data)
@@ -532,7 +548,27 @@ static int embkfs_vfs_chmod(struct vnode *vn, uint32_t mode)
     return rc;
 }
 
+static int embkfs_vfs_sync(struct vnode *vn)
+{
+    if (!vn || !vn->mnt || !vn->mnt->fs_data) return -EMBK_EINVAL;
+    fs_lock();
+    struct embkfs_volume *vol = vol_of(vn);
+    struct embk_block_device *disk = vol->dev ? embk_partition_parent(vol->dev) : NULL;
+    /* EMBKFS commits are write-through; no dirty inode/page state remains.
+     * Device caches still need a barrier. A partition's forwarding callback
+     * must not disguise a parent driver without a flush implementation. */
+    int rc = !disk ? -EMBK_ENODEV
+           : !disk->flush ? -EMBK_ENOTSUP : embk_block_flush(vol->dev);
+    fs_unlock();
+    return rc;
+}
+
+static int embkfs_vfs_check_write(struct vnode *vn) {
+    return vol_of(vn)->read_only ? -EMBK_EROFS : 0;
+}
+
 static const struct vfs_ops embkfs_vfs_ops = {
+    .check_write = embkfs_vfs_check_write,
     .lookup = embkfs_vfs_lookup,
     .readdir = embkfs_vfs_readdir,
     .read = embkfs_vfs_read,
@@ -546,11 +582,13 @@ static const struct vfs_ops embkfs_vfs_ops = {
     .truncate = embkfs_vfs_truncate,
     .rmdir = embkfs_vfs_rmdir,
     .rename = embkfs_vfs_rename,
+    .rename_noreplace = embkfs_vfs_rename_noreplace,
     .chmod = embkfs_vfs_chmod,
     .stat = embkfs_vfs_stat,
     .vget = embkfs_vfs_vget,
     .obj_get = embkfs_vfs_obj_get,
     .obj_put = embkfs_vfs_obj_put,
+    .sync = embkfs_vfs_sync,
 };
 
 /* Mount an already-opened EMBKFS volume into the VFS at `path`. */

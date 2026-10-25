@@ -78,7 +78,8 @@ static inline long sendto(int fd, const void *buf, unsigned long len, int flags,
                           const struct sockaddr *dest, unsigned addrlen) {
     (void)flags; (void)addrlen;
     const struct sockaddr_in *in = (const struct sockaddr_in *)dest;
-    return embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
+    int rc=embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
+    return rc<0?rc:(long)len;
 }
 static inline long recvfrom(int fd, void *buf, unsigned long len, int flags,
                             struct sockaddr *src, unsigned *addrlen) {

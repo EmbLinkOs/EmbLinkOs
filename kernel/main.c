@@ -4,6 +4,9 @@
 #include "include/io.h"
 #include "include/errno.h"
 #include "include/kstring.h"
+#include "update/storage.h"
+#include "update/service.h"
+#include "display/control.h"
 
 #include "drivers/char/serial.h"
 #include "drivers/video/framebuffer.h"
@@ -72,9 +75,14 @@
 #include "mm/kheap.h"
 
 #include "acpi/acpi.h"
+#include "acpi/power.h"
 #include "net/net.h"
 #include "block/block.h"
 #include "block/partition.h"
+#include "block/install.h"
+#include "process/session.h"
+#include "drivers/i2c/hid_i2c.h"
+#include "net/wifi/wifi.h"
 #include "fs/automount.h"
 #include "fs/fat32.h"
 #include "fs/embkfs/embkfs.h"
@@ -337,8 +345,8 @@ static void tui_query_size(int *rows, int *cols)
     char buf[40]; int bi = 0; int got = 0;
     uint64_t start = lapic_timer_get_ticks();
     while (lapic_timer_get_ticks() < start + 20) {          /* ~200ms at 100Hz */
-        while (serial_has_char()) {
-            char c = serial_read_char();
+        while (serial_has_char() || (boot_recovery_mode() && keyboard_has_char())) {
+            char c = serial_has_char()?serial_read_char():keyboard_getchar();
             if (bi < 39) buf[bi++] = c;
             if (c == 'R') { got = 1; break; }
         }
@@ -711,8 +719,8 @@ static void kernel_tui(void)
     serial_write_string("\033[?25l\033[2J");
     for (;;) {
         int quit = 0, moved = 0;
-        while (serial_has_char()) {
-            char c = serial_read_char();
+        while (serial_has_char() || (boot_recovery_mode() && keyboard_has_char())) {
+            char c = serial_has_char()?serial_read_char():keyboard_getchar();
             if (help) { help = 0; dirty = 1; continue; }   /* any key closes help */
             if (c == 'q' || c == 3) { quit = 1; break; }
             else if (c >= '1' && c <= '8') { tab = c - '1'; sel = 0; scr = 0; dirty = 1; }
@@ -1762,6 +1770,21 @@ static bool shell_handle_stat_command(const char *cmd)
 
 static void kernel_handle_line_command(const char *cmd)
 {
+    if(install_command(cmd))return;
+    if(!strcmp(cmd,"recovery check")) {
+        struct embkfs_volume *v=embkfs_live_volume();
+        if(v)embkfs_check(v);else kprintf("recovery: no readable EMBKFS root found\n");return;
+    }
+    if(!strcmp(cmd,"recovery report")) {
+        boot_protocol_dump();shell_handle_process_command("devices");shell_handle_process_command("mounts");
+        kprintf("recovery: report complete; serial output can be saved by the host\n");return;
+    }
+    if(boot_recovery_mode() && strcmp(cmd,"devices") && strcmp(cmd,"drivers") &&
+       strcmp(cmd,"mounts") && strcmp(cmd,"ps") && strcmp(cmd,"poweroff") && strcmp(cmd,"reboot")) {
+        kprintf("Recovery commands: recovery check, recovery report, install list, install plan <disk>, poweroff, reboot\n");return;
+    }
+    if(wifi_command(cmd))return;
+
     if (shell_handle_process_command(cmd))
         return;
 
@@ -2140,6 +2163,14 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     selftests_set_vfs_ready(vfs_ready);
     if (vfs_ready)
         vfs_fd_init();
+    if(vfs_ready) {
+        int update_mount=update_storage_mount();
+        const struct boot_protocol *record=boot_protocol_get();
+        if(update_mount && record && record->size>=BOOT_PROTOCOL_SIZE_V4 && (record->update_flags&1)) {
+            kprintf("update: managed storage unavailable (%d); recovery only\n",update_mount);
+            boot_protocol_force_recovery();
+        }
+    }
 
     /* Load the kernel's own .embdbg so a panic's isr_handler dump names
      * func:line instead of a bare hex RIP (EMBDBG_Specification.md §7). The
@@ -2213,11 +2244,14 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
      * deliberately -- a power-off flushes it, so the thing it flushes has to
      * be there first. */
     power_init();
+    acpi_power_init();
+    if(!boot_recovery_mode())i2c_hid_init();
 
     // --- Networking (M1): virtio-net + Ethernet/ARP/IPv4/ICMP. After PCI is
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
-    net_init();
+    if(!boot_recovery_mode())net_init();
+    {int rc=update_service_init();if(rc)kprintf("update: service unavailable (%d)\n",rc);}
 
     /* AND LEAVE THE LOG SOMEWHERE A PERSON CAN GET AT IT. The next line hands
      * the screen to the desktop; from here on a machine with no serial port
@@ -2233,7 +2267,12 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // child, not the first process. init runs as an ordinary round-robin sibling
     // of this shell context; the loop below keeps pumping the compositor pointer
     // and USB, and the serial/keyboard REPL stays available as a debug console.
-    {
+    if(boot_recovery_mode()) {
+        kprintf("\nEmbLinkOS recovery: filesystems are read-only; desktop and networking disabled\n");
+        kprintf("recovery check | recovery report | install list | poweroff | reboot\n");
+        if(boot_protocol_get()->boot_mode==BOOT_MODE_DIAGNOSTICS)kernel_handle_line_command("recovery check");
+        kprintf("recovery: ready\n");
+    } else {
         char *iargv[] = { (char *)"/system/bin/init.elf", NULL };
         /* The framebuffer is NOT handed over here -- the compositor does it
          * when the first window is actually created (compositor.c). A machine
@@ -2265,6 +2304,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // title-bar drag. Runs here (schedulable shell-process context) so the
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
+        monitor_tick();
         compositor_pointer_tick();
         /* SYSTEM KEY SHORTCUTS, performed here rather than where they were
          * pressed: the keyboard decides them in IRQ context and the compositor
@@ -2282,7 +2322,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
              * locked, GUI+Tab would raise an application window over the lock
              * -- which is the session, handed to whoever is standing there --
              * and GUI+W/GUI+Q would close and quit the absent user's work. */
-            if (sk && compositor_shell_modal()) {
+            if(sk && compositor_shell_modal() && (sk!=SYSKEY_LAUNCHER || session_input_owner())) {
                 /* Said out loud, because "the shortcut did nothing" and "the
                  * keystroke never arrived" look identical from outside the
                  * machine -- and one of them is a screen lock that can be
@@ -2338,7 +2378,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                     }
                 }
             }
-            if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            if(sk==SYSKEY_LAUNCHER)compositor_request_launcher();
+            else if(sk>=SYSKEY_SPACE_1 && sk<SYSKEY_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_SPACE_1,0);
+            else if(sk>=SYSKEY_MOVE_SPACE_1 && sk<SYSKEY_MOVE_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_MOVE_SPACE_1,1);
+            else if(sk==SYSKEY_SPACE_PREVIOUS || sk==SYSKEY_SPACE_NEXT)compositor_workspace_key(sk==SYSKEY_SPACE_PREVIOUS?-1:-2,0);
+            else if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
@@ -2347,7 +2391,10 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         }
         // Advance any window open/minimize motion. Same reasoning as above: it
         // repaints, so it must run in schedulable context, not an IRQ.
+        update_service_health(compositor_desktop_healthy());
+        session_refresh_screen();
         compositor_anim_tick();
+        if(boot_recovery_mode())fb_present();
         // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
         // to userspace now (the launcher, and the shell that reads fd 0); the
         // kernel keeps a SERIAL-ONLY console so selftests + state inspection stay
@@ -2355,10 +2402,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // the keyboard buffer a userspace reader owns, so there's no contention.
         // Polled (the UART RX IRQ is left disabled); the ~100Hz timer wakes the
         // hlt below, giving debug-console-grade latency. Drain the FIFO per pass.
-        while (serial_has_char()) {
-            char c = serial_read_char();
+        while (serial_has_char() || (boot_recovery_mode() && keyboard_has_char())) {
+            char c = serial_has_char()?serial_read_char():keyboard_getchar();
             if (c == '\r' || c == '\n') {
                 serial_write_char('\n');
+                if(boot_recovery_mode())console_putchar('\n');
                 cmd_buf[cmd_len] = '\0';
                 kernel_handle_line_command(cmd_buf);
                 cmd_len = 0;
@@ -2368,6 +2416,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             } else if (c >= 32 && c <= 126) {
                 if (cmd_len + 1 < sizeof cmd_buf) {
                     cmd_buf[cmd_len++] = c;
+                    if(boot_recovery_mode())console_putchar(c);
                     serial_write_char(c);        // echo so the remote terminal shows input
                 }
             }

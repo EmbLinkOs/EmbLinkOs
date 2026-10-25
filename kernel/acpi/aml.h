@@ -194,6 +194,8 @@ void aml_for_each_hid(const char *hid,
 /* ---- objects ------------------------------------------------------------ */
 struct aml_object *aml_integer(uint64_t v);
 struct aml_object *aml_string(const char *s);
+struct aml_object *aml_buffer(const uint8_t *,uint32_t);
+struct aml_object *aml_package(uint32_t);
 struct aml_object *aml_get(struct aml_object *o);   /* take a reference  */
 void               aml_put(struct aml_object *o);   /* drop one          */
 

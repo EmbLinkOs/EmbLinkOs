@@ -52,7 +52,7 @@ static const char *clip_text(void) {
 }
 static char A[32], B[32], C[32];
 static bool subA, subB, subC;
-static bool show_b = true, autofocus = true;
+static bool show_b = true, show_c=true, autofocus = true;
 static uint64_t page = 0x1111;            /* a keyed container: a new key is a new page */
 
 static void form(void) {
@@ -60,7 +60,7 @@ static void form(void) {
       if (autofocus) ui_text_field_autofocus();
       ui_text_field(A, sizeof A, "a");  subA = ui_text_field_submitted();
       if (show_b) { ui_text_field(B, sizeof B, "b");  subB = ui_text_field_submitted(); }
-      ui_password_field(C, sizeof C, "c"); subC = ui_text_field_submitted();
+      if(show_c){ui_password_field(C, sizeof C, "c"); subC = ui_text_field_submitted();}
     ui_end_stack();
 }
 static void frame(const char *keys) {
@@ -157,6 +157,37 @@ static float seg_x_for(int want) {
     return -1;
 }
 
+static bool control_pressed,control_toggled;
+static void control_frame(const char *keys) {
+    for(const char *k=keys;k&&*k;k++)ui_input_char(*k);
+    ui_frame_begin();ui_begin_vstack(0xc01720);
+    ui_text_field_autofocus();ui_text_field(A,sizeof A,"name");
+    if(ui_button_secondary("Apply"))control_pressed=true;
+    if(ui_toggle(control_toggled))control_toggled=!control_toggled;
+    ui_text_field(B,sizeof B,"next");ui_end_stack();ui_frame_end();ui_run_layout(400,300);
+}
+
+static struct instance_handle wrapped_last;
+static void scroll_wrapped(float *sc) {
+    ui_frame_begin();ui_scroll_begin(0x5C402,60,sc);
+    ui_begin_vstack(1);ui_set_size((struct layout_size){.mode=SIZE_FLEX,.flex_grow=1},(struct layout_size){.mode=SIZE_INTRINSIC});ui_set_align(ALIGN_STRETCH);
+    ui_set_font(ui_theme()->font_regular);ui_set_text_size(ui_theme()->text_body);
+    ui_text("Wrapped text must contribute its actual height to the scroll range, so the last control remains reachable.");
+    ui_text("Last control");
+    struct instance_handle content=ui_open();
+    wrapped_last=ui_next_sibling(ui_first_child(content));
+    ui_end_stack();ui_scroll_end();ui_frame_end();ui_run_layout(140,80);
+}
+
+static float nav_scroll;
+static void scroll_controls(void) {
+    ui_frame_begin();ui_scroll_begin(0xACC355,80,&nav_scroll);
+    for(unsigned i=0;i<10;i++) {
+        ui_begin_vstack(i+1);ui_button_primary("Reachable");ui_end_stack();
+    }
+    ui_scroll_end();ui_frame_end();ui_run_layout(400,100);
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -193,8 +224,8 @@ int main(void) {
     frame("x");
     CHECK(!strcmp(A, "testerx"), "Tab in the LAST field wraps to the first");
 
-    /* Hiding one field is NOT a new page: identity is positional, so the
-     * field after it inherits its instance -- and its focus. */
+    /* Removing a field preserves focus continuity within the same form,
+     * while keeping the surviving field's own identity. */
     frame("\t");                          /* focus to B */
     show_b = false;
     frame(NULL);
@@ -329,6 +360,13 @@ int main(void) {
     frame(COPY);
     CHECK(!strcmp(clip_text(), "world"), "Shift+Left selects, and copy puts it on the clipboard");
     CHECK(!strcmp(A, "hello world"), "copying does not change the text");
+
+    clip_set("a\r\nb\tc",6);frame(SALL "\xFF");
+    CHECK(!strcmp(A,"a b c") && !subA,"field paste replaces selection and cannot submit or traverse");
+    frame("!");CHECK(!strcmp(A,"a b c!"),"field paste collapses selection at the new caret");
+    memset(g_clip,'x',100);g_clip_n=100;frame(SALL "\xFF");
+    CHECK(!strcmp(A,"a b c!"),"oversized field paste keeps the original text");
+    frame("hello world");frame(SLEFT SLEFT SLEFT SLEFT SLEFT);
 
     frame("W");
     CHECK(!strcmp(A, "hello W"), "typing REPLACES the selection");
@@ -627,6 +665,14 @@ int main(void) {
               "content that fits shows no thumb at all");
     }
 
+    {
+        float sc=0,x,y,w,h;
+        scroll_wrapped(&sc);scroll_wrapped(&sc);
+        sc=100000;scroll_wrapped(&sc);scroll_wrapped(&sc);
+        CHECK(ui_rect_of(wrapped_last,&x,&y,&w,&h) && y>=-1 && y+h<=61,
+              "scrolling reaches the final control after nested text wraps");
+    }
+
     /* ---- SHIFT-CLICK ----------------------------------------------------
      *
      * Click once to place the caret, then shift-click elsewhere to take
@@ -696,6 +742,59 @@ int main(void) {
         seg_press(380, 12);
         CHECK(seg_pick == 2, "a press outside the control changes nothing");
     }
+
+    /* A queued Tab/Return/Space batch traverses fields AND controls once. */
+    A[0]=B[0]=0;control_pressed=control_toggled=false;
+    control_frame(0);control_frame(0);control_frame("x\t\n\t \ty");
+    CHECK(!strcmp(A,"x") && !strcmp(B,"y"),"Tab carries subsequent text through buttons into the next field");
+    CHECK(control_pressed && control_toggled,"Return activates a button and Space toggles without pointer input");
+
+    page=0xBACC;show_b=autofocus=true;A[0]=B[0]=C[0]=0;
+    frame(NULL);frame(NULL);frame("a\tb\tc");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('B',0);g_mods=0;
+    frame(NULL);frame(NULL);
+    CHECK(!strcmp(A,"a") && !strcmp(B,"bB") && !strcmp(C,"c"),
+          "Shift+Tab uses its queued modifiers and carries text to the previous field");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('C',0);
+    for(int i=0;i<4;i++)frame(NULL);
+    CHECK(!strcmp(A,"a") && !strcmp(B,"bB") && !strcmp(C,"cC"),
+          "multiple queued reverse Tabs wrap without replay or lost text");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_key('\t',0);ui_input_key('!',0);
+    for(int i=0;i<4;i++)frame(NULL);
+    CHECK(!strcmp(C,"cC!") && !strcmp(B,"bB"),"mixed forward/reverse traversal preserves key order");
+
+    /* A segmented control replacing a fixed-width row must not inherit it. */
+    struct instance_handle old_row;
+    ui_frame_begin();ui_begin_vstack(0x51e63);ui_begin_hstack(0);old_row=ui_open();
+    ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=25},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=25});
+    ui_text("old");ui_end_stack();ui_end_stack();ui_frame_end();ui_run_layout(400,100);
+    static const char *wide_choices[]={"Compact","Balanced","Comfortable"};
+    for(int pass=0;pass<2;pass++) {
+        ui_frame_begin();ui_begin_vstack(0x51e63);ui_segmented(wide_choices,3,1);ui_end_stack();ui_frame_end();ui_run_layout(400,100);
+    }
+    float oldx,oldy,neww,newh;
+    CHECK(ui_rect_of(old_row,&oldx,&oldy,&neww,&newh) && neww>180,"a reused segmented root releases an old fixed width");
+
+    ui_request_focus(INSTANCE_HANDLE_NULL);nav_scroll=0;scroll_controls();scroll_controls();
+    for(unsigned i=0;i<9;i++){ui_input_char('\t');scroll_controls();scroll_controls();}
+    CHECK(nav_scroll>100,"Tab reveals a focused control below a scroll viewport");
+    float manual_scroll=nav_scroll-20;nav_scroll=manual_scroll;scroll_controls();scroll_controls();
+    CHECK(nav_scroll==manual_scroll,"manual scrolling is not pinned to an unchanged focused control");
+    for(unsigned i=0;i<8;i++){ui_input_key('\t',UI_MOD_SHIFT);scroll_controls();scroll_controls();}
+    CHECK(nav_scroll<1,"reverse Tab reveals the first control again");
+
+    page=0xD15A;show_b=autofocus=true;A[0]=B[0]=C[0]=0;
+    frame(NULL);frame(NULL);frame("\t\t");
+    ui_input_key('\t',UI_MOD_SHIFT);ui_input_char('x');frame(NULL);
+    show_b=false;frame(NULL);
+    CHECK(!ui_keyboard_pending(),"removing a deferred traversal target stops pending builds");
+    frame(NULL);CHECK(!A[0] && !C[0],"keys for a removed target do not replay into another field");
+
+    page=0xD15B;show_b=show_c=autofocus=true;
+    frame(NULL);frame(NULL);frame("\t\t");
+    ui_input_key('\t',UI_MOD_SHIFT);frame(NULL);
+    show_b=show_c=false;frame(NULL);
+    CHECK(!ui_keyboard_pending(),"a destroyed transfer target cannot leave an idle application rebuilding forever");
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

@@ -329,6 +329,7 @@ static void app(void) {
 
 EM_APPLICATION {
     .title      = "Activity Monitor",
+    .min_size = { 540, 360 },
     .size       = { 720, 520 },
     .chrome     = Chromeless,
     .resize     = Resizable,

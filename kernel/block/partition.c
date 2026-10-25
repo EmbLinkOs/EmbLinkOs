@@ -1,3 +1,4 @@
+#include "boot/boot_protocol.h"
 #include "block/partition.h"
 #include "block/block.h"
 #include "include/kprintf.h"
@@ -44,6 +45,7 @@ struct embk_partition {
     struct embk_block_device *parent;    // underlying whole disk
     uint64_t                  start_lba;  // offset of this partition in parent
     bool                      in_use;
+    uint8_t guid[16];
 };
 
 // Pool of partition descriptors. The block registry caps total devices at
@@ -159,7 +161,7 @@ static int register_one_partition(struct embk_block_device *disk,
         return -EMBK_ENOMEM;
     }
 
-    memset(&p->dev, 0, sizeof(p->dev));
+    memset(p, 0, sizeof *p);
     p->parent    = disk;
     p->start_lba = start_lba;
 
@@ -268,8 +270,12 @@ static int gpt_scan(struct embk_block_device *disk) {
         if (last < first) continue;
         /* type is a 16-byte GUID; we log its first word purely as a hint. GPT
          * has no 1-byte type, so register_one_partition's `type` is cosmetic. */
-        if (register_one_partition(disk, i + 1, (uint8_t)e[0], first, last - first + 1) == EMBK_OK)
+        if (register_one_partition(disk, i + 1, (uint8_t)e[0], first, last - first + 1) == EMBK_OK) {
+            for(unsigned j=0;j<BLOCK_MAX_DEVICES;j++)
+                if(partitions[j].in_use && partitions[j].parent==disk && partitions[j].start_lba==first)
+                    memcpy(partitions[j].guid,e+16,16);
             registered++;
+        }
     }
     kprintf("part: %s: GPT, %d partition(s)\n", disk->name, registered);
     return registered;
@@ -290,7 +296,7 @@ static int ebr_walk(struct embk_block_device *disk, uint32_t ext_start, uint32_t
     int registered = 0;
 
     for (int guard = 0; guard < 32; guard++) {
-        uint8_t sec[512];
+        uint8_t sec[PART_MAX_BLOCK];
         if (embk_block_read(disk, cur, 1, sec) != EMBK_OK) break;
         if (sec[MBR_SIG_OFFSET] != MBR_SIG_0 || sec[MBR_SIG_OFFSET + 1] != MBR_SIG_1) break;
 
@@ -418,4 +424,45 @@ void embk_partition_scan_all(void) {
             kprintf("part: %s has no MBR partitions\n", disk->name);
         }
     }
+}
+/* Resolve the actual EFI loaded device, rather than enumeration order. */
+struct embk_block_device *embk_partition_boot_disk(void) {
+    const struct boot_protocol *bp = boot_protocol_get();
+    if (!bp) return NULL;
+    uint8_t any = 0;
+    for (unsigned j = 0; j < 16; j++) any |= bp->boot_partition_guid[j];
+    if (any) {
+        for (unsigned i = 0; i < BLOCK_MAX_DEVICES; i++)
+            if (partitions[i].in_use && !memcmp(partitions[i].guid, bp->boot_partition_guid, 16))
+                return partitions[i].parent;
+    }
+    if (bp->boot_disk_sig) {
+        uint8_t mbr[PART_MAX_BLOCK];
+        for (unsigned i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (embk_partition_parent(d) != d || (d->block_size != 512 && d->block_size != 4096)) continue;
+            if (!embk_block_read(d, 0, 1, mbr) && rd_le32(mbr + 440) == bp->boot_disk_sig)
+                return d;
+        }
+    }
+    return NULL;
+}
+
+struct embk_block_device *embk_partition_by_guid(const uint8_t guid[16],struct embk_block_device *parent) {
+    if(!guid)return NULL;
+    uint8_t any=0;for(unsigned i=0;i<16;i++)any|=guid[i];if(!any)return NULL;
+    struct embk_block_device *found=NULL;
+    for(unsigned i=0;i<BLOCK_MAX_DEVICES;i++)if(partitions[i].in_use &&
+       (!parent || partitions[i].parent==parent) && !memcmp(partitions[i].guid,guid,16)) {
+        if(found)return NULL;
+        found=&partitions[i].dev;
+    }
+    return found;
+}
+int embk_partition_guid(struct embk_block_device *dev,uint8_t out[16]) {
+    if(!dev || !out)return -EMBK_EINVAL;
+    for(unsigned i=0;i<BLOCK_MAX_DEVICES;i++)if(partitions[i].in_use && &partitions[i].dev==dev) {
+        memcpy(out,partitions[i].guid,16);return 0;
+    }
+    return -EMBK_ENODEV;
 }

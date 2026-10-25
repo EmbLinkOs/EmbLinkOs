@@ -34,6 +34,7 @@
 
 extern void shell_tty_suspend(void);   /* main.c: cooked for the child's lifetime */
 extern void shell_tty_resume(void);
+extern void shell_interrupt_route(int handle);
 
 /* Scratch fds for the shell's own ends of the plumbing. Above stdio+fd3,
  * below anything vfs_open would hand out mid-pipeline in practice. */
@@ -190,7 +191,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
          * simply says who ^C means while it is not the one running. Reclaimed
          * unconditionally after the wait below; leaving it pointing at a reaped
          * child would make the NEXT ^C silently do nothing. */
-        (void)embk_console_interrupt_route((int)child);
+        shell_interrupt_route((int)child);
     }
     if (child < 0) {
         embk_close_handle(pa[0]); embk_close_handle(pa[1]);
@@ -350,7 +351,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
     /* Take the console back: from here on ^C means THIS shell again. Done
      * unconditionally -- a route left pointing at a reaped child makes the next
      * ^C silently do nothing, which reads as a bug rather than a stale route. */
-    (void)embk_console_interrupt_route(-1);
+    shell_interrupt_route(-1);
 
     /* Console back in the shell's hands -> its own line editing resumes. One
      * resume here covers all three returns below. Route-clear and cooked-undo

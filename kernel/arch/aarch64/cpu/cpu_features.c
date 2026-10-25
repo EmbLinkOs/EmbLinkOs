@@ -30,7 +30,9 @@ uint64_t arm_read_pan(void) {
     /* PSTATE is not a register you can read whole; PAN comes back through
      * the "current PSTATE" accessor, where it sits at bit 22. */
     uint64_t v;
-    __asm__ volatile("mrs %0, pan" : "=r"(v));
+    /* Generic register spelling keeps the ARMv8.0 assembler baseline. Callers
+     * still check FEAT_PAN before reading this ARMv8.1 system register. */
+    __asm__ volatile("mrs %0, S3_0_C4_C2_3" : "=r"(v));
     return (v >> 22) & 1;
 }
 
