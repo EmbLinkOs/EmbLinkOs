@@ -124,7 +124,10 @@ class Machine:
                 "-device", "ahci,id=ahci",
                 "-drive", "if=none,id=sata,format=raw,file=%s" % self.sata,
                 "-device", "ide-hd,drive=sata,bus=ahci.0",
-                "-qmp", "unix:%s,server,nowait" % self.qmp_path]
+                "-qmp", "unix:%s,server,nowait" % self.qmp_path,
+                # Normal boots authenticate; every desktop test opts into the
+                # disposable live session the same way (docs/DAILY_USE.md).
+                "-fw_cfg", "name=opt/emblink/live,string=1"]
         if serial:
             argv += ["-serial", "unix:%s,server" % self.ser_path]
         self.log = bytearray()
