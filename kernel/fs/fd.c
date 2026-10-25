@@ -489,7 +489,7 @@ struct vm_object *vfs_fd_object(int fd) {
     struct vm_object *o=entry_object(&held);fd_return(&held);return o;
 }
 
-static int entry_fsync(struct fd_entry *e)
+int fd_sync_entry(struct fd_entry *e)
 {
     /* A pipe, a socket or the console has no device behind it and nothing
      * buffered on the caller's behalf. Succeeding is the true answer, not a
@@ -544,7 +544,7 @@ int vfs_rmdir_path(const char *path)
 
 int vfs_fd_fsync(int fd) {
     struct fd_entry held;int rc=fd_borrow(fd,&held);if(rc)return rc;
-    rc=entry_fsync(&held);fd_return(&held);return rc;
+    rc=fd_sync_entry(&held);fd_return(&held);return rc;
 }
 
 static bool fd_readable(int flags)

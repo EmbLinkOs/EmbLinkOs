@@ -205,7 +205,7 @@ static void network(void) {
         int tid=(int)embk_thread_create(delayed_reader,s);CHECK(tid>=0);
         uint64_t deadline=embk_uptime_ms()+5000;
         while(!__atomic_load_n(&read_started,__ATOMIC_ACQUIRE) && embk_uptime_ms()<deadline)embk_sleep_ms(1);
-        CHECK(read_started!=0);embk_sleep_ms(30);close(s);
+        CHECK(read_started!=0);embk_sleep_ms(30);CHECK(!read_finished);close(s);
         int reused=socket(AF_INET,SOCK_DGRAM,0);CHECK(reused==s);
         while(!__atomic_load_n(&read_finished,__ATOMIC_ACQUIRE) && embk_uptime_ms()<deadline)embk_sleep_ms(5);
         CHECK(read_finished && read_result);if(read_finished)CHECK(embk_thread_join(tid)==0);close(reused);

@@ -3542,6 +3542,11 @@ contour-test:
 	$(BUILD)/contour_test
 
 .PHONY: process-compat-test
+.PHONY: fd-sharing-test
+fd-sharing-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -O1 -g -ffunction-sections -fdata-sections --param asan-globals=0 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -Ikernel tests/process/fd_shared_host.c -Wl,--gc-sections -o $(BUILD)/fd-shared-sanitize
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD)/fd-shared-sanitize
+
 process-compat-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ikernel tests/process/pipe_host.c -o $(BUILD)/pipe_host_test
 	$(BUILD)/pipe_host_test

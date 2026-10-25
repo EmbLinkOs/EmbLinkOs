@@ -708,25 +708,14 @@ static int document_sync_test(void) {
     if(obj->dirty_pages!=0 || dirty!=1)fails++;
     vmo_put(obj);
 
-    /* Install only in this monitor thread's own unused descriptor slot. The
-     * automatic fixture objects outlive the call and are removed before return. */
-    struct fd_entry *table=current_process?current_process->fds:NULL;
-    int fd=-1;
-    if(table) {
-        mutex_lock(&current_process->fd_lock);
-        for(int i=3;i<FD_MAX_OPEN;i++)if(!table[i].used){fd=i;break;}
-    }
-    if(fd<0) {
-        if(table)mutex_unlock(&current_process->fd_lock);
-        kprintf("[cmd] test document sync: fixture fd unavailable -> FAIL\n");return fails+1;
-    }
+    /* Exercise the owned-entry sync backend directly. A stack fixture is not
+     * a published descriptor: it has no inheritable lifetime or table lock. */
     struct open_file file={.vn=vn,.refs=1,.obj=NULL};
-    table[fd]=(struct fd_entry){.used=true,.backing=FD_BACKING_VNODE};
-    table[fd].u.file.of=&file;sync_test_calls=0;sync_test_error=0;
-    if(vfs_fd_fsync(fd)!=EMBK_OK || sync_test_calls!=1)fails++;
+    struct fd_entry entry={.used=true,.backing=FD_BACKING_VNODE};
+    entry.u.file.of=&file;sync_test_calls=0;sync_test_error=0;
+    if(fd_sync_entry(&entry)!=EMBK_OK || sync_test_calls!=1)fails++;
     file.vn.type=VFS_DT_DIR;sync_test_error=-EMBK_EIO;
-    if(vfs_fd_fsync(fd)!=-EMBK_EIO || sync_test_calls!=2)fails++;
-    memset(&table[fd],0,sizeof table[fd]);mutex_unlock(&current_process->fd_lock);
+    if(fd_sync_entry(&entry)!=-EMBK_EIO || sync_test_calls!=2)fails++;
     kprintf("[cmd] test document sync: short writes remain dirty; clean-file and directory barriers/errors: %s\n",fails?"FAIL":"OK");
     return fails;
 }

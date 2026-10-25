@@ -183,6 +183,7 @@ int fd_borrow(int fd,struct fd_entry *copy);
 void fd_return(struct fd_entry *copy);
 int fd_read_entry(struct fd_entry *,void *,size_t,size_t *);
 int fd_write_entry(struct fd_entry *,const void *,size_t,size_t *);
+int fd_sync_entry(struct fd_entry *); /* caller owns backing; no fd lookup */
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */

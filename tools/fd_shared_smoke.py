@@ -21,13 +21,17 @@ def main():
                 except socket.timeout:continue
                 with c:
                     c.settimeout(.2)
+                    pending=bytearray()
                     while not stop.is_set():
                         try:data=c.recv(4096)
                         except socket.timeout:continue
                         if not data:break
                         received.extend(data)
-                        if data==b'delayed\n':time.sleep(.3)
-                        c.sendall(data)
+                        pending.extend(data)
+                        while b'\n' in pending:
+                            line,_,tail=pending.partition(b'\n');pending=bytearray(tail)
+                            if line==b'delayed':time.sleep(1)
+                            c.sendall(line+b'\n')
         except Exception as e:errors.append(str(e))
     def datagram():
         try:
@@ -65,12 +69,14 @@ def main():
         assert match and match[1]==match[2],text
         for _ in range(4):d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_move 120 120'});d.g.pump(.1)
         d.snap('shared-descriptors-and-append');print(match.group(),flush=True)
+        type_text('sh\n');eventually(prompt,'interactive sh prompt')
         type_text('/data/apps/fdprobe/fdprobe.elf --network\n')
         eventually(lambda:'Network: connected TCP' in screen.text(w) and prompt(),'graphical network ownership checks')
         text=screen.text(w);matches=re.findall(r'fdprobe: (\d+)/(\d+) checks passed',text)
         assert matches and all(a==b for a,b in matches),text
         d.snap('shared-socket-traffic')
         type_text('echo 82649\n');eventually(lambda:'82649' in screen.text(w).splitlines() and prompt(),'prompt after socket checks')
+        type_text('exit\n');eventually(prompt,'native prompt after sh')
         expected=b'child-net\nparent-net\nafter-kill\n'+b'delayed\n'*8
         assert bytes(received)==expected*2,(received,errors)
         assert datagrams==['datagram','','datagram',''] and not errors,(datagrams,errors)
