@@ -125,6 +125,10 @@ struct comp_window {
     uint64_t  kview;        /* kernel VA base of the flat view (== content)      */
     uint64_t  client_va;    /* base VA the pages are mapped at in the client     */
     uint64_t  client_pml4;  /* client address space, to unmap on teardown        */
+    /* ---- composing on the GPU: the image over `content` ---- */
+    uint32_t  gimg;         /* 0 = none yet                                      */
+    uint32_t *gimg_px;      /* the pixels and size it was made over, to notice   */
+    uint32_t  gimg_w, gimg_h; /* a resize swapping them                          */
 };
 
 static struct comp_window g_wins[COMP_MAX_WINDOWS];
@@ -239,6 +243,44 @@ static fb_color_t desktop_color(int y, int screen_h) {
     return FB_RGB(r, g, b);
 }
 
+/* ---- composing on the GPU ------------------------------------------------ *
+ * When the display driver can compose (gpu_driver.compose: virgl on a
+ * virtio-gpu, the blitter on an Intel Gen9), paint_region draws the same
+ * layers through it instead of into the backbuffer: the aurora, every
+ * window's shadow, chrome, glass and pixels, the motion ghost and the cursor,
+ * each an image the GPU keeps, so a frame moves only what changed -- the
+ * damage a window presented (uploaded for virgl; read in place by the
+ * blitter). What only the CPU can draw (the kernel's title bars) is drawn
+ * into the backbuffer as before, which is itself an image: the CANVAS. The
+ * framebuffer layer stops pushing the backbuffer while this is on
+ * (fb_set_composed_elsewhere): the scanout's pixels come from the GPU. Any
+ * failure -- the device, the host, an image that cannot be made -- ends it
+ * for good and repaints everything on the CPU, which always works.
+ *
+ * Images are destroyed through a list emptied at the next frame, because a
+ * window can die under the scheduler lock (compositor_reap_pid), where no
+ * device work may happen. The pages under a doomed image may be freed before
+ * it goes; that is safe, because nothing reads them after the frame they
+ * were last drawn in: virgl's host reads an image's pages only when a
+ * transfer asks it to, and the blitter's end() waits for the engine. */
+static const struct gpu_compose *g_gc;
+static int g_gc_asked;
+static uint32_t g_canvas_img, g_canvas_w, g_canvas_h;
+static void *g_canvas_px;
+static uint32_t g_aurora_img;
+static uint32_t g_cursor_img;
+static int g_cursor_img_stale = 1;
+static uint32_t g_snap_img;
+static uint32_t g_gpu_doomed[64];
+static unsigned g_gpu_ndoomed;
+
+static void gpu_image_doom(uint32_t *id) {
+    if (!*id) return;
+    if (g_gc && g_gpu_ndoomed < sizeof g_gpu_doomed / sizeof g_gpu_doomed[0])
+        g_gpu_doomed[g_gpu_ndoomed++] = *id;
+    *id = 0;
+}
+
 /* ---- aurora desktop field ----------------------------------------------- *
  * The signature EmbLink backdrop: soft overlapping color blobs (indigo, violet,
  * teal, a touch of magenta) on a near-black base. Built ONCE into a full-screen
@@ -251,7 +293,7 @@ static int g_aurora_w, g_aurora_h;
 
 static void aurora_build(int W, int H) {
     if (g_aurora && g_aurora_w == W && g_aurora_h == H) return;
-    if (g_aurora) { kfree(g_aurora); g_aurora = 0; g_aurora_w = g_aurora_h = 0; }
+    if (g_aurora) { gpu_image_doom(&g_aurora_img); kfree(g_aurora); g_aurora = 0; g_aurora_w = g_aurora_h = 0; }
     if (W <= 0 || H <= 0) return;
     uint32_t *buf = (uint32_t *)kmalloc((size_t)W * H * 4);
     if (!buf) return;
@@ -778,7 +820,9 @@ static void anim_start(struct comp_window *w, int kind) {
         g_anim.to[0] = full[0] + (full[2] - sw_) / 2;
         g_anim.to[1] = full[1] + (full[3] - sh_) / 2;
         g_anim.to[2] = sw_; g_anim.to[3] = sh_;
-        /* take the copy now, while the buffer is still ours */
+        /* take the copy now, while the buffer is still ours (a close already
+         * in flight for this window lets go of its own copy first) */
+        if (g_anim.snap) { gpu_image_doom(&g_snap_img); kfree(g_anim.snap); g_anim.snap = 0; }
         size_t n = (size_t)w->cw * w->ch;
         uint32_t *cp = (uint32_t *)kmalloc(n * 4);
         if (cp) {
@@ -800,7 +844,7 @@ static void anim_finish(void) {
     int last[4]; int had = g_anim.have_last;
     for (int i = 0; i < 4; i++) last[i] = g_anim.last[i];
     g_anim.kind = ANIM_NONE; g_anim.have_last = 0;
-    if (g_anim.snap) { kfree(g_anim.snap); g_anim.snap = 0; g_anim.snap_w = g_anim.snap_h = 0; }
+    if (g_anim.snap) { gpu_image_doom(&g_snap_img); kfree(g_anim.snap); g_anim.snap = 0; g_anim.snap_w = g_anim.snap_h = 0; }
     if (w) w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK);
     /* repaint the window's footprint AND wherever the ghost last was */
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -821,14 +865,72 @@ static void anim_finish(void) {
  * Chrome that used to be drawn in full on every partial repaint (the title-bar
  * fill and the border ring) is now clipped to the region, so a repaint that
  * doesn't reach a corner box can no longer square it off behind the carve's
- * back. The title text and window buttons stay unclipped: redrawing them
- * outside the region reproduces identical pixels over identical ones, and they
- * never reach the arcs. */
+ * back. The title text and the window's lights are clipped too -- to the
+ * region and to the bar. Drawn whole they were only harmless while nothing
+ * covered the bar: with another window over it, a repaint that touched the
+ * bar drew its lights on top of that window, outside the region, and nothing
+ * ever painted them away again (seen after a resolution change, as stray
+ * "x -" marks on Settings). */
 static void fill_clip(int x, int y, int w, int h, fb_color_t c,
                       int rx0, int ry0, int rx1, int ry1) {
     int x0 = imax(x, rx0), y0 = imax(y, ry0);
     int x1 = imin(x + w, rx1), y1 = imin(y + h, ry1);
     if (x1 > x0 && y1 > y0) fb_fill_rect(x0, y0, x1 - x0, y1 - y0, c);
+}
+
+/* A window's kernel title bar: the bar, its three lights and the title, in
+ * the backbuffer at the bar's place, all of it clipped to the bar and the
+ * region (see the compositing note above). */
+static void draw_titlebar(struct comp_window *w, int focused, int rx0, int ry0, int rx1, int ry1) {
+    int tbx0 = w->x, tby0 = w->y;
+    fb_set_clip(imax(rx0, tbx0), imax(ry0, tby0), imin(rx1, tbx0 + (int)w->cw), imin(ry1, tby0 + COMP_TITLEBAR_H));
+    fb_color_t bar = g_desktop.background;
+    fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
+
+    /* The lights. Dimmed as a set when the window is not focused --
+     * one lit corner on screen at a time says which window the
+     * keyboard belongs to, which is most of what an unfocused title
+     * bar is for. */
+    for (int i = 0; i < 3; i++) {
+        int lx0, ly0, lx1, ly1;
+        if (!win_light_rect(w, i, &lx0, &ly0, &lx1, &ly1)) break;
+        int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
+        unsigned tone=i==0?g_desktop.danger:i==1?g_desktop.secondary:g_desktop.accent;
+        int factor=focused?100:55;
+        int rr=((tone>>16)&255)*factor/100,gg=((tone>>8)&255)*factor/100,bb=(tone&255)*factor/100;
+        if(g_desktop.decoration==1)fb_fill_circle(cx,cy,COMP_DOT/2,FB_RGB(rr,gg,bb));
+        else if(g_desktop.decoration==2) {
+            fb_color_t edge=g_desktop.text;
+            fb_draw_line(cx-6,cy-6,cx+6,cy-6,edge);fb_draw_line(cx-6,cy+6,cx+6,cy+6,edge);
+            fb_draw_line(cx-6,cy-6,cx-6,cy+6,edge);fb_draw_line(cx+6,cy-6,cx+6,cy+6,edge);
+        }
+
+        /* The glyph, ALWAYS -- the toolkit's rule, for the same
+         * reason: nobody has learned this OS's window controls yet. */
+        fb_color_t ink=g_desktop.decoration==1?FB_RGB(0x1a,0x1a,0x1e):g_desktop.text;
+        if (i == 0) {                       /* close: a cross */
+            fb_draw_line(cx - 3, cy - 3, cx + 3, cy + 3, ink);
+            fb_draw_line(cx + 3, cy - 3, cx - 3, cy + 3, ink);
+        } else if (i == 1) {                /* minimize: a rule */
+            fb_draw_line(cx - 3, cy, cx + 3, cy, ink);
+        } else {                            /* zoom: a square */
+            fb_draw_line(cx - 3, cy - 3, cx + 3, cy - 3, ink);
+            fb_draw_line(cx - 3, cy + 3, cx + 3, cy + 3, ink);
+            fb_draw_line(cx - 3, cy - 3, cx - 3, cy + 3, ink);
+            fb_draw_line(cx + 3, cy - 3, cx + 3, cy + 3, ink);
+        }
+    }
+
+    /* The title sits after the lights, not at the window's edge: one
+     * region of chrome instead of two. */
+    {
+        int lx0, ly0, lx1, ly1;
+        int tx = win_light_rect(w, 2, &lx0, &ly0, &lx1, &ly1) ? lx1 + 8 : tbx0 + 12;
+        unsigned ink=g_desktop.text,bg=g_desktop.background;
+        fb_draw_string(w->title, tx, tby0 + (COMP_TITLEBAR_H - 16) / 2,
+                       ink>>16,(ink>>8)&255,ink&255,bg>>16,(bg>>8)&255,bg&255);
+    }
+    fb_reset_clip();
 }
 
 /* Draw one window's chrome + content clipped to region [rx0,ry0)-(rx1,ry1). */
@@ -873,54 +975,8 @@ static void paint_window(struct comp_window *w, int focused,
      *     the chromeless desktop layer. --- */
     if (!w->desktop && !w->chromeless) {
         int tbx0 = w->x, tby0 = w->y, tbx1 = w->x + (int)w->cw, tby1 = w->y + COMP_TITLEBAR_H;
-        if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
-            fb_color_t bar = g_desktop.background;
-            fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
-
-            /* The lights. Dimmed as a set when the window is not focused --
-             * one lit corner on screen at a time says which window the
-             * keyboard belongs to, which is most of what an unfocused title
-             * bar is for. */
-            for (int i = 0; i < 3; i++) {
-                int lx0, ly0, lx1, ly1;
-                if (!win_light_rect(w, i, &lx0, &ly0, &lx1, &ly1)) break;
-                int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
-                unsigned tone=i==0?g_desktop.danger:i==1?g_desktop.secondary:g_desktop.accent;
-                int factor=focused?100:55;
-                int rr=((tone>>16)&255)*factor/100,gg=((tone>>8)&255)*factor/100,bb=(tone&255)*factor/100;
-                if(g_desktop.decoration==1)fb_fill_circle(cx,cy,COMP_DOT/2,FB_RGB(rr,gg,bb));
-                else if(g_desktop.decoration==2) {
-                    fb_color_t edge=g_desktop.text;
-                    fb_draw_line(cx-6,cy-6,cx+6,cy-6,edge);fb_draw_line(cx-6,cy+6,cx+6,cy+6,edge);
-                    fb_draw_line(cx-6,cy-6,cx-6,cy+6,edge);fb_draw_line(cx+6,cy-6,cx+6,cy+6,edge);
-                }
-
-                /* The glyph, ALWAYS -- the toolkit's rule, for the same
-                 * reason: nobody has learned this OS's window controls yet. */
-                fb_color_t ink=g_desktop.decoration==1?FB_RGB(0x1a,0x1a,0x1e):g_desktop.text;
-                if (i == 0) {                       /* close: a cross */
-                    fb_draw_line(cx - 3, cy - 3, cx + 3, cy + 3, ink);
-                    fb_draw_line(cx + 3, cy - 3, cx - 3, cy + 3, ink);
-                } else if (i == 1) {                /* minimize: a rule */
-                    fb_draw_line(cx - 3, cy, cx + 3, cy, ink);
-                } else {                            /* zoom: a square */
-                    fb_draw_line(cx - 3, cy - 3, cx + 3, cy - 3, ink);
-                    fb_draw_line(cx - 3, cy + 3, cx + 3, cy + 3, ink);
-                    fb_draw_line(cx - 3, cy - 3, cx - 3, cy + 3, ink);
-                    fb_draw_line(cx + 3, cy - 3, cx + 3, cy + 3, ink);
-                }
-            }
-
-            /* The title sits after the lights, not at the window's edge: one
-             * region of chrome instead of two. */
-            {
-                int lx0, ly0, lx1, ly1;
-                int tx = win_light_rect(w, 2, &lx0, &ly0, &lx1, &ly1) ? lx1 + 8 : tbx0 + 12;
-                unsigned ink=g_desktop.text,bg=g_desktop.background;
-                fb_draw_string(w->title, tx, tby0 + (COMP_TITLEBAR_H - 16) / 2,
-                               ink>>16,(ink>>8)&255,ink&255,bg>>16,(bg>>8)&255,bg&255);
-            }
-        }
+        if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1))
+            draw_titlebar(w, focused, rx0, ry0, rx1, ry1);
     }
 
     /* --- content: blit only the sub-rectangle overlapping the region --- */
@@ -1108,6 +1164,250 @@ static void region_grow_corners(int *rx0, int *ry0, int *rx1, int *ry1) {
     }
 }
 
+/* ---- the GPU's frame ---------------------------------------------------- */
+/* The driver is asked once, at the first frame. Composition needs a 32-bit
+ * backbuffer: it becomes the canvas image. */
+static const struct gpu_compose *gpu_compose_now(void) {
+    if (g_gc_asked) return g_gc;
+    g_gc_asked = 1;
+    const struct gpu_driver *d = gpu_active();
+    const fb_info_t *fi = fb_get_info();
+    if (!d || !d->compose || !fi || fi->bpp != 32 || !fb_double_buffered())
+        return 0;
+    g_gc = d->compose();
+    if (g_gc) {
+        fb_set_composed_elsewhere(true);
+        kprintf("compositor: composing on the %s\n", g_gc->name);
+    }
+    return g_gc;
+}
+
+static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1);
+
+/* Something on the GPU's side failed: the CPU composes from now on. Images
+ * are let go if the device still listens; a full repaint replaces whatever
+ * half-frame the GPU was left with. */
+static void gpu_fall_back(const char *why) {
+    const struct gpu_compose *gc = g_gc;
+    if (!gc) return;
+    for (unsigned i = 0; i < g_gpu_ndoomed; i++) gc->image_destroy(g_gpu_doomed[i]);
+    g_gpu_ndoomed = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        if (g_wins[i].gimg) gc->image_destroy(g_wins[i].gimg);
+        g_wins[i].gimg = 0; g_wins[i].gimg_px = 0;
+    }
+    uint32_t *singles[] = { &g_canvas_img, &g_aurora_img, &g_cursor_img, &g_snap_img };
+    for (unsigned i = 0; i < 4; i++) { if (*singles[i]) gc->image_destroy(*singles[i]); *singles[i] = 0; }
+    g_canvas_px = 0;
+    g_gc = 0;
+    fb_set_composed_elsewhere(false);
+    g_cursor_under_valid = 0;
+    kprintf("compositor: GPU composition stopped (%s); composing on the CPU\n", why);
+    const fb_info_t *fi = fb_get_info();
+    if (fi) paint_region_cpu(0, 0, (int)fi->width, (int)fi->height);
+}
+
+/* A window's image, made again when its pixels were swapped (a resize). */
+static int gpu_window_image(struct comp_window *w) {
+    if (w->gimg && w->gimg_px == w->content && w->gimg_w == w->cw && w->gimg_h == w->ch) return 0;
+    gpu_image_doom(&w->gimg);
+    if (!w->content || g_gc->image_create(w->content, w->cw, w->ch, w->cw * 4, &w->gimg)) { w->gimg = 0; return -1; }
+    w->gimg_px = w->content; w->gimg_w = w->cw; w->gimg_h = w->ch;
+    return 0;
+}
+
+/* The canvas: the backbuffer, made again when a mode or layout change
+ * brought another one. */
+static int gpu_canvas(const fb_info_t *fi) {
+    void *px = fb_get_buffer();
+    if (g_canvas_img && g_canvas_px == px && g_canvas_w == fi->width && g_canvas_h == fi->height) return 0;
+    gpu_image_doom(&g_canvas_img);
+    if (!px || g_gc->image_create(px, fi->width, fi->height, fi->pitch, &g_canvas_img)) { g_canvas_img = 0; return -1; }
+    g_canvas_px = px; g_canvas_w = fi->width; g_canvas_h = fi->height;
+    return 0;
+}
+
+/* The cursor as one premultiplied picture: its shadow two pixels down and
+ * right, the outline, the fill -- the three layers draw_cursor blends one by
+ * one, blended here once. */
+static uint32_t g_cursor_px[CURSOR_W * CURSOR_H];
+static void cursor_layer_over(const uint32_t *layer, int ox, int oy) {
+    for (int y = 0; y < CURSOR_LAYER_H; y++)
+        for (int x = 0; x < CURSOR_LAYER_W; x++) {
+            uint32_t sp = layer[y * CURSOR_LAYER_W + x], a = sp >> 24;
+            if (!a) continue;
+            uint32_t *d = &g_cursor_px[(y + oy) * CURSOR_W + x + ox], dp = *d, inv = 255 - a;
+            uint32_t r = (((sp >> 16) & 255) * a + ((dp >> 16) & 255) * inv) / 255;
+            uint32_t g = (((sp >> 8) & 255) * a + ((dp >> 8) & 255) * inv) / 255;
+            uint32_t b = ((sp & 255) * a + (dp & 255) * inv) / 255;
+            uint32_t na = a + (dp >> 24) * inv / 255;
+            *d = (na << 24) | (r << 16) | (g << 8) | b;
+        }
+}
+
+static int gpu_cursor_image(void) {
+    if (!cursor_layers_ready) g_cursor_img_stale = 1;
+    cursor_prepare_layers();
+    if (g_cursor_img && !g_cursor_img_stale) return 0;
+    memset(g_cursor_px, 0, sizeof g_cursor_px);
+    cursor_layer_over(cursor_shadow, 2, 2);
+    cursor_layer_over(cursor_outer_layer, 0, 0);
+    cursor_layer_over(cursor_inner_layer, 0, 0);
+    if (g_cursor_img) g_gc->image_update(g_cursor_img, &(struct gpu_rect){ 0, 0, CURSOR_W, CURSOR_H });
+    else if (g_gc->image_create(g_cursor_px, CURSOR_W, CURSOR_H, CURSOR_W * 4, &g_cursor_img)) { g_cursor_img = 0; return -1; }
+    g_cursor_img_stale = 0;
+    return 0;
+}
+
+/* One window, as paint_window draws it. -1: the GPU could not. */
+static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0, int rx1, int ry1) {
+    const struct gpu_compose *gc = g_gc;
+    int fx0, fy0, fx1, fy1;
+    win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+    int shadow = win_shadows(w);
+    int px0 = fx0, py0 = fy0, px1 = fx1, py1 = fy1;
+    if (shadow) { px0 -= SHADOW_PAD; py0 -= SHADOW_PAD; px1 += SHADOW_PAD; py1 += SHADOW_PAD; }
+    if (px1 <= rx0 || px0 >= rx1 || py1 <= ry0 || py0 >= ry1) return 0;
+    if (!w->presented || (!session_ui_allowed(w->pid) || !on_workspace(w))) return 0;
+    if (gpu_window_image(w)) return -1;
+
+    struct gpu_rect frame = { fx0, fy0, fx1 - fx0, fy1 - fy0 };
+    int round = shadow;                    /* the same set paint_window carves */
+    uint32_t radius = round ? (uint32_t)WIN_RADIUS : 0;
+    int chrome = !w->desktop && !w->chromeless;
+    uint32_t ring_rgb = focused ? g_desktop.accent : g_desktop.text;
+
+    if (shadow && g_desktop.shadows) {
+        int sw_ = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
+        int sa_ = (focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE) * (g_desktop.shadows == 2 ? 3 : 2) / 2;
+        struct gpu_rect cast = { fx0, fy0 + SHADOW_DY, fx1 - fx0, fy1 - fy0 };
+        gc->shadow(&cast, &frame, radius, (uint32_t)sw_, (uint32_t)sa_);
+    }
+
+    if (chrome) {
+        int tbx0 = w->x, tby0 = w->y, tbx1 = w->x + (int)w->cw, tby1 = w->y + COMP_TITLEBAR_H;
+        if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
+            draw_titlebar(w, focused, rx0, ry0, rx1, ry1);      /* into the canvas */
+            const fb_info_t *fi = fb_get_info();
+            int x0 = imax(tbx0, 0), y0 = imax(tby0, 0);
+            int x1 = imin(tbx1, (int)fi->width), y1 = imin(tby1, (int)fi->height);
+            if (x1 > x0 && y1 > y0) {
+                struct gpu_rect bar = { x0, y0, x1 - x0, y1 - y0 };
+                gc->image_update(g_canvas_img, &bar);
+                struct gpu_draw d = { .image = g_canvas_img, .src = bar, .dst = bar, .opaque = 1, .opacity = 255,
+                                      .radius = (uint8_t)radius, .ring = 1, .frame = frame, .ring_rgb = ring_rgb };
+                gc->draw(&d);
+            }
+        }
+    }
+
+    int cx0 = w->x, cy0 = w->y + win_titlebar_h(w);
+    int sx0 = imax(cx0, rx0), sy0 = imax(cy0, ry0);
+    int sx1 = imin(cx0 + (int)w->cw, rx1), sy1 = imin(cy0 + (int)w->ch, ry1);
+    if (sx1 > sx0 && sy1 > sy0) {
+        struct gpu_rect all = { 0, 0, (int32_t)w->cw, (int32_t)w->ch };
+        struct gpu_rect at = { cx0, cy0, (int32_t)w->cw, (int32_t)w->ch };
+        struct gpu_rect shown = { sx0, sy0, sx1 - sx0, sy1 - sy0 };
+        struct gpu_draw d = { .image = w->gimg, .src = all, .dst = at, .opaque = 1, .opacity = 255,
+                              .radius = (uint8_t)radius, .ring = (uint8_t)chrome, .frame = frame, .ring_rgb = ring_rgb };
+        if (w->glass) {
+            /* frost what is already drawn behind; a glass widget lays its
+             * translucent tint over it, an acrylic window its opaque pixels at
+             * a uniform translucency (paint_window's two cases) */
+            if (GLASS_BLUR > 0) gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius);
+            if (w->widget && GLASS_ALPHA == 255) gc->fill(&shown, g_desktop.background);
+            if (w->widget) d.opaque = 0;
+            else d.opacity = (uint8_t)GLASS_ALPHA;
+        } else if (w->desktop || w->translucent) {
+            if (w->blur_set && GLASS_BLUR > 0) {
+                int bx0 = imax(sx0, cx0 + w->blur_x), by0 = imax(sy0, cy0 + w->blur_y);
+                int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w), by1 = imin(sy1, cy0 + w->blur_y + w->blur_h);
+                if (bx1 > bx0 && by1 > by0) {
+                    struct gpu_rect b = { bx0, by0, bx1 - bx0, by1 - by0 };
+                    gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0);
+                }
+            }
+            d.opaque = 0;
+        }
+        gc->draw(&d);
+    }
+    return 0;
+}
+
+/* paint_region on the GPU. 0: drawn and shown; -1: the GPU could not. */
+static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
+    const struct gpu_compose *gc = g_gc;
+    const fb_info_t *fi = fb_get_info();
+    int W = (int)fi->width, H = (int)fi->height;
+    for (unsigned i = 0; i < g_gpu_ndoomed; i++) gc->image_destroy(g_gpu_doomed[i]);
+    g_gpu_ndoomed = 0;
+    if (gpu_canvas(fi)) return -1;
+    /* aurora_build dooms the image whenever it lets go of the field, so an
+     * image there is always over the field there is. */
+    aurora_build(W, H);
+    if (g_aurora && !g_aurora_img && g_gc->image_create(g_aurora, (uint32_t)W, (uint32_t)H, (uint32_t)W * 4, &g_aurora_img)) {
+        g_aurora_img = 0;
+        return -1;
+    }
+    if (g_cursor_valid && gpu_cursor_image()) return -1;
+
+    struct gpu_rect dmg = { rx0, ry0, rx1 - rx0, ry1 - ry0 };
+    /* Without the aurora, the gradient is drawn on the canvas and shown from it. */
+    if (!g_aurora_img) {
+        for (int y = ry0; y < ry1; y++) fb_fill_rect(rx0, y, rx1 - rx0, 1, desktop_color(y, H));
+        gc->image_update(g_canvas_img, &dmg);
+    }
+    if (gc->begin(&dmg)) return -1;
+    struct gpu_draw bg = { .image = g_aurora_img ? g_aurora_img : g_canvas_img, .src = dmg, .dst = dmg,
+                           .opaque = 1, .opacity = 255 };
+    gc->draw(&bg);
+
+    int tz = top_z(), drawn = 0, last_z = -1;
+    while (drawn < COMP_MAX_WINDOWS) {
+        int best = -1;
+        for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+            if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+            if (g_wins[i].z <= last_z) continue;
+            if (best < 0 || g_wins[i].z < g_wins[best].z) best = i;
+        }
+        if (best < 0) break;
+        if (paint_window_gpu(&g_wins[best], g_wins[best].z == tz, rx0, ry0, rx1, ry1)) return -1;
+        last_z = g_wins[best].z;
+        drawn++;
+    }
+
+    if (g_anim.kind != ANIM_NONE) {
+        uint32_t ghost = 0; int sw_ = 0, sh_ = 0;
+        if (g_anim.snap) {
+            /* anim_finish dooms it with the copy, so one here is of this copy */
+            if (!g_snap_img && g_gc->image_create(g_anim.snap, (uint32_t)g_anim.snap_w, (uint32_t)g_anim.snap_h,
+                                                  (uint32_t)g_anim.snap_w * 4, &g_snap_img)) { g_snap_img = 0; return -1; }
+            ghost = g_snap_img; sw_ = g_anim.snap_w; sh_ = g_anim.snap_h;
+        } else {
+            struct comp_window *aw_ = win_by_id(g_anim.win_id);
+            if (aw_ && aw_->content) {
+                if (gpu_window_image(aw_)) return -1;
+                ghost = aw_->gimg; sw_ = (int)aw_->cw; sh_ = (int)aw_->ch;
+            }
+        }
+        if (ghost) {
+            int r[4], alpha; anim_frame_rect(r, &alpha);
+            if (alpha > 0 && r[2] > 0 && r[3] > 0) {
+                struct gpu_draw d = { .image = ghost, .src = { 0, 0, sw_, sh_ }, .dst = { r[0], r[1], r[2], r[3] },
+                                      .opaque = 1, .opacity = (uint8_t)alpha };
+                gc->draw(&d);
+            }
+        }
+    }
+
+    if (g_cursor_valid) {
+        struct gpu_draw d = { .image = g_cursor_img, .src = { 0, 0, CURSOR_W, CURSOR_H },
+                              .dst = { g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H }, .opaque = 0, .opacity = 255 };
+        gc->draw(&d);
+    }
+    return gc->end();
+}
+
 static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
@@ -1116,6 +1416,16 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;
     if (rx1 > W) rx1 = W; if (ry1 > H) ry1 = H;
     if (rx1 <= rx0 || ry1 <= ry0) return;
+    if (gpu_compose_now()) {
+        if (paint_region_gpu(rx0, ry0, rx1, ry1)) gpu_fall_back("a frame could not be drawn");
+        return;
+    }
+    paint_region_cpu(rx0, ry0, rx1, ry1);
+}
+
+static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
+    const fb_info_t *fi = fb_get_info();
+    int W = (int)fi->width, H = (int)fi->height;
 
     /* Remove the software cursor before changing the composed framebuffer.
      * This also guarantees that its saved background never contains a previous
@@ -1211,6 +1521,8 @@ static void enforce_focus(void) {
  * the client first and freed exactly once here (not again by the client's
  * address-space teardown). */
 static void win_free_backing(struct comp_window *w) {
+    gpu_image_doom(&w->gimg);
+    w->gimg_px = 0;
     if (w->shared) {
         if (w->client_pml4 && w->client_va) {
             for (uint32_t i = 0; i < w->npages; i++)
@@ -1499,6 +1811,7 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
+    gpu_image_doom(&w->gimg);                    /* it was over the old pages */
     win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);   /* new footprint */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
     spin_unlock(&g_comp_lock);
@@ -1584,6 +1897,10 @@ int64_t compositor_win_damage(int pid, uint32_t id,
      * the frame origin for the chromeless desktop) */
     int sx0 = w->x + (int)rx;
     int sy0 = w->y + win_titlebar_h(w) + (int)ry;
+    /* the GPU's copy of these pixels is stale exactly there (an image not
+     * made yet is made whole when it is first drawn) */
+    if (g_gc && w->gimg && w->gimg_px == w->content)
+        g_gc->image_update(w->gimg, &(struct gpu_rect){ (int32_t)rx, (int32_t)ry, (int32_t)rw, (int32_t)rh });
     if (!w->presented) {
         /* first real frame: this is the moment the window becomes something
          * worth showing, so this -- not create -- is where it grows in. */
@@ -2014,6 +2331,12 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
     int stepx = ((x1 - x0) / 64) + 1, stepy = ((y1 - y0) / 8) + 1;
     uint64_t sum = 0; uint32_t n = 0;
     spin_lock(&g_comp_lock);
+    /* composed on the GPU: the screen is there, not in the backbuffer -- read
+     * it back into the backbuffer first (the scanout's own pages) */
+    if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {
+        spin_unlock(&g_comp_lock);
+        return -1;
+    }
     for (int yy = y0; yy < y1; yy += stepy) {
         for (int xx = x0; xx < x1; xx += stepx) {
             uint32_t c = fb_get_pixel((uint32_t)xx, (uint32_t)yy);
@@ -2051,6 +2374,10 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
     if (need > cap) return -1;
     uint32_t n = 0;
     spin_lock(&g_comp_lock);
+    if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {   /* see backdrop_luma */
+        spin_unlock(&g_comp_lock);
+        return -1;
+    }
     for (int yy = y0; yy < y1; yy++)
         for (int xx = x0; xx < x1; xx++)
             out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
@@ -2220,8 +2547,8 @@ void compositor_pointer_tick(void) {
 
     if (!g_cursor_valid) {
         g_cursor_x = x; g_cursor_y = y; g_cursor_valid = 1;
-        cursor_capture_and_draw();
-        fb_present();
+        if (g_gc) paint_region(x, y, x + CURSOR_W, y + CURSOR_H);
+        else { cursor_capture_and_draw(); fb_present(); }
     }
 
     int raised = 0;
@@ -2346,16 +2673,29 @@ void compositor_pointer_tick(void) {
      * the old cursor is erased and the new one drawn (paint_region stamps the
      * cursor at g_cursor_* last). */
     int cursor_moved = (x != g_cursor_x || y != g_cursor_y);
+    int ocx = g_cursor_x, ocy = g_cursor_y;
     if (cursor_moved) {
         cursor_restore_under();
         g_cursor_x = x; g_cursor_y = y;
     }
 
+    /* On the GPU there is no save-under: where the cursor was is drawn again
+     * from the layers, and where it is now with them. */
     if (have) {
+        if (g_gc && cursor_moved) {
+            DIRTY(ocx, ocy, ocx + CURSOR_W, ocy + CURSOR_H);
+            DIRTY(x, y, x + CURSOR_W, y + CURSOR_H);
+        }
         paint_region(bx0, by0, bx1, by1);
     } else if (cursor_moved) {
-        cursor_capture_and_draw();
-        fb_present();
+        if (g_gc) {
+            int near_ = x < ocx + 2 * CURSOR_W && ocx < x + 2 * CURSOR_W && y < ocy + 2 * CURSOR_H && ocy < y + 2 * CURSOR_H;
+            if (near_) paint_region(imin(x, ocx), imin(y, ocy), imax(x, ocx) + CURSOR_W, imax(y, ocy) + CURSOR_H);
+            else { paint_region(ocx, ocy, ocx + CURSOR_W, ocy + CURSOR_H); paint_region(x, y, x + CURSOR_W, y + CURSOR_H); }
+        } else {
+            cursor_capture_and_draw();
+            fb_present();
+        }
     }
     if (raised) enforce_focus();   /* demote whoever used to be front */
 
@@ -2604,6 +2944,15 @@ int compositor_desktop_healthy(void) {
     spin_unlock(&g_comp_lock);return desktop && strip;
 }
 
+/* What composes the desktop: 1 and its name when a GPU does, else 0. */
+int compositor_renderer(char *name, unsigned len) {
+    spin_lock(&g_comp_lock);
+    const struct gpu_compose *gc = g_gc;
+    if (name && len) snprintf(name, len, "%s", gc ? gc->name : "Software");
+    spin_unlock(&g_comp_lock);
+    return gc != 0;
+}
+
 void compositor_display_lock(void) {spin_lock(&g_comp_lock);}
 void compositor_display_unlock(void) {spin_unlock(&g_comp_lock);}
 /* A new surface -- and, with several monitors, a new arrangement of them.
@@ -2641,6 +2990,7 @@ struct fb_surface *compositor_select_layout(struct fb_surface *next, const struc
         const fb_info_t *fi=fb_get_info();
         struct gpu_layout now=gl?*gl:(struct gpu_layout){1,0,{{1,0,0,fi->width,fi->height}}};
         g_cursor_under_valid=0;g_cursor_valid=0;
+        gpu_image_doom(&g_canvas_img);   /* over the old backbuffer, which is released after this */
         g_cap_pid=0;g_cap_win=0;g_dragging=0;g_drag_on=0;g_ptr_buttons=0;g_buttons_suppressed=1;
         anim_finish();
         g_nouts=0;

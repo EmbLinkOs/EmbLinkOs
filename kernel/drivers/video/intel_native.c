@@ -21,6 +21,8 @@
 #include "drivers/video/intel_dpaux.h"
 #include "drivers/video/intel_gmbus.h"
 #include "drivers/video/intel_mmio.h"
+#include "drivers/video/intel_blt.h"
+#include "drivers/video/intel_compose.h"
 #include "drivers/video/framebuffer.h"
 #include "display/edid.h"
 #include "display/edid_modes.h"
@@ -72,10 +74,11 @@ struct output {
 
 static struct {
     int ready;
+    uint8_t bus, dev, fn;
     struct intel_regs regs;
     struct intel_hw hw;
     struct intel_vbt vbt;
-    uint64_t aperture, aperture_size, gtt_phys;
+    uint64_t aperture, aperture_size, gtt_phys, gtt_window;   /* gtt_window: BAR0's upper half, the GSM's most */
     uint16_t lat[INTEL_WM_LEVELS];
     uint8_t  a_lanes;
     struct output out[MAX_OUT];       /* out[0]: the panel */
@@ -589,10 +592,12 @@ int intel_native_init(const struct intel_native_probe *p)
 {
     memset(&g, 0, sizeof g);
     g.boot_slot = -1;
+    g.bus = p->bus; g.dev = p->dev; g.fn = p->fn;
     intel_regs_init_mmio(&g.regs, p->mmio);
     g.aperture = p->aperture;
     g.aperture_size = p->aperture_size;
     g.gtt_phys = p->bar0 + p->bar0_size / 2;
+    g.gtt_window = p->bar0_size / 2;
     if (p->bar0_size < 0x1000000u || !p->aperture_size) {
         kprintf("intel-native: BAR0 %lu MiB / aperture %lu MiB: no GGTT window to place framebuffers\n",
                 (unsigned long)(p->bar0_size >> 20), (unsigned long)(p->aperture_size >> 20));
@@ -705,6 +710,7 @@ bool intel_native_release(const struct gpu_target *t)
     if (s >= MAX_FBS || !g.fb[s].used) return true;
     if (EDP->lit && EDP->cfg.surf_ggtt == g.fb[s].ggtt) return false;   /* still on screen */
     if ((int)s == g.boot_slot) g.boot_slot = -1;
+    intel_compose_forget_front(g.fb[s].ggtt);                  /* the blitter stops writing it first */
     fb_free(s);
     return true;
 }
@@ -1050,4 +1056,110 @@ bool intel_native_apply_layout(const struct gpu_target *t, const struct gpu_layo
                 l->out[order[k]].x, l->out[order[k]].y, 'A' + c->pipe, want[order[k]].stays ? " (plane moved)" : "");
     }
     return true;
+}
+
+/* ---- composing with the blitter ----------------------------------------------
+ * The compositor asks once it draws (gpu_driver.compose). The engine gets the
+ * GGTT entries mapped once -- sized from GMCH_CTRL, as i915 sizes them -- and
+ * its own pages placed ABOVE the aperture: the GPU reaches all of the GGTT,
+ * the CPU only the aperture, which stays for framebuffers. Frames go to the
+ * surface on screen, whichever fb_select_* made current. */
+static volatile uint64_t *g_gsm;
+static uint32_t g_gsm_entries, g_blt_next;
+
+static uint64_t gm_page_alloc(void *c)
+{
+    (void)c;
+    uint64_t p = pmm_alloc_page();
+    if (p) memset((void *)(uintptr_t)P2V(p), 0, PAGE);
+    return p;
+}
+static void gm_page_free(void *c, uint64_t p) { (void)c; pmm_free_page(p); }
+static void *gm_page_kva(void *c, uint64_t p) { (void)c; return (void *)(uintptr_t)P2V(p); }
+/* Through a walk that knows huge pages: the kernel image and the direct map
+ * are mapped in 2 MiB ones, and the cursor's picture lives in the image. */
+static uint64_t gm_va_phys(void *c, const void *va)
+{
+    (void)c;
+    struct vmm_walk_result w;
+    vmm_walk(vmm_get_kernel_pml4(), (uint64_t)(uintptr_t)va, &w);
+    return w.mapped ? w.phys & ~(uint64_t)(PAGE - 1) : 0;
+}
+static void gm_ggtt_set(void *c, uint32_t i, uint64_t pte) { (void)c; if (i < g_gsm_entries) g_gsm[i] = pte; }
+static uint64_t gm_ggtt_get(void *c, uint32_t i) { (void)c; return i < g_gsm_entries ? g_gsm[i] : 0; }
+static uint32_t gm_ggtt_reserve(void *c, uint32_t pages)
+{
+    (void)c;
+    uint64_t at = g_blt_next, end = at + (((uint64_t)pages * PAGE + 0xffffu) & ~0xffffull);
+    if (end > (uint64_t)g_gsm_entries * PAGE || end > 0xffffffffull) return 0;
+    g_blt_next = (uint32_t)end;
+    return (uint32_t)at;
+}
+static void gm_ggtt_release(void *c, uint32_t ggtt, uint32_t pages)
+{
+    (void)c;
+    uint32_t end = ggtt + ((pages * PAGE + 0xffffu) & ~0xffffu);
+    if (end == g_blt_next) g_blt_next = ggtt;               /* the last placed: give it back */
+}
+static const struct intel_gpu_mem gm_ops = {
+    gm_page_alloc, gm_page_free, gm_page_kva, gm_va_phys, gm_ggtt_set, gm_ggtt_get,
+    gm_ggtt_reserve, gm_ggtt_release, 0,
+};
+
+static int ic_front(void *c, uint32_t *ggtt, uint32_t *pitch, uint32_t *w, uint32_t *h)
+{
+    (void)c;
+    const struct gpu_target *t = fb_current_target();
+    if (!t || !t->mode.width || !t->mode.height) return -1;
+    if (t->resource_id) {
+        unsigned s = t->resource_id - 1u;
+        if (s >= MAX_FBS || !g.fb[s].used) return -1;
+        *ggtt = g.fb[s].ggtt;
+    } else {
+        if (!g.fw_bytes) return -1;
+        *ggtt = g.fw_ggtt;                                   /* the firmware's own framebuffer */
+    }
+    *pitch = t->mode.pitch; *w = t->mode.width; *h = t->mode.height;
+    return 0;
+}
+static void *ic_back(void *c, uint32_t *pitch)
+{
+    (void)c;
+    const fb_info_t *fi = fb_get_info();
+    *pitch = fi ? fi->pitch : 0;
+    return fb_get_buffer();
+}
+static void *ic_alloc(void *c, uint64_t bytes, void **raw)
+{
+    (void)c;
+    uint8_t *p = (uint8_t *)kmalloc(bytes + PAGE);
+    *raw = p;
+    return p ? (void *)(((uintptr_t)p + PAGE - 1) & ~(uintptr_t)(PAGE - 1)) : 0;
+}
+static void ic_free(void *c, void *raw) { (void)c; kfree(raw); }
+
+const struct gpu_compose *intel_native_compose(void)
+{
+    static int tried;
+    static struct intel_compose_env env;
+    if (!tried) {
+        tried = 1;
+        if (!g.ready) return 0;
+        uint16_t gmch = pci_read16(g.bus, g.dev, g.fn, 0x50);
+        uint32_t ggms = (gmch >> 6) & 3u, gsm = ggms ? (1u << ggms) << 20 : 0;
+        if (!gsm || gsm > g.gtt_window) {
+            kprintf("intel-native: no GGTT size in GMCH_CTRL (%04x); composing on the CPU\n", gmch);
+            return 0;
+        }
+        g_gsm = (volatile uint64_t *)map_phys(g.gtt_phys, gsm);
+        if (!g_gsm) return 0;
+        g_gsm_entries = gsm / 8u;
+        g_blt_next = (uint32_t)((g.aperture_size + 0xffffu) & ~0xffffull);
+        struct intel_blt *b = intel_blt_init(&g.regs, &gm_ops);
+        if (!b) return 0;
+        env = (struct intel_compose_env){ b, &gm_ops, ic_front, ic_back, ic_alloc, ic_free, 0 };
+        if (intel_compose_init(&env)) return 0;
+        kprintf("intel-native: composing with the blitter (%u MiB GGTT)\n", g_gsm_entries * PAGE >> 20);
+    }
+    return intel_compose();
 }

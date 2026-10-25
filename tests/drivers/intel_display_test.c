@@ -29,6 +29,7 @@ bool intel_native_release(const struct gpu_target *t){(void)t;return true;}
 void intel_native_describe(struct embk_monitor_info *i){(void)i;}
 unsigned intel_native_output_count(void){return 1;}
 bool intel_native_output_info(unsigned i,struct gpu_output *o){(void)i;(void)o;return false;}
+const struct gpu_compose *intel_native_compose(void){return 0;}
 int intel_native_poll_outputs(void){return 0;}
 bool intel_native_apply_layout(const struct gpu_target *t,const struct gpu_layout *l){(void)t;(void)l;return false;}
 static void fixture(void){memset(regs,0,sizeof regs);regs[0x70180/4]=(1u<<31)|(4u<<24);regs[0x70188/4]=120;regs[0x70190/4]=(1079u<<16)|1919;regs[0x7019c/4]=0x1000;regs[PWM_CTL/4]=(1u<<31)|(1u<<29);regs[PWM_FREQ/4]=(1000u<<16)|600;}

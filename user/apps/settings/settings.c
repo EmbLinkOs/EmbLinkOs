@@ -690,7 +690,7 @@ static void pane_display(void) {
             ListRow(IconGrid,"Desktop",desk);
         }else ListRow(IconGrid,"Resolution",g_res);
         ListRow(IconInfo,"Graphics",g_graphics.driver);
-        ListRow(IconInfo,"Rendering","Software");
+        ListRow(IconInfo,"Rendering",(g_graphics.flags&EMBK_GPU_COMPOSED)?g_graphics.renderer:"Software");
     }
     if(several)pane_arrangement();
     else Section("Display") {

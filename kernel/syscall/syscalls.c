@@ -2745,7 +2745,7 @@ static int64_t sys_gpu_info(const struct sysargs *a) {
     if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU)))return -EMBK_EPERM;
     if(a->arg[1]!=sizeof(struct embk_gpu_info))return -EMBK_EINVAL;
     struct embk_gpu_info info;memset(&info,0,sizeof info);info.version=EMBK_GPU_VERSION;
-    info.flags=EMBK_GPU_SOFTWARE_RENDERING;
+    info.flags=compositor_renderer(info.renderer,sizeof info.renderer)?EMBK_GPU_COMPOSED:EMBK_GPU_SOFTWARE_RENDERING;
     compositor_display_lock();
     const fb_info_t *fb=fb_get_info();const struct gpu_driver *gpu=gpu_active();
     if(fb){info.width=fb->width;info.height=fb->height;info.pitch=fb->pitch;info.bpp=fb->bpp;}

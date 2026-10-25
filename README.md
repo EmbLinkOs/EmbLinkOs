@@ -110,10 +110,15 @@ executable format (EMBX) — which it uses to rebuild its userland on itself.
 - PCI enumeration, HPET/PIT/RTC timers.
 
 **Display & UI**
-- GPU driver with automatic fallback: virtio-gpu → Bochs DISPI → VBE.
-- Live VirtIO/Bochs resolution changes with confirmation, automatic rollback,
-  per-user persistence and desktop/app reflow; validated monitor identity from
-  EDID. Physical native modesetting and accelerated rendering remain open.
+- GPU driver with automatic fallback: virtio-gpu → Bochs DISPI → VBE, and
+  native modesetting on Intel Gen9 laptops.
+- Live resolution changes with confirmation, automatic rollback, per-user
+  persistence and desktop/app reflow; several monitors as one desktop;
+  validated monitor identity from EDID.
+- The desktop **composed on the GPU**: through virgl on QEMU's virtio-vga-gl,
+  with the Gen9 blitter on Intel, the CPU everywhere else
+  ([docs/DISPLAYS.md](docs/DISPLAYS.md#gpu-composition)). The Intel paths have
+  not yet run on physical hardware.
 - An in-kernel **window compositor** (`kernel/gfx/compositor.c`): z-ordered
   windows, kernel-drawn or app-owned ("chromeless") chrome, zero-copy
   shared-memory windows, resizable windows, and always-on-desktop widgets in

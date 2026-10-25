@@ -47,4 +47,9 @@ bool intel_native_output_info(unsigned i, struct gpu_output *out);
 int  intel_native_poll_outputs(void);
 bool intel_native_apply_layout(const struct gpu_target *t, const struct gpu_layout *l);
 
+/* Composing the desktop with the Gen9 blitter (gpu_driver.compose): the
+ * engine is brought up and probed the first time this is asked; NULL when
+ * it would not come, and the CPU composes. */
+const struct gpu_compose *intel_native_compose(void);
+
 #endif

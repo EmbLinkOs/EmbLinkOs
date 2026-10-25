@@ -46,3 +46,10 @@ int boot_qemu_outputs(void) {
     int v=qemu_byte(name,sizeof name);
     return v>='1' && v<='4'?v-'0':0;
 }
+/* Composition stays on the CPU when a test asks for it with -fw_cfg
+ * name=opt/emblink/compose,string=0 -- how one VM, GPU and all, shows both
+ * paths side by side. */
+int boot_qemu_cpu_compose(void) {
+    static const char name[]="opt/emblink/compose";
+    return qemu_byte(name,sizeof name)=='0';
+}

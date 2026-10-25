@@ -97,6 +97,50 @@ struct gpu_driver {
     // How many outputs can be lit at once (a display engine's pipes); 0: as
     // many as it has.
     unsigned max_lit;
+
+    // Optional: composing the desktop on the GPU (see gpu_compose below).
+    // NULL when this device, or this host, cannot.
+    const struct gpu_compose *(*compose)(void);
+};
+
+// ---------------------------------------------------------------------------
+// GPU composition. The compositor draws a frame with these instead of the CPU
+// primitives: images are window surfaces (and its own pictures: background,
+// cursor, decorations), each backed by the pages the CPU already has, which
+// the GPU re-reads only where told they changed. Drawing goes into the
+// current scanout surface, clipped to the damage; end() shows it.
+// All pixels are premultiplied BGRA unless said otherwise.
+// ---------------------------------------------------------------------------
+struct gpu_rect { int32_t x, y, w, h; };
+struct gpu_draw {
+    uint32_t image;
+    struct gpu_rect src;        // in the image, pixels
+    struct gpu_rect dst;        // on the screen; scaled when the sizes differ
+    uint8_t  opaque;            // the image's alpha is ignored
+    uint8_t  opacity;           // 255 = as it is
+    uint8_t  radius;            // rounded corners of `frame` (0: square)
+    uint8_t  ring;              // a border ring along `frame`, this wide (0: none)
+    struct gpu_rect frame;      // the rounded rectangle coverage comes from
+    uint32_t ring_rgb;
+};
+struct gpu_compose {
+    const char *name;           // what composes: "host GPU (virgl)", "Intel blitter"
+    // An image over `pixels` (w x h, rows `stride` bytes apart), uploaded whole.
+    int  (*image_create)(void *pixels, uint32_t w, uint32_t h, uint32_t stride, uint32_t *id);
+    void (*image_update)(uint32_t id, const struct gpu_rect *r);   // those pixels changed
+    void (*image_destroy)(uint32_t id);
+    int  (*begin)(const struct gpu_rect *damage);   // 0: drawing; clipped to damage
+    void (*fill)(const struct gpu_rect *r, uint32_t rgb);
+    // A soft shadow cast by a rounded frame: peak alpha at its edge, gone
+    // `width` out, and none under `cover` (the window casting it; NULL: none).
+    void (*shadow)(const struct gpu_rect *frame, const struct gpu_rect *cover, uint32_t radius,
+                   uint32_t width, uint32_t peak);
+    // Box blur of what is drawn in r, edges clamped to r as fb_blur_region's
+    // are, laid back only inside `frame` rounded by `corner` (NULL: all of r).
+    void (*blur)(const struct gpu_rect *r, uint32_t radius, const struct gpu_rect *frame, uint32_t corner);
+    void (*draw)(const struct gpu_draw *d);
+    int  (*end)(void);                              // 0: shown; else the GPU failed
+    int  (*read)(const struct gpu_rect *r);         // the screen's pixels back into its backing
 };
 
 // Probe PCI for a supported display device and select the best driver.

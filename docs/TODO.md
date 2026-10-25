@@ -1479,9 +1479,9 @@ it can only be late.
   an accelerated guest-memory scan-out (TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
   per dirty rect). `framebuffer.c` gained a RAM backbuffer with dirty-rect
   `fb_present()`, clipped fill/copy rects, lines, circles, alpha-blit.
-  Remaining: `virtio_gpu.c` only negotiates VIRTIO_F_VERSION_1 (no indirect
-  descriptors, no multiple scanouts, no 3D/Virgl); `bochs_vbe.c` has no
-  `-vga qxl` support. (The LFB mapping is now write-combining via
+  Since then `virtio_gpu.c` drives several scanouts and, with VIRGL, a 3D
+  context the compositor draws through (docs/DISPLAYS.md, "GPU composition").
+  Remaining: no indirect descriptors; `bochs_vbe.c` has no `-vga qxl` support. (The LFB mapping is now write-combining via
   `vmm_map_mmio_wc` — see the `vmm_map_mmio` entry above.)
 
 ### Native display, multiple monitors, GPU acceleration -- in that order (2026-10-25)
@@ -1568,9 +1568,24 @@ done when the laptop shows it, not when a host test passes.
       KVMs) counts as nothing connected; i915 falls back to 1024x768.
 - [ ] **Connections are polled once a second**, not taken from the hotplug
       interrupt.
-- [ ] **GPU acceleration**: compositing and fills on the GPU instead of the
-      CPU -- on Intel the blitter engine (command streamer, execlists), in
-      QEMU whatever the virtual device offers.
+- [x] ~~**GPU acceleration**~~ -- the desktop is composed on the GPU
+      (docs/DISPLAYS.md, "GPU composition"): through virgl on QEMU's
+      virtio-vga-gl (frame for frame with the CPU compositor in
+      `tools/virgl_smoke.py`), and with the Gen9 blitter on Intel (execlists,
+      aliasing PPGTT; blits for every copy and fill, the CPU for what blends;
+      proven on a model of the engine). Both probe the hardware first and fall
+      back to the CPU on any failure. Remaining:
+  - [ ] **The blitter has not run on the ProBook.** Bring-up, the probe blit
+        and a frame need checking on the machine (`intel-blt:` and
+        `compositor: composing on the Intel blitter` in the log, Settings >
+        Displays > Rendering).
+  - [ ] **Blending on Intel is the CPU's.** Glass, translucent windows,
+        shadows and rounded corners are drawn by `soft_compose.c`; the render
+        engine (RCS with real shaders) would take them.
+  - [ ] **The pointer is drawn into each frame.** virtio-gpu has a cursor
+        queue and Gen9 a cursor plane; neither is used.
+  - [ ] **No GPU rendering for applications.** The 3D context is the
+        compositor's; EmUI apps still rasterise on the CPU.
 - [ ] **Then the shell**: interactive commands, scripts, pipes and
       redirections in the native structured shell -- text-program fallback
       in pipes, a redirection syntax that does not collide with `>`, argument

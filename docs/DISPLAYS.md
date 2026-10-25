@@ -1,9 +1,12 @@
 # Graphics and displays
 
-EmbLinkOS drives one monitor or several with a CPU compositor. Settings →
-Displays reports the adapter, rendering backend, current resolution and
-validated monitor identity when EDID is available, and arranges the monitors
-when more than one is connected. Resolution and interface scale are separate:
+EmbLinkOS drives one monitor or several. The desktop is composed on the GPU
+where the adapter can do it -- the host's GPU through virgl on QEMU's
+virtio-vga-gl, the Gen9 blitter on Intel laptops -- and on the CPU everywhere
+else ([GPU composition](#gpu-composition)). Settings → Displays reports the
+adapter, what composes (**Rendering**), current resolution and validated
+monitor identity when EDID is available, and arranges the monitors when more
+than one is connected. Resolution and interface scale are separate:
 scale remains in Appearance.
 
 ## Live resolution changes
@@ -34,7 +37,8 @@ Transport timeout poisons further submissions; unacknowledged device-owned
 buffers are retained until reboot rather than freed for unrelated allocations.
 DISPI validates register readback and attempts to restore the old programming
 if the requested mode is rejected. Framebuffer publication and drawing use the
-same compositor lock. Rendering remains software for both adapters.
+same compositor lock. Neither adapter composes on a GPU; virtio-vga-gl, the
+same device with virgl, does (below).
 
 ## Monitor identity and firmware handoff
 
@@ -285,11 +289,143 @@ the write trace, unplugging, mirroring at 1.62 Gbps, a refused request for a
 monitor that is gone, and a monitor that will not train undone with the
 previous picture back.
 
+## GPU composition
+
+The compositor draws every frame the same way whatever draws it: the
+wallpaper, then each window bottom to top -- its drop shadow, its frosted
+backdrop if it is glass, its kernel title bar, its pixels with rounded corners
+and a border ring -- then a window that is opening or closing in flight, then
+the pointer. `struct gpu_compose` (`kernel/drivers/video/gpu.h`) is that list
+as operations: images over pixels the CPU already has (window contents, the
+wallpaper, the pointer), `fill`, `shadow`, `blur`, `draw` with opacity, corner
+radius and ring, all clipped to the damage, and `end` to show the frame. A
+display driver offers it through `gpu_driver.compose`; the compositor asks
+once, at its first frame, and from then on `paint_region` draws through it.
+Window images are updated only where the application presented damage, so a
+frame moves the pixels that changed and nothing else.
+
+Two drivers offer it:
+
+* **virtio-gpu with VIRTIO_GPU_F_VIRGL** (`virgl.c`, `virgl_compose.c`). The
+  driver negotiates the feature, opens one 3D context and hands the compositor
+  a transport: 3D resources with the windows' pages attached as backing,
+  TRANSFER_TO_HOST_3D for the damage, SUBMIT_3D for command streams,
+  RESOURCE_FLUSH to show. virglrenderer runs the streams on the host's OpenGL.
+  Drawing goes straight into the scanout resource; corners, rings and shadows
+  are a rounded-rectangle distance in TGSI fragment shaders, glass is two
+  box-blur passes (the screen sampled into a scratch texture, then back,
+  cut to the window's rounded frame). Every float is made from integers
+  (`vg_f32_ratio`, correctly rounded): the kernel keeps no FPU state.
+* **Intel Gen9, the blitter** (`intel_blt.c`, `intel_compose.c`,
+  `gfx/soft_compose.c`). The BCS engine is driven as i915 drives it: one
+  execlist context (Gen9's register-state layout), a 16 KiB ring, an aliasing
+  32-bit PPGTT, i915's private PAT, forcewake held only while the engine is
+  busy, completion from MI_FLUSH_DW writes and the context status buffer in
+  the status page. The blitter can fill and copy, nothing else, so frames are
+  composed in a buffer both it and the CPU reach (system pages, in the LLC):
+  the wallpaper, every opaque window's inside and title bar, the straight runs
+  of its border and every fill are blits; what blends -- the four corner boxes
+  of a rounded window, shadows, glass, translucent windows, scaled ghosts -- is
+  drawn by the CPU with the same arithmetic as the virgl shaders
+  (`soft_compose.c`). `end` blits the damage onto the scanout through an
+  uncached mapping, because the display engine reads memory, not the LLC.
+  Windows are blitted from the applications' own pages: nothing is uploaded.
+
+Both drivers check the hardware before the compositor may use it: virgl draws
+a probe frame into a target made the way QEMU makes a scanout and reads it
+back (a fill, an image's rows in order, opacity, a blur that must stay where
+it was taken), and the blitter resets its engine, then fills and copies a
+scratch page and reads it back. A host or an engine that gets any of it wrong
+leaves the desktop on the CPU. Any later failure -- a submission the engine
+does not finish in 250 ms (it is then reset), a host that stops answering, an
+image that cannot be made -- ends GPU composition for the session and repaints
+everything on the CPU, which always works. `opt/emblink/compose=0` in QEMU's
+fw_cfg keeps a virgl guest on the CPU, which is how one VM shows both paths.
+
+While a GPU composes, the framebuffer layer stops presenting the backbuffer
+(`fb_set_composed_elsewhere`); the backbuffer is only the canvas the kernel's
+title bars are drawn on before the GPU shows them. Screen reads (the
+screenshot capability, the menu bar asking how bright the wallpaper is) read
+the frame back from the GPU first.
+
+### What it took
+
+Things the protocols do not say, found by running the streams on a real
+virglrenderer and the blitter driver on a model of its engine:
+
+* An iovec handed to `virgl_renderer_resource_create` never reaches its
+  transfers; only an attach does (as ATTACH_BACKING is on the device).
+* QEMU makes every 2D resource Y_0_TOP under virgl: its transfers turn the
+  rows over. A frame drawn into one needs an upright viewport, any other
+  texture a flipped one, and the scissor -- passed to GL as it is -- mirrored
+  under an upright viewport. RESOURCE_COPY_REGION is no way round it:
+  virglrenderer's two copy paths treat Y_0_TOP differently, chosen by format.
+* The CPU compositor drew a kernel title bar's lights and text unclipped. With
+  another window over the bar, a repaint touching it put them on top of that
+  window, where nothing painted them away (stray "x -" marks on Settings
+  after a resolution change). They are clipped to the bar and the region now
+  (`fb_set_clip`), on both paths.
+
+### Tests
+
+* `tests/drivers/virgl_encode_test.c` (any host): `vg_f32_ratio` bit for bit
+  against the C library's correctly rounded division, ties and 64-bit
+  operands included; command layouts; a stream that runs out of room sends
+  nothing.
+* `tests/drivers/compose_checks.h`: one pixel suite for every backend -- fills,
+  opaque and premultiplied images, opacity, rounded corners and the ring, the
+  shadow and its cover, the blur against `fb_blur_region` (square and cut to a
+  rounded frame), scaling, partial updates, damage clipping.
+* `make test-virgl-compose` (Linux, libvirglrenderer): the suite on a real
+  virglrenderer and Mesa, on a Y_0_TOP screen and a plain one, after the probe
+  frame passes.
+* `tests/drivers/intel_compose_test.c` (any host, in `run.sh`): the suite on
+  the blitter, against `intel_blt_model.h` -- a Gen9 command streamer that
+  refuses what the hardware would: ELSP writes without forcewake, a context
+  image not laid out as Gen9's, a first run that does not inhibit the restore,
+  unknown or malformed commands, PPGTT faults, a scanout written through a
+  cached mapping. Its TLB keeps translations until MI_FLUSH_DW invalidates
+  them. Beyond the suite: the scanout equal to the composed frame, the ring
+  wrapping thousands of commands, new pages under an old address, forcewake
+  released when idle, a hung engine found and reset. Each of a missing TLB
+  invalidation, a cached scanout mapping, a wrong LRI header and a first run
+  without restore inhibit was put in deliberately and caught.
+* `make test-virgl-smoke` (`tools/virgl_smoke.py`): `uefi-usb.img` on QEMU's
+  virtio-vga-gl, booted twice -- composed on the host's GPU, then with
+  composition kept on the CPU -- through the same scenes with the same input:
+  the desktop after setup and login, a terminal typed into, two windows with
+  kernel title bars started from it, one of them dragged, Settings > Displays
+  naming what composes, and a resolution trial there and its revert. Every
+  GPU frame is compared with its CPU twin.
+
+Verified on 2026-10-25 (QEMU 8.2 with virglrenderer 1.0 and Mesa llvmpipe in
+an Ubuntu 24.04 VM): the virgl host suite and the probe pass on both screen
+orientations; the smoke test's GPU frames match the CPU's with no pixel off
+by more than 40 on the desktop and the terminal, 0.26 % and 0.37 % along the
+demo windows' rounded edges and live meters, and 0.05 % in Settings and the
+resolution scenes -- the Rendering row itself, "host GPU (virgl)" against
+"Software". The blitter's model suite passes on Linux; the x86-64 and ARM64
+kernels link with both drivers.
+
+Not done yet: none of the Intel path has run on the ProBook (only on the
+model); the blitter cannot blend, so a glass or translucent window is still
+the CPU's on Intel; the pointer is drawn into every frame rather than on a
+cursor plane or virtio-gpu's cursor queue; virgl contexts are not used for
+applications' own rendering.
+
 ## Protocol references
 
 The VirtIO GPU device protocol specifies GET_EDID (optional feature bit 1),
-RESOURCE_CREATE_2D, RESOURCE_ATTACH_BACKING, SET_SCANOUT and RESOURCE_UNREF:
+RESOURCE_CREATE_2D, RESOURCE_ATTACH_BACKING, SET_SCANOUT and RESOURCE_UNREF,
+and with VIRGL (feature bit 0) CTX_CREATE, CTX_ATTACH_RESOURCE,
+RESOURCE_CREATE_3D, TRANSFER_TO/FROM_HOST_3D and SUBMIT_3D:
 [VirtIO 1.2, GPU device](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+The virgl command stream follows virglrenderer 1.0's `virgl_protocol.h` and
+`vrend_decode.c`, with Gallium's enum values; shaders are TGSI text. The
+blitter follows i915's Gen8/9 execlists (`intel_lrc.c`: the xcs register
+state, the descriptor, the status buffer), `gen8_ppgtt` page formats and
+private PAT, and the XY_COLOR_BLT / XY_SRC_COPY_BLT / MI_FLUSH_DW layouts of
+the Gen9 blitter command reference.
 The firmware handoff follows the UEFI Graphics Output and EDID Active protocols;
 DISPI uses the Bochs VBE register interface already used at startup. Intel
 register programming follows Linux's i915 for Skylake to Comet Lake; each
@@ -311,7 +447,7 @@ so the public EmApp descriptor keeps its existing binary layout.
 Not implemented: AMD/NVIDIA modesetting, DisplayPort MST (a dock's daisy
 chain shows at most its first monitor), choosing a refresh rate (one timing
 per size), per-monitor interface scale, rotation, HDR/color profiles,
-accelerated rendering and suspend restoration. Physical laptop display testing
+applications' own GPU rendering and suspend restoration. Physical laptop display testing
 is still required: none of the Intel paths has run on the ProBook yet. These
 are follow-up graphics milestones, not capabilities inferred from successful
 virtual-device tests.

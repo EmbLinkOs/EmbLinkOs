@@ -120,14 +120,36 @@ static inline uint32_t fb_load(const uint8_t *p) {
 }
 
 // Clip a rect against the screen. Returns false when nothing remains.
+/* What drawing may touch besides the screen: everything, unless a caller
+ * narrowed it (fb_set_clip) for drawing that must stay inside a region. */
+static int32_t clip_x0, clip_y0, clip_x1 = INT32_MAX, clip_y1 = INT32_MAX;
+
+void fb_set_clip(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    clip_x0 = x0; clip_y0 = y0; clip_x1 = x1; clip_y1 = y1;
+}
+
+void fb_reset_clip(void) {
+    clip_x0 = clip_y0 = 0; clip_x1 = clip_y1 = INT32_MAX;
+}
+
 static bool fb_clip(int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
     if (*w <= 0 || *h <= 0) return false;
-    if (*x < 0) { *w += *x; *x = 0; }
-    if (*y < 0) { *h += *y; *y = 0; }
-    if (*x >= (int32_t)fb.width || *y >= (int32_t)fb.height) return false;
-    if (*x + *w > (int32_t)fb.width)  *w = (int32_t)fb.width  - *x;
-    if (*y + *h > (int32_t)fb.height) *h = (int32_t)fb.height - *y;
-    return (*w > 0 && *h > 0);
+    int32_t x0 = *x > clip_x0 ? *x : clip_x0, y0 = *y > clip_y0 ? *y : clip_y0;
+    int64_t x1 = (int64_t)*x + *w, y1 = (int64_t)*y + *h;
+    if (x1 > clip_x1) x1 = clip_x1;
+    if (y1 > clip_y1) y1 = clip_y1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)fb.width)  x1 = (int32_t)fb.width;
+    if (y1 > (int32_t)fb.height) y1 = (int32_t)fb.height;
+    if (x1 <= x0 || y1 <= y0) return false;
+    *x = x0; *y = y0; *w = (int32_t)(x1 - x0); *h = (int32_t)(y1 - y0);
+    return true;
+}
+
+static bool fb_clipped_out(uint32_t x, uint32_t y) {
+    return x >= fb.width || y >= fb.height || (int64_t)x < clip_x0 || (int64_t)y < clip_y0 ||
+           (int64_t)x >= clip_x1 || (int64_t)y >= clip_y1;
 }
 
 void fb_init(void) {
@@ -239,12 +261,17 @@ void fb_init(void) {
 // Presentation
 // ---------------------------------------------------------------------------
 
+/* The scanout's pixels come from a GPU composing the desktop, not from the
+ * backbuffer: pushing it would paint a stale picture over every frame. */
+static volatile bool fb_composed_elsewhere;
+void fb_set_composed_elsewhere(bool on) { fb_composed_elsewhere = on; }
+
 static void fb_push_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     /* THE KERNEL HAS FAULTED and the screen is showing why. On a multi-core
      * machine the compositor on another core is still presenting frames, and
      * one of them would paint the desktop straight back over the only message
      * anyone is going to see. See drivers/video/rawcon.c. */
-    if (rawcon_panicked()) return;
+    if (rawcon_panicked() || fb_composed_elsewhere) return;
     if (fb_back && fb_front) {
         uint64_t off = (uint64_t)y * fb.pitch + (uint64_t)x * fb_bypp;
         uint32_t bytes = w * fb_bypp;
@@ -292,7 +319,7 @@ bool fb_double_buffered(void) {
 // ---------------------------------------------------------------------------
 
 void fb_put_pixel_c(uint32_t x, uint32_t y, fb_color_t c) {
-    if (x >= fb.width || y >= fb.height) return;
+    if (fb_clipped_out(x, y)) return;
     fb_store(fb_pixel_ptr(fb_draw, x, y), fb_pack(c));
     fb_mark_dirty(x, y, 1, 1);
 }
@@ -707,7 +734,8 @@ void fb_draw_char(char c, int32_t px, int32_t py, uint8_t fg_r, uint8_t fg_g, ui
     // guard is load-bearing: without it a negative coord would pass the width/
     // height check via unsigned overflow and write far out of the framebuffer.
     if (px >= 0 && py >= 0 &&
-        px + FONT_WIDTH <= (int32_t)fb.width && py + FONT_HEIGHT <= (int32_t)fb.height) {
+        px + FONT_WIDTH <= (int32_t)fb.width && py + FONT_HEIGHT <= (int32_t)fb.height &&
+        px >= clip_x0 && py >= clip_y0 && px + FONT_WIDTH <= clip_x1 && py + FONT_HEIGHT <= clip_y1) {
         uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)px, (uint32_t)py);
         for (uint32_t r = 0; r < FONT_HEIGHT; r++) {
             uint8_t bits = glyph[r];
@@ -856,6 +884,7 @@ void fb_release_surface(struct fb_surface *s) {
 }
 
 struct fb_surface *fb_current_surface(void) {return current_surface;}
+const struct gpu_target *fb_current_target(void) {return &current_surface->gpu;}
 bool fb_can_change_mode(void) {
     const struct gpu_driver *g=gpu_active();
     return current_surface->back && fb.bpp==32 && g && g->prepare && g->select && g->release;

@@ -190,6 +190,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/video/gpu.c \
                   kernel/drivers/video/bootanim.c \
                   kernel/drivers/video/virtio_gpu.c \
+                  kernel/drivers/video/virgl.c \
+                  kernel/drivers/video/virgl_compose.c \
                   kernel/net/net.c \
                   kernel/net/virtio_net.c \
                   kernel/net/e1000.c \

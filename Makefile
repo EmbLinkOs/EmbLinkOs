@@ -201,6 +201,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/video/intel_gmbus.c kernel/drivers/video/intel_capture.c \
              kernel/drivers/video/intel_vbt.c kernel/drivers/video/intel_config.c \
              kernel/drivers/video/intel_hw.c kernel/drivers/video/intel_native.c kernel/display/edid_modes.c \
+             kernel/drivers/video/intel_blt.c kernel/drivers/video/intel_compose.c kernel/gfx/soft_compose.c \
              kernel/display/layout.c \
              kernel/acpi/display.c kernel/acpi/power.c \
              kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
@@ -208,6 +209,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/i2c/hid_i2c.c kernel/drivers/i2c/hid_protocol.c kernel/drivers/input/hid_report.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
+             kernel/drivers/video/virgl.c kernel/drivers/video/virgl_compose.c \
              kernel/drivers/audio/ac97.c \
              kernel/drivers/audio/hda.c \
              kernel/drivers/audio/audio.c \
@@ -2970,6 +2972,23 @@ test-root-mirror: $(IMG) $(EMBKFS_MASTER)
 .PHONY: test-ro-fallback
 test-ro-fallback: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/ro_fallback_test.py || exit 1
+
+# GPU composition (docs/DISPLAYS.md, "GPU composition"). test-virgl-compose
+# runs the compositor's virgl streams on the host's libvirglrenderer and checks
+# every operation in pixels; test-virgl-smoke boots uefi-usb.img on QEMU's
+# virtio-vga-gl twice, GPU- and CPU-composed, and compares the frames. Both
+# need Linux with virglrenderer and a DRM render node; the smoke test also
+# vncdotool (VIRGL_PYTHON: a Python that has it). The Intel blitter's test
+# runs anywhere, in tests/drivers/run.sh.
+VIRGL_PYTHON ?= python3
+.PHONY: test-virgl-compose test-virgl-smoke
+test-virgl-compose: | $(BUILD)
+	$(HOSTCC) -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE -D_TYPES_H -include stdint.h \
+	    -include stdbool.h -include stddef.h -Ikernel -Itests/drivers tests/drivers/virgl_compose_test.c \
+	    kernel/drivers/video/virgl.c kernel/drivers/video/virgl_compose.c -lvirglrenderer -o $(BUILD)/virgl_compose_test
+	LIBGL_ALWAYS_SOFTWARE=$${LIBGL_ALWAYS_SOFTWARE:-1} $(BUILD)/virgl_compose_test
+test-virgl-smoke: uefi-usb.img
+	@$(VIRGL_PYTHON) tools/virgl_smoke.py || exit 1
 
 .PHONY: test-xhci-nointr
 test-xhci-nointr: $(IMG) $(EMBKFS_MASTER)

@@ -36,6 +36,8 @@ struct fb_surface *fb_select_surface(struct fb_surface *);
 struct gpu_layout;
 struct fb_surface *fb_select_layout(struct fb_surface *s, const struct gpu_layout *layout);
 struct fb_surface *fb_current_surface(void);
+/* The surface on screen as its driver knows it: resource and mode. */
+const struct gpu_target *fb_current_target(void);
 void fb_release_surface(struct fb_surface *);
 void fb_init(void);
 void fb_put_pixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b);
@@ -93,6 +95,11 @@ void fb_glow_rect(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t gw
                   uint8_t cr, uint8_t cg, uint8_t cb, uint8_t max_a,
                   int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 
+// Narrow what drawing may touch to [x0,y0)-(x1,y1), besides the screen; the
+// primitives above honour it. fb_reset_clip() gives the whole screen back.
+void fb_set_clip(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+void fb_reset_clip(void);
+
 // Screen-to-screen copy (handles overlap). Coordinates are clipped.
 void fb_copy_rect(int32_t dst_x, int32_t dst_y,
                   int32_t src_x, int32_t src_y, int32_t w, int32_t h);
@@ -107,6 +114,9 @@ void fb_scroll_up(uint32_t pixels, fb_color_t fill);
 // exists, drawing hits VRAM directly and fb_present() only does the GPU flush.
 void fb_present(void);
 void fb_present_all(void);      // force a full-screen push
+// While on, presenting pushes nothing: a GPU composes the scanout itself
+// (the compositor's GPU path) and the backbuffer is only its canvas.
+void fb_set_composed_elsewhere(bool on);
 bool fb_double_buffered(void);
 
 // Get a const pointer to the fb_info struct (read-only)

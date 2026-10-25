@@ -189,6 +189,9 @@ int  compositor_shell_modal(void);
 /* Repaint the whole screen from the window stack -- after something outside
  * the compositor (the kernel log view) has been drawing on it. */
 void compositor_repaint_all(void);
+/* What composes the desktop, for Settings: 1 and its name ("host GPU
+ * (virgl)") when a GPU does, else 0 and "Software". */
+int compositor_renderer(char *name, unsigned len);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */

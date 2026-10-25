@@ -1,15 +1,22 @@
-// VirtIO-GPU 2D display driver (QEMU -device virtio-vga / virtio-gpu-pci).
+// VirtIO-GPU display driver (QEMU -device virtio-vga / virtio-gpu-pci, and
+// the -gl variants).
 //
 // The framebuffer lives in guest RAM (the fb layer's backbuffer) and is
 // attached to a host-side GPU resource. Presenting a dirty rectangle issues
-// TRANSFER_TO_HOST_2D + RESOURCE_FLUSH on the control virtqueue, and the host
-// GPU blits/composites it — that is the acceleration path.
+// TRANSFER_TO_HOST_2D + RESOURCE_FLUSH on the control virtqueue.
+//
+// With VIRTIO_GPU_F_VIRGL (virtio-vga-gl, virglrenderer on the host) the
+// desktop is composed on the host's GPU instead: a 3D context runs the
+// command streams of virgl_compose.c, drawing straight into the scanout
+// resource, and the CPU only uploads what windows changed. See the 3D
+// section below.
 //
 // Transport: virtio 1.x "modern" PCI — vendor capabilities point at the
 // common/notify/isr/device config windows inside the device's BARs, and the
 // control queue is a split virtqueue polled synchronously.
 
 #include "drivers/video/gpu.h"
+#include "drivers/video/virgl_compose.h"
 #include "display/edid.h"
 #include "../../../user/lib/embk_monitor.h"
 #include "include/kmalloc.h"
@@ -89,10 +96,21 @@ struct vring_used {
 #define VIRTIO_GPU_CMD_RESOURCE_FLUSH          0x0104
 #define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D     0x0105
 #define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
+#define VIRTIO_GPU_CMD_CTX_CREATE              0x0200
+#define VIRTIO_GPU_CMD_CTX_DESTROY             0x0201
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE     0x0202
+#define VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE     0x0203
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D      0x0204
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D     0x0205
+#define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D   0x0206
+#define VIRTIO_GPU_CMD_SUBMIT_3D               0x0207
 #define VIRTIO_GPU_RESP_OK_NODATA              0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO        0x1101
 
 #define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM 2   // memory bytes B,G,R,X
+
+#define VIRTIO_GPU_F_VIRGL 0                 // feature bits (bank 0)
+#define VIRTIO_GPU_F_EDID  1
 
 #define VIRTIO_GPU_MAX_SCANOUTS 16
 
@@ -160,6 +178,41 @@ struct virtio_gpu_mem_entry {
     uint32_t padding;
 } __attribute__((packed));
 
+struct virtio_gpu_ctx_create {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t nlen;
+    uint32_t context_init;            // 0: the default capset, virgl
+    char debug_name[64];
+} __attribute__((packed));
+
+struct virtio_gpu_ctx_resource {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resource_create_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, target, format, bind;
+    uint32_t width, height, depth, array_size;
+    uint32_t last_level, nr_samples, flags, padding;
+} __attribute__((packed));
+
+struct virtio_gpu_box { uint32_t x, y, z, w, h, d; } __attribute__((packed));
+
+struct virtio_gpu_transfer_host_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_box box;
+    uint64_t offset;
+    uint32_t resource_id, level, stride, layer_stride;
+} __attribute__((packed));
+
+struct virtio_gpu_cmd_submit {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t size;                    // bytes of command stream after this
+    uint32_t padding;
+} __attribute__((packed));
+
 // ---- driver state -----------------------------------------------------------
 #define VGPU_SCANOUT_RES_ID 1
 // Command staging area: attach_backing for an 8 MB framebuffer needs up to
@@ -180,6 +233,9 @@ struct virtio_gpu_state {
     uint32_t width, height;
     uint32_t active_resource,next_resource;
     bool failed,edid_supported;
+    bool virgl;                       // VIRTIO_GPU_F_VIRGL negotiated
+    bool compose_tried;               // the 3D context was set up (or refused) once
+    uint32_t ctx_resource;            // the scanout resource last attached to the 3D context
     struct display_identity identity;
     bool scanout_ready;
 
@@ -230,17 +286,22 @@ static inline uint64_t vgpu_dma(const volatile void *p) {
  * console flush re-enters this very function -> instant self-deadlock. */
 static spinlock_t vgpu_lock = SPINLOCK_INIT;
 
-static bool vgpu_submit(const void *cmd, uint32_t cmd_len,
-                        void *resp, uint32_t resp_len,
-                        uint32_t expect_type) {
+/* The command is `cmd` followed by `more` (more_len bytes, may be 0): a
+ * SUBMIT_3D's header and its stream go out as one buffer without being
+ * assembled twice. */
+static bool vgpu_submit_parts(const void *cmd, uint32_t cmd_len, const void *more, uint32_t more_len,
+                              void *resp, uint32_t resp_len,
+                              uint32_t expect_type) {
     struct virtio_gpu_state *s = &g_vgpu;
     int fail = 0;   /* 0 ok, 1 bad response type, 2 timeout */
     uint32_t bad_cmd = 0, bad_resp = 0;
 
     spin_lock(&vgpu_lock);
-    if(s->failed || cmd_len>sizeof s->cmd_buf || resp_len>sizeof s->resp_buf) {spin_unlock(&vgpu_lock);return false;}
+    if(s->failed || more_len>sizeof s->cmd_buf || cmd_len>sizeof s->cmd_buf-more_len || resp_len>sizeof s->resp_buf) {spin_unlock(&vgpu_lock);return false;}
 
     if (cmd != s->cmd_buf) memcpy(s->cmd_buf, cmd, cmd_len);
+    if (more_len) memcpy(s->cmd_buf + cmd_len, more, more_len);
+    cmd_len += more_len;
     memset(s->resp_buf, 0, resp_len < sizeof(s->resp_buf) ? resp_len : sizeof(s->resp_buf));
 
     s->desc[0].addr  = vgpu_dma(s->cmd_buf);
@@ -293,6 +354,10 @@ static bool vgpu_submit(const void *cmd, uint32_t cmd_len,
     return fail == 0;
 }
 
+static bool vgpu_submit(const void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len, uint32_t expect_type) {
+    return vgpu_submit_parts(cmd, cmd_len, 0, 0, resp, resp_len, expect_type);
+}
+
 static bool vgpu_simple_cmd(const void *cmd, uint32_t cmd_len) {
     struct virtio_gpu_ctrl_hdr resp;
     return vgpu_submit(cmd, cmd_len, &resp, sizeof(resp),
@@ -307,14 +372,15 @@ static bool vgpu_init_transport(const struct pci_device *dev) {
      * handshake are drivers/bus/virtio_pci.c's now -- this driver carried the
      * second of what became four near-identical copies.
      *
-     * No bank-0 features are requested: this driver uses the 2D control queue
-     * only, and every optional virtio-gpu feature (virgl, EDID, resource UUIDs)
-     * would add an obligation it does not meet. */
+     * Two bank-0 features are requested: EDID (the monitors' identities) and
+     * VIRGL (3D contexts, for composing on the host's GPU). Resource UUIDs and
+     * blob resources would add obligations this driver does not meet. */
     uint32_t features=0;
-    if (!virtio_pci_attach(&s->vp, dev, "virtio-gpu", 1u<<1, &features))
+    if (!virtio_pci_attach(&s->vp, dev, "virtio-gpu", (1u<<VIRTIO_GPU_F_VIRGL)|(1u<<VIRTIO_GPU_F_EDID), &features))
         return false;
 
-    s->edid_supported=(features&(1u<<1))!=0;
+    s->edid_supported=(features&(1u<<VIRTIO_GPU_F_EDID))!=0;
+    s->virgl=(features&(1u<<VIRTIO_GPU_F_VIRGL))!=0;
     s->active_resource=1;s->next_resource=2;
     s->common      = s->vp.common;
     s->notify_base = s->vp.notify;
@@ -337,8 +403,8 @@ static bool vgpu_init_transport(const struct pci_device *dev) {
 
     virtio_pci_driver_ok(&s->vp);
 
-    kprintf("virtio-gpu: transport up, controlq size=%u notify_mult=%u\n",
-            (unsigned int)qsize, (unsigned int)s->notify_off_multiplier);
+    kprintf("virtio-gpu: transport up, controlq size=%u notify_mult=%u%s\n",
+            (unsigned int)qsize, (unsigned int)s->notify_off_multiplier, s->virgl ? ", virgl 3D" : "");
     return true;
 }
 
@@ -398,7 +464,9 @@ static bool vgpu_get_mode(struct gpu_mode *out) {
 
 static bool vgpu_backing(uint32_t resource,void *buf, uint64_t size) {
     // Build the scatter list: walk the buffer page by page, translating to
-    // physical addresses and coalescing contiguous runs.
+    // physical addresses and coalescing contiguous runs. The buffer need not
+    // start on a page (a window's kmalloc'd pixels do not), so each piece runs
+    // to the end of ITS page, not a page's length on.
     uint8_t *command=kmalloc(VGPU_CMD_BUF_SIZE);if(!command)return false;
     struct virtio_gpu_resource_attach_backing *ab =
         (struct virtio_gpu_resource_attach_backing *)command;
@@ -417,11 +485,11 @@ static bool vgpu_backing(uint32_t resource,void *buf, uint64_t size) {
     while (va < end) {
         uint64_t phys = vmm_get_phys(va);
         if (!phys) {
-            kprintf("virtio-gpu: backbuffer page unmapped at %p\n",
+            kprintf("virtio-gpu: backing page unmapped at %p\n",
                     (void *)(uintptr_t)va);
             kfree(command);return false;
         }
-        uint64_t chunk = PAGE_SIZE;
+        uint64_t chunk = PAGE_SIZE - (va & (PAGE_SIZE - 1));
         if (va + chunk > end) chunk = end - va;
 
         if (n > 0 &&
@@ -449,15 +517,13 @@ static bool vgpu_backing(uint32_t resource,void *buf, uint64_t size) {
         kfree(command);return false;
     }
     kfree(command);
-    kprintf("virtio-gpu: backing attached (%u entr%s)\n",
-            (unsigned int)n, n == 1 ? "y" : "ies");
-
     return true;
 }
 
 static bool vgpu_attach_backing(void *buf,uint64_t size) {
     struct virtio_gpu_state *s=&g_vgpu;
     if(!vgpu_backing(1,buf,size))return false;
+    kprintf("virtio-gpu: backbuffer attached to the scanout resource\n");
     // Point scanout 0 at the resource.
     struct virtio_gpu_set_scanout sc;
     memset(&sc, 0, sizeof(sc));
@@ -639,6 +705,135 @@ static int vgpu_poll_outputs(void) {
     return changed;
 }
 
+/* ---- 3D: composing on the host's GPU --------------------------------------
+ * One virgl context (VGPU_CTX) belongs to the compositor. Its resources --
+ * window images, the vertex buffer, scratch textures -- are 3D resources
+ * with their pages attached like the scanout's; it draws into the scanout
+ * resource itself (a 2D resource, which QEMU makes a Y_0_TOP render target
+ * under virgl), and RESOURCE_FLUSH shows the result. Every call comes from
+ * the compositor under its lock, so the transport keeps no lock of its own
+ * beyond vgpu_submit's. */
+#define VGPU_CTX 1u
+
+static bool vgl_ctx_resource(uint32_t type, uint32_t id) {
+    struct virtio_gpu_ctx_resource c = {0};
+    c.hdr.type = type; c.hdr.ctx_id = VGPU_CTX; c.resource_id = id;
+    return vgpu_simple_cmd(&c, sizeof c);
+}
+
+static void vgl_unref(uint32_t id) {
+    struct {struct virtio_gpu_ctrl_hdr header;uint32_t id,padding;} unref={0};
+    unref.header.type=VIRTIO_GPU_CMD_RESOURCE_UNREF;unref.id=id;
+    vgpu_simple_cmd(&unref,sizeof unref);
+}
+
+static uint32_t vgl_new_id(void) { return g_vgpu.next_resource++; }
+
+static int vgl_resource_create(uint32_t id, uint32_t target, uint32_t format, uint32_t bind,
+                               uint32_t w, uint32_t h, uint32_t flags, void *backing, uint64_t bytes) {
+    struct virtio_gpu_resource_create_3d c = {0};
+    c.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    c.resource_id = id; c.target = target; c.format = format; c.bind = bind;
+    c.width = w; c.height = h; c.depth = 1; c.array_size = 1; c.flags = flags;
+    if (!vgpu_simple_cmd(&c, sizeof c)) return -1;
+    if ((backing && !vgpu_backing(id, backing, bytes)) || !vgl_ctx_resource(VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, id)) {
+        vgl_unref(id);
+        return -1;
+    }
+    return 0;
+}
+
+static void vgl_resource_destroy(uint32_t id) {
+    vgl_ctx_resource(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, id);
+    vgl_unref(id);                        /* the host lets go of the pages with it */
+}
+
+static int vgl_transfer(uint32_t type, uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t stride) {
+    struct virtio_gpu_transfer_host_3d t = {0};
+    t.hdr.type = type; t.hdr.ctx_id = VGPU_CTX;      /* in the context: ordered with its drawing */
+    t.box = (struct virtio_gpu_box){ x, y, 0, w, h, 1 };
+    t.offset = (uint64_t)y * stride + (uint64_t)x * 4;
+    t.resource_id = id; t.stride = stride;
+    return vgpu_simple_cmd(&t, sizeof t) ? 0 : -1;
+}
+static int vgl_to_host(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t stride) {
+    return vgl_transfer(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D, id, x, y, w, h, stride);
+}
+static int vgl_from_host(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t stride) {
+    return vgl_transfer(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, id, x, y, w, h, stride);
+}
+
+static int vgl_submit(const uint32_t *dwords, uint32_t n) {
+    struct virtio_gpu_cmd_submit c = {0};
+    c.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; c.hdr.ctx_id = VGPU_CTX; c.size = n * 4;
+    struct virtio_gpu_ctrl_hdr resp;
+    return vgpu_submit_parts(&c, sizeof c, dwords, n * 4, &resp, sizeof resp, VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
+}
+
+/* The surface being shown, attached to the context the first time it is
+ * drawn into (a mode or layout change makes a new one). */
+static void vgl_target(uint32_t *id, uint32_t *w, uint32_t *h, int *y0_top) {
+    struct virtio_gpu_state *s = &g_vgpu;
+    *id = 0; *w = s->width; *h = s->height;
+    *y0_top = 1;                          /* QEMU's RESOURCE_CREATE_2D under virgl: VIRGL_RESOURCE_Y_0_TOP */
+    if (!s->scanout_ready || !s->active_resource) return;
+    if (s->ctx_resource != s->active_resource) {
+        if (!vgl_ctx_resource(VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, s->active_resource)) return;
+        s->ctx_resource = s->active_resource;
+    }
+    *id = s->active_resource;
+}
+
+static int vgl_present(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    struct virtio_gpu_resource_flush f = {0};
+    f.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    f.r.x = x; f.r.y = y; f.r.width = w; f.r.height = h;
+    f.resource_id = id;
+    return vgpu_simple_cmd(&f, sizeof f) ? 0 : -1;
+}
+
+static const struct vgc_transport g_vgl_transport = {
+    vgl_new_id, vgl_resource_create, vgl_resource_destroy, vgl_to_host, vgl_from_host,
+    vgl_submit, vgl_target, vgl_present,
+};
+
+/* The compositor asks once it draws: the context is made then, its probe
+ * frame drawn and checked, and the answer kept. */
+static const struct gpu_compose *vgpu_compose(void) {
+    struct virtio_gpu_state *s = &g_vgpu;
+    if (!s->virgl || s->failed) return 0;
+    if (!s->compose_tried) {
+        s->compose_tried = true;
+#if defined(__x86_64__)
+        if (boot_qemu_cpu_compose()) {
+            kprintf("virtio-gpu: composition kept on the CPU (opt/emblink/compose=0)\n");
+            s->virgl = false;
+            return 0;
+        }
+#endif
+        struct virtio_gpu_ctx_create cc = {0};
+        cc.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE; cc.hdr.ctx_id = VGPU_CTX;
+        static const char name[] = "emblink-compositor";
+        cc.nlen = sizeof name - 1;
+        memcpy(cc.debug_name, name, sizeof name - 1);
+        if (!vgpu_simple_cmd(&cc, sizeof cc)) {
+            kprintf("virtio-gpu: the host refused a 3D context; composing on the CPU\n");
+            s->virgl = false;
+            return 0;
+        }
+        if (virgl_compose_init(&g_vgl_transport)) {
+            struct virtio_gpu_ctrl_hdr d = {0};
+            d.type = VIRTIO_GPU_CMD_CTX_DESTROY; d.ctx_id = VGPU_CTX;
+            vgpu_simple_cmd(&d, sizeof d);
+            kprintf("virtio-gpu: the host's 3D did not draw the probe frame right; composing on the CPU\n");
+            s->virgl = false;
+            return 0;
+        }
+        kprintf("virtio-gpu: composing on the host's GPU (virgl), probe frame correct\n");
+    }
+    return virgl_compose();
+}
+
 static const struct gpu_driver g_vgpu_driver = {
     .name = "virtio-gpu",
     .prepare=vgpu_prepare,.select=vgpu_select,.release=vgpu_release,.describe=vgpu_describe,.resource_id=vgpu_resource,
@@ -647,6 +842,7 @@ static const struct gpu_driver g_vgpu_driver = {
     .attach_backing = vgpu_attach_backing,
     .output_count = vgpu_output_count, .output_info = vgpu_output_info,
     .apply_layout = vgpu_apply_layout, .poll_outputs = vgpu_poll_outputs,
+    .compose = vgpu_compose,
 };
 
 const struct gpu_driver *virtio_gpu_probe(void) {

@@ -5,7 +5,7 @@ It only reads physical memory through GDB; all actions still use QMP input.
 This helper is for x86_64 native acceptance, like workspace_smoke.Desktop.
 """
 from pathlib import Path
-import json,subprocess
+import json,os,subprocess
 from recovery_smoke import ROOT
 
 class NativeUI:
@@ -15,7 +15,7 @@ class NativeUI:
         subprocess.run(['cc','-std=c11','-Iui/declare','-Iui/scene','-Iui/layout','-Iui/reactive','-Iui/backend','-Iuser/lib',
             'tools/ui_probe.c','-o',str(probe)],cwd=ROOT,check=True)
         self.offsets=json.loads(subprocess.check_output([str(probe)]))
-        nm=subprocess.check_output(['x86_64-elf-nm','-S','--defined-only',str(ROOT/'build/libembk.so')],text=True)
+        nm=subprocess.check_output([os.environ.get('EMBLINK_NM','x86_64-elf-nm'),'-S','--defined-only',str(ROOT/'build/libembk.so')],text=True)
         symbols={a[3]:int(a[0],16) for line in nm.splitlines() if len(a:=line.split())==4}
         self.symbols={k:symbols[k] for k in ['g_inst','g_inst_hw','g_sa','g_hovered','g_clicked','g_active','g_focused','g_ptr_down','g_zoom_open','g_tip_visible','g_zoom_overlay','g_menu_scrim']}
     def labels(self,window,diagnostic=False):
