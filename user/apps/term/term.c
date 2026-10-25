@@ -1,12 +1,12 @@
-/* EmbLink Terminal: a private PTY session with a native prompt editor.
+/* EmbLink Terminal: a private PTY session, and a screen for whatever runs in it.
  *
- * At the shell prompt we retain local history, completion and cursor editing.
- * Once a command starts, input goes directly to the PTY master. Programs choose
- * canonical/echo or raw mode through termios; their escape-key input uses ANSI
- * sequences. Output uses a bounded VT screen with primary/alternate grids and
- * streaming Unicode and cursor editing. TERM=emlink advertises this subset.
- * The master is nonblocking and input is queued so a slow child cannot freeze
- * the window. Closing the master hangs up the slave, including blocked reads.
+ * The shells edit their own lines (shell/edit); this is a terminal, not a line
+ * editor. Keys are encoded as xterm encodes them and written to the PTY master;
+ * output goes through the VT screen model (user/terminal/vt.c) and is painted.
+ * The shells mark their prompts with OSC 133, which gives the window its title
+ * and lets a resize redraw a prompt cleanly. The master is nonblocking and
+ * input is queued so a slow child cannot freeze the window. Closing the master
+ * hangs up the slave, including blocked reads.
  */
 
 #include <stdio.h>
@@ -32,9 +32,6 @@ static int g_cols=80,g_rows=20,g_view=0,g_master=-1,g_shell=-1;
 #define FD_SHELL_IN g_master
 #define FD_SHELL_OUT g_master
 static bool g_dead=false,g_at_prompt=false;
-/* The terminal edits the line itself only for a shell that does not (an A
- * mark without edit=shell -- the sh port, until it has the editor too). */
-static bool g_local=false;
 /* A resize happened while the program wanted in-band size reports (and the
  * prompt was erased for it): report once the kernel knows the size. A resize
  * from before reports were on is not reported -- the program learned the size
@@ -56,46 +53,8 @@ static bool term_send(const void *data,size_t n) {
 }
 static void term_reply(void *unused,const char *data,size_t n) {(void)unused;(void)term_send(data,n);}
 
-/* --- the command line ------------------------------------------------------
- * The terminal owns the line: nothing reaches the shell until Enter. g_cur is
- * the caret -- edits happen AT it, not only at the end. */
-#define IN_MAX 256
-#define HIST_MAX 32
-static char g_in[IN_MAX];
-static int  g_in_n = 0;
-static int  g_cur = 0;         /* caret: 0..g_in_n */
-static char g_hist[HIST_MAX][IN_MAX];
-static int  g_hist_n = 0;      /* how many commands remembered */
-static int  g_hist_at = -1;    /* -1 = editing a fresh line, else index back */
-
-static void hist_push_line(const char *s) {
-    if (!s[0]) return;
-    if (g_hist_n && !strcmp(g_hist[(g_hist_n - 1) % HIST_MAX], s)) return;  /* no dupes */
-    snprintf(g_hist[g_hist_n % HIST_MAX], IN_MAX, "%s", s);
-    g_hist_n++;
-}
-
-/* Walk history: dir -1 = older (Up), +1 = newer (Down). */
-static void hist_step(int dir) {
-    int avail = g_hist_n < HIST_MAX ? g_hist_n : HIST_MAX;
-    if (!avail) return;
-    int at = g_hist_at + (dir < 0 ? 1 : -1);
-    if (at < 0) {                       /* back to the fresh line */
-        g_hist_at = -1; g_in[0] = 0; g_in_n = 0; g_cur = 0; return;
-    }
-    if (at >= avail) at = avail - 1;
-    g_hist_at = at;
-    const char *s = g_hist[(g_hist_n - 1 - at) % HIST_MAX];
-    snprintf(g_in, sizeof g_in, "%s", s);
-    g_in_n = (int)strlen(g_in);
-    g_cur = g_in_n;
-}
-
-/* OSC 133 shell integration publishes a completed native prompt. Other
- * programs own their terminal screen and receive input directly. */
+/* The directory the shell's last prompt mark named (OSC 133;A;cwd=). */
 static char g_cwd[192]="/";
-
-#define HOSTNAME "emblink"
 
 /* The window's title is the WORKING DIRECTORY, the way a real terminal titles
  * itself. "Terminal" tells you nothing you did not already know from the icon;
@@ -112,26 +71,13 @@ static const char *title_text(void) {
     return t;
 }
 
-static const char *prompt_text(void) {
-    static char p[288];
-    const char *user = getenv("USER");
-    const char *home = getenv("HOME");
-    if (!user || !*user) user = "user";
-    char tilde[192];
-    const char *shown = g_cwd;
-    size_t hl = home ? strlen(home) : 0;
-    /* ~ for home, as every shell does -- the full path is noise in your own
-     * directory, which is where you spend most of your time. */
-    if (hl && strncmp(g_cwd, home, hl) == 0 && (g_cwd[hl] == '/' || g_cwd[hl] == 0)) {
-        snprintf(tilde, sizeof tilde, "~%s", g_cwd + hl);
-        shown = tilde;
-    }
-    snprintf(p, sizeof p, "%s@%s:%s$", user, HOSTNAME, shown);
-    return p;
-}
-
+/* Clear: the scrollback and the screen. A shell at its prompt is asked to
+ * redraw it (Ctrl+L) rather than having it wiped from under its editor. */
+static bool term_send(const void *data,size_t n);
 static void term_clear(void) {
-    vt_feed(&g_vt,"\033[2J\033[H\033[3J",11);g_view=0;
+    g_view=0;
+    if (g_at_prompt && g_vt.edit_shell && !g_dead) {vt_clear_history(&g_vt);(void)term_send("\f",1);}
+    else vt_feed(&g_vt,"\033[2J\033[H\033[3J",11);
 }
 static void term_putc(char c) {
     vt_feed(&g_vt,&c,1);
@@ -139,161 +85,6 @@ static void term_putc(char c) {
 static void term_newline(void) {vt_feed(&g_vt,"\r\n",2);}
 static void term_say(const char *s) {
     while (*s) {if (*s=='\n')term_newline();else term_putc(*s);s++;}
-}
-
-/* --- line-editor edits ----------------------------------------------------- */
-
-static void in_insert(char c) {
-    if (g_in_n >= IN_MAX - 1) return;
-    memmove(g_in + g_cur + 1, g_in + g_cur, (size_t)(g_in_n - g_cur) + 1);
-    g_in[g_cur++] = c;
-    g_in_n++;
-}
-
-static void in_backspace(void) {
-    if (g_cur == 0) return;
-    int start=g_cur-1;while(start>0 && ((unsigned char)g_in[start]&0xc0)==0x80)start--;
-    memmove(g_in+start,g_in+g_cur,(size_t)(g_in_n-g_cur)+1);g_in_n-=g_cur-start;g_cur=start;
-}
-
-static void in_delete(void) {                    /* forward delete, at the caret */
-    if (g_cur >= g_in_n) return;
-    int end=g_cur+1;while(end<g_in_n && ((unsigned char)g_in[end]&0xc0)==0x80)end++;
-    memmove(g_in+g_cur,g_in+end,(size_t)(g_in_n-end)+1);g_in_n-=end-g_cur;
-}
-
-static void in_kill_to_start(void) {             /* Ctrl+U */
-    memmove(g_in, g_in + g_cur, (size_t)(g_in_n - g_cur) + 1);
-    g_in_n -= g_cur; g_cur = 0;
-}
-
-static void in_kill_to_end(void) {               /* Ctrl+K */
-    g_in[g_cur] = 0; g_in_n = g_cur;
-}
-
-static void in_kill_word(void) {                 /* Ctrl+W */
-    int e = g_cur;
-    while (g_cur > 0 && g_in[g_cur - 1] == ' ') g_cur--;
-    while (g_cur > 0 && g_in[g_cur - 1] != ' ') g_cur--;
-    memmove(g_in + g_cur, g_in + e, (size_t)(g_in_n - e) + 1);
-    g_in_n -= e - g_cur;
-}
-
-/* --- Tab completion --------------------------------------------------------
- * The terminal owns the line, so it owns completion too. It completes the
- * token under the caret against the filesystem (relative to the cwd the shell
- * reports), and -- in command position -- against the shell's builtins and the
- * extern search directories. One match completes; several extend to the common
- * prefix and, when stuck, list into the transcript, exactly as bash does. */
-static const char *k_builtins[] = {
-    "ls","cat","cd","pwd","mkdir","rmdir","touch","rm","cp","mv","save",
-    "ps","kill","env","uptime","date","clear","echo","where","select",
-    "sort-by","first","head","last","tail","reverse","get","count","wc",
-    "history","which","whoami","hostname","help","exit",
-};
-
-struct cand { char name[64]; int is_dir; };
-#define CAND_MAX 96
-
-static int cand_add(struct cand *cs, int n, const char *name, int is_dir) {
-    if (n >= CAND_MAX) return n;
-    snprintf(cs[n].name, sizeof cs[n].name, "%s", name);
-    cs[n].is_dir = is_dir;
-    return n + 1;
-}
-
-static void complete(void) {
-    if (g_cur != g_in_n) return;               /* complete at line end only */
-
-    /* the token being completed, and whether it names a command */
-    int tok = g_in_n;
-    while (tok > 0 && g_in[tok - 1] != ' ') tok--;
-    int is_cmd = 1;
-    for (int i = 0; i < tok; i++) if (g_in[i] != ' ') { is_cmd = 0; break; }
-    const char *token = g_in + tok;
-
-    /* split off any directory part; resolve it against the live cwd */
-    const char *slash = strrchr(token, '/');
-    char dir[224]; const char *base = token;
-    if (slash) {
-        size_t dl = (size_t)(slash - token);
-        char dpart[160];
-        if (dl >= sizeof dpart) return;
-        memcpy(dpart, token, dl); dpart[dl] = 0;
-        base = slash + 1;
-        if (token[0] == '/')      snprintf(dir, sizeof dir, "%s", dl ? dpart : "/");
-        else if (token[0] == '~') {
-            const char *h = getenv("HOME");
-            snprintf(dir, sizeof dir, "%s%s", h ? h : "", dpart + 1);
-        }
-        else snprintf(dir, sizeof dir, "%s/%s", g_cwd, dpart);
-    } else {
-        snprintf(dir, sizeof dir, "%s", g_cwd);
-    }
-    size_t blen = strlen(base);
-
-    static struct cand cs[CAND_MAX];
-    int n = 0;
-
-    /* command position: builtins + the extern search dirs, bare names */
-    if (is_cmd && !slash) {
-        for (size_t i = 0; i < sizeof k_builtins / sizeof k_builtins[0]; i++)
-            if (!strncmp(k_builtins[i], base, blen))
-                n = cand_add(cs, n, k_builtins[i], 0);
-        struct embk_dirent es[64];
-        int64_t m = embk_readdir("/system/bin", es, 64);
-        for (int64_t i = 0; i < m; i++) {
-            size_t l = strlen(es[i].name);
-            if (l > 4 && !strcmp(es[i].name + l - 4, ".elf")) {
-                char bare[64];
-                snprintf(bare, sizeof bare, "%.*s", (int)(l - 4), es[i].name);
-                if (!strncmp(bare, base, blen)) n = cand_add(cs, n, bare, 0);
-            }
-        }
-        m = embk_readdir("/data/apps", es, 64);
-        for (int64_t i = 0; i < m; i++)
-            if (es[i].type == EMBK_DT_DIR && es[i].name[0] != '.' &&
-                !strncmp(es[i].name, base, blen))
-                n = cand_add(cs, n, es[i].name, 0);
-    }
-
-    /* filesystem: everything in `dir` matching the base prefix */
-    {
-        struct embk_dirent es[64];
-        int64_t m = embk_readdir(dir, es, 64);
-        for (int64_t i = 0; i < m; i++) {
-            if (es[i].name[0] == '.' && blen == 0) { /* hide dotfiles unprompted */ }
-            else if (!strncmp(es[i].name, base, blen))
-                n = cand_add(cs, n, es[i].name, es[i].type == EMBK_DT_DIR);
-        }
-    }
-    if (n == 0) return;
-
-    /* longest common prefix across every candidate */
-    size_t common = strlen(cs[0].name);
-    for (int i = 1; i < n; i++) {
-        size_t j = 0;
-        while (j < common && cs[i].name[j] == cs[0].name[j]) j++;
-        common = j;
-    }
-
-    if (common > blen) {                       /* progress: extend the token */
-        for (size_t j = blen; j < common && g_in_n < IN_MAX - 1; j++)
-            in_insert(cs[0].name[j]);
-        if (n == 1) in_insert(cs[0].is_dir ? '/' : ' ');
-        return;
-    }
-    if (n == 1) { in_insert(cs[0].is_dir ? '/' : ' '); return; }
-
-    /* stuck with several: show them, the way a second Tab does in bash */
-    term_say(prompt_text()); term_putc(' '); term_say(g_in); term_newline();
-    for (int i = 0; i < n; i++) {
-        if (cs[i].is_dir) { term_say("\x1b[1;34m"); term_say(cs[i].name);
-                            term_say("\x1b[0m/"); }
-        else term_say(cs[i].name);
-        term_say("  ");
-    }
-    term_newline();
 }
 
 /* --- the test probe ----------------------------------------------------------
@@ -332,8 +123,8 @@ static void probe_refresh(void) {
     p->at_prompt=g_at_prompt;p->dead=g_dead;p->alt=g_vt.alt;p->cursor_visible=g_vt.cursor_visible;
     p->view=g_view;p->shell=g_shell;p->master=g_master;p->session=0;p->sessions=1;
     p->prompt_serial=g_vt.prompt_serial;p->history_count=g_vt.history_count;p->frames=g_frames;
-    p->input_len=g_in_n;p->caret=g_cur;memcpy(p->input,g_in,sizeof g_in);
-    p->flags=(g_local?TERM_PROBE_LOCAL_EDIT:0)|(g_vt.edit_shell?TERM_PROBE_EDIT_SHELL:0)|(g_vt.inband_resize?TERM_PROBE_INBAND_SIZE:0);
+    p->input_len=0;p->caret=0;p->input[0]=0;      /* no local line any more: the shells edit their own */
+    p->flags=(g_vt.edit_shell?TERM_PROBE_EDIT_SHELL:0)|(g_vt.inband_resize?TERM_PROBE_INBAND_SIZE:0);
     snprintf(p->cwd,sizeof p->cwd,"%s",g_cwd);
     p->text_len=probe_screen(s,p->text);p->primary_len=probe_screen(&g_vt.primary,p->primary);
     size_t cells=0;
@@ -377,7 +168,7 @@ static void term_idle(void) {
     }
     static unsigned prompt_serial;
     if(prompt_serial!=g_vt.prompt_serial) {
-        prompt_serial=g_vt.prompt_serial;g_at_prompt=g_vt.shell_ready;g_local=g_at_prompt && !g_vt.edit_shell;
+        prompt_serial=g_vt.prompt_serial;g_at_prompt=g_vt.shell_ready;
         snprintf(g_cwd,sizeof g_cwd,"%.*s",(int)sizeof g_cwd-1,g_vt.directory);got=true;
     }
     if (!g_dead && g_shell >= 0 && !embk_proc_alive(g_shell)) {
@@ -390,19 +181,11 @@ static void term_idle(void) {
 
 static void term_copy(void) {
     static char copy[65536];size_t n=0;
-    struct vt *snapshot=NULL;const struct vt *source=&g_vt;
-    if(g_local && !g_view) {
-        snapshot=malloc(sizeof *snapshot);
-        if(!snapshot){snprintf(g_notice,sizeof g_notice,"Screen text could not be copied.");em_request_frame();return;}
-        *snapshot=g_vt;snapshot->reply=NULL;source=snapshot;
-        vt_feed(snapshot,prompt_text(),strlen(prompt_text()));vt_feed(snapshot," ",1);vt_feed(snapshot,g_in,(size_t)g_in_n);
-    }
     for(int y=0;y<g_rows;y++) {
-        char row[VT_COLS*12+1];size_t k=vt_line_text(source,y,(unsigned)g_view,row,sizeof row);
-        if(n+k+1>sizeof copy){free(snapshot);snprintf(g_notice,sizeof g_notice,"Screen text exceeds the clipboard limit.");em_request_frame();return;}
+        char row[VT_COLS*12+1];size_t k=vt_line_text(&g_vt,y,(unsigned)g_view,row,sizeof row);
+        if(n+k+1>sizeof copy){snprintf(g_notice,sizeof g_notice,"Screen text exceeds the clipboard limit.");em_request_frame();return;}
         memcpy(copy+n,row,k);n+=k;if(y+1<g_rows)copy[n++]='\n';
     }
-    free(snapshot);
     if(embk_clip_set(copy,n)<0)snprintf(g_notice,sizeof g_notice,"Screen text could not be copied.");
     else snprintf(g_notice,sizeof g_notice,"Screen copied");
     em_request_frame();
@@ -413,20 +196,20 @@ static void term_paste(void) {
     int64_t held=embk_clip_get(clipboard,sizeof clipboard);
     if(held<=0)return;
     if(held>(int64_t)sizeof clipboard){snprintf(g_notice,sizeof g_notice,"Clipboard text is too large to paste.");em_request_frame();return;}
-    bool bracketed=!g_local && g_vt.bracketed_paste;
+    /* Bracketed when the program asked (the shells do, at their prompts), so
+     * the text arrives as text; otherwise a line break is Enter, as Terminal.app
+     * pastes. Control bytes other than tab and newline are dropped. */
+    bool bracketed=g_vt.bracketed_paste;
     size_t n=0;if(bracketed){memcpy(paste,"\033[200~",6);n=6;}
     for(int64_t i=0;i<held;i++) {
         unsigned char c=(unsigned char)clipboard[i];
         if(c=='\r') {if(i+1<held && clipboard[i+1]=='\n')continue;c='\n';}
-        if(!bracketed && (c=='\n' || c=='\t'))c=' ';
         if(c==127 || (c<32 && c!='\n' && c!='\t'))continue;
+        if(!bracketed && c=='\n')c='\r';
         paste[n++]=(char)c;
     }
     if(bracketed){memcpy(paste+n,"\033[201~",6);n+=6;}
-    if(g_local) {
-        if(n>IN_MAX-1-(size_t)g_in_n)snprintf(g_notice,sizeof g_notice,"Pasted text exceeds the command line limit.");
-        else {memmove(g_in+g_cur+n,g_in+g_cur,(size_t)(g_in_n-g_cur)+1);memcpy(g_in+g_cur,paste,n);g_cur+=(int)n;g_in_n+=(int)n;}
-    } else (void)term_send(paste,n);
+    (void)term_send(paste,n);
     em_request_frame();
 }
 
@@ -475,16 +258,15 @@ static size_t encode_key(int c,unsigned key,unsigned code,unsigned mods,char out
     return vt_key_sequence(&g_vt,(unsigned)byte,vtmods&2,out);
 }
 
-/* At the local prompt the keys edit the line, emacs-style; while a program
- * runs they are encoded for it. PgUp/PgDn (Shift+ while a program runs) and the
- * wheel page the scrollback; ESC clears the line first and only closes the
- * window when there is nothing to clear. GUI shortcuts never reach a program. */
+/* Keys are encoded for the program. Shift+PgUp/PgDn and the wheel page the
+ * scrollback; GUI shortcuts never reach a program; once the shell has exited,
+ * Escape closes the window. */
 static int term_key(int c) {
     unsigned mods=(unsigned)em_key_modifiers(),code=(unsigned)em_key_code(),flags=(unsigned)em_key_flags();g_notice[0]=0;
     unsigned key=key_identity(c,code,flags);
     if(c==EMBK_KEY_COPY || (c==3 && (mods&(EMBK_KM_CTRL|EMBK_KM_SHIFT))==(EMBK_KM_CTRL|EMBK_KM_SHIFT))) {term_copy();return 1;}
-    if(c==EMBK_KEY_PASTE || (c==22 && (g_local || (mods&EMBK_KM_SHIFT)))) {term_paste();return 1;}
-    if((key==VT_KEY_PAGEUP || key==VT_KEY_PAGEDOWN) && (g_local || (mods&EMBK_KM_SHIFT))) {
+    if(c==EMBK_KEY_PASTE || (c==22 && (mods&EMBK_KM_SHIFT))) {term_paste();return 1;}
+    if((key==VT_KEY_PAGEUP || key==VT_KEY_PAGEDOWN) && (mods&EMBK_KM_SHIFT)) {
         if(!g_vt.alt) {
             g_view+=(key==VT_KEY_PAGEUP?1:-1)*(g_rows/2);
             if(g_view<0)g_view=0;
@@ -493,68 +275,10 @@ static int term_key(int c) {
         em_request_frame();return 1;
     }
     if(mods&EMBK_KM_GUI)return 1;
-    if (!g_local && !g_dead) {
-        char sequence[16];size_t n=encode_key(c,key,code,mods,sequence);
-        if(n)(void)term_send(sequence,n);
-        if(g_view)g_view=0;
-        em_request_frame();return 1;
-    }
-    if (key==VT_KEY_ESCAPE) {
-        if (g_dead || g_in_n == 0) return 0;     /* nothing to clear -> close */
-        g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
-        em_request_frame();
-        return 1;
-    }
-    if (g_dead) return 1;
-    if (key>=VT_KEY_KP_0 && key<=VT_KEY_KP_SLASH && key!=VT_KEY_KP_ENTER) key=0;   /* keypad text */
-
-    switch (key ? key : (unsigned)c) {
-    case VT_KEY_UP:   case 0x10: hist_step(-1); break;   /* Up / Ctrl+P */
-    case VT_KEY_DOWN: case 0x0E: hist_step(+1); break;   /* Down / Ctrl+N */
-    case VT_KEY_LEFT: case 0x02: if(g_cur>0){g_cur--;while(g_cur>0 && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur--;}break;
-    case VT_KEY_RIGHT:case 0x06: if(g_cur<g_in_n){g_cur++;while(g_cur<g_in_n && ((unsigned char)g_in[g_cur]&0xc0)==0x80)g_cur++;}break;
-    case VT_KEY_HOME: case 0x01: g_cur = 0;      break;  /* Home / Ctrl+A */
-    case VT_KEY_END:  case 0x05: g_cur = g_in_n; break;  /* End  / Ctrl+E */
-    case 0x03:                                   /* Ctrl+C: abandon the line */
-        term_say(prompt_text()); term_putc(' ');
-        term_say(g_in); term_say("^C\n");
-        g_in[0] = 0; g_in_n = 0; g_cur = 0; g_hist_at = -1;
-        break;
-    case 0x04:
-        if (!g_in_n && term_send("\004",1)) g_at_prompt=g_local=false;
-        break;
-    case 0x0C:                                   /* Ctrl+L: clear the screen */
-        term_clear();
-        break;
-    case 0x15: in_kill_to_start(); break;        /* Ctrl+U */
-    case 0x0B: in_kill_to_end();   break;        /* Ctrl+K */
-    case 0x17: in_kill_word();     break;        /* Ctrl+W */
-    case VT_KEY_TAB: complete();   break;
-    case VT_KEY_BACKSPACE: in_backspace(); break;
-    case VT_KEY_DELETE: in_delete(); break;
-    case VT_KEY_ENTER: case VT_KEY_KP_ENTER: {
-        if (g_view != 0) g_view = 0;
-        /* Send the whole line at once. The shell echoes it after our written
-         * prompt, completing the transcript line into "user@host:~$ ls" ahead
-         * of the output -- the record of what actually ran. */
-        hist_push_line(g_in);
-        g_hist_at = -1;
-        term_say(prompt_text());
-        term_putc(' ');
-        char command[IN_MAX+1];
-        memcpy(command,g_in,(size_t)g_in_n); command[g_in_n]='\n';
-        if (!term_send(command,(size_t)g_in_n+1)) return 1;
-        g_at_prompt=g_local=false;
-        g_in[0] = 0; g_in_n = 0; g_cur = 0;
-        break;
-    }
-    default:
-        if (!key && c >= 0x20 && c <= 0xF4) {
-            if (g_view != 0) g_view = 0;         /* typing = snap back to live */
-            in_insert((char)c);
-        }
-        break;
-    }
+    if(g_dead)return key==VT_KEY_ESCAPE?0:1;      /* 0: the runtime closes the window */
+    char sequence[16];size_t n=encode_key(c,key,code,mods,sequence);
+    if(n)(void)term_send(sequence,n);
+    if(g_view)g_view=0;
     em_request_frame();
     return 1;                                    /* never reaches the toolkit */
 }
@@ -588,7 +312,7 @@ static bool term_spawn_shell(void) {
     char user_env[64];
     snprintf(user_env, sizeof user_env, "USER=%s",
              getenv("USER") ? getenv("USER") : "user");
-    char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", "TERM_PROGRAM=EmbLinkTerminal", "EMBLINK_PROMPT=1", NULL };
+    char *senv[] = { home_env, pwd_env, user_env, "TERM=emlink", "TERM_PROGRAM=EmbLinkTerminal", NULL };
     int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, senv, acts, 3);
 
     close(pair[1]);
@@ -631,22 +355,9 @@ static void paint_cell(struct render_target *rt,int x,int y,const struct vt_cell
         if(c->flags&VT_STRIKE)fill(rt->pixels,px,py+g_cell_height/2,w,1,fg);
     }
 }
-static unsigned next_rune(const char *s,uint32_t *rune) {
-    int n=font_utf8_decode(s,rune);return n>0?(unsigned)n:1;
-}
-static void overlay_text(struct render_target *rt,const char *text,int *x,int *y,uint32_t fg,uint32_t bg,uint32_t font,uint32_t bold,float size) {
-    for(const char *p=text;*p;) {
-        uint32_t rune;unsigned n=next_rune(p,&rune);p+=n;int w=vt_width(rune);if(w<0)continue;
-        if(w==0)continue;
-        if(*x+w>g_cols){*x=0;(*y)++;}
-        if(*y>=g_rows)break;
-        struct vt_cell c={.rune=rune,.fg=fg,.bg=bg,.width=(uint8_t)w};
-        paint_cell(rt,*x,*y,&c,fg,bg,font,bold,size);*x+=w;
-    }
-}
 static void paint_cursor(struct render_target *rt,int x,int y,uint32_t color) {
     if(x>=g_cols){x=0;y++;}if(y>=g_rows)return;
-    int style=g_local?5:g_vt.cursor_style;
+    int style=g_vt.cursor_style;
     if(style==3 || style==4)fill(rt->pixels,x*g_cell_width,(y+1)*g_cell_height-2,g_cell_width,2,color);
     else if(style==5 || style==6)fill(rt->pixels,x*g_cell_width,y*g_cell_height,2,g_cell_height,color);
     else {
@@ -657,7 +368,6 @@ static void paint_cursor(struct render_target *rt,int x,int y,uint32_t color) {
         fill(rt->pixels,(x+1)*g_cell_width-1,y*g_cell_height,1,g_cell_height,color);
     }
 }
-static uint64_t signature(const char *s,uint64_t h) {for(;*s;s++)h=(h^(unsigned char)*s)*1099511628211ull;return h;}
 static bool screen_bitmap(void) {
     const struct ui_theme *t=ui_theme();
     uint32_t font=em_font("/system/fonts/mono.ttf"),bold=em_font("/system/fonts/mono-bold.ttf");
@@ -688,14 +398,9 @@ static bool screen_bitmap(void) {
     g_cols=cols;g_rows=rows;g_cell_width=cw;g_cell_height=ch;
     if(g_view>(int)g_vt.history_count)g_view=(int)g_vt.history_count;
     if(g_vt.alt)g_view=0;
-    if(g_local && !g_view) {
-        unsigned cells=(unsigned)(strlen(prompt_text())+1+strlen(g_in));
-        unsigned offset=g_vt.primary.cursor.wrap?(unsigned)g_cols:(unsigned)g_vt.primary.cursor.x;
-        vt_prompt_room(&g_vt,(offset+cells)/(unsigned)g_cols);
-    }
     uint32_t bg=rgb(t->bg),fg=rgb(t->text),accent=rgb(t->accent);
-    uint64_t hash=signature(g_in,g_vt.revision*1099511628211ull);
-    hash=signature(prompt_text(),hash);hash^=(uint64_t)g_cur<<32;hash^=(uint64_t)(g_local+2*g_dead+4*g_view)<<24;
+    uint64_t hash=g_vt.revision*1099511628211ull;
+    hash^=(uint64_t)(2*g_dead+4*g_view)<<24;
     hash^=(uint64_t)bg<<16;hash^=(uint64_t)fg;hash^=(uint64_t)accent<<32;
     hash^=(uint64_t)w<<40;hash^=(uint64_t)h<<48;hash^=(uint64_t)font<<8;hash^=(uint64_t)(size*4);
     if(!g_bitmap_valid || hash!=g_painted_signature) {
@@ -704,18 +409,7 @@ static bool screen_bitmap(void) {
         fill(rt.pixels,0,0,w,h,bg);
         for(int y=0;y<rows;y++)for(int x=0;x<cols;x++)paint_cell(&rt,x,y,vt_view_cell(&g_vt,y,x,(unsigned)g_view),fg,bg,font,bold,size);
         struct vt_cursor *cursor=&vt_active(&g_vt)->cursor;
-        int x=cursor->x,y=cursor->y;
-        if(g_local && cursor->wrap){x=0;y++;}
-        if(g_local && !g_view) {
-            overlay_text(&rt,prompt_text(),&x,&y,accent,bg,bold,bold,size);overlay_text(&rt," ",&x,&y,fg,bg,font,bold,size);
-            int caret_x=x,caret_y=y;
-            for(int i=0;i<g_cur;) {
-                uint32_t rune;unsigned n=next_rune(g_in+i,&rune);i+=(int)n;int width=vt_width(rune);if(width<0)width=1;
-                if(caret_x+width>cols){caret_x=0;caret_y++;}caret_x+=width;
-            }
-            overlay_text(&rt,g_in,&x,&y,fg,bg,font,bold,size);x=caret_x;y=caret_y;
-        }
-        if(!g_view && !g_dead && (g_local || g_vt.cursor_visible))paint_cursor(&rt,x,y,accent);
+        if(!g_view && !g_dead && g_vt.cursor_visible)paint_cursor(&rt,cursor->x,cursor->y,accent);
         cpu_clip_restore(&clip);g_painted_signature=hash;g_bitmap_valid=true;
         g_frames++;probe_refresh();
     }

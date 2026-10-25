@@ -12,7 +12,7 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       (bash's default; zsh's share_history is not offered).
 - [ ] On the kernel console the editor works line by line: a multi-line program's earlier lines
       cannot be edited there, and Ctrl+Q/R/S/T/B/E are the console's arrows and Home/End.
-- [ ] M3 `sh` on the editor; Terminal's local prompt removed.
+- [x] M3 `sh` on the editor (its own history, POSIX completion); Terminal's local prompt removed.
 - [ ] M4 Screen model v2 (xterm-compatible, dynamic size, compact scrollback, palette-indexed cells).
 - [ ] M5 Fonts and renderer (cmap 12, fallback, four faces, procedural box/powerline glyphs, damage).
 - [ ] M6 Tabs, mouse selection, find, links, zoom; dynamic PTYs.

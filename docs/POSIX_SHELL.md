@@ -55,8 +55,16 @@ apply to external argv/environments: 31 environment entries, 1024 environment
 bytes, 64 descriptors and 61 user spawn actions. See the
 [process contract](PROCESS_COMPATIBILITY.md) for the complete adapter limits.
 
-Terminal uses OSC prompt markers and its existing local history/caret editing.
-Canonical echo is respected, so submitted commands appear once. Foreground
+On a terminal, `sh` edits its own line with the native shell's editor
+(`shell/edit`, [SHELL.md](SHELL.md#10-the-line--the-shell-edits-its-own)): the
+same keys, Ctrl+R search, multi-line programs (mrsh's parser says when one is
+unfinished, so `for ... do` adds a line instead of failing), bracketed paste,
+history in `~/.local/share/shell/sh_history`, and completion
+(`ports/mrsh/sh_complete.c`: sh builtins, keywords and the port's utilities,
+`/system/bin` and `/data/apps` where a command goes, files elsewhere, `$` names
+from the environment; special characters are backslash-escaped). The prompt is
+`PS1` -- by default `user@emblink:$PWD sh$` -- framed in the same OSC 133 marks
+the native shell writes. From a pipe, lines are read as they come. Foreground
 interrupts use native owned-child cancellation with a 500 ms hard-kill
 backstop. The shell restores its prompt afterward and scopes cancellation to
 foreground children. This is native interruption, not POSIX signals or job

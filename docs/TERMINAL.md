@@ -59,16 +59,25 @@ Canonical editing operates on bytes; Unicode-aware erase is still pending.
 
 ## Terminal application
 
-The native shell edits its own line ([SHELL.md](SHELL.md#10-the-line--the-shell-edits-its-own)):
-it draws the prompt, reads every key in raw mode, and recalls, searches and
-completes itself. Terminal is a screen for it, as for any program: keys are
-encoded and sent, output is drawn. A shell says so in its prompt mark --
-`OSC 133;A` carrying `edit=shell` -- and only a prompt WITHOUT it (the `sh`
-port, until it moves onto the shell's editor) gets Terminal's older local
-editing: a 255-byte line with its own history and completion, sent whole on
-Enter. Shift+PgUp/PgDn and the wheel page the scrollback; Escape and Ctrl+D go
-to the program. An interactive program can read a canonical line, disable
-echo, or select raw mode.
+Both shells edit their own lines ([SHELL.md](SHELL.md#10-the-line--the-shell-edits-its-own)):
+the native shell and `sh` draw their prompts, read every key in raw mode, and
+recall, search and complete themselves. Terminal is a screen for them, as for
+any program -- keys are encoded and sent, output is drawn -- and it has no line
+editor of its own any more (until 2026-10 it edited the native prompt locally
+and sent the finished line). A prompt mark with `edit=shell` says so;
+a program that marks a prompt without it simply gets its keys like any other.
+
+- Shift+PgUp/PgDn and the wheel page the scrollback.
+- Escape, Ctrl+D, Ctrl+L and everything else go to the program. Once the shell
+  has exited, Escape closes the window; GUI+W closes it at any time.
+- **Clear** empties the scrollback and the screen; at a shell prompt it asks
+  the shell to redraw (Ctrl+L) instead of wiping the prompt from under it.
+- **Paste** is bracketed when the program asked for it (both shells do at their
+  prompts): the text arrives as text and nothing runs until Enter. Without it, a
+  line break is sent as Enter, as Terminal.app pastes.
+
+An interactive program can read a canonical line, disable echo, or select raw
+mode.
 
 **Resizing a prompt.** A shell that edits its own line turns on DECSET 2048
 while it does. When the window is resized during such a prompt, Terminal first
@@ -155,19 +164,17 @@ Implemented screen operations include:
   consumed without appearing as output. OSC clipboard writes are ignored.
 
 **Copy screen** exports the visible grid as UTF-8 text, without terminal escape
-sequences. It includes the local prompt when visible. **Paste** removes unsafe
-control bytes. At the native prompt, line breaks and tabs become spaces and an
-oversized paste is refused without inserting a prefix or executing a command.
-An application that explicitly enables bracketed paste receives its delimiters
-and multiline content. Cmd+C/V and Ctrl+Shift+C/V operate on the screen clipboard;
+sequences. **Paste** removes unsafe control bytes; an application that enables
+bracketed paste (both shells, at their prompts) receives its delimiters and
+multiline content. Cmd+C/V and Ctrl+Shift+C/V operate on the screen clipboard;
 ordinary Ctrl-letter input continues to the running program. Shift+PageUp/Down
 and the wheel view primary history; the alternate screen has no history view.
-**Clear** and the shell's `clear` builtin clear the screen and history.
+**Clear** and the shell's `clear` builtin clear the screen and history (at a
+shell prompt, Clear asks the shell to redraw it).
 
 Shell integration uses the OSC 133 marks: `A` (prompt start; `edit=shell`,
 `cwd=` last), `B` (input start), `C` (command start) and `D;status`
-(command end). The `sh` port still opts in with `EMBLINK_PROMPT=1` and uses
-the local prompt. The pending program-input queue holds 65,568 bytes, independently of the smaller
+(command end), plus EmbLink's `R` (back to the prompt's start). The pending program-input queue holds 65,568 bytes, independently of the smaller
 kernel device queues, and reports pressure in the app bar.
 
 Shared text controls now receive a single paste command after the app hook gets
