@@ -52,6 +52,72 @@ without prepare/select/release hooks remain at the firmware resolution and
 Settings explains that live changes are unavailable. See [DAILY_USE.md](DAILY_USE.md)
 for the supported Intel families and brightness limitations.
 
+## Native Intel modesetting on the HP ProBook 450 G7
+
+The target is the HP ProBook 450 G7: 10th-generation Core (Comet Lake-U),
+Intel UHD Graphics with a Gen9 display engine, a Comet Point PCH, and an eDP
+panel (some units also carry an NVIDIA GPU, which does not drive the panel).
+Native modesetting means the OS programs that display engine itself --
+display clock, PLLs, transcoder timings, planes, watermarks, DDI buffers, DP
+link training, panel power sequencing and backlight -- instead of keeping the
+mode the firmware left. QEMU has no Intel display engine, so every step is
+measured on the laptop, and each one leaves its evidence on the boot stick.
+
+| Step | What it delivers | State |
+|---|---|---|
+| 1. Capture | `/EMBKDISP.BIN`: a read-only record of the laptop's display, and a decoder | **Built and host-tested; waiting for the laptop's capture** |
+| 2. Reproduce | From the capture: compute the native mode's complete register state and check it against what the firmware programmed | Open |
+| 3. eDP modeset | Disable the firmware pipe and light the panel natively at its native mode | Open |
+| 4. Other modes | Lower resolutions through the pipe scaler; Settings → Displays with keep/revert | Open |
+| 5. External outputs | HDMI (GMBUS EDID, WRPLL, TMDS) and DP over USB-C if the VBT says it is wired | Open |
+
+### Step 1: the capture
+
+On any machine with an Intel display controller, the kernel records, before
+any driver claims the device:
+
+- the GPU's, PCH's and any other display controller's PCI configuration;
+- the ACPI OpRegion and its VBT -- the board's own table of which DDI is the
+  eDP panel, which is HDMI, which AUX channel and DDC pin each uses, the
+  panel's power-sequencing delays and its backlight PWM;
+- every Gen9 display register block: power wells, DC states, CDCLK, the four
+  DPLLs, the transcoders' timings and M/N values, the DDIs and their buffer
+  translation tables, the pipe scalers, the planes with their DDB allocation
+  and watermarks, panel power and the backlight;
+- each DP/eDP sink's DPCD (receiver capabilities, eDP link-rate table, link
+  and lane status, eDP backlight capabilities) and its EDID read over AUX;
+- each HDMI connector's EDID over GMBUS;
+- the DRAM latencies pcode reports, which the watermark calculation needs;
+- the GTT entries behind the firmware's framebuffer.
+
+It writes nothing that changes the display: the only register writes are
+AUX, GMBUS and pcode request transactions, the same ones Linux makes while the
+firmware's mode is on screen. AUX channels B-D are probed only when the
+firmware left power well 2 on. The record goes to the boot stick's EFI
+partition as `EMBKDISP.BIN` (beside `EMBLINK.LOG`), and the boot log gains one
+line beginning `intel-capture:` that summarises it. Read it on another
+computer:
+
+```sh
+python3 tools/intel_display_dump.py /Volumes/EMBLINK/EMBKDISP.BIN
+python3 tools/intel_display_dump.py /Volumes/EMBLINK/EMBKDISP.BIN --json
+```
+
+The report leads with what the firmware put on screen -- for example
+`transcoder eDP -> DDI A, DP SST, 4 lanes, 8 bpc, pipe A: 1920x1080 (total
+2080x1110), 142.5 MHz, 61.72 Hz, DPLL0 at 2.70 Gbps` -- followed by the VBT's
+ports, the sinks' capabilities and EDIDs, and the raw decoded state.
+
+Verification: `tests/drivers/intel_capture_test.c` runs the real AUX, GMBUS
+and capture code against a simulated Comet Lake laptop -- a DP sink that
+DEFERs, returns short replies and NACKs a reserved range, an EDID behind
+I2C-over-AUX, an HDMI EDID behind GMBUS, pcode, an OpRegion 2.1 with its VBT
+behind RVDA and one with the VBT in mailbox 4 -- checks every section of the
+file, and asserts the capture never writes a register outside those
+protocols. `tests/drivers/intel_capture_decode_test.py` then decodes that
+file and checks every value the simulation holds. Both run from
+`tests/drivers/run.sh`.
+
 ## Protocol references
 
 The VirtIO GPU device protocol specifies GET_EDID (optional feature bit 1),

@@ -32,11 +32,16 @@ static int supported(uint16_t id) {
     case 0x5902:case 0x5906:case 0x590b:case 0x5912:case 0x5916:case 0x5917:
     case 0x591b:case 0x591d:case 0x5926:case 0x5927:
     case 0x3e90:case 0x3e91:case 0x3e92:case 0x3e9b:case 0x3ea0:case 0x3ea5:
-    case 0x3ea6:case 0x3ea8:case 0x9b41:case 0x9bc4:case 0x9bc5:case 0x9bc8:return 1;
+    case 0x3ea6:case 0x3ea8:
+    /* Comet Lake, all of i915's INTEL_CML_IDS: U GT1/GT2 (the ProBook 450 G7
+     * family) and H/S GT1/GT2. Same Gen9 display engine as Kaby Lake. */
+    case 0x9b21:case 0x9baa:case 0x9bac:case 0x9b41:case 0x9bca:case 0x9bcc:
+    case 0x9ba2:case 0x9ba4:case 0x9ba5:case 0x9ba8:
+    case 0x9bc2:case 0x9bc4:case 0x9bc5:case 0x9bc6:case 0x9bc8:case 0x9be6:case 0x9bf6:return 1;
     default:return 0;
     }
 }
-static unsigned pch_layout(void) {
+unsigned intel_pch_layout(void) {
     for(unsigned i=0;i<pci_devices_count();i++) {
         const struct pci_device *d=pci_get_device(i);
         if(!d || d->vendor_id!=0x8086 || d->class_code!=6 || d->subclass!=1)continue;
@@ -110,7 +115,7 @@ const struct gpu_driver *intel_display_probe(void) {
         }
         if(!matches) {vmm_unmap_mmio((uint64_t)registers,REGS_SIZE);registers=NULL;continue;}
         current=(struct gpu_mode){bp->fb_addr,bp->fb_width,bp->fb_height,bp->fb_pitch,32,bp->fb_format};
-        pwm_kind=pch_layout();unsigned percent;
+        pwm_kind=intel_pch_layout();unsigned percent;
         if(intel_backlight_get(&percent))pwm_kind=0;
         kprintf("intel-display: %04x firmware scanout verified, %ux%u, %u pipe(s), PWM %s\n",
             d->device_id,current.width,current.height,matches,pwm_kind?"available":"unavailable");

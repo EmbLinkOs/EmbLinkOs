@@ -26,6 +26,8 @@
 #include "process/process.h"
 #include "process/sched.h"
 #include "drivers/timer/timer.h"
+#include "include/spinlock.h"
+#include "include/types.h"   /* bool -- NOT <stdbool.h>: types.h typedefs it */
 
 #define BOOTLOG_PATH      "/EMBLINK.LOG"
 #define BOOTLOG_FIRST_MS   4000    /* soon: a machine that wedges at 15 s must still leave a log */
@@ -62,10 +64,62 @@ static struct fat32_volume *bootlog_volume(void)
     }
 }
 
+/* Files handed over before the volume existed (bootlog_attach). Registered
+ * during boot, written by the bootlog thread, so the lock only ever meets a
+ * late registration racing the first write. */
+#define BOOTLOG_ATTACH_MAX 4
+static struct {
+    const char *path;
+    const void *data;
+    uint32_t len;
+    bool written;
+} g_attached[BOOTLOG_ATTACH_MAX];
+static unsigned g_attached_count;
+static spinlock_t g_attach_lock = SPINLOCK_INIT;
+
+void bootlog_attach(const char *path, const void *data, uint32_t len)
+{
+    spin_lock(&g_attach_lock);
+    bool kept = g_attached_count < BOOTLOG_ATTACH_MAX;
+    if (kept) {
+        unsigned i = g_attached_count++;
+        g_attached[i].path = path;
+        g_attached[i].data = data;
+        g_attached[i].len = len;
+        g_attached[i].written = false;
+    }
+    spin_unlock(&g_attach_lock);
+    if (!kept)
+        kprintf("bootlog: no room to attach %s; it will not reach the stick\n", path);
+}
+
+static void bootlog_write_attached(struct fat32_volume *vol)
+{
+    for (unsigned i = 0; i < BOOTLOG_ATTACH_MAX; i++) {
+        spin_lock(&g_attach_lock);
+        bool pending = i < g_attached_count && !g_attached[i].written;
+        const char *path = pending ? g_attached[i].path : 0;
+        const void *data = pending ? g_attached[i].data : 0;
+        uint32_t len = pending ? g_attached[i].len : 0;
+        spin_unlock(&g_attach_lock);
+        if (!pending) continue;
+        int rc = fat32_write(vol, path, (const uint8_t *)data, len);
+        if (rc < 0) {
+            kprintf("bootlog: could not write %s: %s (will retry)\n", path, embk_strerror(rc));
+            continue;
+        }
+        spin_lock(&g_attach_lock);
+        g_attached[i].written = true;
+        spin_unlock(&g_attach_lock);
+        kprintf("bootlog: wrote %s to the EFI partition (%u bytes)\n", path, (unsigned)len);
+    }
+}
+
 static void bootlog_write_once(void)
 {
     struct fat32_volume *vol = bootlog_volume();
     if (!vol) return;                    /* not booted from a FAT volume: nothing to do */
+    bootlog_write_attached(vol);
 
     /* The heap, not .bss: the kernel image has to fit under the address the
      * firmware loads it at, and 64 KB of it for a copy of something already in

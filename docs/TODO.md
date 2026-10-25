@@ -1484,6 +1484,55 @@ it can only be late.
   `-vga qxl` support. (The LFB mapping is now write-combining via
   `vmm_map_mmio_wc` — see the `vmm_map_mmio` entry above.)
 
+### Native display, multiple monitors, GPU acceleration -- in that order (2026-10-25)
+
+The order is the user's. Target hardware for the native work is the HP
+ProBook 450 G7 (Comet Lake-U, Gen9 display, Comet Point PCH, eDP panel);
+see docs/DISPLAYS.md. QEMU has no Intel display engine, so each Intel step is
+done when the laptop shows it, not when a host test passes.
+
+- [x] **Step 1, capture.** `/EMBKDISP.BIN` on the boot stick: PCI, OpRegion
+      and VBT, every Gen9 display register block, DPCD and EDID over AUX,
+      HDMI EDID over GMBUS, pcode memory latencies, the framebuffer's GTT
+      entries. Read-only apart from AUX/GMBUS/pcode requests.
+      `tools/intel_display_dump.py` decodes it. Host-tested against a
+      simulated laptop (`tests/drivers/intel_capture_test.c`,
+      `intel_capture_decode_test.py`).
+- [ ] **The ProBook's own capture.** Boot the stick on the laptop and read
+      back `EMBKDISP.BIN`. Until it exists, every later step would be written
+      against assumptions about this board's wiring.
+- [ ] **The capture runs on every boot of Intel hardware.** About one file
+      and a few milliseconds of AUX traffic. Once native modesetting is
+      verified it should become something asked for, not something always
+      done.
+- [ ] **Step 2, reproduce the firmware's mode** from the capture: CDCLK,
+      DPLL0 link rate, transcoder timings and M/N, DDI buffer translations,
+      plane, DDB and watermarks (from the pcode latencies), panel power
+      delays -- computed by the driver's own code and compared with the
+      registers the firmware programmed.
+- [ ] **Step 3, eDP modeset**: disable the firmware pipe in order, then
+      PLL, DDI, link training over AUX (clock recovery, channel
+      equalisation, the panel's link-rate table), transcoder, plane,
+      watermarks, panel power sequencing and backlight -- native, at the
+      panel's native mode. GGTT-mapped framebuffer of the driver's own.
+- [ ] **Step 4, other modes on the panel** through the pipe scaler, behind
+      the gpu_driver prepare/select/release hooks Settings → Displays uses.
+- [ ] **Step 5, external outputs**: HDMI (GMBUS EDID, WRPLL, HDMI buffer
+      translations, AVI infoframe, hotplug) and DP over USB-C if the VBT
+      lists it.
+- [ ] **Multiple monitors**: more than one output in the gpu and compositor
+      layers -- per-output framebuffer and mode, a desktop that spans them,
+      windows that move between them, Settings arranging them. Verifiable in
+      QEMU with a multi-head virtio-gpu and on the laptop with two pipes.
+- [ ] **GPU acceleration**: compositing and fills on the GPU instead of the
+      CPU -- on Intel the blitter engine (command streamer, execlists), in
+      QEMU whatever the virtual device offers.
+- [ ] **Then the shell**: interactive commands, scripts, pipes and
+      redirections in the native structured shell -- text-program fallback
+      in pipes, a redirection syntax that does not collide with `>`, argument
+      limits that fail loudly, `#!` and `source`. (`sh` already has POSIX
+      pipes and redirections; docs/POSIX_SHELL.md.)
+
 ### Keyboard
 
 *(`kernel/drivers/input/keyboard.c`. Several items below were closed by work

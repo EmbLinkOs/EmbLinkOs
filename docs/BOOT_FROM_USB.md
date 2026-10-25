@@ -128,6 +128,12 @@ in any text editor. The kernel writes it only to the stick it booted from —
 the volume holding `/EFI/BOOT/BOOTX64.EFI` — never to another stick you plug
 in.
 
+On a machine with Intel graphics the kernel also leaves **`EMBKDISP.BIN`**
+beside it: a read-only record of the display hardware and firmware tables
+that native modesetting is built from (docs/DISPLAYS.md). It is binary;
+`python3 tools/intel_display_dump.py /Volumes/EMBLINK/EMBKDISP.BIN` reads
+it, and the log line starting `intel-capture:` summarises it.
+
 Lines worth searching for:
 
 | Search for | What it tells you |

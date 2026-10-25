@@ -31,6 +31,7 @@
 #include "ipc/clipboard.h"                   /* test session: whose the clipboard is */
 #include "process/ksync.h"
 #include "mm/kheap.h"
+#include "lib/bootlog.h"                    /* test bootlog attach */
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "mm/swap.h"                         /* test swap store */
@@ -1053,6 +1054,25 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("\n[cmd] test usbdevs: OK\n");
+        return 1;
+    }
+
+    /* test bootlog attach -- the road the Intel display capture takes to the
+     * stick (bootlog_attach), driven where there is no Intel GPU to take it.
+     * Queued and left: the bootlog thread writes it within one period, and
+     * tools/laptop_test.py reads the bytes back off the stick image itself,
+     * which is the only proof that they reached the disk. */
+    if (strcmp(cmd, "test bootlog attach") == 0) {
+        const uint32_t n = 70000;              /* more than one FAT cluster */
+        uint8_t *data = (uint8_t *)kmalloc(n); /* owned by the bootlog from here */
+        if (!data) {
+            kprintf("[cmd] test bootlog attach: FAIL (no memory)\n");
+            return 1;
+        }
+        for (uint32_t i = 0; i < n; i++)
+            data[i] = (uint8_t)(i * 31u + 7u);
+        bootlog_attach("/EMBKTEST.BIN", data, n);
+        kprintf("[cmd] test bootlog attach: queued %u bytes as /EMBKTEST.BIN\n", (unsigned)n);
         return 1;
     }
 
