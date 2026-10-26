@@ -355,6 +355,49 @@ static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
     return next;
 }
 
+
+/* Hand the compositor what this frame changed, and nothing else.
+ *
+ * After a full repaint, the whole window. Otherwise the bounding box of the
+ * renderer's dirty rects, and of a scroll blit's region (it moved pixels the
+ * rects do not name). And when NOTHING is dirty, nothing: a frame is built on
+ * every hover, refresh tick and drag step, and this used to present the whole
+ * window whenever such a frame changed no pixel -- a full compose of the
+ * window, many times a second, for nothing (docs/DESKTOP_PERFORMANCE.md). The
+ * renderer reports overflow as r->full, so an empty list means unchanged. */
+static void present_changes(int win, uint32_t *px, const uint32_t *back, int winw, int winh,
+                            const struct scene_renderer *r, bool full) {
+    if (full || r->full) {
+        if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
+        embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
+        return;
+    }
+    int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
+    if (r->has_scroll_present) {
+        x0 = (int)r->sp_x; y0 = (int)r->sp_y;
+        x1 = (int)(r->sp_x + r->sp_w) + 1;
+        y1 = (int)(r->sp_y + r->sp_h) + 1;
+    }
+    for (int i = 0; i < r->n_dirty; i++) {
+        int a = (int)r->dirty[i].x, b = (int)r->dirty[i].y;
+        int c = (int)(r->dirty[i].x + r->dirty[i].w) + 1, d = (int)(r->dirty[i].y + r->dirty[i].h) + 1;
+        if (a < x0) x0 = a;
+        if (b < y0) y0 = b;
+        if (c > x1) x1 = c;
+        if (d > y1) y1 = d;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > winw) x1 = winw;
+    if (y1 > winh) y1 = winh;
+    if (x1 <= x0 || y1 <= y0) return;
+    /* only the band that changed crosses over */
+    if (back)
+        for (int y = y0; y < y1; y++)
+            memcpy(px + (size_t)y * winw + x0, back + (size_t)y * winw + x0, (size_t)(x1 - x0) * 4);
+    embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
+}
+
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;
@@ -881,9 +924,16 @@ int em_app_run(const EmApp *app) {
 
         /* full clear+repaint on structural frames (epoch bump / first), and while
          * a close pull animates (the fade/slide moves the whole window, which the
-         * dirty-rect present would otherwise ghost). */
+         * dirty-rect present would otherwise ghost).
+         *
+         * NOT when the window moved. Its pixels are the same wherever it is: the
+         * compositor holds them and composes them at the new place, and a blur
+         * in here samples this canvas, not the desktop. A move still builds a
+         * frame, for whatever follows the window; repainting all of it on every
+         * step of a drag presented 647 thousand pixels a step for nothing
+         * (docs/DESKTOP_PERFORMANCE.md). */
         bool force_full = false;
-        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || win_moved || g_mat_full) {
+        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || g_mat_full) {
             const struct ui_theme *t = ui_theme();
             g_mat_full = 0;
             /* translucent windows -- and one that shows through -- clear to
@@ -933,39 +983,7 @@ int em_app_run(const EmApp *app) {
             return g_app_exit_requested ? g_app_exit_code : 0;
         }
 
-        if (force_full || r.full || r.n_dirty == 0) {
-            if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
-            embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
-        } else {
-            int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
-            /* a scroll blit moved pixels the dirty rects do not cover: the
-             * whole blitted region must reach the compositor */
-            if (r.has_scroll_present) {
-                x0 = (int)r.sp_x; y0 = (int)r.sp_y;
-                x1 = (int)(r.sp_x + r.sp_w) + 1;
-                y1 = (int)(r.sp_y + r.sp_h) + 1;
-            }
-            for (int i = 0; i < r.n_dirty; i++) {
-                int a = (int)r.dirty[i].x, b = (int)r.dirty[i].y;
-                int c = (int)(r.dirty[i].x + r.dirty[i].w) + 1, d = (int)(r.dirty[i].y + r.dirty[i].h) + 1;
-                if (a < x0) x0 = a;
-                if (b < y0) y0 = b;
-                if (c > x1) x1 = c;
-                if (d > y1) y1 = d;
-            }
-            if (x0 < 0) x0 = 0;
-            if (y0 < 0) y0 = 0;
-            if (x1 > winw) x1 = winw;
-            if (y1 > winh) y1 = winh;
-            if (x1 > x0 && y1 > y0) {
-                /* only the band that changed crosses over */
-                if (back)
-                    for (int y = y0; y < y1; y++)
-                        memcpy(px + (size_t)y * winw + x0, back + (size_t)y * winw + x0,
-                               (size_t)(x1 - x0) * 4);
-                embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
-            }
-        }
+        present_changes(win, px, back, winw, winh, &r, force_full);
 
         /* The frame is on screen. What it COST is the budget estimate -- see
          * the cadence note above for why the minimum of several is used and
@@ -1106,6 +1124,8 @@ int em_widget_run(const EmWidget *wg) {
         if (in.focused) ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
         else            ui_pointer(-100.0f, -100.0f, false);
 
+        /* repainted whole below: presented whole */
+        bool whole = glass || first || em_ui_epoch() != prev_epoch;
         if (glass) {
             /* a glass widget renders a translucent tint the compositor lays over
              * the blurred aurora -- clear to TRANSPARENT + full-render every build
@@ -1128,8 +1148,7 @@ int em_widget_run(const EmWidget *wg) {
         ui_frame_begin(); em_new_frame(); wg->view(); em_flush();em_tooltip_host();ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
-        if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
-        embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
+        present_changes(win, px, back, winw, winh, &r, whole);
         cad_frame(&cad, pace, (embk_thread_cpu_ns() - frame_c0) / 1000000u, title);
 
         if (first) { first = 0; char b[64]; snprintf(b, sizeof b, "%s: widget first frame\n", title); embk_puts(1, b); }

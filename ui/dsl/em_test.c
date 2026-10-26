@@ -657,6 +657,42 @@ int main(void) {
     struct scene_node *toast=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
     CHECK(toast && toast->opacity==1,"reduced motion presents a toast without a fade or slide");
 
+    /* A glass box rebuilt with nothing changed stays clean. Its fill and border
+     * are the material's; written first as the box's own and then as the
+     * material's, they differed from the last frame every frame, and the dock
+     * re-presented itself ten times a second doing nothing. The renderer clears
+     * the flags after a frame; here the test does. */
+    struct scene_node *glass=0;bool glass_clean=true,glass_tinted=false;
+    for (int f=0;f<3;f++) {
+        ui_frame_begin();em_new_frame();
+        VStack(.key="glass-host") {HStack(.key="glass-dock",.height=40,.glass=1,.corner=14,.border=1,.shadow=2) {Spacer();}}
+        em_flush();ui_frame_end();ui_run_layout(400,100);
+        glass=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+        if (!glass) break;
+        if (f>0 && (glass->dirty || glass->dirty_content)) glass_clean=false;
+        glass_tinted=glass->data.rect.fill.kind==PAINT_SOLID && glass->data.rect.fill.solid.a==ui_theme()->material_alpha &&
+                     glass->border_width==1 && glass->border_color.a==ui_theme()->border_strong.a;
+        glass->dirty=glass->dirty_content=false;
+    }
+    CHECK(glass && glass_clean,"a glass box rebuilt with nothing changed is not dirty");
+    CHECK(glass_tinted,"its fill and border are still the material's");
+
+    /* An idle menu-bar button rebuilt is not dirty either: it was painted the
+     * hover colour and then cleared on every frame, and the bar re-presented
+     * its whole strip on every tick. */
+    struct scene_node *mb=0;bool menu_clean=true;
+    ui_pointer(-100.0f,-100.0f,false);
+    for (int f=0;f<3;f++) {
+        ui_frame_begin();em_new_frame();
+        HStack(.key="menu-host") {Menu("Idle") {MenuItem("Item");}}
+        em_flush();ui_frame_end();ui_run_layout(400,100);
+        mb=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+        if (!mb) break;
+        if (f>0 && (mb->dirty || mb->dirty_content)) menu_clean=false;
+        mb->dirty=mb->dirty_content=false;
+    }
+    CHECK(mb && menu_clean && mb->data.rect.fill.solid.a==0,"an idle menu button rebuilt is clear and not dirty");
+
     navigation_regressions();
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);

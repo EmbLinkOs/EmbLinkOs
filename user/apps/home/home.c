@@ -2034,10 +2034,15 @@ int main(int argc, char **argv, char **envp) {
         if (g_invalidate > 0) { g_invalidate--; scene_render_invalidate(&r); }
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
-        if (r.full || r.n_dirty == 0 || g_full_present > 0) {
+        /* Nothing dirty is nothing to present. This used to present the whole
+         * desktop instead -- a full-screen compose on every frame the desktop
+         * built and changed nothing in, which while idle was ten a second
+         * (docs/DESKTOP_PERFORMANCE.md). g_full_present still pushes the
+         * whole surface after a structural change. */
+        if (r.full || g_full_present > 0) {
             if (g_full_present > 0) g_full_present--;
             if(embk_win_present(win, pixels, sw, sh)>=0){restore_presented=1;presented_gen=g_out_gen;}
-        } else {
+        } else if (r.n_dirty > 0 || r.has_scroll_present) {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
             if (r.has_scroll_present) {           /* a scroll blit moved pixels */
                 x0 = (int)r.sp_x; y0 = (int)r.sp_y;

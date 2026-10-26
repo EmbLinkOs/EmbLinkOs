@@ -165,15 +165,22 @@ static void em_apply_box(EmProps p) {
      * EmProps cannot distinguish "unset" from "transparent" -- both are alpha 0 --
      * so the fix is that they MEAN THE SAME THING: no fill. Containers that want
      * a default (Card, Sidebar, Window...) now pass it through p.background
-     * above rather than pre-painting behind this function's back. */
-    ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
+     * above rather than pre-painting behind this function's back.
+     *
+     * Except glass: its fill and border are the material's (em_glass_apply,
+     * below), and setting them here first made a glass box DIRTY ON EVERY
+     * FRAME -- the scene keeps a node clean only while each set repeats the
+     * last, and clear-then-tint never repeats tint. The dock re-presented
+     * itself ten times a second with nothing changing
+     * (docs/DESKTOP_PERFORMANCE.md). Every property is now set once a frame. */
+    if (!p.glass) ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
     if (em_set(p.corner))   ui_set_corner_radius(em_z(p.corner));
     /* em_set, not `> 0`, for the reason the paint above spells out at length:
      * a container that DROPS its border must be able to say so, or the reused
      * instance keeps last frame's. Same one-way-highlight bug, one prop over --
      * the dock's sockets light when an app runs and have to go dark when it
      * exits. `.border = EmZero` is how a caller means no border. */
-    if (em_set(p.border))
+    if (em_set(p.border) && !p.glass)
         ui_set_border(em_z(p.border), p.border_color.a > 0 ? p.border_color : TH->border);
     if (p.shadow > 0) {
         const struct ui_theme *t = TH;
@@ -3262,9 +3269,11 @@ void em_menu_(const char *label, EmProps p) {
     struct instance_handle btn = ui_open();
     if(g_menu_button_count<24){g_menu_buttons[g_menu_button_count].label=label;g_menu_buttons[g_menu_button_count++].button=btn;}
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    /* One paint, decided once: set to the hover colour and then cleared, an
+     * idle button changed twice a frame and was dirty on every one -- the menu
+     * bar re-presented its whole strip twice a second for nothing. */
     ui_set_paint(solid(is_open ? t->accent_soft : pressed ? shade(t->surface_alt, 0.94f)
-                                : hov ? t->surface_alt : t->surface_alt));
-    if (!is_open && !hov && !pressed) ui_set_paint(solid((Color){0,0,0,0}));   /* flat until hovered */
+                       : hov ? t->surface_alt : (Color){0,0,0,0}));   /* flat until hovered */
     ui_set_corner_radius(t->radius_sm);ui_set_border(0,t->border);
     ui_set_padding(p.height>0?1:t->sp1,t->sp3,p.height>0?1:t->sp1,t->sp3);
     if(p.height>0)ui_set_size(sz_intrinsic(),sz_fixed(p.height));
