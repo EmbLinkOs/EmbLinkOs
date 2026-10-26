@@ -2189,7 +2189,7 @@ int64_t compositor_win_damage(int pid, uint32_t id,
     g_src = EMBK_COMP_SRC_PRESENT;
     struct comp_window *w = win_find(pid, id);
     if (!w) { comp_unlock(); return -EMBK_ENOENT; }
-    comp_stats_present(pid, w->desktop ? "(desktop)" : w->title, (uint64_t)(rw ? rw : w->cw) * (rh ? rh : w->ch));
+    comp_stats_present(pid, w->desktop ? "(desktop)" : w->title, rx, ry, rw ? rw : w->cw, rh ? rh : w->ch);
     if (rw == 0 || rh == 0) { rx = 0; ry = 0; rw = w->cw; rh = w->ch; }
     if (rx > w->cw) rx = w->cw; if (ry > w->ch) ry = w->ch;
     if (rx + rw > w->cw) rw = w->cw - rx;

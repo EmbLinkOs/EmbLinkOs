@@ -14,9 +14,10 @@
 
 /* One compose of `px` screen pixels charged to `src`, from t0 to t1 (ns). */
 void comp_stats_record(unsigned src, uint64_t t0_ns, uint64_t t1_ns, uint64_t px, int full_screen);
-/* Window `title` of `pid` presented `px` pixels: who is asking, not only why.
- * Kept for the few windows presenting most since the last reset. */
-void comp_stats_present(int pid, const char *title, uint64_t px);
+/* Window `title` of `pid` presented the w x h rect at (x, y) of its content:
+ * who is asking, not only why, and where. Kept for the few windows presenting
+ * most since the last reset, with the rect each presented last. */
+void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 /* The pointer moved at some instant and a compose showed it `ns` later. */
 void comp_stats_pointer(uint64_t ns);
 void comp_stats_snapshot(struct embk_comp_stats *out);

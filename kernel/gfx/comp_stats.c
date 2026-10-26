@@ -25,7 +25,7 @@
 
 struct sample { uint64_t t1; uint32_t us; uint32_t kpx; };
 #define PRESENTERS 8
-struct presenter { int pid; char title[24]; uint64_t n, px; };
+struct presenter { int pid; char title[24]; uint64_t n, px; uint32_t last[4]; };
 
 static spinlock_t g_lock = SPINLOCK_INIT;
 static struct {
@@ -64,7 +64,7 @@ void comp_stats_record(unsigned src, uint64_t t0, uint64_t t1, uint64_t px, int 
     spin_unlock(&g_lock);
 }
 
-void comp_stats_present(int pid, const char *title, uint64_t px)
+void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     char name[sizeof g.pres[0].title];
     unsigned k = 0;
@@ -83,7 +83,8 @@ void comp_stats_present(int pid, const char *title, uint64_t px)
         p->pid = pid; p->n = 0; p->px = 0;
         memcpy(p->title, name, sizeof name);
     }
-    p->n++; p->px += px;
+    p->n++; p->px += (uint64_t)w * h;
+    p->last[0] = x; p->last[1] = y; p->last[2] = w; p->last[3] = h;
     spin_unlock(&g_lock);
 }
 
@@ -229,8 +230,10 @@ static void dump(void)
         for (int j = 0; j < PRESENTERS; j++)
             if (pres[j].n && (best < 0 || pres[j].n > pres[best].n)) best = j;
         if (best < 0) break;
-        kprintf("perf: win=%s pid=%d presents=%lu kpx=%lu\n", pres[best].title[0] ? pres[best].title : "?",
-                pres[best].pid, (unsigned long)pres[best].n, (unsigned long)(pres[best].px / 1000u));
+        kprintf("perf: win=%s pid=%d presents=%lu kpx=%lu last_x=%u last_y=%u last_w=%u last_h=%u\n",
+                pres[best].title[0] ? pres[best].title : "?", pres[best].pid, (unsigned long)pres[best].n,
+                (unsigned long)(pres[best].px / 1000u), pres[best].last[0], pres[best].last[1],
+                pres[best].last[2], pres[best].last[3]);
         pres[best].n = 0;
     }
     kprintf("perf: end\n");
