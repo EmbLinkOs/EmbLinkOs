@@ -317,6 +317,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/compositor.c \
              kernel/gfx/comp_stats.c \
              kernel/gfx/ui_events.c \
+             kernel/gfx/frameclock.c \
              kernel/gfx/backdrop.c \
              kernel/gfx/pix.c \
              kernel/lib/kstring.c \
@@ -2797,6 +2798,14 @@ terminal-screentext-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Iuser/terminal \
 	    user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c tests/tty/screentext_test.c -o $(BUILD)/screentext_test
 	$(BUILD)/screentext_test
+
+.PHONY: frameclock-test
+# The compositor's frame-rate policy (kernel/gfx/frameclock.c): the rate for
+# motion, requests and content that asked nothing; the governor; the beat.
+frameclock-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Ikernel tests/gfx/frameclock_test.c kernel/gfx/frameclock.c -o $(BUILD)/frameclock_test
+	$(BUILD)/frameclock_test
 
 .PHONY: pix-test pix-bench
 # The compositor's pixel loops (kernel/gfx/pix.c): every row bit-exact with
