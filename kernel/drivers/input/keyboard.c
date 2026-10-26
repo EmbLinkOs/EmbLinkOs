@@ -439,6 +439,69 @@ void keyboard_inject_hid_usage(uint16_t usage,int down) {
     spin_lock(&input_state_lock);hid_usage_inner(usage,down);spin_unlock(&input_state_lock);
 }
 
+/* THE INTERFACE'S KEYS, decided the same for every keyboard: the system
+ * shortcuts (recorded for the kernel loop and swallowed) and the GUI editing
+ * commands (delivered as their byte). `base` is the key's unshifted character,
+ * `cp` what it types now. 1 if the key was one of these and is done.
+ *
+ * Its own function because it was written inline in kbd_translate -- the PS/2
+ * path -- and a virtio keyboard never passes through there: on arm64 GUI+Tab,
+ * GUI+W, GUI+Space and the rest typed a tab, a w and a space. Caller holds
+ * input_state_lock. */
+static int interface_key(uint16_t key, uint32_t base, uint32_t cp) {
+    /* GUI + letter -> an editing command. The interface's modifier, kept
+     * separate from the terminal's: Ctrl+C is an INTERRUPT in this OS and
+     * always will be, so the clipboard cannot live there. See EK_SEL_ALL and
+     * friends in keyboard.h for the whole argument.
+     *
+     * Delivered as a RAW BYTE, not through keyboard_deliver_cp: these are byte
+     * values, not codepoints, and encoding 0xFD as UTF-8 would turn one command
+     * into the two bytes of ý. Unclaimed GUI+letter combinations fall through
+     * and type their letter, so the key is not a hole. */
+    if(g_shortcut_modifier?((g_mods&(EKM_CTRL|EKM_ALT))==(EKM_CTRL|EKM_ALT)):(g_mods&EKM_GUI)) {
+        char system=base;
+        if(system>='A' && system<='Z')system+=32;
+        if(system=='\t'){g_syskey=SYSKEY_NEXT_WINDOW;return 1;}
+        if(system=='w'){g_syskey=SYSKEY_CLOSE_WINDOW;return 1;}
+        if(system=='q'){g_syskey=SYSKEY_QUIT_APP;return 1;}
+        if(system==' '){g_syskey=SYSKEY_LAUNCHER;return 1;}
+        if(system=='['){g_syskey=SYSKEY_SPACE_PREVIOUS;return 1;}
+        if(system==']'){g_syskey=SYSKEY_SPACE_NEXT;return 1;}
+        if(system>='1' && system<='6') {g_syskey=((g_mods&EKM_SHIFT)?SYSKEY_MOVE_SPACE_1:SYSKEY_SPACE_1)+system-'1';return 1;}
+        /* GUI+K: THE KERNEL LOG, ON SCREEN. The one question a machine with no
+         * serial port and no working mouse can still be asked. */
+        if(system=='k'){g_syskey=SYSKEY_KERNEL_LOG;return 1;}
+        /* GUI+Shift+P: what composing costs, on the screen (comp_stats.h). */
+        if(system=='p' && (g_mods&EKM_SHIFT)){g_syskey=SYSKEY_PERF_HUD;return 1;}
+    }
+    if (g_mods & EKM_GUI) {
+        uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
+        /* SYSTEM shortcuts first, and they are swallowed: see SYSKEY_* in
+         * keyboard.h for why an application must not be able to see -- and so
+         * decline -- the window switcher. Recorded, not performed: this is IRQ
+         * context and the compositor is not safe to call from one. */
+
+
+
+        char cmd = 0;
+        switch (low) {
+            case 'a': cmd = (char)EK_SEL_ALL; break;
+            case 'c': cmd = (char)EK_COPY;    break;
+            case 'x': cmd = (char)EK_CUT;     break;
+            case 'v': cmd = (char)EK_PASTE;   break;
+            /* UNDO is GUI+Z and REDO is GUI+Shift+Z -- the shift is read here
+             * because the char stream cannot carry it, so a reader downstream
+             * could never tell the two apart. GUI+Y is the other spelling of
+             * redo and costs one line to honour. */
+            case 'z': cmd = (g_mods & EKM_SHIFT) ? (char)EK_REDO : (char)EK_UNDO; break;
+            case 'y': cmd = (char)EK_REDO;    break;
+            default: break;
+        }
+        if (cmd) { deliver_key(key, 0, cmd); return 1; }
+    }
+    return 0;
+}
+
 /* THE TRANSLATION, AS A FUNCTION YOU CAN CALL. Split out of the interrupt
  * handler so a selftest can drive a layout with make codes and read what comes
  * out of the char stream -- there is no other way to test a keymap without an
@@ -516,56 +579,7 @@ void kbd_translate(uint8_t make, int pressed) {
     if ((g_mods & EKM_CTRL) && cp >= 'a' && cp <= 'z') cp = cp & 0x1f;
     else if ((g_mods & EKM_CTRL) && cp >= 'A' && cp <= 'Z') cp = cp & 0x1f;
 
-    /* GUI + letter -> an editing command. The interface's modifier, kept
-     * separate from the terminal's: Ctrl+C is an INTERRUPT in this OS and
-     * always will be, so the clipboard cannot live there. See EK_SEL_ALL and
-     * friends in keyboard.h for the whole argument.
-     *
-     * Delivered as a RAW BYTE, not through keyboard_deliver_cp: these are byte
-     * values, not codepoints, and encoding 0xFD as UTF-8 would turn one command
-     * into the two bytes of ý. Unclaimed GUI+letter combinations fall through
-     * and type their letter, so the key is not a hole. */
-    if(g_shortcut_modifier?((g_mods&(EKM_CTRL|EKM_ALT))==(EKM_CTRL|EKM_ALT)):(g_mods&EKM_GUI)) {
-        char system=base;
-        if(system>='A' && system<='Z')system+=32;
-        if(system=='\t'){g_syskey=SYSKEY_NEXT_WINDOW;return;}
-        if(system=='w'){g_syskey=SYSKEY_CLOSE_WINDOW;return;}
-        if(system=='q'){g_syskey=SYSKEY_QUIT_APP;return;}
-        if(system==' '){g_syskey=SYSKEY_LAUNCHER;return;}
-        if(system=='['){g_syskey=SYSKEY_SPACE_PREVIOUS;return;}
-        if(system==']'){g_syskey=SYSKEY_SPACE_NEXT;return;}
-        if(system>='1' && system<='6') {g_syskey=((g_mods&EKM_SHIFT)?SYSKEY_MOVE_SPACE_1:SYSKEY_SPACE_1)+system-'1';return;}
-        /* GUI+K: THE KERNEL LOG, ON SCREEN. The one question a machine with no
-         * serial port and no working mouse can still be asked. */
-        if(system=='k'){g_syskey=SYSKEY_KERNEL_LOG;return;}
-        /* GUI+Shift+P: what composing costs, on the screen (comp_stats.h). */
-        if(system=='p' && (g_mods&EKM_SHIFT)){g_syskey=SYSKEY_PERF_HUD;return;}
-    }
-    if (g_mods & EKM_GUI) {
-        uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
-        /* SYSTEM shortcuts first, and they are swallowed: see SYSKEY_* in
-         * keyboard.h for why an application must not be able to see -- and so
-         * decline -- the window switcher. Recorded, not performed: this is IRQ
-         * context and the compositor is not safe to call from one. */
-
-
-
-        char cmd = 0;
-        switch (low) {
-            case 'a': cmd = (char)EK_SEL_ALL; break;
-            case 'c': cmd = (char)EK_COPY;    break;
-            case 'x': cmd = (char)EK_CUT;     break;
-            case 'v': cmd = (char)EK_PASTE;   break;
-            /* UNDO is GUI+Z and REDO is GUI+Shift+Z -- the shift is read here
-             * because the char stream cannot carry it, so a reader downstream
-             * could never tell the two apart. GUI+Y is the other spelling of
-             * redo and costs one line to honour. */
-            case 'z': cmd = (g_mods & EKM_SHIFT) ? (char)EK_REDO : (char)EK_UNDO; break;
-            case 'y': cmd = (char)EK_REDO;    break;
-            default: break;
-        }
-        if (cmd) { deliver_key(key, 0, cmd); return; }
-    }
+    if (interface_key(key, base, cp)) return;
 
     deliver_key_cp(key, pad, cp);
 }
@@ -949,7 +963,10 @@ void keyboard_inject_cp(uint16_t code, int pressed, uint32_t cp) {
     spin_lock(&input_state_lock);
     if (cp) kbd_event_push(code, pressed);      /* the event half */
     else inject_event_inner(code, pressed, 0);  /* (a modifier, or a key with no text) */
-    if (pressed && cp) deliver_key_cp(code, 0, cp);   /* the text half, as UTF-8 */
+    /* the interface's keys first, as on PS/2; a printable key's code is its
+     * unshifted character (keyboard.h), which is the `base` they are read by */
+    if (pressed && cp && !interface_key(code, code < 0x80 ? code : 0, cp))
+        deliver_key_cp(code, 0, cp);            /* the text half, as UTF-8 */
     spin_unlock(&input_state_lock);
 }
 
