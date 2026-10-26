@@ -95,8 +95,9 @@ editing keys. See [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md) for contracts and limit
 Assistive-technology semantics and arbitrary shortcut recording remain further
 work. System shortcuts offer Super or Ctrl+Alt as their modifier:
 Space opens the library, Tab cycles windows, W closes, Q quits, 1–6 selects a
-workspace, Shift+1–6 moves a window, and [ / ] walks spaces. Editing shortcuts
-retain their existing meanings.
+workspace, Shift+1–6 moves a window, and [ / ] walks spaces; Shift+P shows what
+composing costs ([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)). Editing
+shortcuts retain their existing meanings.
 
 Scaling applies to shared type, control and spacing metrics; it is not a new
 fractional display compositor. Application minimum sizes and bounded scrolling

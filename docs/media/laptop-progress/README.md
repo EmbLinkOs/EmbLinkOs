@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-207 actual EmbLinkOS captures document the original laptop work, its
+208 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,17 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: the prompt, Powerlevel10k-style
+## Latest: the desktop measures itself
+
+The first step of the fluid desktop: before anything is made faster, the compositor says what composing costs -- every compose timed and charged to the cause that asked for it and the window that presented, and the pointer's motion timed to the screen ([DESKTOP_PERFORMANCE.md](../../DESKTOP_PERFORMANCE.md)).
+
+### What composing costs, on the screen it costs
+
+GUI+Shift+P: the compositor's own account at the top right -- CPU composing 1280 × 800, composes and megapixels in the last second, compose time (median, 95th percentile, worst), the pointer's motion-to-screen latency, and composes by cause. The baseline at 241cb9d, after `tools/perf_smoke.py`'s five scenes, under TCG.
+
+![The EmbLinkOS desktop with Settings open and the compositor statistics overlay at the top right](208-perf-hud.png)
+
+## The prompt, Powerlevel10k-style
 
 With the terminal real, the prompt that runs in it: the system the Mac's Powerlevel10k setup is built on, here in the native shell. First the plumbing -- `~/.config/shell/rc.esh` read by every shell a person types into, the `prompt` builtin setting options by Powerlevel10k's names, a right side the editor keeps out of the typing's way, and a transient prompt ([SHELL.md](../../SHELL.md#the-prompt)).
 

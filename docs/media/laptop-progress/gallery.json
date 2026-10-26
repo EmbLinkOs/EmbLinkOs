@@ -4077,6 +4077,26 @@
       "featured": false,
       "milestone": "The line: suggestions and colours",
       "historical": false
+    },
+    {
+      "id": "208-perf-hud",
+      "phase": "Fluid desktop",
+      "title": "What composing costs, on the screen it costs",
+      "caption": "GUI+Shift+P: the compositor's own account at the top right -- CPU composing 1280 x 800, composes and megapixels in the last second, compose time (median, 95th percentile, worst), the pointer's motion-to-screen latency, and composes by cause. The baseline at 241cb9d, after tools/perf_smoke.py's five scenes, under TCG.",
+      "alt": "The EmbLinkOS desktop with Settings open and the compositor statistics overlay at the top right",
+      "file": "208-perf-hud.png",
+      "capture_date": "2026-10-26",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP by tools/perf_smoke.py",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "760dee5346f5d109d9d62bfb259745f6cc8874282503cf5bc380173b098aac25",
+      "source_capture": "emblink-perf-y59lxjhc/perf-hud.ppm",
+      "source_sha256": "a8f399b0ff6d8126b9623e3660878b5a66a66ad58b3aeef3ad69de6137145e8a",
+      "source_commit": "241cb9d",
+      "featured": false,
+      "milestone": "Fluid desktop P0: the desktop measures itself",
+      "historical": false
     }
   ]
 }

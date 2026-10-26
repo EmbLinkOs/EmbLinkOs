@@ -1,3 +1,34 @@
+## Fluid desktop: frame clock, motion, materials, type (2026-10-26)
+
+The roadmap the user set: from a hobby-OS look to a macOS-class desktop, fluid
+at 60-120 Hz with the rate adapting as macOS does, on any hardware (no machine is
+the default target). Measured before and after every step
+([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)).
+
+- [ ] P0 Measure, and quick wins.
+  - [x] The compositor measures each compose (cause, time, area, presenter) and the pointer's
+        motion-to-screen latency: GUI+Shift+P overlay, serial `perf`, syscall 160;
+        `tools/perf_smoke.py` measures five scenes (baseline at 241cb9d).
+  - [ ] An idle desktop composes 10 times a second: the desktop process presents about 8 times a
+        second and the top bar twice, with nothing changing.
+  - [ ] A dragged window re-presents all of itself on every move (`em_app.c` force_full on a move).
+  - [ ] The kernel's pixel loops at `-O2`, two channels per multiply, bit-exact with today's output.
+  - [ ] Blur allocates two screen-sized buffers on every call (`fb_blur_region`).
+  - [ ] Real-speed numbers: the same scenes on arm64 under HVF, which needs the arm64 boot to reach
+        the desktop (see the arm64 boot test's first-boot setup item).
+- [ ] P1 Frame clock: a compositor thread on a deadline reservation, nanosecond timer, region damage,
+      one late compose per frame, frame callbacks and frame-rate requests, rate adapting to motion
+      (divisors of the refresh on fixed displays, the refresh itself on VRR ones), a simulated
+      120 Hz / VRR output, high-refresh modes, cursor planes, the compositor dragging windows.
+- [ ] P2 Springs (fixed point, shared by kernel and toolkit), interruptible window motion to the real
+      dock icon, momentum scrolling, pointer acceleration, a USB mouse driver, precise scrolling.
+- [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
+      governor and an Effects setting; the toolkit's span rasterizer, gradient LUT, one blend policy,
+      layer caching.
+- [ ] P4 Inter, area-coverage text, subpixel positioning, kerning; the token pass.
+- [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
+- [ ] P6 Overview, touchpad gestures, tiling previews.
+
 ## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
 
 The roadmap the user set: the Terminal first, then the customisation system.
