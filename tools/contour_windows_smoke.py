@@ -37,8 +37,17 @@ def main():
         ui.click_text(w,'Right')
         eventually(lambda:d.window('Settings')['x']==640 and d.window('Settings')['cw']==640,'right tiling failed')
         d.snap('window-tiled')
+        # DRAGGED INTO AN EDGE, IT TILES. The compositor drags it by the title
+        # (a region the app declared), tells the app where it went when the
+        # button comes up, and the app snaps to the half it reached.
+        w=d.window('Settings');ui.move(w['x']+w['cw']//2,w['y']+18);d.g.pump(.5)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});d.g.pump(.5)
+        ui.move(w['x']+w['cw']//2-900,w['y']+18);d.g.pump(.5)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'});d.g.pump(2)
+        eventually(lambda:d.window('Settings')['x']==0 and d.window('Settings')['cw']==640,'dragging into the left edge did not tile left')
+        d.snap('window-dragged-left')
         assert b'PANIC' not in d.g.seen
-        print('PASS: compact resize minimums, fill/restore through the hover board, and right-half tiling',flush=True)
+        print('PASS: compact resize minimums, fill/restore through the hover board, right-half tiling, and tiling by dragging into an edge',flush=True)
     finally:
         try:d.snap('last')
         finally:d.g.close()

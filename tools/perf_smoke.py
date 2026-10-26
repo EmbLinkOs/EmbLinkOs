@@ -81,7 +81,7 @@ def windows(d):
     for line in text.splitlines():
         if line.startswith('perf: window '):
             pairs = dict(kv.split('=', 1) for kv in line[13:].split() if '=' in kv)
-            out[pairs['title'].replace('_', ' ')] = {k: int(v) for k, v in pairs.items() if k != 'title'}
+            out[pairs['title'].replace('_', ' ')] = {k: (v if ',' in v else int(v)) for k, v in pairs.items() if k != 'title'}
     return out
 
 
@@ -214,10 +214,14 @@ def main():
 
         start = windows(d)['Settings']
 
+        midway = {}
+
         def drag():
             move(d, *SETTINGS_TITLE)
             press(d, True); d.g.pump(0.3)
             glide(d, SETTINGS_TITLE[0] - 160, SETTINGS_TITLE[1] + 120, step=6)
+            d.g.pump(0.5)
+            midway.update(windows(d)['Settings'])
             glide(d, *SETTINGS_TITLE, step=6)
             press(d, False); d.g.pump(2)
         scene(d, results, 'drag', drag)
@@ -225,6 +229,8 @@ def main():
         # point, it must end where it started: a drag that counts motion twice
         # (or loses some) leaves it somewhere else.
         def came_back(name):
+            # it moved with the hand (160 left), and then it came back
+            assert midway['x'] <= start['x'] - 100, f"{name}: the window did not follow the drag: {start} -> {midway}"
             end = windows(d)['Settings']
             results[name]['window_moved_by'] = [end['x'] - start['x'], end['y'] - start['y']]
             assert abs(end['x'] - start['x']) <= 2 and abs(end['y'] - start['y']) <= 2, \
