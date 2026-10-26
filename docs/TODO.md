@@ -32,7 +32,13 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       that still holds the last press its release before replaying the next one.
       Damage rects are rounded out to whole pixels, so a title that shrinks leaves no sliver of the old one.
 - [ ] Tabs cannot be dragged to reorder or into a window of their own; no Super+N for a new window.
-- [ ] M7 Profiles, Preferences and translucency (Clear Dark default); OSC 52 writes and bold-as-bright as options.
+- [x] M7 Profiles (`~/.config/terminal`, Clear Dark by default, four more built in, rewritten without losing
+      unknown keys, read again when changed), the macOS profile importer, Preferences beside the screen
+      (Super+,), and windows that show through: per-pixel alpha over a kept, incrementally re-blurred backdrop
+      (`embk_win_set_material`) on the CPU and the GPU; OSC 52 writes, bold-as-bright and bold colour as options.
+- [ ] A profile is the window's: its tabs cannot each have their own (Terminal.app allows it).
+- [ ] Two font families (Meslo NF, DejaVu Sans Mono): Preferences lists what the image ships, not any font
+      file; no audible bell (a profile's audible bell is shown as the visual one).
 - [ ] M8-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.

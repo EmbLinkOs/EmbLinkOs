@@ -148,6 +148,105 @@ already on its way when the window changed still lands on the prompt. Other
 terminals ignore an OSC they do not know, and the editor falls back to
 relative motion there.
 
+### Profiles and Preferences
+
+**A profile** is how a window looks and what it runs. The default is **Clear
+Dark**, the profile of the Mac this Terminal follows, converted by
+`tools/import_macos_terminal_profile.py`:
+
+- its colours in sRGB, with the background at 95% over a blur of the desktop;
+- MesloLGS Nerd Font Mono at 14 px, bright colours for bold text;
+- a 120 x 30 window.
+
+Four more profiles are built in:
+
+- **EmbLink**, the look before profiles: the system theme's colours, opaque;
+- **Solarized Dark** and **Solarized Light**;
+- **Basic**, black on white.
+
+Profiles are text files of `key = value` lines (`user/terminal/profile.h`):
+
+| Key | Value |
+|---|---|
+| `name` | the profile's name |
+| `font`, `font_size` | `MesloLGS Nerd Font Mono` or `DejaVu Sans Mono`; pixels at the standard interface size |
+| `line_spacing`, `letter_spacing` | 0.8-2, a multiple of the font's own cell |
+| `bold_is_bright` | `yes`/`no`: bold ANSI colours 0-7 drawn as 8-15 |
+| `theme_colors` | `yes`: text, background and cursor follow the system theme |
+| `foreground`, `background`, `bold`, `selection`, `cursor`, `color0`-`color15` | `#rrggbb` |
+| `opacity`, `blur` | 0.3-1; 0-1 (of a 32-pixel radius) |
+| `padding` | pixels around the cells |
+| `cursor_shape`, `cursor_blink` | `block`/`underline`/`bar`; `yes`/`no` |
+| `columns`, `rows` | a new window's size |
+| `scrollback` | megabytes, 1-64 |
+| `bell` | `visual` or `none` |
+| `command`, `term` | the shell and `TERM` (new tabs) |
+| `directory` | where a new tab starts: `same` (where the shown tab is), `home`, or a path |
+| `clipboard_write` | `yes`: programs may set the clipboard (OSC 52) |
+
+**Where they live.** Files go in `~/.config/terminal/profiles/`, and
+`~/.config/terminal/terminal.conf` names the default for new windows
+(`default_profile = ...`).
+
+- Terminal owns these files: the Settings app rewrites its own file from the
+  keys it knows, and would drop these.
+- Rewriting a profile keeps every line Terminal does not understand, comments
+  included, where it was.
+- A built-in profile has no file until it is changed. Deleting its file
+  ("Restore") brings back the built-in one.
+- Writes are atomic: a temporary file, fsync, then rename.
+
+**Watching for changes.** Every second, Terminal reads the window's profile
+file and `terminal.conf` again and compares their contents. When either
+changes, the window takes the new profile. That covers another window's
+Preferences, an editor, or a command such as
+`echo "opacity = 0.6" out>> ".config/terminal/profiles/clear-dark.conf"`.
+
+- It compares contents because a file's mtime is 0 on some filesystems.
+- It checks the directory listing first, because opening a missing file logs
+  a line.
+
+**Preferences** opens with Super+, (or from the menu), as a panel beside the
+screen, so each change shows as it is made. Edits are written once they have
+settled for 400 ms. The panel has:
+
+- **Profile:** the window's profile, chosen from the list. Make Default,
+  Duplicate, and Restore (a changed built-in) or Delete (your own).
+- **Text:** font, size, line and letter spacing, bright colours for bold,
+  cursor shape and blink.
+- **Colours:** the system's colours, or the sixteen plus text, bold,
+  background, selection and cursor. A swatch opens a colour picker.
+- **Window:** opacity, blur, padding, and a new window's columns and rows.
+- **Shell:** command, where new tabs open, TERM, scrollback size, the bell,
+  and whether programs may set the clipboard.
+
+The bars take the profile's background colour, and switch to the light
+theme when it is light, so their text stays readable.
+
+**Showing through.** A profile below 100% opacity makes the window show what
+is behind it (`embk_win_set_material`, the toolkit's `em_window_material`).
+
+- The window stays an ordinary window: its own workspace, its shadow, its
+  place in the layout. The bars' Translucent material is not like that.
+- The compositor blends each pixel by its own alpha, over the backdrop
+  blurred by two box passes each way of half the radius, which gives a tent
+  filter (`kernel/gfx/backdrop.c`).
+- The CPU path keeps two copies: the sharp backdrop and its blurred version.
+  On each repaint it compares what is now behind the window with the sharp
+  copy, and blurs again only the changed area, plus the blur's reach. The
+  blur reads past the repainted rect, so there is no seam. The margin it
+  reaches is repainted straight after.
+- The GPU keeps no copy. Instead, a repaint that touches the window grows to
+  cover all of it, and the same tent is drawn with two half-radius blurs.
+- A window hidden entirely by one opaque window above it blurs nothing; the
+  repaint that shows it again covers all of it. Under emulation, a Terminal
+  behind Settings used to re-blur the desktop on every desktop frame during a
+  display change, and held the compositor long enough for the desktop to miss
+  its redraw.
+- On Terminal's side, the screen is drawn as one picture covering the whole
+  area below the bars, padding included. Only the default background is
+  translucent: text, coloured cells, the marks and the cursor stay opaque.
+
 ### Keys
 
 The keyboard queue says which key produced every byte (`embk_key_poll_key`,
@@ -281,9 +380,11 @@ Mac's Powerlevel10k setup uses -- in four faces (regular, bold, italic, bold
 italic), vendored with its licences in `third_party/fonts/meslo-nf` and
 installed as `/system/fonts/meslo-nf-mono*.ttf` on both architectures
 (`tools/embkfs_mkfs/fonts.py`, the one list both image builders use). The
-size is 14 px at the standard interface size and follows the interface's
-scale; at 14 px a cell is 8 x 18 pixels, the font's own advance and line
-height. A character the face lacks is taken from regular Meslo, then DejaVu
+size is the profile's -- 14 px by default -- at the standard interface size,
+and follows the interface's scale; at 14 px a cell is 8 x 18 pixels, the
+font's own advance and line height, widened or heightened by the profile's
+letter and line spacing (the glyph centred, the extra height split above and
+below). A character the face lacks is taken from regular Meslo, then DejaVu
 Sans Mono, then DejaVu Sans (centred in its cells); one no face has is drawn
 as a box the width of its cells.
 
@@ -295,8 +396,9 @@ and segments meet the next cell edge to edge -- no seams between rows, no
 sliver of background at a separator's point.
 
 **What a cell shows** (`user/terminal/render.c`): colours through the
-model's palette; bold from the bold face (bold-as-bright, brightening ANSI
-0-7, is a renderer option for Preferences); italic from the italic face; dim
+model's palette; bold from the bold face, in the profile's bold colour
+when its text is in the default colour, and in the bright colours with
+`bold_is_bright`; italic from the italic face; dim
 as half-way to the ground; inverse, and DECSCNM over the whole screen;
 underline in its five styles and its own colour; strike; overline; combining
 marks over their base; blinking text every 500 ms. The cursor is a block
@@ -359,6 +461,8 @@ SDK paths even when upstream headers with the same names are present.
 
 ```
 make terminal-test terminal-screen-test terminal-golden-test terminal-render-test terminal-screentext-test font-test backend-test
+make terminal-profile-test backdrop-test
+python3 tools/import_macos_terminal_profile.py --self-test
 make shell-test declare-test em-test kit-test     # shell-test includes the line editor on the screen model
 # Boot the image, then use the serial debug console:
 test terminal
@@ -370,6 +474,7 @@ python3 tools/terminal_screen_smoke.py
 python3 tools/terminal_xterm_smoke.py
 python3 tools/terminal_render_smoke.py
 python3 tools/terminal_tabs_smoke.py
+python3 tools/terminal_profile_smoke.py            # and --virgl: the GPU's composition
 ```
 
 `terminal-test` compiles the production device state machine with a minimal
@@ -442,6 +547,34 @@ Copy and Paste, find into the scrollback, Super over a link and a Super-click
 opening it in Files, the menu, zoom, and Super+W closing a tab -- its shell
 gone and its PTY freed.
 
+`make terminal-profile-test` (under ASan/UBSan) covers profiles:
+
+- Clear Dark as the default, and every preset's every key;
+- values the parser refuses (out of range, malformed, unknown), with the
+  profile left as it was;
+- a rewrite that keeps comments, blank lines and unknown keys in place,
+  writes a key that appeared twice only once, adds missing keys at the end,
+  and reads back the same;
+- file names, and `terminal.conf`'s keys.
+
+`make backdrop-test` (under ASan/UBSan) checks that blurring any part of a
+picture -- a corner, an edge, a single pixel -- gives exactly the pixels a
+blur of the whole picture gives there, including inside a domain smaller
+than the buffer. `import_macos_terminal_profile.py --self-test` checks the
+Generic RGB to sRGB conversion against values macOS gave.
+
+`tools/terminal_profile_smoke.py` drives the real window:
+
+- Clear Dark at 120 x 30, its background measured in the screenshot at 95%
+  over the desktop;
+- Preferences beside the screen, and a swatch opening the colour picker;
+- the profile's file written from the shell, and the window taking it within
+  a second, the desktop showing through at 60%;
+- `terminal.conf` naming Solarized Light, and a new window opening in it with
+  light bars.
+
+With `--virgl` it runs the same steps with the GPU composing.
+
 `tools/terminal_xterm_smoke.py` runs `ttyprobe --xterm` in the real Terminal:
 a card of attributes, underline styles and colours, the 16- and 256-colour
 palettes, truecolour, wide cells and a link, checked cell by cell through the
@@ -480,7 +613,9 @@ The acceptance tools never read Terminal's internals. Terminal keeps one
 fixed-layout symbol, `g_term_probe` (`user/apps/term/term_probe.h`), current
 whenever the screen changes: prompt state, size, cursor, cwd, the local input
 line, the shown and primary screens as UTF-8, and every shown cell's colours
-and attributes. `tools/native_terminal.py` reads it through GDB, refuses an
+and attributes. Version 3 added the tabs, the selection, find, the font and the
+link under the pointer. Version 4 adds the profile's name, its opacity and blur,
+whether the window shows through, and the Preferences panel's state. `tools/native_terminal.py` reads it through GDB, refuses an
 unknown magic or version, and rereads a probe caught mid-update (its serial is
 odd while Terminal writes it). `ttyprobe --bench [MiB]` writes coloured lines
 as fast as the terminal drains them and reports KiB/s; the probe's frame count

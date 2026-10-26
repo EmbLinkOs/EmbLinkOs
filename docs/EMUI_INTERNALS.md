@@ -278,6 +278,23 @@ damage rect, and paid only when the window paints; a *drag* re-blurs each step
 `kernel/drivers/video/framebuffer.c` (`fb_blit_uniform`, `fb_blur_region`) and
 `kernel/gfx/compositor.c` (`GLASS_BLUR`, `GLASS_ALPHA`).
 
+**Windows that show through** are a different material, set at any time with
+`em_window_material(see_through, blur)` (syscall `embk_win_set_material`).
+Acrylic gives every pixel one alpha; this material uses each pixel's own alpha
+and a per-window blur radius. The window stays an ordinary one -- its
+workspace, its shadow, its place in the layout -- which is what the bars'
+Translucent material is not. The runtime handles the details:
+
+- it clears the canvas to transparent and erases the dirty rects each frame
+  (`render_target.clear_dirty`);
+- a `Window` background given as clear stays clear (`em_window_set_clear`),
+  where on an opaque window it means "the theme's";
+- the view paints what should be seen through, at the alpha it wants.
+
+The compositor keeps the blurred backdrop and redoes it only where the
+backdrop changed (`kernel/gfx/backdrop.c`; docs/TERMINAL.md, Profiles and
+Preferences).
+
 ### `ui/dsl/em.{h,c}` — the DSL
 
 A thin macro + function layer with three ideas, all defined in `em.h`/`em.c`:

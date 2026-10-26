@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-173 actual EmbLinkOS captures document the original laptop work, its
+179 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, and tabs, selection, find and links. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -133,6 +133,44 @@ Copy, Paste, Select All, Find, Clear Scrollback, New Tab and Close Tab, each wit
 Super+= and Super+- change the font a pixel at a time and Super+0 puts it back. Every tab reflows to the new cell size, and the title shows it.
 
 ![Zoom in EmbLinkOS](173-terminal-zoom.png)
+
+Then its profiles: Clear Dark by default -- the Mac profile it follows, converted from its plist -- at 95% over a blur of the desktop; Preferences beside the screen; any change a profile file goes through, taken by every window showing it ([TERMINAL.md](../../TERMINAL.md#profiles-and-preferences)).
+
+### Clear Dark, as the Mac has it
+
+The default profile is the Mac's Clear Dark, converted from its Terminal plist: MesloLGS Nerd Font Mono at 14 px, its sixteen colours in sRGB, a 120 x 30 window, and the background at 95% over a blur of the desktop -- the faint teal is the wallpaper behind it.
+
+![Clear Dark, as the Mac has it in EmbLinkOS](174-terminal-clear-dark.png)
+
+### Preferences beside the screen
+
+Super+, opens Preferences as a panel beside the screen, so a change is seen as it is made: the profile, its font, size and spacing, bold, the cursor, the colours, the window and the shell. Edits go to the profile file, which other windows showing it read again.
+
+![Preferences beside the screen in EmbLinkOS](175-terminal-preferences.png)
+
+### The sixteen, and a colour picker
+
+Each of the sixteen colours, and the text, bold, background, selection and cursor colours, is a swatch; a click opens a picker for it, and the screen takes the colour as it is dragged.
+
+![The sixteen, and a colour picker in EmbLinkOS](176-terminal-colours.png)
+
+### A window that shows through
+
+The profile file written from the shell -- as another window or an editor would -- and the window takes it within a second: at 60% the Files window behind it shows through, blurred. The compositor keeps the blur and redoes only where the backdrop changes.
+
+![A window that shows through in EmbLinkOS](177-terminal-translucent.png)
+
+### The same, composed by the GPU
+
+The same window with the host's GPU composing (virgl): the same tent blur from two half-radius passes, frame for frame with the CPU's.
+
+![The same, composed by the GPU in EmbLinkOS](178-terminal-translucent-gpu.png)
+
+### A new window in the default profile
+
+terminal.conf names Solarized Light, and the next window opens in it, opaque; its bars switch to the light theme so their text can be read on it.
+
+![A new window in the default profile in EmbLinkOS](179-terminal-solarized-light.png)
 
 ## The native shell runs any program
 
