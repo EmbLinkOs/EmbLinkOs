@@ -2807,6 +2807,14 @@ frameclock-test: | $(BUILD)
 	    -Ikernel tests/gfx/frameclock_test.c kernel/gfx/frameclock.c -o $(BUILD)/frameclock_test
 	$(BUILD)/frameclock_test
 
+.PHONY: spring-test
+# The springs and the velocity fit everything on the desktop moves by
+# (ui/motion/): one trajectory at any frame rate, against the exact curve.
+spring-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -D_DEFAULT_SOURCE -Iui tests/motion/spring_test.c -lm -o $(BUILD)/spring_test
+	$(BUILD)/spring_test
+
 .PHONY: pix-test pix-bench
 # The compositor's pixel loops (kernel/gfx/pix.c): every row bit-exact with
 # the framebuffer's old per-pixel arithmetic; pix-bench times old against new,
