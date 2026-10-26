@@ -938,6 +938,9 @@ static struct value bi_help(const struct command *cmd, struct value input,
  *   prompt get KEY            -> its value, or null
  *   prompt unset KEY          -> forget it
  *   prompt reset              -> forget every option
+ *   prompt style [NAME]       -> Powerlevel10k's style NAME as the base (plain: none);
+ *                                alone, the base's name
+ *   prompt import-p10k FILE   -> a ~/.p10k.zsh as the base -> {parameters, ignored}
  *
  * Keys and words are taken as written (`prompt set right status time`);
  * a quoted string or a number is its value (`prompt set char "❯"`).
@@ -945,9 +948,14 @@ static struct value bi_help(const struct command *cmd, struct value input,
 static bool prompt_value(const struct command *cmd, size_t from, struct scope *env, char *out, size_t cap,
                          struct value *error) {
     out[0] = 0;
-    size_t n = 0;
+    size_t n = 0, after_number = 0;   /* where the last argument, a number, ended: 12h lexes as 12, h */
     for (size_t i = from; i < cmd->nargs; i++) {
         char num[32];
+        const struct expr *e = cmd->args[i];
+        bool glued = i > from && after_number && e->line == cmd->args[i - 1]->line && e->col == after_number;
+        after_number = 0;
+        if (e->kind == EXPR_LITERAL && e->u.literal.type == VAL_INT)
+            after_number = e->col + (size_t)snprintf(num, sizeof num, "%lld", (long long)e->u.literal.u.i);
         const char *word = expr_as_word(cmd->args[i]);
         size_t k = word ? strlen(word) : 0;
         struct value v = value_null();
@@ -961,7 +969,7 @@ static bool prompt_value(const struct command *cmd, size_t from, struct scope *e
         if (n + (n ? 1 : 0) + k >= cap || memchr(word, 0, k)) {
             value_free(&v); *error = value_error("prompt set: the value is too long"); return false;
         }
-        if (n) out[n++] = ' ';
+        if (n && !glued) out[n++] = ' ';
         memcpy(out + n, word, k);
         n += k;
         out[n] = 0;
@@ -970,9 +978,83 @@ static bool prompt_value(const struct command *cmd, size_t from, struct scope *e
     return true;
 }
 
+/* A configuration file read and loaded as the prompt's Powerlevel10k base. */
+static struct value prompt_load(const char *path, const char *source, const char *who) {
+    struct value text = shell_read_file(path, who);
+    if (text.type == VAL_ERROR) return text;
+    if (text.type != VAL_STRING) { value_free(&text); return value_error("prompt: not a text file"); }
+    struct p10k_import rep;
+    bool ok = prompt_p10k_load(source, text.u.s.bytes, &rep);
+    value_free(&text);
+    if (!ok) {
+        char msg[400];
+        snprintf(msg, sizeof msg, "%s: %s: %s", who, path, rep.error);
+        return value_error(msg);
+    }
+    struct value r = value_record();
+    value_record_set(&r, "parameters", value_int(rep.set));
+    struct value ignored = value_list();
+    for (const char *p = rep.ignored; *p;) {
+        size_t n = strcspn(p, " ");
+        if (n) value_list_push(&ignored, value_string_n(p, n));
+        p += n;
+        while (*p == ' ') p++;
+    }
+    value_record_set(&r, "ignored", ignored);
+    return r;
+}
+
+/* prompt style [NAME] / prompt import-p10k FILE: Powerlevel10k as the base.
+ * A style is one of the configurations p10k configure starts from, installed
+ * in /system/share/powerlevel10k (PROMPT_STYLES elsewhere); `plain` is the
+ * prompt without one. */
+static struct value prompt_p10k(const struct command *cmd, const char *sub, struct scope *env) {
+    char arg[256] = "";
+    if (cmd->nargs > 1) {
+        const char *w = expr_as_word(cmd->args[1]);
+        if (w) snprintf(arg, sizeof arg, "%s", w);
+        else {
+            struct value v = expr_eval(cmd->args[1], env);
+            if (v.type == VAL_STRING && v.u.s.len < sizeof arg && !memchr(v.u.s.bytes, 0, v.u.s.len)) {
+                memcpy(arg, v.u.s.bytes, v.u.s.len);
+                arg[v.u.s.len] = 0;
+            }
+            value_free(&v);
+            if (!arg[0]) return value_error("prompt: a name or a path is a word or a string");
+        }
+    }
+    if (!strcmp(sub, "style")) {
+        static const char *const styles[] = { "lean", "lean-8colors", "classic", "rainbow", "pure" };
+        if (cmd->nargs == 1) return value_string(prompt_p10k_source() ? prompt_p10k_source() : "plain");
+        if (cmd->nargs != 2) return value_error("prompt style: prompt style NAME (lean, lean-8colors, classic, rainbow, pure, plain)");
+        if (!strcmp(arg, "plain")) { prompt_p10k_drop(); return value_null(); }
+        for (size_t i = 0; i < sizeof styles / sizeof *styles; i++) {
+            if (strcmp(arg, styles[i])) continue;
+            const char *dir = getenv("PROMPT_STYLES");
+            char path[320];
+            snprintf(path, sizeof path, "%s/p10k-%s.zsh", dir && dir[0] ? dir : "/system/share/powerlevel10k", arg);
+            struct value r = prompt_load(path, arg, "prompt style");
+            if (r.type == VAL_ERROR) return r;
+            value_free(&r);
+            return value_null();
+        }
+        return value_error("prompt style: lean, lean-8colors, classic, rainbow, pure or plain");
+    }
+    /* import-p10k: a person's own ~/.p10k.zsh (~ is the home) */
+    if (cmd->nargs != 2) return value_error("prompt import-p10k: prompt import-p10k FILE");
+    char file[320], path[320];
+    const char *home = getenv("HOME");
+    if ((arg[0] == '~' && (!arg[1] || arg[1] == '/')) && home)
+        snprintf(file, sizeof file, "%s%s", strcmp(home, "/") ? home : "", arg + 1);
+    else snprintf(file, sizeof file, "%s", arg);
+    shell_path_resolve(file, path, sizeof path);
+    return prompt_load(path, path, "prompt import-p10k");
+}
+
 static struct value bi_prompt(const struct command *cmd, struct value input, struct scope *env) {
     value_free(&input);
-    static const char usage[] = "prompt: usage: prompt | prompt set KEY VALUE... | prompt get KEY | prompt unset KEY | prompt reset";
+    static const char usage[] = "prompt: usage: prompt | prompt set KEY VALUE... | prompt get KEY | prompt unset KEY | "
+                                "prompt reset | prompt style [NAME] | prompt import-p10k FILE";
     if (cmd->nargs == 0) {
         struct value out = value_table();
         for (size_t i = 0; i < prompt_opt_count(); i++) {
@@ -996,6 +1078,7 @@ static struct value bi_prompt(const struct command *cmd, struct value input, str
         value_free(&k);
     }
     if (!sub) return value_error(usage);
+    if (!strcmp(sub, "style") || !strcmp(sub, "import-p10k")) return prompt_p10k(cmd, sub, env);
     if (!strcmp(sub, "reset") && cmd->nargs == 1) { prompt_opt_reset(); return value_null(); }
     if (!key) return value_error(usage);
     if (!prompt_key_valid(key)) return value_error("prompt: a key is lower-case words joined by dots (dir.anchor.fg)");

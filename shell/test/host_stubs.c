@@ -6,6 +6,8 @@
 #include "builtins/builtins.h"
 #include "eval/eval.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -40,6 +42,38 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
     char msg[96];
     snprintf(msg, sizeof msg, "unknown command '%s' (externals need the OS)", cmd->name);
     return value_error(msg);
+}
+
+/* Paths and whole files, the host's way: what `prompt import-p10k` reads in
+ * the host tests. */
+void shell_path_resolve(const char *in, char *out, size_t cap) {
+    char cwd[512];
+    if (in[0] == '/' || !getcwd(cwd, sizeof cwd)) snprintf(out, cap, "%s", in);
+    else snprintf(out, cap, "%s/%s", cwd, in);
+}
+struct value shell_read_file(const char *path, const char *who) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        char msg[400];
+        snprintf(msg, sizeof msg, "%s: can't open '%s'", who, path);
+        return value_error(msg);
+    }
+    char *buf = NULL;
+    size_t n = 0, cap = 0;
+    for (;;) {
+        if (n + 4096 + 1 > cap) {
+            char *grown = realloc(buf, cap = (cap ? cap * 2 : 8192));
+            if (!grown) { free(buf); fclose(f); return value_error("out of memory"); }
+            buf = grown;
+        }
+        size_t got = fread(buf + n, 1, cap - n - 1, f);
+        if (!got) break;
+        n += got;
+    }
+    fclose(f);
+    struct value v = value_string_n(buf ? buf : "", n);
+    free(buf);
+    return v;
 }
 
 /* Files are the OS's: a redirected builtin says so on the host. */

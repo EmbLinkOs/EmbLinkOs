@@ -17,10 +17,14 @@
  *                        duration to show
  *   time.format          24h | 12h                                (24h)
  *
- * The names follow Powerlevel10k's parameters (POWERLEVEL9K_TRANSIENT_PROMPT,
- * ..._COMMAND_EXECUTION_TIME_THRESHOLD), so a configuration reads the same
- * way, and options the builder does not know yet are kept for those that
- * will (docs/SHELL.md, "The prompt").
+ * POWERLEVEL10K. A style (`prompt style lean`) or a person's ~/.p10k.zsh
+ * (`prompt import-p10k`) loaded as the base turns the prompt into
+ * Powerlevel10k's (shell/prompt/p10k.h), drawn by its own parameters; every
+ * option set is then one of them on top of the base, by its name in dotted
+ * lower case -- dir.anchor.fg is POWERLEVEL9K_DIR_ANCHOR_FOREGROUND (fg and
+ * bg for FOREGROUND and BACKGROUND). The five above keep their meaning
+ * there (char, right, transient, duration.threshold, time.format). With no
+ * base the prompt is the plain one above (docs/SHELL.md, "The prompt").
  *
  * PURE: no clock, no environment, no files -- the shell hands the builder
  * what it needs (struct prompt_state), so the host tests it.
@@ -28,6 +32,7 @@
 #ifndef __EMBK_PROMPT_H__
 #define __EMBK_PROMPT_H__
 
+#include "prompt/p10k.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -54,11 +59,32 @@ struct prompt_state {
     int status;                    /* the last command's exit status, -1 before the first */
     uint64_t duration_ms;          /* how long it ran */
     int hour, minute, second;      /* now */
+    /* and for Powerlevel10k's segments */
+    const char *pwd, *last_pwd, *home;     /* absolute */
+    int year, month, mday, wday;   /* month 1-12, wday 0 = Sunday */
+    int jobs;                      /* background jobs */
+    bool root;
+    const struct p10k_git *git;    /* NULL: not in a repository */
+    const struct p10k_fs *fs;      /* NULL: no listings (no unique prefixes, no markers) */
 };
 
 /* The prompt for a row of `cols` columns. `left` and `right` may carry SGR;
- * `transient` is empty when the transient prompt is off. */
-struct prompt_text { char left[1024], right[256], transient[128]; };
+ * `transient` is empty when the transient prompt is off. `left` may be
+ * several lines, \r\n between them; the right side goes on the last. */
+struct prompt_text { char left[4096], right[1024], transient[512]; };
 void prompt_build(const struct prompt_state *s, int cols, struct prompt_text *out);
+
+/* --- Powerlevel10k ------------------------------------------------------- */
+
+/* Load `text` (a .p10k.zsh) as the base; `source` names it (a style, a
+ * path). False, and the prompt as it was, when it does not read. */
+bool prompt_p10k_load(const char *source, const char *text, struct p10k_import *report);
+void prompt_p10k_drop(void);                 /* back to the plain prompt */
+const char *prompt_p10k_source(void);        /* the base's name, or NULL */
+/* An option's parameter: "dir.anchor.fg" -> "DIR_ANCHOR_FOREGROUND". */
+void prompt_p10k_name(const char *key, char *out, size_t cap);
+/* The configuration the prompt is drawn from now: the base and the options
+ * (NULL with no base). */
+const struct p10k *prompt_p10k_config(void);
 
 #endif /* __EMBK_PROMPT_H__ */

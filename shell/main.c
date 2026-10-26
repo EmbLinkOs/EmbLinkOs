@@ -27,6 +27,7 @@
 #include "edit/edit.h"
 #include "complete/complete.h"
 #include "prompt/prompt.h"
+#include "prompt/prompt_os.h"
 #include "embk.h"
 #include <unistd.h>
 #include <string.h>
@@ -177,7 +178,9 @@ static int run_program(const char *src, struct scope *top) {
     }
 
     struct exec_out out = { FLOW_NORMAL, value_null(), false };
+    (void)exec_interrupt_hit(true);
     int rc = block_exec(prog, top, print_sink, NULL, &out);
+    bool interrupted = exec_interrupt_hit(true);
 
     if (g_console_session || g_terminal_session) {
         shell_interrupt_route(-1);
@@ -209,7 +212,7 @@ static int run_program(const char *src, struct scope *top) {
     } else {
         block_free(prog);
     }
-    return rc != 0 ? 1 : 0;
+    return interrupted ? 130 : rc != 0 ? 1 : 0;      /* ^C: 128 + SIGINT, as every shell has it */
 }
 
 /* One typed line. Kept as its own name because that is what the REPL, `-c`
@@ -350,6 +353,18 @@ static void prompt_where(char *where, size_t cap) {
  * built again for a new width (edit_host.reprompt) from the same state. */
 static struct prompt_state g_pstate;
 static struct prompt_text g_ptext;
+static struct p10k_git g_git;
+
+/* Background jobs that have not finished: Powerlevel10k's background_jobs. */
+static int unfinished_jobs(void) {
+    jobs_poll();
+    int n = 0;
+    for (size_t i = 0; i < jobs_count(); i++) {
+        const struct job *j = jobs_at(i);
+        if (j && j->id && !j->reaped) n++;
+    }
+    return n;
+}
 static void prompt_into(struct edit_prompt *p) {
     p->text = g_ptext.left;
     p->right = g_ptext.right[0] ? g_ptext.right : NULL;
@@ -498,7 +513,7 @@ int main(int argc, char **argv) {
     editing.c_cc[VTIME] = 0;
     int status = -1;                          /* the last command's; -1 before the first */
     uint64_t duration = 0;                    /* how long it ran, ms */
-    char last_where[200] = "";                /* where the last prompt was */
+    char last_where[200] = "", last_cwd[192] = "";   /* where the last prompt was */
     (void)scope_bind(&top, "status", value_int(0));
     char plain[LINE_MAX_LEN];
     for (;;) {
@@ -520,15 +535,28 @@ int main(int argc, char **argv) {
                 snprintf(done, sizeof done, "\033]133;D;%d\007", status);
                 puts1(done);
             }
-            char where[200], cwd[192], mark[256];
+            char where[200], cwd[192], shown[192], mark[256];
             prompt_where(where, sizeof where);
             if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
-            for (char *p = cwd; *p; p++) if ((unsigned char)*p < 32 || (unsigned char)*p == 127) *p = '?';
-            snprintf(mark, sizeof mark, "\033]133;A;edit=shell;cwd=%s\007", cwd);
+            memcpy(shown, cwd, sizeof shown);
+            for (char *p = shown; *p; p++) if ((unsigned char)*p < 32 || (unsigned char)*p == 127) *p = '?';
+            snprintf(mark, sizeof mark, "\033]133;A;edit=shell;cwd=%s\007", shown);
             time_t now = time(NULL);
             struct tm *tm = localtime(&now);
-            g_pstate = (struct prompt_state){ getenv("USER"), getenv("HOSTNAME"), where, last_where, status, duration,
-                                              tm ? tm->tm_hour : 0, tm ? tm->tm_min : 0, tm ? tm->tm_sec : 0 };
+            /* Powerlevel10k asks about the directory and the repository:
+             * fresh listings for every prompt */
+            bool p10k = prompt_p10k_source() != NULL;
+            if (p10k) prompt_os_fresh();
+            const char *user = getenv("USER");
+            g_pstate = (struct prompt_state){
+                .user = user, .host = getenv("HOSTNAME"), .dir = where, .last_dir = last_where,
+                .status = status, .duration_ms = duration,
+                .hour = tm ? tm->tm_hour : 0, .minute = tm ? tm->tm_min : 0, .second = tm ? tm->tm_sec : 0,
+                .pwd = cwd, .last_pwd = last_cwd, .home = getenv("HOME"),
+                .year = tm ? tm->tm_year + 1900 : 1970, .month = tm ? tm->tm_mon + 1 : 1,
+                .mday = tm ? tm->tm_mday : 1, .wday = tm ? tm->tm_wday : 4,
+                .jobs = p10k ? unfinished_jobs() : 0, .root = user && !strcmp(user, "root"),
+                .git = p10k && prompt_os_git(cwd, &g_git) ? &g_git : NULL, .fs = p10k ? &prompt_os_fs : NULL };
             prompt_build(&g_pstate, cols, &g_ptext);
             const char *program = getenv("TERM_PROGRAM");
             bool ours = program && !strcmp(program, "EmbLinkTerminal");
@@ -540,6 +568,7 @@ int main(int argc, char **argv) {
             (void)tcsetattr(0, TCSANOW, &g_prompt_attr);
             puts1("\033[0 q");
             snprintf(last_where, sizeof last_where, "%s", where);
+            snprintf(last_cwd, sizeof last_cwd, "%s", cwd);
             if (r == EDIT_EOF) break;
             if (r == EDIT_CANCEL) { status = 130; continue; }
             line = edit_line(g_ed);

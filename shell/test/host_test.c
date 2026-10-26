@@ -820,6 +820,14 @@ static void test_prompt(void) {
     v = run("prompt set duration.threshold 5", value_null(), &top);
     CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("duration.threshold"), "5"), "a number too");
     value_free(&v);
+    v = run("prompt set time.format 12h", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("time.format"), "12h"), "12h is one word, though it lexes as 12 and h");
+    value_free(&v);
+    v = run("prompt set right 12 h", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("right"), "12 h") && prompt_opt_unset("time.format"), "apart, two");
+    value_free(&v);
+    v = run("prompt set right status duration time", value_null(), &top);
+    value_free(&v);
     CHECK(string_is("prompt get char", &top, "\xe2\x9d\xaf"), "get: the value");
     CHECK(count_is("prompt | count", &top, 3), "prompt: a table of them");
     CHECK(fails("prompt set Dir.fg 4", &top) && fails("prompt set \"a..b\" 4", &top) && fails("prompt set \".a\" 4", &top) &&
@@ -841,7 +849,8 @@ static void test_prompt(void) {
     value_free(&v);
     CHECK(count_is("prompt | count", &top, 0), "reset: all of them");
 
-    struct prompt_state st = { "yves", "emblink", "~/src", "~/src", 1, 4200, 14, 5, 9 };
+    struct prompt_state st = { .user = "yves", .host = "emblink", .dir = "~/src", .last_dir = "~/src", .status = 1,
+                               .duration_ms = 4200, .hour = 14, .minute = 5, .second = 9 };
     struct prompt_text t;
     prompt_build(&st, 80, &t);
     CHECK(strstr(t.left, "yves@emblink:~/src$") && !t.right[0] && !t.transient[0],
@@ -890,6 +899,70 @@ static void test_prompt(void) {
     scope_free(&top);
 }
 
+/* Powerlevel10k as the base: a style, a person's ~/.p10k.zsh, options on top. */
+static void test_prompt_p10k(void) {
+    printf("the prompt: Powerlevel10k styles and configurations:\n");
+    struct scope top;
+    scope_init(&top, NULL);
+    prompt_opt_reset();
+    setenv("PROMPT_STYLES", "third_party/powerlevel10k/config", 1);
+    CHECK(string_is("prompt style", &top, "plain"), "no style: the plain prompt");
+    struct value v = run("prompt style lean", value_null(), &top);
+    CHECK(v.type == VAL_NULL && string_is("prompt style", &top, "lean"), "style: lean loaded as the base");
+    value_free(&v);
+    struct prompt_state st = { .user = "yves", .host = "emblink", .dir = "~/src", .last_dir = "", .status = -1,
+                               .hour = 14, .minute = 5, .second = 9, .pwd = "/home/yves/src", .home = "/home/yves" };
+    struct prompt_text t;
+    prompt_build(&st, 80, &t);
+    const char *dir = strstr(t.left, "src");
+    CHECK(dir && strstr(dir, "\xe2\x9d\xaf") && !strstr(t.left, "yves@emblink"), "drawn by Powerlevel10k: the directory, then \xe2\x9d\xaf");
+    CHECK(strstr(t.left, "\r\n") && strncmp(t.left, "\r\n", 2), "two lines, \\r\\n between them; no empty line above the first prompt");
+    st.status = 0;
+    prompt_build(&st, 80, &t);
+    CHECK(!strncmp(t.left, "\r\n", 2), "then an empty line above every prompt (PROMPT_ADD_NEWLINE)");
+    v = run("prompt set dir.anchor.fg 196", value_null(), &top);
+    value_free(&v);
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.left, "38;5;196m") != NULL, "an option on top: dir.anchor.fg is DIR_ANCHOR_FOREGROUND");
+    v = run("prompt set time.format 12h", value_null(), &top);
+    value_free(&v);
+    v = run("prompt set right status time", value_null(), &top);
+    value_free(&v);
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.left, "02:05:09 PM") != NULL, "the plain prompt's options keep their meaning: right, time.format");
+    char name[64];
+    prompt_p10k_name("dir.anchor.fg", name, sizeof name);
+    bool ok = !strcmp(name, "DIR_ANCHOR_FOREGROUND");
+    prompt_p10k_name("left_prompt_elements", name, sizeof name);
+    ok &= !strcmp(name, "LEFT_PROMPT_ELEMENTS");
+    prompt_p10k_name("multiline.first.prompt.gap.bg", name, sizeof name);
+    CHECK(ok && !strcmp(name, "MULTILINE_FIRST_PROMPT_GAP_BACKGROUND"), "names: dots are underscores, fg and bg in full");
+
+    v = run("prompt import-p10k tests/prompt/configs/user.p10k.zsh", value_null(), &top);
+    const struct value *n = v.type == VAL_RECORD ? value_record_get(&v, "parameters") : NULL;
+    const struct value *ign = v.type == VAL_RECORD ? value_record_get(&v, "ignored") : NULL;
+    CHECK(n && n->type == VAL_INT && n->u.i > 300 && ign && ign->type == VAL_LIST && ign->u.list.count > 10,
+          "import-p10k: a ~/.p10k.zsh read, and the segments that draw nothing here listed");
+    value_free(&v);
+    CHECK(strstr(prompt_p10k_source(), "user.p10k.zsh") != NULL, "the imported file is the base");
+    CHECK(fails("prompt import-p10k tests/prompt/configs/nothing-here.zsh", &top) && fails("prompt style frob", &top),
+          "a missing file or an unknown style is an error");
+    FILE *f = fopen("/tmp/emblink-broken.p10k.zsh", "w");
+    if (f) { fputs("typeset -g POWERLEVEL9K_MODE=ascii\nif [[ x == x ]]; then\n", f); fclose(f); }
+    v = run("prompt import-p10k /tmp/emblink-broken.p10k.zsh", value_null(), &top);
+    CHECK(v.type == VAL_ERROR && strstr(v.u.s.bytes, "if without fi") && strstr(prompt_p10k_source(), "user.p10k.zsh"),
+          "one that does not read says where, and the prompt stays as it was");
+    value_free(&v);
+    remove("/tmp/emblink-broken.p10k.zsh");
+    v = run("prompt style plain", value_null(), &top);
+    value_free(&v);
+    prompt_build(&st, 80, &t);
+    CHECK(string_is("prompt style", &top, "plain") && strstr(t.left, "yves@emblink:~/src"), "style plain: back to the plain prompt");
+    prompt_opt_reset();
+    unsetenv("PROMPT_STYLES");
+    scope_free(&top);
+}
+
 int main(void) {
     printf("=== shell host tests ===\n");
     test_lexer();
@@ -903,6 +976,7 @@ int main(void) {
     test_incomplete();
     test_redirect_text();
     test_prompt();
+    test_prompt_p10k();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);
     return g_fail;
 }

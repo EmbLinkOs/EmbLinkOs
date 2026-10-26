@@ -461,10 +461,13 @@ static void complete(struct editor *e, bool backwards) {
 
 struct pos { int row, col; };
 
-/* Advance over printable text, skipping escape sequences (they take no cells). */
+/* Advance over printable text, skipping escape sequences (they take no cells).
+ * A prompt of several lines (Powerlevel10k's two) has \r\n between them. */
 static void layout(const char *s, size_t n, struct pos *p, int cols) {
     for (size_t i = 0; i < n;) {
         unsigned char c = (unsigned char)s[i];
+        if (c == '\r') { p->col = 0; i++; continue; }
+        if (c == '\n') { p->row++; p->col = 0; i++; continue; }
         if (c == 0x1b && i + 1 < n && (s[i + 1] == '[' || s[i + 1] == ']')) {
             bool osc = s[i + 1] == ']';
             i += 2;

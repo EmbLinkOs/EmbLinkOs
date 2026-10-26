@@ -8617,7 +8617,8 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test embbuild shell") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild shell: VFS not registered\n"); return 1; }
         /* Room for every unit's compiler chatter: the verdict is the LAST
-         * line, and sixteen tcc runs overflowed 4 KiB before reaching it. */
+         * line, and sixteen tcc runs overflowed 4 KiB before reaching it (there are
+         * twenty-three now). */
         static char cap[65536];
         int ok = 1, rc;
         char *bb = "/data/apps/embbuild/embbuild.elf";
@@ -8631,7 +8632,7 @@ int selftests_handle_command(const char *cmd)
         kprintf("[v2] (1) building the shell from /data/src/shell\n");
         char *a1[] = { bb, "/data/src/shell/build.ebm", NULL };
         rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
-        if (rc != 0 || !emb_find(cap, "17 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }   /* 16 units + the link */
+        if (rc != 0 || !emb_find(cap, "24 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }   /* 23 units + the link */
 
         /* (2) verify the staged shell BEFORE adoption */
         if (ok) {

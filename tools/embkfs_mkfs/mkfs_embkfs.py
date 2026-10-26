@@ -51,6 +51,7 @@ import uuid as uuidlib
 from crc32c import crc32c
 import layout as L
 import fonts
+import share
 
 # v2.2: real wall-clock timestamps for every object this formatter creates,
 # instead of the placeholder zeros v2.0/v2.1 shipped with (the kernel had no
@@ -1001,6 +1002,9 @@ def discover_userland_objects(build_dir="build"):
     # list is fonts.py's, shared with the ARM image.
     for name, data in fonts.font_files(_read_font):
         objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    # /system/share: the prompt's Powerlevel10k styles (share.py, shared with ARM).
+    for name, data in share.share_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
     # Sealed visual assets used by full-screen system experiences (login/setup).
     objects.extend(_tree_objects("system/images", b"system/images/", (".ppm", ".pam", ".eic")))
     # Vellum's built-in documents (docs/BROWSER.md). Sealed with the OS: the
@@ -1295,6 +1299,10 @@ def discover_userland_objects(build_dir="build"):
                   "edit/edit.c", "edit/edit.h", "edit/wcwidth.c", "edit/wcwidth.h",
                   "complete/complete.c", "complete/complete.h",
                   "prompt/prompt.c", "prompt/prompt.h",
+                  "prompt/p10k.c", "prompt/p10k.h", "prompt/p10k_int.h",
+                  "prompt/p10k_zsh.c", "prompt/p10k_render.c", "prompt/p10k_import.c",
+                  "prompt/icons.c", "prompt/icons.h", "prompt/colors.c", "prompt/colors.h",
+                  "prompt/prompt_os.c", "prompt/prompt_os.h",
                   "builtins/builtins.c", "builtins/builtins_os.c",
                   "builtins/builtins.h",
                   "hist/hist.c", "hist/hist.h",

@@ -1,0 +1,627 @@
+{
+ "config": [
+  "third_party/powerlevel10k/config/p10k-lean.zsh",
+  "tests/prompt/configs/variants/dir-marker.zsh"
+ ],
+ "home": "/tmp/emblink-prompt-home",
+ "dirs": [
+  "projects",
+  "projects/detached",
+  "projects/detached/.git",
+  "projects/embedded",
+  "projects/emblink",
+  "projects/emblink/.git",
+  "projects/emblink/kernel",
+  "projects/emblink/kernel/drivers",
+  "projects/emblink/kernel/drivers/video",
+  "projects/fork",
+  "projects/fork/.git",
+  "projects/merging",
+  "projects/merging/.git",
+  "sources",
+  "src",
+  "src/operating-systems",
+  "src/operating-systems/emacs",
+  "src/operating-systems/emblink",
+  "src/operating-systems/emblink/user",
+  "src/operating-systems/emblink/user/term",
+  "src/operating-systems/emblink/user/terminal",
+  "src/operating-systems/emblink/user/terminal/renderer",
+  "src/operating-systems/emblink/user/terminal/renderer/fonts",
+  "src/operating-systems/emblink/user/terminal/renderer/fonts/with-a-rather-long-name",
+  "src/operating-systems/emblink/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it",
+  "src/other"
+ ],
+ "files": [
+  "projects/detached/a.txt",
+  "projects/emblink/README.md",
+  "projects/emblink/kernel.c",
+  "projects/emblink/notes.txt",
+  "projects/emblink/shell.c",
+  "projects/emblink/todo.txt",
+  "projects/fork/a.txt",
+  "projects/fork/c.txt",
+  "projects/fork/d.txt",
+  "projects/merging/f.txt",
+  "src/operating-systems/emblink/user/package.json"
+ ],
+ "recorded": "2026-10-26",
+ "reference": "Powerlevel10k powerlevel10k under tmux 3.8",
+ "sessions": [
+  {
+   "name": "wide",
+   "cols": 100,
+   "rows": 16,
+   "steps": [
+    {
+     "step": "home",
+     "typed": null,
+     "state": {
+      "dir": "~",
+      "status": null,
+      "time": null
+     },
+     "cursor": [
+      2,
+      1
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                                                                 ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deep",
+     "typed": "cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 0,
+      "time": null
+     },
+     "cursor": [
+      2,
+      4
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                                                                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts            ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "error",
+     "typed": "false",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 1,
+      "time": null
+     },
+     "cursor": [
+      2,
+      7
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                                                                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts            ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;76m❯\u001b[39m false                  ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;196m❯\u001b[39m                        ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deeper",
+     "typed": "cd $deeper",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it",
+      "status": 0,
+      "time": null
+     },
+     "cursor": [
+      2,
+      10
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                                                                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts            ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;76m❯\u001b[39m false                  ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;196m❯\u001b[39m cd $deeper             ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it\u001b[39m                 ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "git",
+     "typed": "cd /tmp/emblink-prompt-home/projects/emblink",
+     "state": {
+      "dir": "~/projects/emblink",
+      "status": 0,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      13
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                                                                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts            ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;76m❯\u001b[39m false                  ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;196m❯\u001b[39m cd $deeper             ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it\u001b[39m                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink    ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                                ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "slow",
+     "typed": "sleep 3.2",
+     "state": {
+      "dir": "~/projects/emblink",
+      "status": 0,
+      "duration_ms": 3200,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      15
+     ],
+     "screen": [
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts            ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;76m❯\u001b[39m false                  ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;196m❯\u001b[39m cd $deeper             ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it\u001b[39m                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink    ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                                ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 3.2              ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                           \u001b[38;5;101m 3s\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      ""
+     ]
+    },
+    {
+     "step": "jobs",
+     "typed": "sleep 100 &",
+     "state": {
+      "dir": "~/projects/emblink",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                                                                  ",
+      "\u001b[38;5;196m❯\u001b[39m cd $deeper             ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it\u001b[39m                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink    ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                                ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 3.2              ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                           \u001b[38;5;101m 3s\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 100 &            ",
+      "[1] 72241                ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      ""
+     ],
+     "output": true
+    },
+    {
+     "step": "fork",
+     "typed": "cd $fork",
+     "state": {
+      "dir": "~/projects/fork",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "branch": "main",
+       "remote_branch": "main",
+       "ahead": 2,
+       "behind": 1,
+       "remote_url": "/tmp/emblink-prompt-remote.git",
+       "stashes": 1,
+       "summary": "wip: four"
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it\u001b[39m                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink    ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                                ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 3.2              ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                           \u001b[38;5;101m 3s\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 100 &            ",
+      "[1] 72241                ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m cd $fork               ",
+      "",
+      "\u001b[38;5;31m ~/projects/fork \u001b[38;5;76m main \u001b[38;5;178mwip \u001b[38;5;76m⇣1⇡2 *1\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      ""
+     ]
+    },
+    {
+     "step": "detached",
+     "typed": "cd $detached",
+     "state": {
+      "dir": "~/projects/detached",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "commit": "e802fca6b87c91cfa6a1295b0c4d3a423baa0090",
+       "summary": "One"
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                                ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 3.2              ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                           \u001b[38;5;101m 3s\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 100 &            ",
+      "[1] 72241                ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m cd $fork               ",
+      "",
+      "\u001b[38;5;31m ~/projects/fork \u001b[38;5;76m main \u001b[38;5;178mwip \u001b[38;5;76m⇣1⇡2 *1\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m cd $detached           ",
+      "",
+      "\u001b[38;5;31m ~/projects/detached \u001b[38;5;76m \u001b[39m@\u001b[38;5;76me802fca6\u001b[39m                                                                 \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      ""
+     ]
+    },
+    {
+     "step": "merging",
+     "typed": "cd $merging",
+     "state": {
+      "dir": "~/projects/merging",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "conflicted": 1,
+       "branch": "main",
+       "action": "merge",
+       "summary": "Main"
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                           \u001b[38;5;101m 3s\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 100 &            ",
+      "[1] 72241                ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m cd $fork               ",
+      "",
+      "\u001b[38;5;31m ~/projects/fork \u001b[38;5;76m main \u001b[38;5;178mwip \u001b[38;5;76m⇣1⇡2 *1\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m cd $detached           ",
+      "",
+      "\u001b[38;5;31m ~/projects/detached \u001b[38;5;76m \u001b[39m@\u001b[38;5;76me802fca6\u001b[39m                                                                 \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m cd $merging            ",
+      "",
+      "\u001b[38;5;31m ~/projects/merging \u001b[38;5;76m main \u001b[38;5;196mmerge ~1\u001b[39m                                                              \u001b[38;5;70m\u001b[39m ",
+      "\u001b[38;5;76m❯\u001b[39m                        ",
+      ""
+     ]
+    }
+   ]
+  },
+  {
+   "name": "narrow",
+   "cols": 60,
+   "rows": 16,
+   "steps": [
+    {
+     "step": "home",
+     "typed": null,
+     "state": {
+      "dir": "~",
+      "status": null,
+      "time": null
+     },
+     "cursor": [
+      2,
+      1
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                         ",
+      "\u001b[38;5;76m❯\u001b[39m              ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deep",
+     "typed": "cd $deep",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 0,
+      "time": null
+     },
+     "cursor": [
+      2,
+      4
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                         ",
+      "\u001b[38;5;76m❯\u001b[39m cd $deep     ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                          ",
+      "\u001b[38;5;76m❯\u001b[39m              ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "interrupt",
+     "typed": "sleep 30",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 130,
+      "time": null
+     },
+     "cursor": [
+      2,
+      8
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                         ",
+      "\u001b[38;5;76m❯\u001b[39m cd $deep     ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                          ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 30     ",
+      "^C             ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                    \u001b[38;5;160m✘ INT\u001b[39m ",
+      "\u001b[38;5;196m❯\u001b[39m              ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ],
+     "output": true
+    },
+    {
+     "step": "repo",
+     "typed": "cd $repodeep",
+     "state": {
+      "dir": "~/projects/emblink/kernel/drivers/video",
+      "status": 0,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": null
+     },
+     "cursor": [
+      2,
+      11
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                                         ",
+      "\u001b[38;5;76m❯\u001b[39m cd $deep     ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                          ",
+      "\u001b[38;5;76m❯\u001b[39m sleep 30     ",
+      "^C             ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m                    \u001b[38;5;160m✘ INT\u001b[39m ",
+      "\u001b[38;5;196m❯\u001b[39m cd $repodeep ",
+      "",
+      "\u001b[38;5;31m ~/projects/emblink/kernel/drivers/video \u001b[38;5;76m\u001b[38;5;178m \u001b[38;5;76mmain \u001b[38;5;178m+1 !1 \u001b[38;5;39m?2\u001b[39m   ",
+      "\u001b[38;5;76m❯\u001b[39m              ",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    }
+   ]
+  },
+  {
+   "name": "tiny",
+   "cols": 36,
+   "rows": 12,
+   "steps": [
+    {
+     "step": "home",
+     "typed": null,
+     "state": {
+      "dir": "~",
+      "status": null,
+      "time": null
+     },
+     "cursor": [
+      2,
+      1
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                 ",
+      "\u001b[38;5;76m❯\u001b[39m        ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deep",
+     "typed": "cd $deep",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 0,
+      "time": null
+     },
+     "cursor": [
+      2,
+      4
+     ],
+     "screen": [
+      "\u001b[38;5;31m ~\u001b[39m                                 ",
+      "\u001b[38;5;76m❯\u001b[39m cd $deep        ",
+      "",
+      "\u001b[38;5;31m ~/\u001b[38;5;103m…\u001b[38;5;31m/user/terminal/renderer/fonts\u001b[39m  ",
+      "\u001b[38;5;76m❯\u001b[39m        ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -13,6 +13,7 @@
 struct opt { char key[PROMPT_KEY_MAX]; char *value; };
 static struct opt g_opts[PROMPT_OPTS];
 static size_t g_nopts;
+static unsigned g_changes;               /* every change: the merged configuration is stale */
 
 bool prompt_key_valid(const char *key) {
     size_t n = key ? strlen(key) : 0;
@@ -42,6 +43,7 @@ bool prompt_opt_set(const char *key, const char *value) {
         memcpy(o->key, key, strlen(key) + 1);
     } else free(o->value);
     o->value = copy;
+    g_changes++;
     return true;
 }
 
@@ -57,12 +59,14 @@ bool prompt_opt_unset(const char *key) {
     size_t i = (size_t)(o - g_opts);
     memmove(&g_opts[i], &g_opts[i + 1], (g_nopts - i - 1) * sizeof *g_opts);
     g_nopts--;
+    g_changes++;
     return true;
 }
 
 void prompt_opt_reset(void) {
     for (size_t i = 0; i < g_nopts; i++) free(g_opts[i].value);
     g_nopts = 0;
+    g_changes++;
 }
 
 size_t prompt_opt_count(void) { return g_nopts; }
@@ -125,8 +129,10 @@ static bool right_element(const struct prompt_state *s, const char *name, char *
     return false;                  /* not an element (yet): left out */
 }
 
+static void p10k_build(const struct prompt_state *s, int cols, struct prompt_text *out);
+
 void prompt_build(const struct prompt_state *s, int cols, struct prompt_text *out) {
-    (void)cols;                    /* the left side does not depend on the width yet */
+    if (prompt_p10k_config()) { p10k_build(s, cols, out); return; }
     const char *ch = opt_or("char", "$");
     out->left[0] = out->right[0] = out->transient[0] = 0;
     snprintf(out->left, sizeof out->left, "\033[1;36m%s@%s:%s%s\033[0m ",
@@ -153,4 +159,134 @@ void prompt_build(const struct prompt_state *s, int cols, struct prompt_text *ou
     bool same = s->last_dir && s->dir && !strcmp(s->last_dir, s->dir);
     if (!strcmp(t, "always") || (!strcmp(t, "same-dir") && same))
         snprintf(out->transient, sizeof out->transient, "\033[1;%dm%s\033[0m ", s->status > 0 ? 31 : 32, ch);
+}
+
+/* --- Powerlevel10k ---------------------------------------------------------- */
+
+static struct p10k *g_base, *g_merged;
+static char g_source[256];
+static unsigned g_merged_at = (unsigned)-1;
+
+bool prompt_p10k_load(const char *source, const char *text, struct p10k_import *report) {
+    struct p10k *cfg = p10k_new();
+    if (!cfg) { if (report) snprintf(report->error, sizeof report->error, "out of memory"); return false; }
+    if (!p10k_import(cfg, text, report)) { p10k_free(cfg); return false; }
+    p10k_free(g_base);
+    g_base = cfg;
+    snprintf(g_source, sizeof g_source, "%s", source ? source : "");
+    g_changes++;
+    return true;
+}
+
+void prompt_p10k_drop(void) {
+    p10k_free(g_base);
+    p10k_free(g_merged);
+    g_base = g_merged = NULL;
+    g_source[0] = 0;
+    g_changes++;
+}
+
+const char *prompt_p10k_source(void) { return g_base ? g_source : NULL; }
+
+void prompt_p10k_name(const char *key, char *out, size_t cap) {
+    size_t n = 0;
+    out[0] = 0;
+    for (const char *w = key; *w && n + 1 < cap;) {
+        size_t len = strcspn(w, ".");
+        const char *word = w;
+        if (len == 2 && !strncmp(w, "fg", 2)) word = "FOREGROUND", len = 10;
+        else if (len == 2 && !strncmp(w, "bg", 2)) word = "BACKGROUND", len = 10;
+        if (n && n + 1 < cap) out[n++] = '_';
+        for (size_t i = 0; i < len && n + 1 < cap; i++)
+            out[n++] = word[i] >= 'a' && word[i] <= 'z' ? (char)(word[i] - 32) : word[i];
+        w += strcspn(w, ".");
+        if (*w == '.') w++;
+    }
+    out[n] = 0;
+}
+
+/* An option on top of the base: the five the plain prompt has, as their
+ * Powerlevel10k parameters; any other by its name. */
+static void apply(struct p10k *cfg, const char *key, const char *value) {
+    if (!strcmp(key, "char")) {
+        p10k_set(cfg, "PROMPT_CHAR_OK_VIINS_CONTENT_EXPANSION", value);
+        p10k_set(cfg, "PROMPT_CHAR_ERROR_VIINS_CONTENT_EXPANSION", value);
+    } else if (!strcmp(key, "right")) {
+        char list[PROMPT_VALUE_MAX * 2] = "";
+        for (const char *p = value; *p;) {
+            while (*p == ' ' || *p == ',') p++;
+            size_t n = strcspn(p, " ,");
+            if (!n) break;
+            char name[48];
+            snprintf(name, sizeof name, "%.*s", (int)(n < sizeof name ? n : sizeof name - 1), p);
+            add(list, sizeof list, list[0] ? " " : "");
+            add(list, sizeof list, !strcmp(name, "duration") ? "command_execution_time" : name);
+            p += n;
+        }
+        p10k_set(cfg, "RIGHT_PROMPT_ELEMENTS", list);
+    } else if (!strcmp(key, "transient")) p10k_set(cfg, "TRANSIENT_PROMPT", value);
+    else if (!strcmp(key, "duration.threshold")) p10k_set(cfg, "COMMAND_EXECUTION_TIME_THRESHOLD", value);
+    else if (!strcmp(key, "time.format")) {
+        if (!strcmp(value, "12h")) p10k_set(cfg, "TIME_FORMAT", "%D{%I:%M:%S %p}");
+        else if (!strcmp(value, "24h")) p10k_set(cfg, "TIME_FORMAT", "%D{%H:%M:%S}");
+        else p10k_set(cfg, "TIME_FORMAT", value);
+    } else {
+        char name[PROMPT_KEY_MAX * 2];
+        prompt_p10k_name(key, name, sizeof name);
+        p10k_set(cfg, name, value);
+    }
+}
+
+const struct p10k *prompt_p10k_config(void) {
+    if (!g_base) return NULL;
+    if (g_merged && g_merged_at == g_changes) return g_merged;
+    struct p10k *cfg = p10k_new();
+    if (!cfg) return g_merged ? g_merged : g_base;
+    for (size_t i = 0; i < p10k_count(g_base); i++) p10k_set(cfg, p10k_name_at(g_base, i), p10k_value_at(g_base, i));
+    for (size_t i = 0; i < g_nopts; i++) apply(cfg, g_opts[i].key, g_opts[i].value);
+    p10k_free(g_merged);
+    g_merged = cfg;
+    g_merged_at = g_changes;
+    return g_merged;
+}
+
+/* `src` into `dst` with \n as \r\n: the editor writes the prompt raw. */
+static void lines_into(char *dst, size_t cap, const char *src) {
+    size_t n = strlen(dst);
+    for (; *src && n + 2 < cap; src++) {
+        if (*src == '\n') dst[n++] = '\r';
+        dst[n++] = *src;
+    }
+    dst[n] = 0;
+}
+
+static void p10k_build(const struct prompt_state *s, int cols, struct prompt_text *out) {
+    out->left[0] = out->right[0] = out->transient[0] = 0;
+    struct p10k_state st = { 0 };
+    st.pwd = s->pwd ? s->pwd : "/";
+    st.home = s->home;
+    st.user = s->user;
+    st.host = s->host;
+    st.root = s->root;
+    st.status = s->status;
+    st.duration = s->status < 0 ? -1 : (double)s->duration_ms / 1000;
+    st.jobs = s->jobs;
+    st.year = s->year; st.month = s->month; st.mday = s->mday; st.wday = s->wday;
+    st.hour = s->hour; st.minute = s->minute; st.second = s->second;
+    st.os = "emblink";
+    st.last_prompt_pwd = s->last_pwd;
+    st.first = s->status < 0;
+    if (s->git) st.git = *s->git;
+    st.fs = s->fs;
+    struct p10k_prompt p;
+    if (!p10k_render(prompt_p10k_config(), &st, cols, &p)) {
+        snprintf(out->left, sizeof out->left, "%s ", s->dir ? s->dir : "");     /* out of memory: still a prompt */
+        return;
+    }
+    /* PROMPT_ADD_NEWLINE: empty lines above every prompt but the first */
+    for (int i = 0; i < p.add_newline; i++) add(out->left, sizeof out->left, "\r\n");
+    lines_into(out->left, sizeof out->left, p.left);
+    snprintf(out->right, sizeof out->right, "%s", p.right);
+    snprintf(out->transient, sizeof out->transient, "%s", p.transient);
+    p10k_prompt_free(&p);
 }

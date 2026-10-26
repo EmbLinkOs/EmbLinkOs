@@ -1,0 +1,13 @@
+# On top of p10k-lean.zsh: truncate_to_unique before the first marker, and every dir style.
+typeset -g POWERLEVEL9K_DIR_TRUNCATE_BEFORE_MARKER=first
+typeset -g POWERLEVEL9K_SHORTEN_DELIMITER='…'
+typeset -g POWERLEVEL9K_DIR_SHORTENED_FOREGROUND=103
+typeset -g POWERLEVEL9K_DIR_PATH_SEPARATOR_FOREGROUND=244
+typeset -g POWERLEVEL9K_DIR_PATH_HIGHLIGHT_BOLD=true
+typeset -g POWERLEVEL9K_DIR_PATH_HIGHLIGHT_FOREGROUND=255
+typeset -g POWERLEVEL9K_DIR_CLASSES=(
+  '~/projects(|/*)'  PROJECTS  '★'
+  '~'                HOME      ''
+  '*'                DEFAULT   '')
+typeset -g POWERLEVEL9K_DIR_PROJECTS_FOREGROUND=208
+typeset -g POWERLEVEL9K_DIR_PROJECTS_ANCHOR_FOREGROUND=214

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import layout as L
 import fonts
+import share
 from mkfs_embkfs import (make_image, _read_font, _tree_objects,
                           FIXTURE_OBJECTS, _prog_meta,
                           _SYSTEM_BIN as _X86_SYSTEM_BIN)
@@ -170,6 +171,9 @@ def main(argv):
     # at pack time when the host lacks a DejaVu face -- the toolkit would draw
     # no text without it, a worse symptom than a missing file).
     for name, data in fonts.font_files(_read_font) + fonts.licence_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    # /system/share: the prompt's Powerlevel10k styles (share.py).
+    for name, data in share.share_files():
         objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
 
     # ICONS AND THE WALLPAPER. /system/images is what the desktop draws itself

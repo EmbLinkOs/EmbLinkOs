@@ -1109,11 +1109,13 @@ static struct value bi_sleep(const struct command *cmd, struct value input,
     value_free(&msv);
     if (ms < 0) return value_error("sleep cannot go backwards");
 
-    uint64_t t0 = embk_uptime_ms();
-    int rc = embk_sleep_ms((uint64_t)ms);
-    uint64_t took = embk_uptime_ms() - t0;
-
-    if (rc < 0) return value_error("sleep was interrupted");
+    /* In slices, so ^C ends it: the shell, not a child, is the one sleeping. */
+    uint64_t t0 = embk_uptime_ms(), took = 0;
+    while (took < (uint64_t)ms) {
+        uint64_t left = (uint64_t)ms - took;
+        if (embk_sleep_ms(left < 50 ? left : 50) < 0 || exec_interrupt_poll()) return value_error("sleep was interrupted");
+        took = embk_uptime_ms() - t0;
+    }
 
     struct value out = value_record();
     value_record_set(&out, "ms",   value_int(ms));

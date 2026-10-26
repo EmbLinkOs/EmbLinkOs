@@ -377,6 +377,33 @@ static void test_right_transient(void) {
     ed = saved;
 }
 
+/* Powerlevel10k's two lines: the editor redraws from the first, puts the
+ * right side on the row the typing is on, and the transient prompt takes the
+ * place of both. */
+static void test_two_lines(void) {
+    printf("a prompt of two lines:\n");
+    vt_free(&term);
+    vt_init(&term, 30, 8, from_screen, NULL);
+    nreplies = 0;
+    to_screen(NULL, "before\r\n", 8);
+    struct edit_prompt p = { "\033]133;A;edit=shell;cwd=/home\007", "\r\n\033[38;5;238m\xe2\x95\xad\xe2\x94\x80\033[39m ~"
+                             "          12:00:00\r\n\033[38;5;238m\xe2\x95\xb0\xe2\x94\x80\033[38;5;76m\xe2\x9d\xaf\033[39m ",
+                             "> ", "\033]133;B\007", use_home ? "\033]133;R\007" : NULL, "R", "\033[38;5;76m\xe2\x9d\xaf\033[39m " };
+    edit_begin(ed, &p, EDIT_VT, 30);
+    CHECK(!strcmp(row(0), "before") && !strcmp(row(1), "") && !strncmp(row(2), "\xe2\x95\xad\xe2\x94\x80 ~", 7)
+          && !strncmp(row(3), "\xe2\x95\xb0\xe2\x94\x80\xe2\x9d\xaf", 9) && cy() == 3 && cx() == 4,
+          "an empty line, the first line, and the typing after the second");
+    /* ╰─❯ is three cells in nine bytes: R ends the row at column 28 */
+    CHECK(row(3)[strlen(row(3)) - 1] == 'R' && strlen(row(3)) - 6 == 29,
+          "the right side on the second line, against the edge one column in");
+    keys("ls -l");
+    CHECK(!strcmp(row(1), "") && strstr(row(2), "12:00:00") && !strncmp(row(3) + 9, " ls -l", 6) && cy() == 3,
+          "typing redraws both lines in place");
+    keys("\r");
+    CHECK(!strcmp(row(1), "\xe2\x9d\xaf ls -l") && !strcmp(row(2), "") && !strcmp(row(3), "") && cy() == 2,
+          "accepted: the transient prompt takes the empty line's place, the rest is cleared");
+}
+
 static void test_dumb(void) {
     printf("the console (no escapes):\n");
     hist_reset();
@@ -418,9 +445,11 @@ int main(void) {
     test_control();
     test_resize();
     test_right_transient();
+    test_two_lines();
     use_home = false;
     printf("-- the right and transient prompts, with relative cursor motion:\n");
     test_right_transient();
+    test_two_lines();
     use_home = true;
     test_dumb();
     edit_free(ed);

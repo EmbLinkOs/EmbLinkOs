@@ -1488,7 +1488,8 @@ SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
              shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h \
              shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h \
-             shell/prompt/prompt.h
+             shell/prompt/prompt.h shell/prompt/p10k.h shell/prompt/p10k_int.h shell/prompt/icons.h \
+             shell/prompt/colors.h shell/prompt/prompt_os.h
 
 $(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1516,6 +1517,20 @@ $(BUILD)/shobj_complete.o: shell/complete/complete.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_prompt.o: shell/prompt/prompt.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k.o: shell/prompt/p10k.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k_zsh.o: shell/prompt/p10k_zsh.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k_render.o: shell/prompt/p10k_render.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k_import.o: shell/prompt/p10k_import.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_icons.o: shell/prompt/icons.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_colors.o: shell/prompt/colors.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_prompt_os.o: shell/prompt/prompt_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_eval_extern.o: shell/eval/eval_extern.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
@@ -1526,9 +1541,10 @@ $(BUILD)/shobj_main.o: shell/main.c $(SHELL_HDRS) | $(BUILD)
 # The shell's own sources ride in the image (/data/src/shell) for `test embbuild
 # shell` to rebuild it with tcc, so a change to any of them -- or to a manifest
 # -- has to remake the image even when shell.elf itself did not change.
-# The fonts and licences fonts.py installs on both images: a face that changes
-# rebuilds the image.
-IMAGE_FONT_INPUTS = tools/embkfs_mkfs/fonts.py $(wildcard third_party/fonts/*/*.ttf) $(wildcard system/licenses/*)
+# The fonts and licences fonts.py installs on both images, and share.py's
+# prompt styles: one that changes rebuilds the image.
+IMAGE_FONT_INPUTS = tools/embkfs_mkfs/fonts.py $(wildcard third_party/fonts/*/*.ttf) $(wildcard system/licenses/*) \
+                    tools/embkfs_mkfs/share.py $(wildcard third_party/powerlevel10k/config/*.zsh)
 SHELL_SELFBUILD_SRC = $(wildcard shell/*.c shell/*/*.c shell/*/*.h) shell/build.ebm $(wildcard shell/tools/*.ebm)
 
 SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o \
@@ -1536,7 +1552,9 @@ SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o 
              $(BUILD)/shobj_exec.o \
              $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
              $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o \
-             $(BUILD)/shobj_prompt.o $(BUILD)/shobj_eval_extern.o \
+             $(BUILD)/shobj_prompt.o $(BUILD)/shobj_p10k.o $(BUILD)/shobj_p10k_zsh.o \
+             $(BUILD)/shobj_p10k_render.o $(BUILD)/shobj_p10k_import.o $(BUILD)/shobj_icons.o \
+             $(BUILD)/shobj_colors.o $(BUILD)/shobj_prompt_os.o $(BUILD)/shobj_eval_extern.o \
              $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
 
 build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
@@ -2781,11 +2799,29 @@ terminal-test: | $(BUILD)
 # builtins + the wire round-trip), host-run. The two OS-backed pieces (ls,
 # external spawn) link as stubs; they get exercised live by `test shell`.
 
+# The prompt and its Powerlevel10k engine, as the shell links them.
+PROMPT_SRC = shell/prompt/prompt.c shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c \
+             shell/prompt/p10k_import.c shell/prompt/icons.c shell/prompt/colors.c
+
+# The prompt engine against Powerlevel10k itself: its pieces (p10k_test.c),
+# then whole prompts, cell for cell, against recordings of p10k drawing the
+# same states on a Mac (tools/golden_prompt.py, tests/prompt/golden).
+P10K_HOST_SRC = shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c shell/prompt/p10k_import.c \
+                shell/prompt/icons.c shell/prompt/colors.c shell/edit/wcwidth.c
+prompt-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
+	    $(P10K_HOST_SRC) tests/prompt/p10k_test.c -o $(BUILD)/p10k_test
+	$(BUILD)/p10k_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
+	    $(P10K_HOST_SRC) tests/prompt/prompt_dump.c -o $(BUILD)/prompt_dump
+	python3 tools/golden_prompt.py
+.PHONY: prompt-test
+
 shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
-	    shell/builtins/builtins.c shell/prompt/prompt.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/builtins/builtins.c $(PROMPT_SRC) shell/edit/wcwidth.c shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/test/host_test.c -o $(BUILD)/shell_test
 	$(BUILD)/shell_test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
@@ -2795,7 +2831,7 @@ shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
-	    shell/builtins/builtins.c shell/prompt/prompt.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c \
 	    shell/test/complete_test.c -o $(BUILD)/complete_test
 	$(BUILD)/complete_test
