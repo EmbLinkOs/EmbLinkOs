@@ -331,7 +331,7 @@ ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn l
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \
                     $(if $(HAVE_QJS),js,) \
-                    $(if $(HAVE_ZLIB_ARM),gitclone gitpush,)
+                    $(if $(HAVE_ZLIB_ARM),gitclone gitpush gitstatus,)
 
 # Freestanding: own _start, no libc at all (-T user.ld).
 ARM_PLAIN_PROGS  ?= init primtest
@@ -509,6 +509,12 @@ ARM_INC_gitclone  := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
 ARM_INC_gitpush   := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
 ARM_EXTRAOBJ_gitclone := $(ZLIB_ARM_A)
 ARM_EXTRAOBJ_gitpush  := $(ZLIB_ARM_A)
+# gitstatus: the prompt's git status daemon -- the repository readers and sha1.
+ARM_XSRC_gitstatus := user/gitstatus/gs_util.c user/gitstatus/gs_odb.c user/gitstatus/gs_index.c \
+                      user/gitstatus/gs_ignore.c user/gitstatus/gs_status.c user/git/sha1.c
+ARM_INC_gitstatus  := -DEMBLINK_TARGET -Iuser/gitstatus -Iuser/git -I$(ZLIB_ARM_BUILD)/include
+ARM_EXTRAOBJ_gitstatus := $(ZLIB_ARM_A)
+ARM_MAIN_gitstatus := user/gitstatus/gitstatus.c
 
 ARM_MAIN_shell    := shell/main.c
 ARM_MAIN_sysinfo  := shell/tools/sysinfo.c

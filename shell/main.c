@@ -297,6 +297,9 @@ static bool input_within(int ms) {
     return false;
 }
 
+static struct prompt_state g_pstate;      /* the prompt's state (below) */
+static struct p10k_git g_git;
+
 static enum edit_result edit_one_line(const struct edit_prompt *prompt, enum edit_mode mode) {
     edit_begin(g_ed, prompt, mode, mode == EDIT_VT ? terminal_cols() : 80);
     enum edit_result r = EDIT_MORE;
@@ -307,6 +310,15 @@ static enum edit_result edit_one_line(const struct edit_prompt *prompt, enum edi
         g_ahead_n -= used;
     }
     while (r == EDIT_MORE) {
+        /* An answer the prompt is still waiting for (the git status): watch
+         * for it beside the keys, and draw the prompt again when it comes. */
+        while (prompt_os_git_waiting() >= 0 && !(embk_fd_poll(0, EMBK_POLLIN) & EMBK_POLLIN)) {
+            if (prompt_os_git_answer(prompt_p10k_config(), &g_git)) {
+                g_pstate.git = g_git.repo ? &g_git : NULL;
+                prompt_os_fresh();
+                edit_reprompt(g_ed);
+            } else embk_sleep_ms(10);
+        }
         char buf[256];
         ssize_t n = read(0, buf, sizeof buf);
         if (n <= 0) return EDIT_EOF;
@@ -556,7 +568,8 @@ int main(int argc, char **argv) {
                 .year = tm ? tm->tm_year + 1900 : 1970, .month = tm ? tm->tm_mon + 1 : 1,
                 .mday = tm ? tm->tm_mday : 1, .wday = tm ? tm->tm_wday : 4,
                 .jobs = p10k ? unfinished_jobs() : 0, .root = user && !strcmp(user, "root"),
-                .git = p10k && prompt_os_git(cwd, &g_git) ? &g_git : NULL, .fs = p10k ? &prompt_os_fs : NULL };
+                .git = p10k && prompt_os_gitstatus(prompt_p10k_config(), cwd, &g_git) ? &g_git : NULL,
+                .fs = p10k ? &prompt_os_fs : NULL };
             prompt_build(&g_pstate, cols, &g_ptext);
             const char *program = getenv("TERM_PROGRAM");
             bool ours = program && !strcmp(program, "EmbLinkTerminal");

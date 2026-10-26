@@ -105,6 +105,10 @@ enum edit_result edit_escape_timeout(struct editor *e);
  * it began, so the editor redraws from there. */
 void edit_resize(struct editor *e, int cols, bool cleared);
 
+/* What the prompt shows has changed (an answer that came late -- the git
+ * status): the host's reprompt builds it again, and it is redrawn in place. */
+void edit_reprompt(struct editor *e);
+
 /* The accepted line, valid until the next edit_begin(). */
 const char *edit_line(const struct editor *e);
 

@@ -222,6 +222,9 @@ def main(argv):
     objects.append((b"home/" + DEV_USER + b"/readme.txt", L.DT_REG,
                     L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink on aarch64.\n"))
+    # The sample project under git (share.py), as on the x86 image.
+    for name, data in share.sample_files(b"home/" + DEV_USER):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
 
     # Say it in words BEFORE struct.pack says it in hex. A rough block count is
     # enough: this is a guard against "the image is too small", not an

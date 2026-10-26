@@ -1189,6 +1189,16 @@ GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack
 build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
+# gitstatus -- the prompt's git status daemon (gitstatusd's protocol): reads a
+# repository's objects (zlib), refs, index and ignore rules itself.
+GITSTATUS_SRC := user/gitstatus/gitstatus.c user/gitstatus/gs_util.c user/gitstatus/gs_odb.c \
+                 user/gitstatus/gs_index.c user/gitstatus/gs_ignore.c user/gitstatus/gs_status.c
+GITSTATUS_OBJS := $(patsubst user/gitstatus/%.c,build/gitstatus_%.o,$(GITSTATUS_SRC)) build/git_sha1.o
+build/gitstatus_%.o: user/gitstatus/%.c user/gitstatus/gs.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -DEMBLINK_TARGET -Iuser/gitstatus -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/gitstatus.elf: build/crt0.o build/syscalls.o $(GITSTATUS_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITSTATUS_OBJS) $(ZLIB_A) -lc -lgcc -o $@
+
 # gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
 build/gitpush.o: user/tools/gitpush/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
@@ -2096,7 +2106,7 @@ endif
 
 EMBKFS_APPS := build/updateprobe.elf build/updatectl.elf build/updateworker.elf build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf build/spawnprobe.elf build/shprobe.elf build/fdprobe.elf build/sh.elf $(if $(PIE_OK),build/pieprobe.elf,) \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf build/gitstatus.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf build/notepp.elf \
                build/install.elf \
@@ -2816,6 +2826,18 @@ prompt-test: | $(BUILD)
 	    $(P10K_HOST_SRC) tests/prompt/prompt_dump.c -o $(BUILD)/prompt_dump
 	python3 tools/golden_prompt.py
 .PHONY: prompt-test
+
+# The git status daemon against gitstatusd itself (tools/gitstatus_golden.py:
+# 38 repositories in every state, five flag sets, a repository changed under
+# one daemon), and gitclone's checkout against git (fsck, status).
+GS_HOST_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined
+gitstatus-test: | $(BUILD)
+	$(HOSTCC) $(GS_HOST_CFLAGS) -Iuser/gitstatus -Iuser/git $(GITSTATUS_SRC) user/git/sha1.c -lz -o $(BUILD)/gitstatus_host
+	python3 tools/gitstatus_golden.py
+	$(HOSTCC) $(GS_HOST_CFLAGS) -Iuser/git user/git/pack.c user/git/repo.c user/git/sha1.c tests/git/checkout_host.c \
+	    -lz -o $(BUILD)/checkout_host
+	python3 tools/gitclone_index_test.py
+.PHONY: gitstatus-test
 
 shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \

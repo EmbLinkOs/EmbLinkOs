@@ -282,17 +282,22 @@ static void seg_vcs(struct ctx *c) {
         }
         state = "LOADING";
     }
-    bool conflicted = g->conflicted && p9k_bool(cfg, "VCS_CONFLICTED_STATE", false);
+    /* VCS_STATUS_HAS_*: 1, 0, or -1 when the index was too big to look
+     * (VCS_MAX_INDEX_SIZE_DIRTY): a state, but no count */
+    bool big = g->has_unstaged == -1;
+    int has_staged = g->staged > 0, has_unstaged = big ? -1 : g->unstaged > 0;
+    int has_untracked = big ? -1 : g->untracked > 0, has_conflicted = big ? -1 : g->conflicted > 0;
+    bool conflicted = has_conflicted == 1 && p9k_bool(cfg, "VCS_CONFLICTED_STATE", false);
     int si = 0;
     if (p9k_bool(cfg, "VCS_DISABLE_GITSTATUS_FORMATTING", false)) {
-        if (!state) state = conflicted ? "CONFLICTED" : g->staged || g->unstaged ? "MODIFIED" : g->untracked ? "UNTRACKED" : "CLEAN";
+        if (!state) state = conflicted ? "CONFLICTED" : has_staged || has_unstaged ? "MODIFIED" : has_untracked ? "UNTRACKED" : "CLEAN";
         for (int i = 0; i < 5; i++) if (!strcmp(VCS_STATE[i], state)) si = i;
         snprintf(name, sizeof name, "prompt_vcs_%s", state);
         segment(c, name, VCS_STATE_BG[si], COLOR1, vcs_icon(g), "");
         return;
     }
     /* _p9k_vcs_render: Powerlevel10k's own formatting */
-    int untracked = hook(cfg, "git-untracked") ? g->untracked : 0;
+    if (!hook(cfg, "git-untracked")) has_untracked = 0;
     int ahead = hook(cfg, "git-aheadbehind") ? g->ahead : 0, behind = hook(cfg, "git-aheadbehind") ? g->behind : 0;
     int stashes = hook(cfg, "git-stash") ? g->stashes : 0;
     const char *remote = hook(cfg, "git-remotebranch") ? g->remote_branch : "";
@@ -304,8 +309,8 @@ static void seg_vcs(struct ctx *c) {
     if (hook(cfg, "vcs-detect-changes")) {
         if (state) {}
         else if (conflicted) state = "CONFLICTED";
-        else if (g->staged || g->unstaged) state = "MODIFIED";
-        else if (untracked) state = "UNTRACKED";
+        else if (has_staged || has_unstaged) state = "MODIFIED";
+        else if (has_untracked) state = "UNTRACKED";
         icon = vcs_icon(g);
     }
     if (!state) state = "CLEAN";
@@ -340,16 +345,16 @@ static void seg_vcs(struct ctx *c) {
             vcs_style(cfg, state, "REMOTE_BRANCH", &content);
             sb_chr(&content, ' '); sb_str(&content, p9k_icon(cfg, name, "VCS_REMOTE_BRANCH_ICON", NULL, &ic)); esc(&content, remote);
         }
-        if (g->staged || g->unstaged || untracked) {
+        if (has_staged == 1 || has_unstaged == 1 || has_untracked == 1) {
             vcs_style(cfg, state, "DIRTY", &content);
             sb_str(&content, p9k_icon(cfg, name, "VCS_DIRTY_ICON", NULL, &ic));
-            struct { int n; const char *part, *icon, *max; } k[] = {
-                { g->staged, "STAGED", "VCS_STAGED_ICON", "VCS_STAGED_MAX_NUM" },
-                { g->unstaged, "UNSTAGED", "VCS_UNSTAGED_ICON", "VCS_UNSTAGED_MAX_NUM" },
-                { untracked, "UNTRACKED", "VCS_UNTRACKED_ICON", "VCS_UNTRACKED_MAX_NUM" },
+            struct { int has, n; const char *part, *icon, *max; } k[] = {
+                { has_staged, g->staged, "STAGED", "VCS_STAGED_ICON", "VCS_STAGED_MAX_NUM" },
+                { has_unstaged, g->unstaged, "UNSTAGED", "VCS_UNSTAGED_ICON", "VCS_UNSTAGED_MAX_NUM" },
+                { has_untracked, g->untracked, "UNTRACKED", "VCS_UNTRACKED_ICON", "VCS_UNTRACKED_MAX_NUM" },
             };
             for (int i = 0; i < 3; i++) {
-                if (!k[i].n) continue;
+                if (k[i].has != 1) continue;
                 vcs_style(cfg, state, k[i].part, &content);
                 sb_chr(&content, ' ');
                 sb_str(&content, p9k_icon(cfg, name, k[i].icon, NULL, &ic));

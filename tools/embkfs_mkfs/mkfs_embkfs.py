@@ -823,7 +823,10 @@ _SYSTEM_BIN = {"sh.elf", "init.elf", "primtest.elf", "shell.elf", "home.elf",
                # never by a user: it is the only program in reach of a session
                # that can read /etc/shadow, so it belongs with the system's
                # own, not among the applications.
-               "authd.elf", "updateworker.elf"}   # -> /system/bin/
+               "authd.elf", "updateworker.elf",
+               # The shell's git status daemon (docs/SHELL.md, "The prompt"):
+               # the system's, started by every shell whose prompt shows git.
+               "gitstatus.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -1394,6 +1397,10 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink.\n\nThis is your home directory.\n"))
+    # A sample project under git (share.py, shared with ARM): the prompt's git
+    # status has something to show, and git something to try.
+    for name, data in share.sample_files(b"home/yves"):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
     # OS update trust is an explicit publisher input, never the public dev key.
     objects.append((b"system/update", L.DT_DIR, L.S_IFDIR | 0o755, None))
     update_key = os.environ.get("EMBK_UPDATE_KEY")

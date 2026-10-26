@@ -1229,6 +1229,13 @@ enum edit_result edit_escape_timeout(struct editor *e) {
     return e->result;
 }
 
+void edit_reprompt(struct editor *e) {
+    if (e->result != EDIT_MORE) return;
+    reprompt(e);
+    render(e);
+    flush(e);
+}
+
 void edit_resize(struct editor *e, int cols, bool cleared) {
     if (cols > 0 && cols != e->cols) { e->cols = cols; reprompt(e); }
     if (cleared) e->fresh = true;
