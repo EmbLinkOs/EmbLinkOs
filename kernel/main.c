@@ -2234,6 +2234,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     }
 
     kworker_init();
+    /* The compositor's frame thread: from here on a paint is damage, composed
+     * once a frame (gfx/compositor.c, "the frame clock"). */
+    compositor_start();
 
     /* The page cache's writeback thread. AFTER the scheduler (it is a kthread
      * and takes a sleeping lock) and after the filesystem is mounted -- from

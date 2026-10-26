@@ -54,6 +54,11 @@ void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel
  * took to reach the screen. */
 uint64_t mouse_take_motion_ns(void);
 
+/* Called after every change of position, buttons or wheel, from whatever
+ * context made it -- the PS/2 interrupt included -- and outside the driver's
+ * lock. The compositor's frame thread waits on it rather than polling. */
+void mouse_set_notify(void (*fn)(void));
+
 /* Put the cursor at (x, y), clamped to the bounds. For the compositor, which
  * keeps it off the parts of a multi-monitor desktop no monitor shows. */
 void mouse_warp(int32_t x, int32_t y);

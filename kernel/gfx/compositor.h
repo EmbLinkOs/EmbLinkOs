@@ -192,8 +192,15 @@ void compositor_repaint_all(void);
 /* What composes the desktop, for Settings: 1 and its name ("host GPU
  * (virgl)") when a GPU does, else 0 and "Software". */
 int compositor_renderer(char *name, unsigned len);
-/* Advance window open/park motion one frame; no-op when nothing is moving. */
+/* Advance window open/park motion one frame; no-op when nothing is moving.
+ * Once the frame thread runs (compositor_start) motion is its work and this
+ * does nothing; before then it is the inline pump. */
 void compositor_anim_tick(void);
+/* Start the frame thread (kcompositor): from then on paints are recorded as
+ * damage and composed once per frame. Call once the scheduler runs. */
+void compositor_start(void);
+/* The pointer changed -- wake the frame thread. Any context, IRQ included. */
+void compositor_input_kick(void);
 /* The statistics overlay (comp_stats.h): toggle it (returns 1 if it is now
  * wanted), whether it is on screen, and the kernel loop's refresh of it. */
 int  compositor_hud_toggle(void);

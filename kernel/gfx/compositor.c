@@ -160,9 +160,57 @@ static unsigned g_src = EMBK_COMP_SRC_OTHER;
 /* Pixels the compose in progress repainted, counted where the repaint is
  * finally decided (after the growth for corners and materials). */
 static uint64_t g_paint_px;
+
+/* ---- the frame clock -------------------------------------------------------
+ *
+ * Composition used to happen where it was asked for: a present composed its
+ * rect inside the syscall, a move composed inside win_move, the pointer
+ * composed on every pass of the kernel loop -- which an interrupt wakes, so a
+ * mouse sending a thousand packets a second asked for a thousand composes. Two
+ * windows presenting in the same 16 ms composed twice; nothing anywhere knew
+ * what a frame was.
+ *
+ * Now the asking only RECORDS: paint_region adds the rect to the damage list
+ * (merged with any rect it touches, at most DMG_MAX of them), and the frame
+ * thread (kcompositor, comp_thread_main) composes all of it once per frame --
+ * the pointer, window motion and the damage, at most once per period. A
+ * desktop that has been still composes the moment something changes (on
+ * demand); one in motion composes on the beat.
+ *
+ * Waking it is the one subtle part. The scheduler lock is taken by the reap
+ * path BEFORE this lock (compositor_reap_pid), so nothing may take it while
+ * holding g_comp_lock: comp_unlock wakes the thread after the release, when
+ * the critical section left damage behind. Until the thread runs -- early
+ * boot, or if it could not be made -- paint_region composes inline, as it
+ * always did. */
+#define DMG_MAX 16
+struct dmg_rect { int x0, y0, x1, y1; unsigned src; };
+static struct dmg_rect g_dmg[DMG_MAX];
+static int g_ndmg;
+static int g_need_kick;                     /* this critical section left damage */
+static struct thread *volatile g_comp_thread;   /* the frame clock, once it runs */
+static struct wait_queue g_comp_wq;         /* where it waits for work */
+static volatile int g_kicked;               /* work arrived since it last looked */
+
+/* Tell the frame thread there is work. Any context but under g_comp_lock --
+ * the mouse interrupt included. A kick is a hint, not a payload: the frame
+ * reads the actual state, so two kicks before it runs are one frame. */
+static void comp_wake(void) {
+    struct thread *t = g_comp_thread;
+    if (!t) return;
+    __atomic_store_n(&g_kicked, 1, __ATOMIC_RELEASE);
+    sched_lock();
+    wait_queue_wake_one(&g_comp_wq);
+    sched_unlock();
+}
+
 static inline void comp_unlock(void) {
+    int kick = g_need_kick;
+    g_need_kick = 0;
     g_src = EMBK_COMP_SRC_OTHER;
     spin_unlock(&g_comp_lock);
+    /* the frame thread composes its own damage in the frame that made it */
+    if (kick && current_thread != g_comp_thread) comp_wake();
 }
 static uint32_t   g_next_id = 1;
 /* z bands: desktop = 0; widgets in [1, WIDGET_Z_TOP); app windows above it. */
@@ -1674,9 +1722,73 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
 
 static void paint_region_now(int rx0, int ry0, int rx1, int ry1);
 
+static void compose_region(int rx0, int ry0, int rx1, int ry1);
+
+/* Fold [x0,x1) x [y0,y1) into the damage: into every rect it touches, the
+ * union then tried again, so the list stays disjoint; with the list full, into
+ * the rect the union grows least. A rect keeps the cause it was first
+ * recorded with. */
+static void damage_add(int x0, int y0, int x1, int y1, unsigned src) {
+    for (int merged = 1; merged; ) {
+        merged = 0;
+        for (int i = 0; i < g_ndmg; i++) {
+            struct dmg_rect *d = &g_dmg[i];
+            if (x0 > d->x1 || d->x0 > x1 || y0 > d->y1 || d->y0 > y1) continue;
+            x0 = imin(x0, d->x0); y0 = imin(y0, d->y0);
+            x1 = imax(x1, d->x1); y1 = imax(y1, d->y1);
+            src = d->src;
+            g_dmg[i] = g_dmg[--g_ndmg];
+            merged = 1;
+            break;
+        }
+    }
+    if (g_ndmg < DMG_MAX) {
+        g_dmg[g_ndmg++] = (struct dmg_rect){ x0, y0, x1, y1, src };
+        return;
+    }
+    int best = 0; int64_t best_growth = 0;
+    for (int i = 0; i < g_ndmg; i++) {
+        const struct dmg_rect *d = &g_dmg[i];
+        int64_t was = (int64_t)(d->x1 - d->x0) * (d->y1 - d->y0);
+        int64_t now = (int64_t)(imax(x1, d->x1) - imin(x0, d->x0)) * (imax(y1, d->y1) - imin(y0, d->y0));
+        if (i == 0 || now - was < best_growth) { best = i; best_growth = now - was; }
+    }
+    struct dmg_rect *d = &g_dmg[best];
+    d->x0 = imin(x0, d->x0); d->y0 = imin(y0, d->y0);
+    d->x1 = imax(x1, d->x1); d->y1 = imax(y1, d->y1);
+}
+
+/* Ask for a screen region to be composed: recorded for the next frame, or --
+ * before the frame thread runs -- composed now. Caller holds g_comp_lock. */
+static void paint_region(int x0, int y0, int x1, int y1) {
+    if (!g_comp_thread) { compose_region(x0, y0, x1, y1); return; }
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return;
+    x0 = imax(x0, 0); y0 = imax(y0, 0);
+    x1 = imin(x1, (int)fi->width); y1 = imin(y1, (int)fi->height);
+    if (x1 <= x0 || y1 <= y0) return;
+    damage_add(x0, y0, x1, y1, g_src);
+    g_need_kick = 1;
+}
+
+/* Compose every recorded rect, each charged to the cause it was recorded with.
+ * Caller holds g_comp_lock. */
+static void compose_pending_locked(void) {
+    struct dmg_rect todo[DMG_MAX];
+    int n = g_ndmg;
+    for (int i = 0; i < n; i++) todo[i] = g_dmg[i];
+    g_ndmg = 0;
+    unsigned was = g_src;
+    for (int i = 0; i < n; i++) {
+        g_src = todo[i].src;
+        compose_region(todo[i].x0, todo[i].y0, todo[i].x1, todo[i].y1);
+    }
+    g_src = was;
+}
+
 /* Every compose goes through here, so every compose is measured: its time from
  * the first pixel to the presentation, its area, and the cause in g_src. */
-static void paint_region(int rx0, int ry0, int rx1, int ry1) {
+static void compose_region(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     g_paint_px = 0;
@@ -2639,6 +2751,7 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
     int stepx = ((x1 - x0) / 64) + 1, stepy = ((y1 - y0) / 8) + 1;
     uint64_t sum = 0; uint32_t n = 0;
     spin_lock(&g_comp_lock);
+    compose_pending_locked();        /* the screen as it is, not a frame ago */
     /* composed on the GPU: the screen is there, not in the backbuffer -- read
      * it back into the backbuffer first (the scanout's own pages) */
     if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {
@@ -2682,6 +2795,7 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
     if (need > cap) return -1;
     uint32_t n = 0;
     spin_lock(&g_comp_lock);
+    compose_pending_locked();        /* see backdrop_luma */
     if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {   /* see backdrop_luma */
         comp_unlock();
         return -1;
@@ -2765,7 +2879,7 @@ void compositor_reap_pid(int pid) {
  * compositor spinlock is never taken from an IRQ, and the ~100Hz timer that
  * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
  * which is almost always. */
-void compositor_anim_tick(void) {
+static void anim_frame(void) {
     if (g_anim.kind == ANIM_NONE) return;        /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
     if (g_anim.kind == ANIM_NONE) { comp_unlock(); return; }
@@ -2831,7 +2945,7 @@ int compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly) {
     return got;
 }
 
-void compositor_pointer_tick(void) {
+static void pointer_frame(void) {
     if (!g_active) return;               /* no desktop yet -> nothing to route */
     int32_t x, y; uint32_t b;
     mouse_get_state(&x, &y, &b);
@@ -3200,6 +3314,92 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
     return focused;
 }
 
+/* ---- the frame thread ------------------------------------------------------
+ * One frame: the pointer (its motion, clicks, title-bar drags, the cursor),
+ * window motion, then every rect of damage composed. Each step records what it
+ * changed and the last one composes it all, so a frame in which the cursor
+ * moved over an animating window under a presenting app is still one pass. */
+static uint64_t g_frame_seq;           /* frames composed since boot           */
+static uint64_t g_frame_due_ns;        /* when the frame in progress was due    */
+static uint64_t g_frame_period_ns = 16666667;  /* 60 Hz until an output says otherwise */
+
+static void comp_frame(void) {
+    pointer_frame();
+    anim_frame();
+    spin_lock(&g_comp_lock);
+    compose_pending_locked();
+    g_frame_seq++;
+    uint64_t now = time_get_ns();
+    comp_unlock();
+    comp_stats_frame(now, g_frame_period_ns);
+}
+
+/* Work that keeps frames coming without a kick: window motion in flight. */
+static int comp_continuous(void) { return g_anim.kind != ANIM_NONE; }
+
+static void comp_thread_main(void) {
+    /* A deadline, not a priority: a frame that is late is a frame dropped, and
+     * one that is early buys nothing. Half the period is what it may spend at
+     * deadline priority; past that it competes like anyone else. */
+    uint32_t period_ms = (uint32_t)(g_frame_period_ns / 1000000u);
+    int rc = sched_declare_period(period_ms, period_ms / 2);
+    spin_lock(&g_comp_lock);
+    g_comp_thread = current_thread;
+    comp_unlock();
+    kprintf("compositor: frame thread running, %u ms period%s\n", period_ms,
+            rc ? " (no deadline reservation: admission refused)" : ", deadline reserved");
+    for (;;) {
+        sched_lock();
+        if (!__atomic_load_n(&g_kicked, __ATOMIC_ACQUIRE) && !comp_continuous())
+            sched_block_current_locked(&g_comp_wq);       /* returns unlocked */
+        else
+            sched_unlock();
+        __atomic_store_n(&g_kicked, 0, __ATOMIC_RELEASE);
+
+        /* ON THE BEAT, OR AT ONCE. A desktop that has been still for a period
+         * composes the moment it is asked -- the first frame after idle is the
+         * one a hand is waiting for. One that is moving composes a period
+         * after the last frame was due, phase-locked rather than measured
+         * from when that frame finished, so the beat does not drift by the
+         * cost of each frame. The scheduler sleeps in milliseconds, so a beat
+         * lands within one of where it is due. */
+        uint64_t now = time_get_ns();
+        if (now >= g_frame_due_ns + g_frame_period_ns) {
+            g_frame_due_ns = now;
+        } else {
+            g_frame_due_ns += g_frame_period_ns;
+            if (g_frame_due_ns > now) {
+                uint64_t ms = (g_frame_due_ns - now + 500000u) / 1000000u;
+                if (ms) sched_sleep_ms(ms);
+            }
+        }
+        comp_frame();
+    }
+}
+
+void compositor_input_kick(void);
+/* The frame thread, made once the scheduler runs. Until it is running every
+ * paint composes inline, and the kernel loop's ticks do the pointer and the
+ * motion as they always did. */
+void compositor_start(void) {
+    static int started;
+    if (started) return;
+    started = 1;
+    mouse_set_notify(compositor_input_kick);
+    if (!process_create_kthread(comp_thread_main, NULL))
+        kprintf("compositor: no frame thread; composing inline\n");
+}
+
+/* The mouse moved, a button changed or the wheel turned (mouse.c). From any
+ * context, the interrupt included. */
+
+void compositor_input_kick(void) { comp_wake(); }
+
+/* The kernel loop's ticks: the frame thread's work once it runs, and the old
+ * inline pump until then (boot, or no thread). */
+void compositor_pointer_tick(void) { if (!g_comp_thread) pointer_frame(); }
+void compositor_anim_tick(void)    { if (!g_comp_thread) anim_frame(); }
+
 void compositor_session_changed(void) {
     spin_lock(&g_comp_lock);
     g_drag_id=0;reset_pointer_capture_locked();
@@ -3375,7 +3575,10 @@ struct fb_surface *compositor_select_layout(struct fb_surface *next, const struc
         layout_clamp_point(g_outs,g_nouts,&px,&py);
         mouse_warp(px,py);
         g_prev_layout=now;
-        paint_region(0,0,fi->width,fi->height);
+        /* NOW, not at the next frame: the caller shows this surface next, and
+         * whatever damage was waiting was measured on the one it replaces */
+        g_ndmg=0;
+        compose_region(0,0,fi->width,fi->height);
     }
     comp_unlock();return old;
 }

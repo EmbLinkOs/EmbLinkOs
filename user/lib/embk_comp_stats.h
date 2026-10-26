@@ -14,7 +14,7 @@
  * layout without a version dance beyond `version`. */
 #include <stdint.h>
 
-#define EMBK_COMP_STATS_VERSION 1
+#define EMBK_COMP_STATS_VERSION 2
 
 #define EMBK_COMP_SRC_PRESENT 0   /* an application presented new pixels        */
 #define EMBK_COMP_SRC_MOVE    1   /* a window was moved, placed or resized       */
@@ -50,6 +50,15 @@ struct embk_comp_stats {
     uint32_t screen_w, screen_h;
     uint32_t gpu;                 /* 1 when a GPU composes the desktop */
     uint32_t reserved;
+
+    /* FRAMES (version 2): what the frame thread composed, each once however
+     * much it held. The interval is between two frames in a row -- a frame
+     * after a still desktop starts a new run and is not an interval -- so
+     * its spread is the beat's jitter. */
+    uint64_t frames;              /* since `since_ns` */
+    uint32_t sec_frames;          /* in the last second */
+    uint32_t period_us;           /* the beat the frame thread keeps */
+    uint32_t intervals, interval_p50_us, interval_p95_us, interval_max_us;
 };
 
 #endif

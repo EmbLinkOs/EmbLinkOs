@@ -80,6 +80,8 @@ def scene(d, results, name, body):
     print(f"{name:10} {stats['composes']:6} composes {stats['composes'] * 1000 / span:6.1f}/s "
           f"{stats['kpx'] / 1000:9.1f} Mpx {stats['full']:5} full  p50 {stats['p50_us'] / 1000:6.2f} ms "
           f"p95 {stats['p95_us'] / 1000:6.2f} ms  ptr p95 {stats['ptr_p95_us'] / 1000:6.2f} ms  "
+          + (f"{stats.get('frames', 0)} frames beat p50 {stats.get('interval_p50_us', 0) / 1000:5.2f} "
+             f"p95 {stats.get('interval_p95_us', 0) / 1000:5.2f} ms  " if 'frames' in stats else '')
           + ' '.join(f"{k}={v['composes']}" for k, v in stats['src'].items() if v['composes']),
           flush=True)
 

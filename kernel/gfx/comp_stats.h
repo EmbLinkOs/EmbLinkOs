@@ -18,6 +18,8 @@ void comp_stats_record(unsigned src, uint64_t t0_ns, uint64_t t1_ns, uint64_t px
  * who is asking, not only why, and where. Kept for the few windows presenting
  * most since the last reset, with the rect each presented last. */
 void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+/* The frame thread finished a frame at `t_ns`, keeping a beat of `period_ns`. */
+void comp_stats_frame(uint64_t t_ns, uint64_t period_ns);
 /* The pointer moved at some instant and a compose showed it `ns` later. */
 void comp_stats_pointer(uint64_t ns);
 void comp_stats_snapshot(struct embk_comp_stats *out);

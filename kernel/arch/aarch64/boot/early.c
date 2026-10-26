@@ -766,6 +766,7 @@ void arch_early_main(uint64_t dtb_phys) {
     pl011_irq_enable();
 
     kworker_init();
+    compositor_start();        /* the frame thread, as on x86 (kernel/main.c) */
     vmo_writeback_init();
     power_init();
 

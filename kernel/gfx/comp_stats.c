@@ -21,6 +21,7 @@
 #include "include/kstring.h"
 
 #define RING     512           /* recent composes kept for percentiles */
+#define FRAME_RING 256         /* recent frame intervals */
 #define PTR_RING 256           /* recent pointer latencies */
 
 struct sample { uint64_t t1; uint32_t us; uint32_t kpx; };
@@ -37,6 +38,10 @@ static struct {
     uint32_t ptr[PTR_RING];
     uint32_t ptr_head, ptr_count;
     struct presenter pres[PRESENTERS];
+    uint64_t frames, last_frame_ns, period_ns;
+    uint64_t frame_t[FRAME_RING];          /* when each recent frame finished */
+    uint32_t interval[FRAME_RING];         /* and the gap before it, when it had one */
+    uint32_t frame_head, frame_count, interval_count, interval_head;
 } g;
 
 static uint32_t us_of(uint64_t ns)
@@ -88,6 +93,25 @@ void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint
     spin_unlock(&g_lock);
 }
 
+void comp_stats_frame(uint64_t t, uint64_t period_ns)
+{
+    spin_lock(&g_lock);
+    if (!g.since) g.since = t;
+    g.frames++;
+    g.period_ns = period_ns;
+    g.frame_t[g.frame_head] = t;
+    g.frame_head = (g.frame_head + 1) % FRAME_RING;
+    if (g.frame_count < FRAME_RING) g.frame_count++;
+    /* a frame within two beats of the last continues a run: an interval */
+    if (g.last_frame_ns && t > g.last_frame_ns && t - g.last_frame_ns < 2 * period_ns) {
+        g.interval[g.interval_head] = us_of(t - g.last_frame_ns);
+        g.interval_head = (g.interval_head + 1) % FRAME_RING;
+        if (g.interval_count < FRAME_RING) g.interval_count++;
+    }
+    g.last_frame_ns = t;
+    spin_unlock(&g_lock);
+}
+
 void comp_stats_pointer(uint64_t ns)
 {
     spin_lock(&g_lock);
@@ -129,7 +153,7 @@ static uint32_t rank(const uint32_t *v, uint32_t n, uint32_t pct)
 
 void comp_stats_snapshot(struct embk_comp_stats *out)
 {
-    static uint32_t scratch[RING];          /* under g_lock: one reader at a time */
+    static uint32_t scratch[RING > FRAME_RING ? RING : FRAME_RING];   /* under g_lock: one reader at a time */
     memset(out, 0, sizeof *out);
     out->version = EMBK_COMP_STATS_VERSION;
     uint64_t now = time_get_ns();
@@ -160,6 +184,16 @@ void comp_stats_snapshot(struct embk_comp_stats *out)
     out->ptr_p50_us = rank(scratch, g.ptr_count, 50);
     out->ptr_p95_us = rank(scratch, g.ptr_count, 95);
     out->ptr_max_us = g.ptr_count ? scratch[g.ptr_count - 1] : 0;
+    out->frames = g.frames;
+    out->period_us = us_of(g.period_ns);
+    for (uint32_t i = 0; i < g.frame_count; i++)
+        if (g.frame_t[i] + 1000000000ull > now) out->sec_frames++;
+    for (uint32_t i = 0; i < g.interval_count; i++) scratch[i] = g.interval[i];
+    out->intervals = g.interval_count;
+    sort_u32(scratch, g.interval_count);
+    out->interval_p50_us = rank(scratch, g.interval_count, 50);
+    out->interval_p95_us = rank(scratch, g.interval_count, 95);
+    out->interval_max_us = g.interval_count ? scratch[g.interval_count - 1] : 0;
     spin_unlock(&g_lock);
 
     const fb_info_t *fi = fb_get_info();
@@ -180,11 +214,12 @@ int comp_stats_hud_text(char rows[COMP_STATS_HUD_ROWS][COMP_STATS_HUD_COLS + 1])
     struct embk_comp_stats s;
     comp_stats_snapshot(&s);
     char a[16], b[16], c[16];
-    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s  %ux%u",
-             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h);
+    uint32_t hz = s.period_us ? (1000000u + s.period_us / 2) / s.period_us : 0;
     uint32_t mpx10 = s.sec_kpixels / 100u;   /* tenths of a megapixel */
-    snprintf(rows[1], COMP_STATS_HUD_COLS + 1, "%3u composes/s %u.%u Mpx/s",
-             s.sec_composes, mpx10 / 10u, mpx10 % 10u);
+    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s %ux%u %uHz %u.%uMpx/s",
+             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h, hz, mpx10 / 10u, mpx10 % 10u);
+    ms_text(a, sizeof a, s.interval_p50_us); ms_text(b, sizeof b, s.interval_p95_us);
+    snprintf(rows[1], COMP_STATS_HUD_COLS + 1, "%3u fps beat %s p95 %s", s.sec_frames, a, b);
     ms_text(a, sizeof a, s.p50_us); ms_text(b, sizeof b, s.p95_us); ms_text(c, sizeof c, s.max_us);
     snprintf(rows[2], COMP_STATS_HUD_COLS + 1, "ms %s p95 %s max %s", a, b, c);
     ms_text(a, sizeof a, s.ptr_p50_us); ms_text(b, sizeof b, s.ptr_p95_us);
@@ -211,12 +246,14 @@ static void dump(void)
     kprintf("perf: span_ms=%lu composes=%lu compose_us=%lu kpx=%lu full=%lu"
             " p50_us=%u p95_us=%u max_us=%u recent=%u"
             " ptr_n=%u ptr_p50_us=%u ptr_p95_us=%u ptr_max_us=%u"
-            " screen=%ux%u gpu=%u\n",
+            " screen=%ux%u gpu=%u frames=%lu period_us=%u intervals=%u"
+            " interval_p50_us=%u interval_p95_us=%u interval_max_us=%u\n",
             (unsigned long)(span / 1000000u), (unsigned long)s.composes,
             (unsigned long)(s.compose_ns / 1000u), (unsigned long)(s.pixels / 1000u),
             (unsigned long)s.full_screen, s.p50_us, s.p95_us, s.max_us, s.recent,
             s.ptr_samples, s.ptr_p50_us, s.ptr_p95_us, s.ptr_max_us,
-            s.screen_w, s.screen_h, s.gpu);
+            s.screen_w, s.screen_h, s.gpu, (unsigned long)s.frames, s.period_us, s.intervals,
+            s.interval_p50_us, s.interval_p95_us, s.interval_max_us);
     for (int i = 0; i < EMBK_COMP_SRCS; i++)
         kprintf("perf: src=%s composes=%lu compose_us=%lu kpx=%lu\n", g_src_name[i],
                 (unsigned long)s.src_composes[i], (unsigned long)(s.src_ns[i] / 1000u),

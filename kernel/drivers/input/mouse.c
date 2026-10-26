@@ -52,6 +52,15 @@ static volatile uint64_t g_motion_ns;
 static inline void note_motion(int32_t nx, int32_t ny) {
     if ((nx != g_x || ny != g_y) && !g_motion_ns) g_motion_ns = time_get_ns();
 }
+/* Who to tell that the pointer changed: the compositor's frame thread. Called
+ * after the lock is let go -- it takes the scheduler's. */
+static void (*volatile g_notify)(void);
+void mouse_set_notify(void (*fn)(void)) { g_notify = fn; }
+static void notify(void) {
+    void (*fn)(void) = g_notify;
+    if (fn) fn();
+}
+
 uint64_t mouse_take_motion_ns(void) {
     uint64_t t = g_motion_ns;
     g_motion_ns = 0;
@@ -197,6 +206,7 @@ void mouse_set_absolute(int32_t x,int32_t y,int32_t range,uint32_t buttons,int32
     spin_lock(&pointer_state_lock);
     mouse_set_absolute_inner(x,y,range,buttons,wheel);
     spin_unlock(&pointer_state_lock);
+    notify();
 }
 
 
@@ -215,6 +225,7 @@ void mouse_move_relative(int32_t dx,int32_t dy,uint32_t buttons,int32_t wheel) {
     spin_lock(&pointer_state_lock);
     mouse_move_relative_inner(dx,dy,buttons,wheel);
     spin_unlock(&pointer_state_lock);
+    notify();
 }
 
 
@@ -253,6 +264,7 @@ static void mouse_handler(void) {
     spin_lock(&pointer_state_lock);
     mouse_handler_inner();
     spin_unlock(&pointer_state_lock);
+    notify();
 }
 
 
