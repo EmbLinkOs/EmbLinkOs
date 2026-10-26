@@ -21,27 +21,48 @@ for it:
 | other | create, destroy, focus, workspaces, displays |
 
 The **pointer latency** is the time from the mouse driver noticing a motion to
-the compose that drew the cursor there. It is what software can observe;
+the compose that drew the cursor there -- or, where the pointer is on a cursor
+plane (virtio-gpu), to the plane being moved. It is what software can observe;
 photons need a camera.
+
+A **frame** is one turn of the compositor's frame thread (P1): it composes
+whatever damage is waiting, which may be none -- a pointer frame on a cursor
+plane composes nothing. Frames carry the clock's own numbers:
+
+| Number | What it is |
+|---|---|
+| beat | the interval between frames finishing: the period, when the clock keeps it |
+| late | how late the frame thread began a frame that was due on the beat |
+| lead | how early the kernel wakes it to cover its timer's lateness, spun out to the instant |
+| rate | the rate composed at: now, and the fastest since the counters started |
 
 Three ways to read it:
 
 - **GUI+Shift+P** shows an overlay at the top right of the primary display,
-  refreshed twice a second: the renderer and size; composes and megapixels in
-  the last second; compose time (median, 95th percentile, worst of the last
-  512); pointer latency; composes per cause since the counters started. Its own
-  repaints are left out of what it reports.
+  refreshed twice a second: the renderer, size, rate and the display's top
+  rate; frames in the last second and the beat (median, 95th percentile);
+  compose time (median, 95th percentile, worst of the last 512); pointer
+  latency; composes per cause since the counters started. Its own repaints are
+  left out of what it reports.
 - The serial console's `perf` prints the same as `key=value` integers, then the
   busiest presenting windows; `perf reset` starts the counters again; `perf hud`
-  toggles the overlay.
+  toggles the overlay. `perf display 120` (or `48-120`, or `auto`) tells the
+  frame clock the display is a fixed 120 Hz one (a VRR one, the real one);
+  `perf beat N` keeps the beat for N seconds composing nothing; `perf cursor
+  hw|sw` puts the pointer on the cursor plane or draws it; `perf windows` lists
+  the window stack.
 - `embk_comp_stats()` (`user/lib/embk_comp_stats.h`) hands any program the
   snapshot. It says how long composing takes and why, never what a window shows.
 
 `tools/perf_smoke.py` boots a disposable copy of `uefi-usb.img`, makes an
-account, logs in and measures five scenes: ten idle seconds, the pointer swept
+account, logs in and measures nine scenes: ten idle seconds, the pointer swept
 across the desktop, the Settings window dragged by its title and back, the
-launcher opened and dismissed, and a Terminal opened from the dock and closed
-with GUI+W. It writes `perf.json` and a capture with the overlay.
+launcher opened and dismissed, a Terminal opened from the dock and closed
+with GUI+W, the same drag on a simulated 120 Hz display and on a 48-120 Hz VRR
+one, and three seconds of the beat alone at 60 and at 120 Hz. A drag must
+follow the hand and bring the window back where it started. It writes
+`perf.json` and a capture with the overlay; `--beat` measures only the beat,
+and `--arch aarch64` runs the same on arm64 under HVF.
 
 ```sh
 make FB_W=1280 FB_H=800 STAGED_APPS="build/cxxdemo.elf build/embcc.elf build/embld.elf" uefi-usb.img
@@ -160,3 +181,117 @@ What it says about the frame budget:
 
 The arm64 desktop's text layout is wrong in these captures, and it is the same
 before this work: see TODO.md.
+
+## After P1 (3641c51)
+
+What changed:
+
+- **A frame clock.** A kernel thread composes once a frame: presents, moves
+  and the pointer record damage (up to 16 rectangles), and the thread composes
+  what is waiting, on the beat while something moves and at once when the
+  desktop has been still. The beat is phase-locked, so it does not drift by
+  each frame's cost.
+- **Applications wait instead of sleeping.** An app with nothing to draw blocks
+  until input or a window event concerns it; an animating one waits for the
+  compositor's next frame (`em_wait_input`, `em_wait_frame`; syscalls 161 and
+  162). Nothing polls every 5 ms any more.
+- **The rate adapts.** Motion under a hand gets the display's top rate; an app
+  that asks for a rate (syscall 163) gets the slowest whole fraction of the
+  refresh at or above it, or exactly that rate on a VRR display; everything
+  else gets 60. A governor holds the rate to what a frame's cost allows (three
+  quarters of the period), and the Efficiency profile holds it to 60. The
+  policy is one pure function (`kernel/gfx/frameclock.c`, `make
+  frameclock-test`). No display here reports 120 Hz or VRR, so `perf display`
+  simulates both.
+- **The pointer is on virtio-gpu's cursor plane.** Moving it composes nothing.
+- **The compositor drags windows.** An app declares the regions it is dragged
+  by (syscall 164); the compositor moves the window in the frame the pointer
+  moves, with no round trip to the app and no re-render. The toolkit declares
+  its title bars.
+- **The beat lands on the nanosecond.** The frame thread sleeps to an instant,
+  not a millisecond, and the sleeping core's timer is armed for it. The kernel
+  also learns how late its timer is: under HVF the interrupt came 0.9 ms late
+  on average and 2.2 ms at worst, because the host coalesces the timer that
+  wakes an idle vCPU, while the kernel then took 25 µs to run the thread. A
+  precise sleeper is woken that much early and spins out the rest -- the lead.
+  On hardware with an exact timer it settles at microseconds.
+- **The frame thread reserves only what it uses.** It holds a deadline
+  reservation sized to its frames' cost (half again, plus the lead), and only
+  while frames keep coming. At first it took half of every period from boot:
+  500 of the 700 permille the machine admits, held on a still desktop, and
+  `test-arm64-boot`'s deadline check failed because the test's periodic thread
+  was refused.
+
+### x86 under TCG, against P0
+
+| Scene | Composes | Pixels | Compose p95 | Pointer p95 |
+|---|---|---|---|---|
+| Idle, 10 s | 0 → 1 | 0 → 0.03 Mpx | — | — |
+| Pointer sweep | 453 → **0** | 1.1 → 0 Mpx | 0.3 ms → — | 0.7 → 0.02 ms |
+| Drag Settings | 184 → **57** | 79.8 → 39.6 Mpx | 23.8 → 24.7 ms | 23.8 → 0.02 ms |
+| Launcher | 6 → 3 | 5.5 → 3.1 Mpx | 31.4 → 30.9 ms | — |
+| Terminal open + close | 44 → 19 | 10.6 → 8.1 Mpx | 32.9 → 208.5 ms | 14.1 → 0.01 ms |
+
+Reading it:
+
+- **The one idle compose is an application's present** (the top bar's clock
+  turning a minute in the window), not the compositor's.
+- **A drag is one compose per pointer step.** 55 steps, 55 pointer composes,
+  and the dragged app presented nothing (two presents in the scene are other
+  windows).
+- **The open + close p95 is an animation frame.** P1 composes three frames
+  of the window's motion where P0 managed one under TCG, each about 90 ms
+  here and the slowest 208 ms: the moving window and everything under it.
+  arm64 composes the same frames in under 3 ms (below). P2 replaces this
+  motion.
+
+### arm64 under HVF, against P0
+
+| Scene | Composes | Compose p50 | Compose p95 | Pointer p95 | Frames |
+|---|---|---|---|---|---|
+| Idle, 10 s | 0 → 1 | — | — | — | 0 → 1 |
+| Pointer sweep | 453 → **0** | 0.05 ms → — | 0.12 ms → — | 0.10 → 0.03 ms | 452 |
+| Drag Settings | 462 → **57** | 1.97 → 2.08 ms | 2.33 → 4.90 ms | 1.89 → 0.02 ms | 60 |
+| Launcher | 10 → 8 | 2.23 → 2.25 ms | 2.46 → 2.61 ms | — | 13 |
+| Terminal open + close | 51 → 23 | 2.73 → 2.43 ms | 3.07 → 2.99 ms | 0.23 → 0.01 ms | 41 |
+
+### The beat
+
+Three seconds of frames on the clock alone (`perf beat 3`), and the drag at a
+simulated rate. Interval median and 95th percentile; the target is a p95 within
+1 ms of the period.
+
+| | Rate | Beat p50 | Beat p95 | Late p95 | Lead |
+|---|---|---|---|---|---|
+| arm64 HVF, beat | 60 Hz | 16.67 ms | 16.98 ms | 0.31 ms | 1.4 ms |
+| arm64 HVF, beat | 120 Hz | 8.33 ms | 8.84 ms | 0.51 ms | 1.4 ms |
+| arm64 HVF, drag | 120 Hz | 8.48 ms | 9.56 ms | 1.02 ms | 1.0 ms |
+| arm64 HVF, drag | VRR 48-120 | 8.32 ms | 8.95 ms | 0.64 ms | 1.3 ms |
+| x86 TCG, beat | 60 Hz | 16.66 ms | 20.37 ms | 4.33 ms | 3.0 ms |
+| x86 TCG, beat | 120 Hz | 8.34 ms | 9.50 ms | 1.21 ms | 2.9 ms |
+
+How the 120 Hz beat got there under HVF (p95 of the interval, one run or the
+range over several):
+
+| Step | p95 |
+|---|---|
+| Nanosecond sleeps, the timer armed for them at a core's next re-arm | 11.45 ms |
+| The sleeping core's timer armed for the instant at once | 9.63–10.70 ms |
+| The timer's lateness learned and spun out | 8.80–8.94 ms |
+
+The beat was first measured with nanosecond sleeps; the millisecond clock
+before them was not measured this way.
+
+What it says:
+
+- **On a real core the clock keeps 60 and 120 within the target.** Beat medians
+  are the period to the hundredth of a millisecond.
+- **The lead is what that costs: about 1.4 ms spun per frame under HVF**, 17%
+  of a core at 120 Hz while something moves, and nothing while the desktop is
+  still. On hardware whose timer fires when armed it is microseconds.
+- **TCG's timer is later than the lead may cover** (it may spin at most 3 ms),
+  so its 60 Hz p95 stays 3.7 ms off. TCG times are the emulator's.
+- **A drag's beat is the hand's.** The drag's composes follow the pointer's
+  steps, so its interval is the input rate's wherever that is slower than the
+  display.
+

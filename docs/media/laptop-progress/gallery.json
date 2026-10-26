@@ -4137,6 +4137,26 @@
       "featured": false,
       "milestone": "Fluid desktop P0: measure, and quick wins",
       "historical": false
+    },
+    {
+      "id": "211-frame-clock-120",
+      "phase": "Fluid desktop",
+      "title": "On the beat at 120 Hz",
+      "caption": "The frame clock told the display is a fixed 120 Hz one (perf display 120) and keeping the beat (perf beat): the overlay reads 120 of 120 Hz, 120 frames in the last second, a beat of 8.33 ms with a 95th percentile of 9.53. Under TCG; arm64 under HVF keeps the same beat to a p95 of 8.8 ms.",
+      "alt": "The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 120/120Hz, 120 fps, beat 8.33 ms",
+      "file": "211-frame-clock-120.png",
+      "capture_date": "2026-10-26",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; a simulated 120 Hz display; driven over QMP and the serial console",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "07f1941b7332f2da8ae39f955d0f9ba3ee42b234b386466dd2d271df5767252f",
+      "source_capture": "emblink-cap120-ysd2nqsx/beat120.ppm",
+      "source_sha256": "95a228bb4c03dccf91a388d1f7dd4bd104beec90eadc5dfa5a9e09f5afc4f8b5",
+      "source_commit": "3641c51",
+      "featured": false,
+      "milestone": "Fluid desktop P1: frame clock and presentation",
+      "historical": false
     }
   ]
 }

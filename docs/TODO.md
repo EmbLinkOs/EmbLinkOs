@@ -26,19 +26,49 @@ the default target). Measured before and after every step
       off at the top edge and the dock's label is an empty box. The same with the P0 UI changes
       reverted, so it predates them; x86 draws the same build correctly. Not investigated --
       a text metric (char signedness in the font parser is the first suspect) differs between
-      the two userlands. Seen in the arm64 perf captures (gallery 210).
+      the two userlands. Seen in the arm64 perf captures (gallery 210). The same fault puts a
+      title bar's drag zone at (104,-7,864,51) there, above the window's content: the
+      compositor refuses a zone outside the content and the toolkit then keeps dragging the
+      window itself (`em_app.c` claims the compositor's drag only when every zone was taken).
 - [ ] **Two desktop smokes fail before any of this work** (6eed0ad, checked by building it):
       `menu_smoke.py` clicks (916,195) for Settings' Light appearance, which is now at about
       (1005,426), so the light menu never comes; `desktop_smoke.py`'s mute click at (1000,306)
       misses the same way (volume stays 100). Their coordinates predate the current Settings
       layout.
 - [ ] A drag step still recomposes the window's old and new footprints (about 0.7 Mpx for
-      Settings): 2 ms a step on an M5 core, an order more on slow ones. P1's compositor-owned
-      drag and exposed-strip repaint replace it.
-- [ ] P1 Frame clock: a compositor thread on a deadline reservation, nanosecond timer, region damage,
-      one late compose per frame, frame callbacks and frame-rate requests, rate adapting to motion
-      (divisors of the refresh on fixed displays, the refresh itself on VRR ones), a simulated
-      120 Hz / VRR output, high-refresh modes, cursor planes, the compositor dragging windows.
+      Settings): 2 ms a step on an M5 core (arm64 drag p50 2.08 ms), an order more on slow
+      ones. The compositor drags the window now (P1), so the app no longer presents, but the
+      repaint is still both footprints; repainting only the strips a move exposes and copying
+      the window's own pixels is P3's, with the corner masks and cached shadows that make the
+      copy exact.
+- [x] P1 Frame clock (3635fef..3641c51; [DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md#after-p1-3641c51)).
+  - [x] A compositor thread composes once a frame from recorded damage (16 rectangles), on a
+        phase-locked beat while something moves and at once after stillness.
+  - [x] Nanosecond sleeps for the beat: the sleeping core's timer armed for the instant, and the
+        timer's own lateness learned and spun out (the lead). arm64 under HVF keeps 60 and 120 Hz
+        within 1 ms at the 95th percentile.
+  - [x] A deadline reservation sized to the frames' cost, held only while frames keep coming.
+  - [x] Applications wait for input or the next frame instead of sleeping (syscalls 161, 162);
+        an app may ask for a frame rate (163).
+  - [x] The rate adapts: the display's top rate under a hand, an app's rate as the slowest
+        fraction of the refresh at or above it (exact on VRR), 60 for the rest; a governor and
+        the Efficiency profile cap it. `perf display` simulates a 120 Hz and a VRR display.
+  - [x] The pointer on virtio-gpu's cursor plane: moving it composes nothing.
+  - [x] The compositor drags windows by the regions their apps declare (164); the toolkit's
+        title bars are such regions, and a drag into an edge still tiles.
+- [ ] **Late compose**: a frame is composed when its beat starts, not at the next vblank less its
+      predicted cost. No display path here has a vblank to aim at (virtio-gpu, Bochs, GOP, the
+      Pi's framebuffer); Intel's native path does, untested here.
+- [ ] **High refresh rates as a choice**: Settings → Displays offers no refresh rate, and the
+      frame clock reads the mode's (`display_refresh_mhz`). Picking a 120 Hz EDID mode needs a
+      driver that programs one; none here can be tested at 120 Hz.
+- [ ] **Flips and the other cursor planes**: Intel Gen9's plane flips and cursor plane, and the
+      Pi mailbox cursor, are not used; every path still copies to the front. Untestable here.
+- [ ] **A multi-rect present** (`embk_win_present_region`): an app still presents one bounding
+      rectangle of what changed.
+- [ ] **Window motion composes slowly under TCG**: three frames of a Terminal opening and
+      closing took about 90 ms each, the slowest 208 ms, against under 3 ms on arm64 under HVF.
+      P2 replaces this motion; measure it again then.
 - [ ] P2 Springs (fixed point, shared by kernel and toolkit), interruptible window motion to the real
       dock icon, momentum scrolling, pointer acceleration, a USB mouse driver, precise scrolling.
 - [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
@@ -46,6 +76,8 @@ the default target). Measured before and after every step
       layer caching.
 - [ ] P4 Inter, area-coverage text, subpixel positioning, kerning; the token pass.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
+      A double click on a title bar should zoom the window as on macOS, now that the
+      compositor owns the drag that the first click starts.
 - [ ] P6 Overview, touchpad gestures, tiling previews.
 
 ## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)

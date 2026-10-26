@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-210 actual EmbLinkOS captures document the original laptop work, its
+211 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, and keeping time at 120 Hz. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,9 +14,9 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: the desktop measures itself
+## Latest: the desktop measures itself, then keeps time
 
-The first step of the fluid desktop: before anything is made faster, the compositor says what composing costs -- every compose timed and charged to the cause that asked for it and the window that presented, and the pointer's motion timed to the screen ([DESKTOP_PERFORMANCE.md](../../DESKTOP_PERFORMANCE.md)).
+The first step of the fluid desktop: before anything is made faster, the compositor says what composing costs -- every compose timed and charged to the cause that asked for it and the window that presented, and the pointer's motion timed to the screen ([DESKTOP_PERFORMANCE.md](../../DESKTOP_PERFORMANCE.md)). The second gives it a frame clock: one compose a frame, at a rate that rises to the display's top under a hand and falls back to 60, on a beat kept to the nanosecond.
 
 ### What composing costs, on the screen it costs
 
@@ -35,6 +35,12 @@ The same five scenes after P0: the overlay reads 0 composes a second on a deskto
 arm64 under HVF, on the host's own core: window motion at about 100 frames a second (A31 -- 31 frames to open and close a Terminal), a compose median of 2.7 ms in that scene, the pointer reaching the screen in 0.2 ms. The text layout here is wrong -- icons below their labels, the top bar cut off -- and was before P0; it is recorded in [TODO.md](../../TODO.md).
 
 ![The EmbLinkOS desktop on arm64 with the compositor statistics overlay; Settings' sidebar icons sit below their labels](210-perf-arm64-hvf.png)
+
+### On the beat at 120 Hz
+
+The frame clock told the display is a fixed 120 Hz one (`perf display 120`) and keeping the beat (`perf beat`): the overlay reads 120 of 120 Hz, 120 frames in the last second, a beat of 8.33 ms with a 95th percentile of 9.53. Under TCG; arm64 under HVF keeps the same beat to a p95 of 8.8 ms ([the beat](../../DESKTOP_PERFORMANCE.md#the-beat)).
+
+![The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 120/120Hz, 120 fps, beat 8.33 ms](211-frame-clock-120.png)
 
 ## The prompt, Powerlevel10k-style
 
