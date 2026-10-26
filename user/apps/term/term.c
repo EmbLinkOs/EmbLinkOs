@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <math.h>
 #include "../../terminal/vt.h"
+#include "../../terminal/render.h"
 #include "term_probe.h"
 #include "font.h"
 #include "backend.h"
@@ -149,7 +150,14 @@ static void probe_refresh(void) {
 
 /* --- runtime hooks -------------------------------------------------------- */
 
-/* Whether the window has the keyboard, for programs that asked (DECSET 1004). */
+/* Whether the window has the keyboard: the cursor goes hollow without it, and
+ * programs that asked (DECSET 1004) are told. */
+static bool g_focused=true;
+static uint64_t g_activity;      /* the last key or output: a blinking cursor shows from here */
+static bool cursor_blinks(void);
+static bool cursor_phase(uint64_t now);
+static bool text_phase(uint64_t now);
+static struct term_render g_render;
 static void term_focus(void) {
     static uint64_t next;static int focused=-1;
     uint64_t now=embk_uptime_ms();
@@ -157,7 +165,7 @@ static void term_focus(void) {
     next=now+100;
     int f=embk_win_focused();
     if (f==focused) return;
-    focused=f;
+    focused=f;g_focused=f!=0;g_activity=now;em_request_frame();
     char out[4];size_t n=vt_focus_report(&g_vt,f!=0,out);
     if (n && !g_dead) (void)term_send(out,n);
 }
@@ -191,6 +199,7 @@ static void term_idle(void) {
         /* reading the scrollback, the view stays on what it shows */
         if (g_view>0) {g_view+=(int)(g_vt.scrolls-scrolled);if (g_view>(int)g_vt.history_rows) g_view=(int)g_vt.history_rows;}
         got = true; budget-=(size_t)r;
+        g_activity=embk_uptime_ms();
     }
     static unsigned prompt_serial;
     if (prompt_serial!=g_vt.prompt_serial) {
@@ -213,6 +222,11 @@ static void term_idle(void) {
         term_say("\n[shell exited -- press ESC to close]\n");
         got = true;
     }
+    /* blinking text and a blinking cursor: a frame when a phase turns */
+    uint64_t now=embk_uptime_ms();
+    static int phase=-1;
+    int p=(g_render.blink_text && text_phase(now) ? 1 : 0)|(cursor_blinks() && cursor_phase(now) ? 2 : 0);
+    if (p!=phase) {phase=p;em_request_frame();}
     if (got) {probe_refresh();em_request_frame();}
 }
 
@@ -329,6 +343,7 @@ static void view_scroll(int rows) {
  * Escape closes the window. */
 static int term_key(int c) {
     unsigned mods=(unsigned)em_key_modifiers(),code=(unsigned)em_key_code(),flags=(unsigned)em_key_flags();g_notice[0]=0;
+    g_activity=embk_uptime_ms();
     unsigned key=key_identity(c,code,flags);
     if (c==EMBK_KEY_COPY || (c==3 && (mods&(EMBK_KM_CTRL|EMBK_KM_SHIFT))==(EMBK_KM_CTRL|EMBK_KM_SHIFT))) {term_copy();return 1;}
     if (c==EMBK_KEY_PASTE || (c==22 && (mods&EMBK_KM_SHIFT))) {term_paste();return 1;}
@@ -433,67 +448,38 @@ failed:
 
 /* --- the view -------------------------------------------------------------- */
 
-/* --- a single retained bitmap, painted only when the model/input changes --- */
-static uint32_t *g_pixels[2];
-static int g_pixel_width,g_pixel_height,g_pixel_index;
-static uint64_t g_painted_signature;
-static bool g_bitmap_valid;
+/* The renderer (user/terminal/render.h) paints rows that changed into one
+ * retained buffer, and only those rows go to the screen. */
+static bool g_render_ready,g_bell_drawn;
 static uint64_t g_sync_since,g_bell_until;
 static unsigned g_bells_seen;
+static int g_dmg_y0,g_dmg_y1;
+#define CURSOR_BLINK_MS 530
+#define TEXT_BLINK_MS   500
 
 static uint32_t rgb(Color c) {
     return ((uint32_t)(c.r*255+.5f)<<16)|((uint32_t)(c.g*255+.5f)<<8)|(uint32_t)(c.b*255+.5f);
 }
-static Color colour(uint32_t c) {return (Color){((c>>16)&255)/255.f,((c>>8)&255)/255.f,(c&255)/255.f,1};}
-static uint32_t mix(uint32_t a,uint32_t b) {return ((a&0xfefefeu)>>1)+((b&0xfefefeu)>>1);}
-static void fill(uint32_t *pixels,int x,int y,int w,int h,uint32_t color) {
-    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>g_pixel_width?g_pixel_width:x+w,y1=y+h>g_pixel_height?g_pixel_height:y+h;
-    for (int row=y0;row<y1;row++) for (int col=x0;col<x1;col++) pixels[(size_t)row*g_pixel_width+col]=0xff000000u|color;
-}
-/* The underline styles: a line, two, a wave, dots, dashes. */
-static void underline(uint32_t *pixels,int px,int py,int w,uint8_t style,uint32_t color) {
-    int y=py+g_cell_height-2;
-    switch (style) {
-    case VT_UL_DOUBLE: fill(pixels,px,y,w,1,color);fill(pixels,px,y-2,w,1,color);break;
-    case VT_UL_CURLY:
-        for (int i=0;i<w;i++) {int phase=(px+i)%8;int dy=phase<4?(phase<2?-1:0):(phase<6?0:-1);fill(pixels,px+i,y+dy,1,1,color);}
-        break;
-    case VT_UL_DOTTED: for (int i=0;i<w;i+=2) if (((px+i)/2)%2==0) fill(pixels,px+i,y,2,1,color);break;
-    case VT_UL_DASHED: for (int i=0;i<w;i++) if ((px+i)%6<4) fill(pixels,px+i,y,1,1,color);break;
-    default: fill(pixels,px,y,w,1,color);break;
-    }
-}
-static void paint_cell(struct render_target *rt,int x,int y,const struct vt_cell *c,uint32_t font,uint32_t bold,float size) {
-    if (!c->width) return;
-    const struct vt_style *s=vt_style_of(&g_vt,c);
-    uint32_t fg=vt_rgb(&g_vt,s->fg,true),bg=vt_rgb(&g_vt,s->bg,false);
-    /* DECSCNM swaps the whole screen; a cell's own inverse swaps it back */
-    if (((s->attrs&VT_INVERSE)!=0)!=g_vt.reverse_video) {uint32_t tmp=fg;fg=bg;bg=tmp;}
-    if (s->attrs&VT_DIM) fg=mix(fg,bg);
-    int px=x*g_cell_width,py=y*g_cell_height,w=c->width*g_cell_width;
-    fill(rt->pixels,px,py,w,g_cell_height,bg);
-    if (s->attrs&VT_HIDDEN) return;
-    if (c->cp!=' ' || c->flags) {
-        char text[64];vt_cell_text(&g_vt,c,text);
-        cpu_backend_get()->draw_text(rt,(float)px,(float)py+1,text,(s->attrs&VT_BOLD)?bold:font,size,colour(fg),1,NULL,(float)w,(float)g_cell_height,false);
-    }
-    if (s->underline) underline(rt->pixels,px,py,w,s->underline,s->ul==VT_COLOR_DEFAULT?fg:vt_rgb(&g_vt,s->ul,true));
-    if (s->attrs&VT_STRIKE) fill(rt->pixels,px,py+g_cell_height/2,w,1,fg);
-    if (s->attrs&VT_OVERLINE) fill(rt->pixels,px,py,w,1,fg);
-}
-static void paint_cursor(struct render_target *rt,int x,int y,uint32_t color) {
-    if (x>=g_cols) {x=0;y++;}
-    if (y>=g_rows) return;
-    int style=g_vt.cursor_style;
-    if (style==3 || style==4) fill(rt->pixels,x*g_cell_width,(y+1)*g_cell_height-2,g_cell_width,2,color);
-    else if (style==5 || style==6) fill(rt->pixels,x*g_cell_width,y*g_cell_height,2,g_cell_height,color);
-    else {
-        /* An outline keeps the underlying character readable without blink. */
-        fill(rt->pixels,x*g_cell_width,y*g_cell_height,g_cell_width,1,color);
-        fill(rt->pixels,x*g_cell_width,(y+1)*g_cell_height-1,g_cell_width,1,color);
-        fill(rt->pixels,x*g_cell_width,y*g_cell_height,1,g_cell_height,color);
-        fill(rt->pixels,(x+1)*g_cell_width-1,y*g_cell_height,1,g_cell_height,color);
-    }
+/* The faces: MesloLGS Nerd Font Mono, as the Mac's profile -- 14 px at the
+ * standard interface size, following the interface's scale -- and DejaVu
+ * after it for what Meslo lacks. */
+static bool load_fonts(const struct ui_theme *t) {
+    static float loaded;
+    float size=14.0f*t->text_caption/12.0f;
+    if (g_render_ready && size==loaded) return true;
+    static const char *const paths[4]={"/system/fonts/meslo-nf-mono.ttf","/system/fonts/meslo-nf-mono-bold.ttf",
+        "/system/fonts/meslo-nf-mono-italic.ttf","/system/fonts/meslo-nf-mono-bold-italic.ttf"};
+    struct font *faces[4];
+    for (int i=0;i<4;i++) faces[i]=font_for_handle(em_font(paths[i]));
+    struct font *mono=font_for_handle(em_font("/system/fonts/mono.ttf")),*sans=font_for_handle(em_font("/system/fonts/font.ttf"));
+    if (!faces[0]) faces[0]=mono;                 /* an image without Meslo still has a terminal */
+    if (!faces[0]) return false;
+    struct font *chain[2];int n=0;
+    if (mono && mono!=faces[0]) chain[n++]=mono;
+    if (sans) chain[n++]=sans;
+    if (!term_render_fonts(&g_render,faces,chain,n,size)) return false;
+    loaded=size;g_render_ready=true;
+    return true;
 }
 /* The profile's colours: until Preferences exist (docs/TODO.md), the theme's
  * text and background with the built-in 256-colour palette. Applied to the
@@ -508,63 +494,72 @@ static void apply_palette(const struct ui_theme *t) {
     vt_set_palette(&g_vt,&p);
     memcpy(applied,want,sizeof want);once=true;
 }
+/* DECSCUSR 1, 3, 5 blink; 0 (the default block) only with DECSET 12. */
+static bool cursor_blinks(void) {
+    int s=g_vt.cursor_style;
+    return s==1 || s==3 || s==5 || (s==0 && g_vt.cursor_blink);
+}
+static bool cursor_phase(uint64_t now) {
+    return !cursor_blinks() || !g_focused || ((now-g_activity)/CURSOR_BLINK_MS)%2==0;
+}
+static bool text_phase(uint64_t now) { return (now/TEXT_BLINK_MS)%2==0; }
+static void bell_frame(void) {
+    uint32_t a=vt_cursor_rgb(&g_vt);int w=g_render.width,h=g_render.height;
+    for (int y=0;y<h;y++) {
+        uint32_t *row=g_render.pixels+(size_t)y*w;
+        for (int x=0;x<w;x++) if (y<2 || y>=h-2 || x<2 || x>=w-2) row[x]=0xff000000u|a;
+    }
+}
 static bool screen_bitmap(void) {
     const struct ui_theme *t=ui_theme();
-    uint32_t font=em_font("/system/fonts/mono.ttf"),bold=em_font("/system/fonts/mono-bold.ttf");
-    if (!font) font=t->font_regular;
-    if (!bold) bold=font;
-    float size=t->text_caption;struct font *f=font_for_handle(font);if (!f) return false;
-    struct glyph_cache_entry *m=glyph_cache_lookup_or_rasterize(font_global_atlas(),f,'M',size);
-    int cw=m?(int)ceilf(m->advance_px):8;
-    int ch=(int)ceilf((f->ascent+f->descent+f->line_gap)*size/f->units_per_em)+2;
-    if (cw<1) cw=1;
-    if (ch<1) ch=1;
+    if (!load_fonts(t)) return false;
+    int cw=g_render.cell_w,ch=g_render.cell_h;
     int cols=(int)((em_viewport_width()-28)/cw),rows=(int)((em_viewport_height()-t->toolbar_height-20)/ch);
     if (cols<2) cols=2;
     if (cols>VT_MAX_COLS) cols=VT_MAX_COLS;
     if (rows<2) rows=2;
     if (rows>VT_MAX_ROWS) rows=VT_MAX_ROWS;
-    int w=cols*cw,h=rows*ch;
-    if (w!=g_pixel_width || h!=g_pixel_height) {
-        uint32_t *a=malloc((size_t)w*h*4),*b=malloc((size_t)w*h*4);
-        if (!a || !b) {free(a);free(b);return false;}
+    if (cols!=g_render.cols || rows!=g_render.rows || !g_render.pixels) {
         bool erased=g_vt.inband_resize && vt_prompt_erase(&g_vt);   /* the shell redraws on the report */
         if (g_vt.inband_resize) g_size_report=true;
-        if (!vt_resize(&g_vt,cols,rows)) {free(a);free(b);return false;}
+        if (!vt_resize(&g_vt,cols,rows)) return false;
         if (erased) vt_prompt_here(&g_vt);
-        g_vt.pixel_width=w;g_vt.pixel_height=h;
-        free(g_pixels[0]);free(g_pixels[1]);g_pixels[0]=a;g_pixels[1]=b;g_pixel_width=w;g_pixel_height=h;g_bitmap_valid=false;
+        if (!term_render_resize(&g_render,cols,rows)) return false;
+        g_vt.pixel_width=g_render.width;g_vt.pixel_height=g_render.height;
     }
     g_cols=cols;g_rows=rows;g_cell_width=cw;g_cell_height=ch;
     if (g_view>(int)g_vt.history_rows) g_view=(int)g_vt.history_rows;
     if (g_vt.alt) g_view=0;
     apply_palette(t);
     uint64_t now=embk_uptime_ms();
+    g_dmg_y0=g_dmg_y1=0;
     /* DECSET 2026: a program drawing a frame in parts is shown the whole
      * frame -- held for at most 200 ms, so one that never ends it still shows */
     if (g_vt.sync_output) {
         if (!g_sync_since) g_sync_since=now?now:1;
-        if (g_bitmap_valid && now-g_sync_since<200) {em_request_frame();return true;}
+        if (g_frames && now-g_sync_since<200) {em_request_frame();return true;}
     } else g_sync_since=0;
     if (g_vt.bells!=g_bells_seen) {g_bells_seen=g_vt.bells;g_bell_until=now+150;}
     bool bell=now<g_bell_until;
     if (bell) em_request_frame();
-    uint64_t hash=g_vt.revision*1099511628211ull;
-    hash^=(uint64_t)(2*g_dead+4*g_view+(bell?1:0))<<24;
-    hash^=(uint64_t)w<<40;hash^=(uint64_t)h<<48;hash^=(uint64_t)font<<8;hash^=(uint64_t)(size*4);
-    if (!g_bitmap_valid || hash!=g_painted_signature) {
-        g_pixel_index^=1;struct render_target rt={g_pixels[g_pixel_index],(uint32_t)w,(uint32_t)h,(uint32_t)w*4,EMBK_PIXFMT_BGRA8888_PRE,0};
-        struct clip_saved clip;cpu_clip_save_and_clear(&clip);
-        fill(rt.pixels,0,0,w,h,vt_rgb(&g_vt,VT_COLOR_DEFAULT,g_vt.reverse_video));
-        for (int y=0;y<rows;y++) for (int x=0;x<cols;x++) paint_cell(&rt,x,y,vt_view_cell(&g_vt,y,x,(unsigned)g_view),font,bold,size);
-        struct vt_cursor *cursor=&vt_active(&g_vt)->cursor;
-        if (!g_view && !g_dead && g_vt.cursor_visible) paint_cursor(&rt,cursor->x,cursor->y,vt_cursor_rgb(&g_vt));
-        if (bell) {                                /* the visual bell: a frame for a moment */
-            uint32_t a=vt_cursor_rgb(&g_vt);
-            fill(rt.pixels,0,0,w,2,a);fill(rt.pixels,0,h-2,w,2,a);fill(rt.pixels,0,0,2,h,a);fill(rt.pixels,w-2,0,2,h,a);
-        }
-        cpu_clip_restore(&clip);g_painted_signature=hash;g_bitmap_valid=true;
-        g_frames++;probe_refresh();
+    if (bell!=g_bell_drawn) term_render_invalidate(&g_render);   /* the visual bell comes or goes */
+    struct vt_cursor *cursor=&vt_active(&g_vt)->cursor;
+    struct term_frame fr={
+        .back=(unsigned)g_view,
+        .cursor=!g_view && !g_dead && g_vt.cursor_visible && cursor_phase(now),
+        .cursor_x=cursor->x,.cursor_y=cursor->y,.cursor_shape=g_vt.cursor_style,
+        .cursor_hollow=!g_focused,.blink_on=text_phase(now),.bold_is_bright=false,
+    };
+    bool painted=term_render_frame(&g_render,&g_vt,&fr);
+    if (bell) {bell_frame();g_dmg_y0=0;g_dmg_y1=g_render.height;}
+    else if (painted) {g_dmg_y0=g_render.dmg_y0;g_dmg_y1=g_render.dmg_y1;}
+    g_bell_drawn=bell;
+    if (painted || bell) g_frames++;
+    /* The probe follows what is shown, not the blink: a reader takes longer
+     * than a blink phase, and a probe rewritten under it is never whole. */
+    static uint64_t probed_revision;static int probed_view=-1;
+    if (painted && (g_vt.revision!=probed_revision || g_view!=probed_view)) {
+        probed_revision=g_vt.revision;probed_view=g_view;probe_refresh();
     }
     return true;
 }
@@ -580,8 +575,12 @@ static void term_view(void) {
             float wheel=ui_take_wheel();
             float bx=0,by=0,bw=0,bh=0;
             if (ui_open_rect(&bx,&by,&bw,&bh)) term_mouse(bx+14,by+10,wheel);   /* the image sits inside the padding */
-            if (screen_bitmap()) {em_flush();ui_image_sized(0x5445524d,g_pixels[g_pixel_index],(uint32_t)g_pixel_width,(uint32_t)g_pixel_height,(float)g_pixel_width,(float)g_pixel_height);}
-            else Text("Terminal display could not be resized.").secondary();
+            if (screen_bitmap()) {
+                em_flush();
+                int w=g_render.width,h=g_render.height;
+                ui_image_sized_damage(0x5445524d,g_render.pixels,(uint32_t)w,(uint32_t)h,(float)w,(float)h,
+                                      0,g_dmg_y0,w,g_dmg_y1-g_dmg_y0);
+            } else Text("Terminal display could not be resized.").secondary();
         }
         Spacer();
     }
@@ -619,7 +618,7 @@ int main(void) {
         close(FD_SHELL_IN);          /* an fd, so close() -- NOT a handle close */
         embk_wait(g_shell);          /* ...so this returns */
     }
-    free(g_pixels[0]);free(g_pixels[1]);
+    term_render_free(&g_render);
     vt_free(&g_vt);
     return rc;
 }

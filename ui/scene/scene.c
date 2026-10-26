@@ -392,6 +392,28 @@ void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pi
         n->data.image.h == ht && n->data.image.fmt == fmt) return;
     n->data.image.pixels = pixels;
     n->data.image.w = w; n->data.image.h = ht; n->data.image.fmt = fmt;
+    n->data.image.damage = 2;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+void scene_set_image_damage(struct scene_arena *a, struct node_handle h,
+                            float x, float y, float w, float ht) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || n->kind != SCENE_NODE_IMAGE || w <= 0 || ht <= 0) return;
+    if (n->dirty_content && n->data.image.damage == 2) return;    /* already all of it */
+    if (n->dirty_content && n->data.image.damage == 1) {
+        float x1 = n->data.image.dmg_x + n->data.image.dmg_w, y1 = n->data.image.dmg_y + n->data.image.dmg_h;
+        if (x + w > x1) x1 = x + w;
+        if (y + ht > y1) y1 = y + ht;
+        if (x > n->data.image.dmg_x) x = n->data.image.dmg_x;
+        if (y > n->data.image.dmg_y) y = n->data.image.dmg_y;
+        w = x1 - x; ht = y1 - y;
+    } else if (n->dirty_content) {
+        n->data.image.damage = 2;       /* dirty for some other reason: all of it */
+        return;
+    }
+    n->data.image.damage = 1;
+    n->data.image.dmg_x = x; n->data.image.dmg_y = y; n->data.image.dmg_w = w; n->data.image.dmg_h = ht;
     DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 

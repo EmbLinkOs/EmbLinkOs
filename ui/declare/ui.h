@@ -84,6 +84,11 @@ void ui_text_line(const char *fmt, ...);
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px);
 void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                     float width_px, float height_px);
+/* The same, for a buffer edited in place where only (dx,dy,dw,dh) -- image
+ * pixels -- changed since the last frame: only that is repainted and
+ * presented. dw or dh <= 0: nothing changed. */
+void ui_image_sized_damage(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                           float width_px, float height_px, int dx, int dy, int dw, int dh);
 /* draws the image as a stencil filled with `tint` (its alpha = coverage), so a
  * single-colour icon follows the theme exactly as a glyph does */
 void ui_image_sized_tinted(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,

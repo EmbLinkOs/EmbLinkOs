@@ -349,6 +349,42 @@ static void t7_layers(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* T8: an image edited in place repaints and reports only what changed. A
+ * terminal changes a line at a time; repainting and presenting the window
+ * for it is the cost this exists to avoid. */
+static void t8_image_damage(void) {
+    printf("T8 an image's damage is all that repaints:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    static uint32_t img[32 * 32];
+    for (int i = 0; i < 32 * 32; i++) img[i] = 0xff0000ffu;      /* opaque blue */
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle im = scene_create_node(&a, SCENE_NODE_IMAGE, root);
+    scene_set_size(&a, im, 32, 32); scene_set_transform(&a, im, 16,8,0, 0,0,0,1, 1,1,1);
+    scene_set_image(&a, im, img, 32, 32, EMBK_PIXFMT_BGRA8888_PRE);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 20, 12) < 50, "frame 1: the image shows");
+    for (int y = 10; y < 14; y++) for (int x = 4; x < 12; x++) img[y * 32 + x] = 0xffff0000u;   /* red, in place */
+    scene_set_image_damage(&a, im, 4, 10, 8, 4);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(!r.full && r.n_dirty == 1 && r.dirty[0].x == 20 && r.dirty[0].y == 18 && r.dirty[0].w == 8 && r.dirty[0].h == 4,
+          "frame 2: one dirty rect, the damage at the image's place");
+    CHECK(red_at(&rt, 22, 19) > 200, "frame 2: the edited pixels show");
+    scene_set_image_damage(&a, im, 0, 0, 2, 2);
+    scene_set_image_damage(&a, im, 30, 30, 2, 2);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 1 && r.dirty[0].w == 32 && r.dirty[0].h == 32, "two damages in a frame: the rect around both");
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0 && !r.full, "frame 4: nothing said, nothing repainted");
+    static uint32_t other[32 * 32];
+    scene_set_image(&a, im, other, 32, 32, EMBK_PIXFMT_BGRA8888_PRE);
+    scene_set_image_damage(&a, im, 0, 0, 1, 1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty >= 1 && r.dirty[0].w >= 32, "a new buffer is all new, whatever damage is said");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -358,6 +394,7 @@ int main(void) {
     t5_ghost();
     t6_destroyed();
     t7_layers();
+    t8_image_damage();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

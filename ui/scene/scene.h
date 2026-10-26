@@ -147,8 +147,12 @@ struct scene_node {
         /* tinted: paint `tint` using the image's ALPHA as coverage, so a
          * single-colour icon behaves exactly like a glyph and follows the
          * theme. Untinted images draw their own colours. */
+        /* damage: what changed in the pixels since the last render -- 0
+         * nothing said, 1 just dmg_* (image pixels; scene_set_image_damage),
+         * 2 all of it (a new buffer or size). */
         struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt;
-                 bool tinted; struct color tint; } image;
+                 bool tinted; struct color tint;
+                 uint8_t damage; float dmg_x, dmg_y, dmg_w, dmg_h; } image;
         struct { const char *utf8; uint32_t font_handle; float size_px; struct color color;
                  struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */
                  /* Content hash of `utf8` as it was when last set. A node holds
@@ -229,6 +233,12 @@ void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color
 
 /* Force-dirty a node whose (aliased) content was edited in place. */
 void scene_mark_dirty(struct scene_arena *a, struct node_handle h);
+/* An image whose buffer was edited in place, but only in (x,y,w,h) -- image
+ * pixels. Only that part is repainted and presented (calls in one frame add
+ * up to the rectangle around them); a terminal line that changed costs that
+ * line, not the window. */
+void scene_set_image_damage(struct scene_arena *a, struct node_handle h,
+                            float x, float y, float w, float ht);
 void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pixels,
                      uint32_t w, uint32_t ht, enum embk_pixfmt fmt);
 /* Draw the image as a MASK filled with `tint` (alpha = coverage). enabled=false

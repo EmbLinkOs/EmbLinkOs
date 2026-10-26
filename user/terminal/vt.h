@@ -183,6 +183,9 @@ struct vt_screen *vt_active(struct vt *);
 /* Reading the picture. `back` rows into the scrollback (0 = the live screen;
  * the alternate screen has none). A cell outside the grid reads as a blank. */
 const struct vt_cell *vt_view_cell(const struct vt *, int row, int col, unsigned back);
+/* A whole row of the view: `cols` cells, valid until the next view read or
+ * change. NULL outside the grid. */
+const struct vt_cell *vt_view_row(const struct vt *, int row, unsigned back);
 bool vt_view_wrapped(const struct vt *, int row, unsigned back);
 const struct vt_style *vt_style_of(const struct vt *, const struct vt_cell *);
 /* The cell's text as UTF-8 (base and marks); returns the bytes written. */

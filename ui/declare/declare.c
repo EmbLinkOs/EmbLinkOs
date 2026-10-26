@@ -809,17 +809,32 @@ void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float 
     scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
 }
 
-void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
-                    float width_px, float height_px) {
+static struct instance *image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                                    float width_px, float height_px) {
     bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, 0, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
-    if (!n) return;
+    if (!n) return 0;
     struct layout_node *ln = layout_resolve(g_la, n->layout_node);
     if (ln) {
         ln->width.mode = SIZE_FIXED;   ln->width.fixed_value = width_px;
         ln->height.mode = SIZE_FIXED;  ln->height.fixed_value = height_px;
     }
     scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
+    return n;
+}
+void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                    float width_px, float height_px) {
+    (void)image_sized(key, pixels, iw, ih, width_px, height_px);
+}
+
+/* As ui_image_sized, for a buffer the caller edits in place: only (dx,dy,dw,dh)
+ * -- image pixels -- changed since the last frame, and only that is repainted
+ * and presented. dw or dh <= 0: nothing changed. A new buffer or size is still
+ * all new. */
+void ui_image_sized_damage(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                           float width_px, float height_px, int dx, int dy, int dw, int dh) {
+    struct instance *n = image_sized(key, pixels, iw, ih, width_px, height_px);
+    if (n && dw > 0 && dh > 0) scene_set_image_damage(g_sa, n->scene_node, (float)dx, (float)dy, (float)dw, (float)dh);
 }
 
 /* As ui_image_sized, but draws the image as a stencil filled with `tint` (the

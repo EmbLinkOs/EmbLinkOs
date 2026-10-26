@@ -50,6 +50,7 @@ import uuid as uuidlib
 
 from crc32c import crc32c
 import layout as L
+import fonts
 
 # v2.2: real wall-clock timestamps for every object this formatter creates,
 # instead of the placeholder zeros v2.0/v2.1 shipped with (the kernel had no
@@ -302,8 +303,8 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
-    # 128 MB (was 64, 8, 4). Each bump had the same trigger: content grew past
+def make_image(path: str, size_bytes: int = 192 * 1024 * 1024, objects=None):
+    # 192 MB (was 128, 64, 8, 4). Each bump had the same trigger: content grew past
     # the volume and free_blocks went NEGATIVE -- struct.pack('Q') then refuses
     # it, which is the (cryptic) way this failure announces itself.
     #   4 -> 8 MB: shell.elf (~410 KB static-newlib)
@@ -313,6 +314,8 @@ def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
     #   64 -> 128 MB: staging the KERNEL source tree on the image (/data/src/
     #               kernel, ~180 files) for EmbBuild-builds-the-kernel (BUILD.md
     #               §12) tipped the near-full 64 MB volume over.
+    #   128 -> 192 MB: Terminal's four MesloLGS Nerd Font Mono faces (11.7 MB,
+    #               fonts.py) put the root mirror block on file data.
     # The kernel reads total_blocks from the superblock, so growing is safe;
     # the image is sparse-ish on disk and QEMU only reads what's used.
     bs = L.BLOCK_SIZE
@@ -994,24 +997,10 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
     # UI fonts are part of the sealed OS, not root stragglers: they live under
     # /system/fonts (USERSPACE_v2 UP1 -- nothing at bare /). The EmUI runtime
-    # (ui/dsl/em_app.c) and the explicit readers default to these paths.
-    font = _read_font("DejaVuSans.ttf")
-    if font is not None:
-        objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
-    for source, destination in [("DejaVuSansMono-Bold.ttf", "mono-bold.ttf"),
-                                ("DejaVuSans-Bold.ttf", "bold.ttf"),
-                                ("DejaVuSansCondensed.ttf", "condensed.ttf"),
-                                ("DejaVuSansCondensed-Bold.ttf", "condensed-bold.ttf"),
-                                ("DejaVuSerif.ttf", "serif.ttf"),
-                                ("DejaVuSerif-Bold.ttf", "serif-bold.ttf")]:
-        face = _read_font(source)
-        if face is not None:
-            objects.append((("system/fonts/" + destination).encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, face))
-    # The terminal's MONOSPACE face (same DejaVu family, so the same
-    # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
-    mono = _read_font("DejaVuSansMono.ttf")
-    if mono is not None:
-        objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
+    # (ui/dsl/em_app.c) and the explicit readers default to these paths. The
+    # list is fonts.py's, shared with the ARM image.
+    for name, data in fonts.font_files(_read_font):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
     # Sealed visual assets used by full-screen system experiences (login/setup).
     objects.extend(_tree_objects("system/images", b"system/images/", (".ppm", ".pam", ".eic")))
     # Vellum's built-in documents (docs/BROWSER.md). Sealed with the OS: the
@@ -1078,8 +1067,11 @@ def discover_userland_objects(build_dir="build"):
         if blob is not None:
             objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
-    # Device firmware is data; never compile it into the kernel image.
-    for prefix in ("system/firmware", "system/licenses"):
+    # Device firmware is data; never compile it into the kernel image. The
+    # licences go with what they license (fonts.py, shared with ARM).
+    for name, data in fonts.licence_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    for prefix in ("system/firmware",):
         directory=Path(prefix)
         if directory.is_dir():
             for host in sorted(directory.rglob("*")):

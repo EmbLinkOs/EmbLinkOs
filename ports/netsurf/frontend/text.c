@@ -173,7 +173,7 @@ void emblink_text_draw(struct emblink_surface *s, int x, int y,
         if (x1 <= x0 || y1 <= y0) continue;
 
         for (int py = y0; py < y1; py++) {
-            const uint8_t *cov = &g_atlas->coverage[g->atlas_y + (py - gy)][g->atlas_x];
+            const uint8_t *cov = glyph_coverage(g_atlas, g) + (size_t)(py - gy) * GLYPH_ATLAS_SIZE;
             uint32_t *row = s->px + (size_t)py * s->stride;
             for (int pxx = x0; pxx < x1; pxx++) {
                 unsigned a = cov[pxx - gx];

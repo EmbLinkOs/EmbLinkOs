@@ -1522,6 +1522,9 @@ $(BUILD)/shobj_main.o: shell/main.c $(SHELL_HDRS) | $(BUILD)
 # The shell's own sources ride in the image (/data/src/shell) for `test embbuild
 # shell` to rebuild it with tcc, so a change to any of them -- or to a manifest
 # -- has to remake the image even when shell.elf itself did not change.
+# The fonts and licences fonts.py installs on both images: a face that changes
+# rebuilds the image.
+IMAGE_FONT_INPUTS = tools/embkfs_mkfs/fonts.py $(wildcard third_party/fonts/*/*.ttf) $(wildcard system/licenses/*)
 SHELL_SELFBUILD_SRC = $(wildcard shell/*.c shell/*/*.c shell/*/*.h) shell/build.ebm $(wildcard shell/tools/*.ebm)
 
 SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o \
@@ -1706,9 +1709,16 @@ $(VT_OBJS): build/%.o: user/terminal/%.c $(VT_HDRS) | $(BUILD)
 # The cell width table the shell's editor uses too: one table, both sides.
 build/wcwidth.o: shell/edit/wcwidth.c shell/edit/wcwidth.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/term.o: user/terminal/vt.h user/apps/term/term_probe.h
-build/term.elf: build/term.o $(VT_OBJS) build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o $(VT_OBJS) build/wcwidth.o \
+# The renderer and its drawn glyphs: Terminal's own, beside the screen model
+# (user/apps/*/*.c would each be taken for a program of their own).
+TERM_UI_OBJS := build/term_render.o build/term_glyphs.o
+build/term_render.o: user/terminal/render.c user/terminal/render.h user/terminal/glyphs.h $(VT_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/terminal -c $< -o $@
+build/term_glyphs.o: user/terminal/glyphs.c user/terminal/glyphs.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term.o: user/terminal/vt.h user/terminal/render.h user/apps/term/term_probe.h
+build/term.elf: build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Photos -- the picture viewer. Like vellum it needs more than one object, so
@@ -2129,7 +2139,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(SHELL_SELFBUILD_SRC) $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(IMAGE_FONT_INPUTS) $(SHELL_SELFBUILD_SRC) $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -2711,6 +2721,15 @@ terminal-screen-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	    -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test_asan
 	$(BUILD)/vt_test_asan --fuzz 20000
+
+.PHONY: terminal-render-test
+# Terminal's renderer (glyphs drawn and taken from the vendored Meslo faces,
+# DejaVu as the fallback) on real screens from the screen model.
+terminal-render-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -g -Iuser/terminal -Iui/backend -Iui/scene \
+	    user/terminal/render.c user/terminal/glyphs.c $(VT_SRC) shell/edit/wcwidth.c \
+	    ui/backend/font.c ui/backend/cpu_backend.c ui/scene/scene.c tests/tty/render_test.c -lm -o $(BUILD)/render_test
+	$(BUILD)/render_test $(RENDER_SAMPLE)
 
 .PHONY: terminal-golden-test
 # Real programs' output (tests/tty/golden, made by tools/record_golden.py on a

@@ -700,10 +700,19 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
     if (!scrolled) {
         for (int i = 0; i < nrec; i++) {
             struct noderec *rec = &recs[i];
-            if (rec->dirty) {
-                dirty_add(r, rec->foot);                              /* new footprint */
-                if (rec->has_old) dirty_add(r, rec->old);             /* old ghost */
+            if (!rec->dirty) continue;
+            /* an image that said which part of it changed, in place: that part */
+            struct scene_node *n = scene_resolve(a, rec->h);
+            if (n && n->kind == SCENE_NODE_IMAGE && n->data.image.damage == 1 && !rec->moved &&
+                rec->has_old && n->data.image.w && n->data.image.h) {
+                float sx = rec->aabb.w / (float)n->data.image.w, sy = rec->aabb.h / (float)n->data.image.h;
+                struct frect d = { rec->aabb.x + n->data.image.dmg_x * sx, rec->aabb.y + n->data.image.dmg_y * sy,
+                                   n->data.image.dmg_w * sx, n->data.image.dmg_h * sy };
+                dirty_add(r, d);
+                continue;
             }
+            dirty_add(r, rec->foot);                                  /* new footprint */
+            if (rec->has_old) dirty_add(r, rec->old);                 /* old ghost */
         }
     }
 
@@ -779,7 +788,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
             r->cache[idx].valid = 1;
         }
         struct scene_node *n = scene_resolve(a, recs[i].h);
-        if (n) { n->dirty = 0; n->dirty_content = 0; }
+        if (n) { n->dirty = 0; n->dirty_content = 0; if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0; }
     }
     free(recs);
 }

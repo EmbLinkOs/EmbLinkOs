@@ -803,6 +803,10 @@ const struct vt_cell *vt_view_cell(const struct vt *v,int row,int col,unsigned b
     const struct vt_cell *cells=view_row(v,row,back,NULL);
     return cells?&cells[col]:&plain_blank;
 }
+const struct vt_cell *vt_view_row(const struct vt *v,int row,unsigned back) {
+    if (row<0 || row>=v->rows) return NULL;
+    return view_row(v,row,back,NULL);
+}
 bool vt_view_wrapped(const struct vt *v,int row,unsigned back) {
     bool w=false;
     if (row>=0 && row<v->rows) view_row(v,row,back,&w);

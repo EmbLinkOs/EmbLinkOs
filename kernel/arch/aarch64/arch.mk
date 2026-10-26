@@ -429,8 +429,9 @@ ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
                  $(wildcard user/audio/mp3/*.c)) \
                user/audio/resample.c
 
-ARM_XSRC_term     := user/terminal/vt_grid.c user/terminal/vt_parse.c user/terminal/vt_keys.c shell/edit/wcwidth.c
-$(ARM_USER)/term.o: user/terminal/vt.h
+ARM_XSRC_term     := user/terminal/vt_grid.c user/terminal/vt_parse.c user/terminal/vt_keys.c shell/edit/wcwidth.c \
+                     user/terminal/render.c user/terminal/glyphs.c
+$(ARM_USER)/term.o: user/terminal/vt.h user/terminal/render.h
 
 ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \
                      user/photos/album.c user/web/png.c user/web/jpeg.c \
@@ -818,7 +819,7 @@ $(ARM_KBUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_KBUILD)
 	 else echo "  (embdbg tool absent -> no kernel panic symbols on aarch64)"; : > $@; fi
 
 ARM_ROOTFS_INPUTS := tools/embkfs_mkfs/mkfs_arm64.py tools/embkfs_mkfs/mkfs_embkfs.py \
-                     tools/embkfs_mkfs/layout.py \
+                     tools/embkfs_mkfs/layout.py $(IMAGE_FONT_INPUTS) \
                      $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app)
 $(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) $(ARM_KBUILD)/kernel.embdbg | $(ARM_KBUILD)
 	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)
