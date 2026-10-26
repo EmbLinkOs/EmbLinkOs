@@ -654,10 +654,11 @@ reflowed duplicate.
 
 ### The prompt
 
-`~/.config/shell/rc.esh` is read when a shell starts for a person -- in the
-Terminal or on the console -- and not for a script or `-c`. It is an ordinary
+`~/.config/shell/prompt.esh` -- what `prompt configure` writes -- and then
+`~/.config/shell/rc.esh` are read when a shell starts for a person -- in the
+Terminal or on the console -- and not for a script or `-c`. Each is an ordinary
 program run in the session's scope, so its `let`s and `def`s stay. A mistake
-in it is printed, and the shell starts anyway.
+in one is printed, and the shell starts anyway.
 
 The prompt is configured with the `prompt` builtin, usually from `rc.esh`.
 Options live for the session.
@@ -671,6 +672,7 @@ prompt reset                    forget them all
 prompt style [NAME]             Powerlevel10k's style NAME as the base (below);
                                 plain for none; alone, the base's name
 prompt import-p10k FILE         a ~/.p10k.zsh as the base -> {parameters, ignored}
+prompt configure                Powerlevel10k's wizard (below)
 ```
 
 A key is lower-case words joined by dots (`dir.anchor.fg`). It may be quoted,
@@ -812,6 +814,69 @@ compares cell for cell: character, colours, bold. `tools/record_prompts.py` reco
 zsh, tmux and Powerlevel10k. Live, `tools/shell_p10k_smoke.py` writes that
 configuration as `prompt set` lines into `rc.esh` and checks the prompt the
 shell draws on the OS, then draws every style.
+
+#### `prompt configure`
+
+`prompt configure` is Powerlevel10k's configuration wizard
+(`shell/prompt/wizard.c`: p10k 1.20's internal/wizard.zsh, function for
+function). It asks what `p10k configure` asks, in its order and on its pages,
+on the alternate screen: whether the font draws a diamond, a lock, an upwards
+arrow -- which decides `POWERLEVEL9K_MODE` -- then whether icons fit between
+crosses, the style, character set, colours, time, separators, heads, tails,
+height, connection, frame, the ornaments' colour, spacing, icons, flow and the
+transient prompt, each page showing the prompts to choose between. A page
+that does not fit the window drops its blank lines, then its diagrams, then
+its sample prompts, as p10k's does, and a window under 47 columns by 14 lines
+gets p10k's "Not enough space" page until it is resized. `r` starts over; `q`
+or Ctrl+C quits.
+
+Two questions are not asked. Instant prompt is how zsh shows a prompt before
+.zshrc has finished -- this shell has no slow startup to hide -- so the
+configuration keeps the template's `INSTANT_PROMPT` and the header does not
+list it. p10k's last question, whether to change .zshrc, has nothing to
+change here: the shell reads prompt.esh itself.
+
+The answers make the configuration `p10k configure` would make: the style's
+template from /system/share/powerlevel10k with the same lines changed, byte for
+byte but two words of the header (it says to type `prompt configure`, and it
+does not list instant prompt). It goes to `~/.config/shell/p10k.zsh` -- an
+older one is kept beside it as `p10k.zsh.<date>-<time>` when the person says to
+overwrite it -- and `~/.config/shell/prompt.esh` loads it in every shell from
+then on, under the same "Wizard options:" header:
+
+```
+let p10k = $(prompt import-p10k "~/.config/shell/p10k.zsh")
+```
+
+(`$p10k.ignored` lists the segments it names that draw nothing here). It is
+read before rc.esh, so a person's own `prompt set` lines there still win. The
+shell that ran the wizard loads the configuration straight away.
+
+**The first start.** A shell in the Terminal that finds no prompt
+configuration -- neither file loads a style or sets an option -- runs the
+wizard before its first prompt, as zsh with Powerlevel10k does, and p10k's
+greeting says why. Quitting it says how to keep it away (`prompt set
+disable.configuration.wizard true` in rc.esh, an option that does nothing
+else); otherwise it runs again in the next shell. It does not start by itself
+in a Live session -- a disposable one for trying the system, which skips the
+first-boot setup the same way -- or when EMBLINK_NO_WIZARD is set; `prompt
+configure` runs it anywhere there is a terminal of that size.
+
+**Tests.** `make prompt-test` holds the wizard to `p10k configure` itself:
+`tests/prompt/wizard` holds fifteen paths of answers recorded under tmux on a
+Mac (`tools/record_wizard.py`) -- between them every answer to every question,
+a restart, an overwrite, quitting, the wizard a shell with no configuration
+starts, and a window resized too small and back -- at 100x40, 80x24 and 47x14.
+`tools/golden_wizard.py` drives the wizard (`build/wizard_dump`) with the same
+keys and compares 454 pages cell for cell, and 13 configurations line for
+line. The recording runs where EmbLinkOS does as far as the wizard can tell:
+256 colours and 24-bit ones (COLORTERM), an OS p10k has no icon for, the
+configuration at ~/.config/shell/p10k.zsh. The answers in the header of the
+Mac's own ~/.p10k.zsh (`tests/prompt/configs/user.p10k.zsh`) make that file
+again, but its date. Live, `tools/shell_wizard_smoke.py` makes an account on a
+fresh image, logs in and opens the Terminal: the wizard starts by itself, the
+same answers are typed page by page, and the prompt, the files, a new tab and
+`prompt configure` are checked.
 
 ### `$status`
 

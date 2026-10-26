@@ -70,7 +70,12 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       a split or sparse index, config `include` files, or `GIT_DIR` requests (`:dir`). Contents are compared as
       bytes: clean/smudge filters and line-ending conversion (core.autocrlf, `text` attributes) are not applied,
       so such files can read as changed. `status.showUntrackedFiles=all` is not taken as `-e`. One thread.
-- [ ] M11-M12 `prompt configure` wizard, autosuggestions, highlighting.
+- [x] M11 `prompt configure`: Powerlevel10k's wizard -- its questions, pages and their shortening for small
+      windows -- writing the configuration p10k configure writes (~/.config/shell/p10k.zsh, loaded by
+      prompt.esh); it starts by itself in the first shell that finds no prompt configuration, outside Live
+      sessions. 454 pages and 13 configurations match p10k configure 1.20 (`make prompt-test`). Instant prompt
+      and the .zshrc question are zsh's and are not asked.
+- [ ] M12 autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
 - [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not

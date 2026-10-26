@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-187 actual EmbLinkOS captures document the original laptop work, its
+203 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, and git status read by the system's own daemon. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, and Powerlevel10k's configuration wizard. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -19,6 +19,104 @@ backlight, battery and lid readings do not come from physical hardware.
 With the terminal real, the prompt that runs in it: the system the Mac's Powerlevel10k setup is built on, here in the native shell. First the plumbing -- `~/.config/shell/rc.esh` read by every shell a person types into, the `prompt` builtin setting options by Powerlevel10k's names, a right side the editor keeps out of the typing's way, and a transient prompt ([SHELL.md](../../SHELL.md#the-prompt)).
 
 Then the engine: Powerlevel10k 1.20's prompt ported to C in the shell, held cell for cell to recordings of p10k itself on a Mac -- 18 configurations, 288 prompts. A person's `.p10k.zsh` is read by `prompt import-p10k`, or its settings written as `prompt set` lines; `prompt style` draws the styles `p10k configure` starts from.
+
+Then the wizard: `prompt configure` is p10k configure, its questions and pages held cell for cell to recordings of p10k's own (454 pages), and the configuration it writes line for line. A new account's first Terminal starts it by itself; the answers from the Mac's own header make the Mac's prompt.
+
+### The wizard, on its own, in a new account's first shell
+
+A fresh account opens the Terminal for the first time: its shell finds no prompt configuration and starts Powerlevel10k's configuration wizard, p10k's greeting saying why. First, the font: does it draw a diamond?
+
+![The wizard, on its own, in a new account's first shell: prompt configure on EmbLinkOS](188-prompt-wizard-first-start.png)
+
+### Does the font draw a lock?
+
+The glyph that tells a font with Font Awesome icons from one without. On the Mac the answers come from, it did not.
+
+![Does the font draw a lock?: prompt configure on EmbLinkOS](189-prompt-wizard-lock.png)
+
+### Let's try another one
+
+A second lock, from another icon set. No again: diamonds without icons, so POWERLEVEL9K_MODE is powerline.
+
+![Let's try another one: prompt configure on EmbLinkOS](190-prompt-wizard-lock-again.png)
+
+### Prompt style
+
+Lean, classic, rainbow and pure, drawn from the wizard's own sample prompts as p10k draws them -- the page is held cell for cell to p10k configure's.
+
+![Prompt style: prompt configure on EmbLinkOS](191-prompt-wizard-style.png)
+
+### Character set
+
+Unicode, or ASCII for a font with neither.
+
+![Character set: prompt configure on EmbLinkOS](192-prompt-wizard-charset.png)
+
+### Prompt colours
+
+Lean in 256 colours, or in the terminal's 8.
+
+![Prompt colours: prompt configure on EmbLinkOS](193-prompt-wizard-colors.png)
+
+### Show current time?
+
+No clock, a 12-hour one or a 24-hour one.
+
+![Show current time?: prompt configure on EmbLinkOS](194-prompt-wizard-time.png)
+
+### Prompt height
+
+One line, or two: the information above, the typing below.
+
+![Prompt height: prompt configure on EmbLinkOS](195-prompt-wizard-height.png)
+
+### Prompt connection
+
+What joins the two sides of the first line: nothing, dots or a solid line.
+
+![Prompt connection: prompt configure on EmbLinkOS](196-prompt-wizard-connection.png)
+
+### Prompt frame
+
+No frame, on the left, on the right, or both.
+
+![Prompt frame: prompt configure on EmbLinkOS](197-prompt-wizard-frame.png)
+
+### Frame colour
+
+Four greys for the frame, with p10k's marker pointing at it; the Mac's answer is the darkest.
+
+![Frame colour: prompt configure on EmbLinkOS](198-prompt-wizard-frame-color.png)
+
+### Prompt spacing
+
+Compact, or sparse: an empty line before each prompt.
+
+![Prompt spacing: prompt configure on EmbLinkOS](199-prompt-wizard-spacing.png)
+
+### Prompt flow
+
+Concise, or fluent: on master, took 5s, at 04:23:42 PM.
+
+![Prompt flow: prompt configure on EmbLinkOS](200-prompt-wizard-flow.png)
+
+### Transient prompt
+
+Whether a line, once accepted, keeps only ❯ -- so the scrollback shows the commands, not every full prompt.
+
+![Transient prompt: prompt configure on EmbLinkOS](201-prompt-wizard-transient.png)
+
+### The prompt the answers make
+
+The answers in the header of the Mac's ~/.p10k.zsh make that file again, byte for byte but the date, at ~/.config/shell/p10k.zsh; prompt.esh loads it in every shell from now on. The frame, the home, the 12-hour clock.
+
+![The prompt the answers make: prompt configure on EmbLinkOS](202-prompt-wizard-done.png)
+
+### prompt configure, and q
+
+Typed in a second tab -- which loaded the configuration by itself -- `prompt configure` greets as p10k configure does; q leaves it, saying how to run it again.
+
+![prompt configure, and q: prompt configure on EmbLinkOS](203-prompt-wizard-quit.png)
 
 ### Git status, from the repository itself
 
