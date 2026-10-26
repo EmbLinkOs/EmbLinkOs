@@ -225,13 +225,72 @@ Retained text runs explicitly clear their highlights after selection collapse.
 Note++'s custom hook also bounds the full clipboard length before indexing its
 buffer and accepts multiline text up to the 64 KiB clipboard limit.
 
+### Fonts and the renderer
+
+**The faces.** Terminal draws in MesloLGS Nerd Font Mono -- the face the
+Mac's Powerlevel10k setup uses -- in four faces (regular, bold, italic, bold
+italic), vendored with its licences in `third_party/fonts/meslo-nf` and
+installed as `/system/fonts/meslo-nf-mono*.ttf` on both architectures
+(`tools/embkfs_mkfs/fonts.py`, the one list both image builders use). The
+size is 14 px at the standard interface size and follows the interface's
+scale; at 14 px a cell is 8 x 18 pixels, the font's own advance and line
+height. A character the face lacks is taken from regular Meslo, then DejaVu
+Sans Mono, then DejaVu Sans (centred in its cells); one no face has is drawn
+as a box the width of its cells.
+
+**Drawn, not from a font** (`user/terminal/glyphs.c`): box drawing
+U+2500-257F (light, heavy, double, dashed, rounded, diagonal, and every mix
+of them), block elements U+2580-259F, braille U+2800-28FF and the Powerline
+separators U+E0B0-E0BF. They fill the cell exactly at any size, so frames
+and segments meet the next cell edge to edge -- no seams between rows, no
+sliver of background at a separator's point.
+
+**What a cell shows** (`user/terminal/render.c`): colours through the
+model's palette; bold from the bold face (bold-as-bright, brightening ANSI
+0-7, is a renderer option for Preferences); italic from the italic face; dim
+as half-way to the ground; inverse, and DECSCNM over the whole screen;
+underline in its five styles and its own colour; strike; overline; combining
+marks over their base; blinking text every 500 ms. The cursor is a block
+(the character under it in the ground colour), an underline or a bar
+(DECSCUSR); styles 1, 3 and 5 -- and 0 with DECSET 12 -- blink every 530 ms,
+restarting at each key and each output; without the keyboard it is an
+outline.
+
+**Repaints.** Each row has a signature of what it shows -- cells, resolved
+colours, the cursor on it, the blink phase if it blinks -- and only rows
+whose signature changed are repainted, into one retained buffer. When the
+screen scrolled, last frame's rows are moved up and only the new rows drawn.
+The repainted rows are the frame's damage: `ui_image_sized_damage` tells the
+scene which part of the image changed, the scene renderer repaints and the
+window presents only that (`scene_set_image_damage`). A key typed or a cursor
+blink presents one row, not the window.
+
+Measured under QEMU (x86-64 emulated on an Apple-silicon host, so every
+instruction is translated) with `ttyprobe --bench`: output that replaces the
+whole 156 x 34 screen every frame costs the renderer about 35 ms a frame, out
+of about 640 ms a frame in all -- the rest is presenting and compositing the
+whole window, which a screen that changed everywhere needs. The PTY's 4 KiB
+output queue brings at most 4 KiB a frame, so that host sustains about 7 KiB/s
+of scrolling output; M6's larger queue raises what a frame takes in.
+
+**The font engine** (`ui/backend/font.c`, shared by every app) reads cmap
+format 12 as well as 4, so icons in the supplementary private use planes
+(Nerd Fonts' Material Design set) and other astral characters are found;
+holds 16 fonts; reports a glyph the font lacks (`font_has_glyph`, and
+`missing` on a cache entry) so a caller can fall back; and caches glyphs in a
+hashed table over up to four atlas pages allocated as they are needed. When
+they are full, the page used longest ago is emptied, not the whole cache.
+
 ### Compatibility limits
 
-The renderer is the next piece (docs/TODO.md, M5): italic draws upright,
-blinking text does not blink, a glyph the font lacks (CJK, emoji) is a box,
-combining marks are not composed onto their base, and cursor styles stay
-static. Hyperlinks are kept but not yet clickable, and the mouse does not yet
-select text (M6). OSC 52 writes need Preferences to allow them (M7).
+There is no CJK or emoji font on the image: those characters draw as boxes
+two cells wide (the model and widths are right; M5 adds faces, not fonts for
+every script). Colour emoji, emoji ZWJ sequences and ligatures need shaping
+the font engine does not do. Combining marks are drawn at their base's
+origin, where both shipped mono faces place them; a mark from a proportional
+fallback may sit off-centre. Hyperlinks are kept but not yet clickable, and
+the mouse does not yet select text (M6). OSC 52 writes and bold-as-bright
+need Preferences to turn them on (M7).
 
 Not offered: left/right margins (DECSLRM), double-width and double-height
 lines, sixel and other inline images, the kitty keyboard protocol and
@@ -251,7 +310,7 @@ SDK paths even when upstream headers with the same names are present.
 ## Verification
 
 ```
-make terminal-test terminal-screen-test terminal-golden-test
+make terminal-test terminal-screen-test terminal-golden-test terminal-render-test font-test backend-test
 make shell-test declare-test em-test kit-test     # shell-test includes the line editor on the screen model
 # Boot the image, then use the serial debug console:
 test terminal
@@ -261,6 +320,7 @@ test kbd ring
 python3 tools/terminal_smoke.py
 python3 tools/terminal_screen_smoke.py
 python3 tools/terminal_xterm_smoke.py
+python3 tools/terminal_render_smoke.py
 ```
 
 `terminal-test` compiles the production device state machine with a minimal
@@ -300,6 +360,24 @@ AddressSanitizer/UBSan with 20,000 rounds of structured random input, random
 resizes up to 1000 x 500, resets and history-limit changes, checking the
 model's invariants (row ownership, wide-cell pairing, style and cluster ids,
 scrollback accounting) as it goes.
+
+`make terminal-render-test` renders real screens from the screen model with
+the vendored Meslo faces (and the host's DejaVu as the fallback) and checks
+the pixels: the cell metrics, box frames of every weight unbroken across
+cells, a double frame's inner and outer corners, a Powerline separator's edge
+and point, blocks, braille, shades, bold and italic from their faces,
+bold-as-bright, the fallback chain and the box for what no face has,
+combining accents, the three cursor shapes and the outline, row-level damage
+(one changed row repaints one row; a blink phase only the blinking rows; a
+palette change the rows it colours; a line scrolling in draws the new row and
+the cursor's while the rest move), and that painting only what changed --
+scrolled or not -- gives the same pixels as painting everything. `font-test` covers cmap 12, the
+missing-glyph flag, the vendored face, and the cache under pressure (pages
+fill, the oldest is emptied, a glyph used every frame is never evicted or
+overwritten); `backend-test` covers image damage in the scene renderer.
+`tools/terminal_render_smoke.py` runs `ttyprobe --glyphs` (a
+Powerlevel10k-style framed prompt, frames, blocks, braille, icons) and
+`ttyprobe --bench` in the real Terminal.
 
 `tools/terminal_xterm_smoke.py` runs `ttyprobe --xterm` in the real Terminal:
 a card of attributes, underline styles and colours, the 16- and 256-colour

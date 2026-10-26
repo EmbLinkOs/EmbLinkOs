@@ -19,9 +19,14 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       `TERM=xterm-256color`; the golden corpus matches tmux on all nine cases.
 - [ ] Left/right margins (DECSLRM), double-width/height lines, sixel and inline images.
 - [ ] No terminfo database on the image: a ported ncurses program would not find xterm-256color.
-- [ ] M5 Fonts and renderer (cmap 12, fallback, four faces, procedural box/powerline glyphs, damage).
+- [x] M5 Fonts and renderer: MesloLGS Nerd Font Mono in four faces (vendored, on both images), DejaVu
+      fallback, drawn box/block/braille/Powerline glyphs, blink, cursor shapes, row damage presented
+      alone (`ui_image_sized_damage`); the font engine reads cmap 12, holds 16 fonts, flags missing
+      glyphs and caches in LRU atlas pages.
+- [ ] No CJK or emoji font on the image (boxes, two cells wide), no colour emoji, ZWJ sequences or
+      ligatures: the font engine does not shape.
 - [ ] M6 Tabs, mouse selection, find, links, zoom; dynamic PTYs.
-- [ ] M7 Profiles, Preferences and translucency (Clear Dark default); the OSC 52 write permission.
+- [ ] M7 Profiles, Preferences and translucency (Clear Dark default); OSC 52 writes and bold-as-bright as options.
 - [ ] M8-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.

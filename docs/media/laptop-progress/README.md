@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-165 actual EmbLinkOS captures document the original laptop work, its
+167 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing and an xterm-compatible screen. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen and its own fonts and renderer. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -81,6 +81,20 @@ Narrowed from 156 columns to 74, the 233-character line re-wraps from two rows t
 Shift+PgUp pages back to the top of the card. The scrollback stores logical lines, not rows, so what was written at 156 columns is read back laid out at 74, with its colours and underlines kept.
 
 ![The scrollback re-wraps too in EmbLinkOS](165-terminal-xterm-scrollback.png)
+
+And then the pixels: Terminal draws in MesloLGS Nerd Font Mono, the face of the Mac setup it follows, in four faces with DejaVu after it; draws box lines, blocks, braille and Powerline separators itself so they meet cell to cell; and repaints and presents only the rows that changed ([TERMINAL.md](../../TERMINAL.md#fonts-and-the-renderer)).
+
+### Meslo Nerd Font, Powerline segments and frames that join
+
+ttyprobe --glyphs writes a sample in the Terminal: the four MesloLGS Nerd Font Mono faces, Armenian letters drawn from DejaVu because Meslo has none (the Ω and ♫ after them are Meslo's own), and a Powerlevel10k-style framed prompt -- Powerline segments meeting without a seam, the frame lines joining the rows, Nerd Font icons for the OS, the folder and the branch. Below it are frames of every weight, blocks, braille and the Powerline shapes, which Terminal draws itself to fill the cell; a row of icons, one of them from Unicode plane 15; then the underline styles in their own colours. The real prompt engine comes later; this is a program writing what one would.
+
+![Meslo Nerd Font, Powerline segments and frames that join in EmbLinkOS](166-terminal-render-glyphs.png)
+
+### A screen that scrolls every frame
+
+ttyprobe --bench writes 1 MiB of coloured lines as fast as Terminal takes them: 13,618 lines in 145 s on this host, which emulates every x86 instruction. Each frame replaces the whole screen here, so the renderer draws every row (about 35 ms) and the window presents in full; output that changes a row presents that row.
+
+![A screen that scrolls every frame in EmbLinkOS](167-terminal-render-bench.png)
 
 ## The native shell runs any program
 
