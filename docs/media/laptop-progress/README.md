@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-186 actual EmbLinkOS captures document the original laptop work, its
+187 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, and Powerlevel10k's own engine drawing a Mac's configuration and every style. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, and git status read by the system's own daemon. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -19,6 +19,12 @@ backlight, battery and lid readings do not come from physical hardware.
 With the terminal real, the prompt that runs in it: the system the Mac's Powerlevel10k setup is built on, here in the native shell. First the plumbing -- `~/.config/shell/rc.esh` read by every shell a person types into, the `prompt` builtin setting options by Powerlevel10k's names, a right side the editor keeps out of the typing's way, and a transient prompt ([SHELL.md](../../SHELL.md#the-prompt)).
 
 Then the engine: Powerlevel10k 1.20's prompt ported to C in the shell, held cell for cell to recordings of p10k itself on a Mac -- 18 configurations, 288 prompts. A person's `.p10k.zsh` is read by `prompt import-p10k`, or its settings written as `prompt set` lines; `prompt style` draws the styles `p10k configure` starts from.
+
+### Git status, from the repository itself
+
+gitstatus.elf, the shell's gitstatusd, reads the sample repository ~/Projects/hello from its own files -- its packed history one commit ahead of origin/main (⇡1), an edited file (!1), a new one (?1), a file under the ignored build/ left out -- and the prompt draws it as on the Mac.
+
+![Git status in the prompt, drawn on EmbLinkOS](187-prompt-gitstatus.png)
 
 ### The Mac's prompt, on EmbLinkOS
 

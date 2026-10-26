@@ -47,8 +47,6 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       images) and `prompt import-p10k` (a ~/.p10k.zsh read: typeset, brace lists, arrays, `if`s, the git
       formatter's colours), options on top by p10k's names. The user's configuration and the four styles match
       recordings of p10k itself cell for cell at 100, 60 and 36 columns (`make prompt-test`).
-- [ ] Git in the prompt is the branch (or commit) from `.git/HEAD` alone, drawn in the loading colours: the
-      counts, ahead/behind, stashes, tag and action come with M10's gitstatus.
 - [ ] Prompt segments with nothing to read here: `battery` (no battery reading reaches the shell, so it is
       not drawn at all), `os_icon`
       (EmbLinkOS is not an OS p10k knows, so it draws nothing, as p10k does for an unknown uname), `context`
@@ -63,7 +61,16 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [ ] `DIR_SHOW_WRITABLE` never shows a lock: the system's `access(2)` allows writing anything that exists, and a
       read-only namespace binding (`/system`) cannot be asked for its mode. `truncate_with_package_name` falls
       back to `truncate_from_right`, as p10k does without `jq`.
-- [ ] M10-M12 Git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
+- [x] M10 Git status: `/system/bin/gitstatus.elf` speaks gitstatusd's protocol and reads repositories itself
+      (packs, index v2-v4, refs, config, ignore rules, worktrees, submodules), keeping trees, file names and
+      directory listings between prompts; the shell waits VCS_MAX_SYNC_LATENCY_SECONDS and redraws when a late
+      answer comes. 201 of 201 answers match gitstatusd 1.5.4 (`make gitstatus-test`); gitclone writes an index;
+      `~/Projects/hello` on both images.
+- [ ] The git status daemon reads SHA-1 repositories with the files ref backend: not SHA-256 objects, reftable,
+      a split or sparse index, config `include` files, or `GIT_DIR` requests (`:dir`). Contents are compared as
+      bytes: clean/smudge filters and line-ending conversion (core.autocrlf, `text` attributes) are not applied,
+      so such files can read as changed. `status.showUntrackedFiles=all` is not taken as `-e`. One thread.
+- [ ] M11-M12 `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
 - [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not

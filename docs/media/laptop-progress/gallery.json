@@ -3657,6 +3657,26 @@
       "featured": false,
       "milestone": "The prompt: Powerlevel10k's engine",
       "historical": false
+    },
+    {
+      "id": "187-prompt-gitstatus",
+      "phase": "The prompt, Powerlevel10k-style",
+      "title": "Git status, from the repository itself",
+      "caption": "gitstatus.elf, the shell's gitstatusd, reads the sample repository ~/Projects/hello from its own files -- its packed history one commit ahead of origin/main (⇡1), an edited file (!1), a new one (?1), a file under the ignored build/ left out -- and the prompt draws it as on the Mac.",
+      "alt": "Git status in the prompt, drawn on EmbLinkOS",
+      "file": "187-prompt-gitstatus.png",
+      "capture_date": "2026-10-26",
+      "environment": "QEMU x86_64, 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; the shell in the Terminal, driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "6c206e27744366cb37ba95277f7bb82494ed2d9186ec23a6b5a4f19349088f66",
+      "source_capture": "shell-gitstatus-abkf5db_/gitstatus-hello.ppm",
+      "source_sha256": "692a9c83940f7f1ec1c4ffc1781ccdc5b3f7fa79e457bd14db1c6408c8236408",
+      "source_commit": "e956b31",
+      "featured": true,
+      "milestone": "The prompt: the git status daemon",
+      "historical": false
     }
   ]
 }

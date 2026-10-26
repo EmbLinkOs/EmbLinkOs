@@ -738,15 +738,53 @@ prompt set transient always
 **The segments.** `dir`, `vcs`, `prompt_char`, `status` (extended states,
 `INT` for Ctrl+C's 130), `command_execution_time`, `background_jobs`, `time`,
 `context` and `os_icon` are drawn, and `_joined` and `newline` work as in p10k.
-Git is read from `.git/HEAD`: the branch (or the commit), in the loading
-colours p10k uses while gitstatus has not answered -- the counts come with the
-git status daemon (M10). `os_icon` shows nothing (EmbLinkOS is not an OS p10k
+Git comes from the git status daemon (below). `os_icon` shows nothing (EmbLinkOS is not an OS p10k
 knows), `context` is DEFAULT or ROOT. `battery` (no battery reading reaches
 the shell) and the segments for tools this system does not have (`direnv`,
 `asdf`, `kubecontext`... about seventy) draw nothing, and `prompt import-p10k` lists
 those a configuration names. `DIR_SHOW_WRITABLE` asks the system's
 `access(2)`, which allows writing anything that exists (EMBKFS has no
 permission bits).
+
+**Git status.** `/system/bin/gitstatus.elf` (`user/gitstatus/`) is the
+shell's gitstatusd: it speaks gitstatusd's protocol -- requests `id ␟ dir ␟ 0
+␞` on its stdin, answers of gitstatusd's 27 fields on its stdout -- and takes
+its flags (`-s -u -c -d` caps, `-m`, `-e`, `-U -W -D`, `-z`). It reads a
+repository's own files: loose objects and packs (`.idx` v2, offset and ref
+deltas, alternates), refs loose and packed, the configuration (the person's,
+then the repository's), the index (v2 to v4, skip-worktree, assume-unchanged),
+`.gitignore` files with `info/exclude` and `core.excludesFile` (git's
+wildmatch), and linked worktrees and submodules. It answers the branch or
+commit, upstream and push remote with the commits ahead and behind
+(libgit2's walk, as gitstatusd counts), the repository's state (`merge`,
+`rebase-i 1/2`, `cherry-seq`, `bisect`, `am`...), staged, unstaged, conflicted
+and untracked counts, stashes, the tag at HEAD and the commit's summary. It
+keeps, per repository, the HEAD tree by commit, each file's name by its stat
+data, and directory listings by their mtime (EMBKFS moves a directory's mtime
+when an entry comes or goes), so a prompt in a known repository reads only
+what changed.
+
+One daemon runs per shell, started on the first prompt in a repository with
+the configuration's `VCS_*_MAX_NUM`, `VCS_MAX_INDEX_SIZE_DIRTY` and
+`VCS_RECURSE_UNTRACKED_DIRS`; it ends when the shell does. The prompt waits
+`VCS_MAX_SYNC_LATENCY_SECONDS` (0.01) for the answer, as p10k waits for
+gitstatusd; later than that, it shows the repository's last known status in
+the loading colours (or `VCS_LOADING_TEXT` the first time), and the editor
+draws it again the moment the answer comes -- while it watches for keys -- and
+a repository slower than that is not waited for next time.
+`VCS_DISABLED_WORKDIR_PATTERN` leaves a repository out. On EmbLinkOS the exec
+bit is not compared (EMBKFS keeps none). `~/Projects/hello` on the image is a
+small sample repository to see it on; `gitclone` writes the index now too, so
+a fresh clone reads clean.
+
+`make gitstatus-test` holds the daemon to gitstatusd itself: 38 repositories
+built the same way every time (fixed names and dates) in every state above,
+each asked under five sets of flags, then one repository changed eleven times
+under one daemon -- 201 answers, field for field
+(`tools/gitstatus_golden.py`, `tests/gitstatus/golden.json`; `record` asks
+gitstatusd again) -- and `gitclone`'s checkout to git (`git fsck`, `git
+status`). Live, `tools/shell_gitstatus_smoke.py` reads the sample repository
+on the OS: ⇡1, then !1 and ?1 as files change, nothing for an ignored one.
 
 **The importer** reads what p10k writes: `typeset -g POWERLEVEL9K_...` with
 brace lists (`{LEFT,RIGHT}_...`), `'...'`, `"..."` and `$'...'`, arrays across
