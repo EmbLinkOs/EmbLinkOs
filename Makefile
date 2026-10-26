@@ -1487,7 +1487,8 @@ SHELL_INC = -Ishell
 SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
              shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h \
-             shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h
+             shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h \
+             shell/prompt/prompt.h
 
 $(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1513,6 +1514,8 @@ $(BUILD)/shobj_wcwidth.o: shell/edit/wcwidth.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_complete.o: shell/complete/complete.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_prompt.o: shell/prompt/prompt.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_eval_extern.o: shell/eval/eval_extern.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
@@ -1533,7 +1536,7 @@ SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o 
              $(BUILD)/shobj_exec.o \
              $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
              $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o \
-             $(BUILD)/shobj_eval_extern.o \
+             $(BUILD)/shobj_prompt.o $(BUILD)/shobj_eval_extern.o \
              $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
 
 build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
@@ -2782,7 +2785,7 @@ shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
-	    shell/builtins/builtins.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/builtins/builtins.c shell/prompt/prompt.c shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/test/host_test.c -o $(BUILD)/shell_test
 	$(BUILD)/shell_test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
@@ -2792,7 +2795,7 @@ shell-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
-	    shell/builtins/builtins.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/builtins/builtins.c shell/prompt/prompt.c shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c \
 	    shell/test/complete_test.c -o $(BUILD)/complete_test
 	$(BUILD)/complete_test

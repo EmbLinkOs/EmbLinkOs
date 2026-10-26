@@ -154,13 +154,16 @@ static bool spawn_shell(struct session *s,const char *dir) {
      * tab is in -- and the shell's crt0 seeds cwd from it. TERM says what
      * this screen is: xterm's sequences, 256 colours, and (COLORTERM) 24-bit
      * colour too. */
-    char home_env[160],pwd_env[224],user_env[64],term_env[48];
+    char home_env[160],pwd_env[224],user_env[64],term_env[48],tz_env[96];
     snprintf(home_env,sizeof home_env,"HOME=%s",home_dir());
     snprintf(pwd_env,sizeof pwd_env,"PWD=%s",dir && dir[0]?dir:home_dir());
     snprintf(user_env,sizeof user_env,"USER=%s",getenv("USER")?getenv("USER"):"user");
     snprintf(term_env,sizeof term_env,"TERM=%s",g_prof.term);
+    /* the system's time zone, as the runtime took it from the preferences:
+     * the prompt's clock reads as the top bar's does */
+    snprintf(tz_env,sizeof tz_env,"TZ=%s",getenv("TZ")?getenv("TZ"):"UTC0");
     char *env[]={home_env,pwd_env,user_env,term_env,"COLORTERM=truecolor",
-                 "TERM_PROGRAM=EmbLinkTerminal","TERM_PROGRAM_VERSION=1.0",NULL};
+                 "TERM_PROGRAM=EmbLinkTerminal","TERM_PROGRAM_VERSION=1.0",tz_env,NULL};
     int64_t h=embk_spawn_env(g_prof.command,argv,env,acts,3);
     close(pair[1]);
     if (h<0) {close(s->master);s->master=-1;return false;}

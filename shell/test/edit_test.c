@@ -81,7 +81,7 @@ static void start(int cols, int rows, enum edit_mode mode) {
     live = vt_init(&term, cols, rows, from_screen, NULL);
     nreplies = 0;
     struct edit_prompt p = { "\033]133;A;edit=shell;cwd=/home\007", "\033[1;36m$\033[0m ", "\033[2m>\033[0m ",
-                             "\033]133;B\007", use_home ? "\033]133;R\007" : NULL };
+                             "\033]133;B\007", use_home ? "\033]133;R\007" : NULL, NULL, NULL };
     if (mode == EDIT_DUMB) { p.mark = p.after = p.home = NULL; p.text = "$ "; p.more = "> "; }
     edit_begin(ed, &p, mode, cols);
 }
@@ -314,6 +314,69 @@ static void test_resize(void) {
           "a redraw already on its way when the window changed lands where the prompt is");
 }
 
+/* A prompt with a right side and a transient form, and one built for the width. */
+static void start_rich(int cols, const char *right, const char *transient) {
+    vt_free(&term);
+    vt_init(&term, cols, 8, from_screen, NULL);
+    nreplies = 0;
+    struct edit_prompt p = { "\033]133;A;edit=shell;cwd=/home\007", "\033[1;36m$\033[0m ", "\033[2m>\033[0m ",
+                             "\033]133;B\007", use_home ? "\033]133;R\007" : NULL, right, transient };
+    edit_begin(ed, &p, EDIT_VT, cols);
+}
+static char g_wide[64];
+static void wide_prompt(void *ctx, int cols, struct edit_prompt *p) {
+    (void)ctx;
+    snprintf(g_wide, sizeof g_wide, "[%d]$ ", cols);
+    p->text = g_wide;
+    p->right = cols >= 20 ? "R" : NULL;
+}
+
+static void test_right_transient(void) {
+    printf("the right prompt and the transient prompt:\n");
+    start_rich(30, "\033[2m12:00:00\033[0m", "\033[32m>\033[0m ");
+    const char *r = row(0);
+    CHECK(!strncmp(r, "$", 1) && strstr(r, "12:00:00") == r + 21 && cx() == 2,
+          "the right side against the edge, one column in; the cursor where the typing starts");
+    keys("echo hi");
+    CHECK(!strncmp(row(0), "$ echo hi", 9) && strstr(row(0), "12:00:00") && cx() == 9, "typing leaves it while there is room");
+    keys(" abcdefghij");                             /* the typing ends at column 20 */
+    CHECK(strstr(row(0), "12:00:00") != NULL, "a column between them is still room");
+    keys("k");
+    CHECK(!strstr(row(0), "12:00:00") && !strcmp(row(0), "$ echo hi abcdefghijk"), "one more and it goes");
+    keys("\x7f");
+    CHECK(strstr(row(0), "12:00:00") != NULL, "and comes back when there is room again");
+    keys("\r");
+    CHECK(last == EDIT_LINE && !strcmp(row(0), "> echo hi abcdefghij") && cy() == 1,
+          "accepted: the prompt is drawn the short way, without its right side");
+    start_rich(30, "R", NULL);
+    keys("\r");
+    CHECK(!strncmp(row(0), "$", 1) && row(0)[28] == 'R' && cy() == 1,
+          "no transient prompt: the line keeps its prompt and its right side, as zsh does");
+
+    /* a prompt built for the width, built again when it changes */
+    struct editor *saved = ed;
+    struct edit_host host = { to_screen, complete, unfinished, NULL, wide_prompt };
+    ed = edit_new(&host);
+    vt_free(&term);
+    vt_init(&term, 24, 8, from_screen, NULL);
+    nreplies = 0;
+    wide_prompt(NULL, 24, &(struct edit_prompt){0});
+    struct edit_prompt p = { "\033]133;A;edit=shell;cwd=/home\007", g_wide, "> ", "\033]133;B\007",
+                             use_home ? "\033]133;R\007" : NULL, "R", NULL };
+    edit_begin(ed, &p, EDIT_VT, 24);
+    keys("ls");
+    CHECK(!strncmp(row(0), "[24]$ ls", 8) && row(0)[22] == 'R', "the prompt for 24 columns");
+    vt_prompt_erase(&term);
+    vt_resize(&term, 16, 8);
+    vt_prompt_here(&term);
+    char report[48];
+    size_t n = vt_size_report(&term, report);
+    keys_n(report, n);
+    CHECK(!strcmp(row(0), "[16]$ ls") && edit_cols(ed) == 16, "and built again for 16: its text, and no right side");
+    edit_free(ed);
+    ed = saved;
+}
+
 static void test_dumb(void) {
     printf("the console (no escapes):\n");
     hist_reset();
@@ -335,7 +398,7 @@ static void test_dumb(void) {
 }
 
 int main(void) {
-    struct edit_host host = { to_screen, complete, unfinished, NULL };
+    struct edit_host host = { to_screen, complete, unfinished, NULL, NULL };
     ed = edit_new(&host);
     if (!ed) { puts("no memory"); return 1; }
     test_typing();
@@ -354,6 +417,11 @@ int main(void) {
     test_completion();
     test_control();
     test_resize();
+    test_right_transient();
+    use_home = false;
+    printf("-- the right and transient prompts, with relative cursor motion:\n");
+    test_right_transient();
+    use_home = true;
     test_dumb();
     edit_free(ed);
     printf(g_fail ? "edit: %d FAILED\n" : "edit: all passed\n", g_fail);

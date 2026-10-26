@@ -5,6 +5,7 @@
  * ========================================================================== */
 #include "builtins/builtins.h"
 #include "hist/hist.h"
+#include "prompt/prompt.h"
 #include "sval/sval.h"
 #include <stdlib.h>
 #include <string.h>
@@ -911,6 +912,9 @@ static struct value bi_help(const struct command *cmd, struct value input,
         { "let x = <expr>",   "bind a variable ($x)" },
         { "assert <cond> [msg]", "stop the program unless the condition is true" },
         { "source <file>",    "run a file's program here: its lets and defs stay" },
+        { "prompt",           "the prompt's options, as a table (~/.config/shell/rc.esh sets them)" },
+        { "prompt set K V...", "set an option (prompt set right status duration time)" },
+        { "prompt get/unset K", "read / forget an option; prompt reset forgets them all" },
         { "cmd out> f / out>> f", "a command's output to a file (replace / append)" },
         { "cmd err> f / out+err> f", "its errors, or both, to a file" },
         { "cmd in< f",        "a file as the command's input" },
@@ -924,6 +928,91 @@ static struct value bi_help(const struct command *cmd, struct value input,
         value_table_push_row(&out, r);
     }
     return out;
+}
+
+/* -------------------------------------------------------------------------
+ * prompt -- the interactive prompt's options (shell/prompt/prompt.h).
+ *
+ *   prompt                    -> table {key, value}
+ *   prompt set KEY VALUE...   -> set; several values are one, space-separated
+ *   prompt get KEY            -> its value, or null
+ *   prompt unset KEY          -> forget it
+ *   prompt reset              -> forget every option
+ *
+ * Keys and words are taken as written (`prompt set right status time`);
+ * a quoted string or a number is its value (`prompt set char "❯"`).
+ * ------------------------------------------------------------------------- */
+static bool prompt_value(const struct command *cmd, size_t from, struct scope *env, char *out, size_t cap,
+                         struct value *error) {
+    out[0] = 0;
+    size_t n = 0;
+    for (size_t i = from; i < cmd->nargs; i++) {
+        char num[32];
+        const char *word = expr_as_word(cmd->args[i]);
+        size_t k = word ? strlen(word) : 0;
+        struct value v = value_null();
+        if (!word) {
+            v = expr_eval(cmd->args[i], env);
+            if (v.type == VAL_ERROR) { *error = v; return false; }
+            if (v.type == VAL_STRING) { word = v.u.s.bytes; k = v.u.s.len; }
+            else if (v.type == VAL_INT) { snprintf(num, sizeof num, "%lld", (long long)v.u.i); word = num; k = strlen(num); }
+            else { value_free(&v); *error = value_error("prompt set: a value is a word, a string or a number"); return false; }
+        }
+        if (n + (n ? 1 : 0) + k >= cap || memchr(word, 0, k)) {
+            value_free(&v); *error = value_error("prompt set: the value is too long"); return false;
+        }
+        if (n) out[n++] = ' ';
+        memcpy(out + n, word, k);
+        n += k;
+        out[n] = 0;
+        value_free(&v);
+    }
+    return true;
+}
+
+static struct value bi_prompt(const struct command *cmd, struct value input, struct scope *env) {
+    value_free(&input);
+    static const char usage[] = "prompt: usage: prompt | prompt set KEY VALUE... | prompt get KEY | prompt unset KEY | prompt reset";
+    if (cmd->nargs == 0) {
+        struct value out = value_table();
+        for (size_t i = 0; i < prompt_opt_count(); i++) {
+            struct value r = value_record();
+            value_record_set(&r, "key", value_string(prompt_opt_key(i)));
+            value_record_set(&r, "value", value_string(prompt_opt_value(i)));
+            value_table_push_row(&out, r);
+        }
+        return out;
+    }
+    const char *sub = expr_as_word(cmd->args[0]);
+    const char *key = cmd->nargs > 1 ? expr_as_word(cmd->args[1]) : NULL;
+    char quoted[PROMPT_KEY_MAX + 1];
+    if (cmd->nargs > 1 && !key) {                    /* a key may be quoted too */
+        struct value k = expr_eval(cmd->args[1], env);
+        if (k.type == VAL_STRING && k.u.s.len < sizeof quoted && !memchr(k.u.s.bytes, 0, k.u.s.len)) {
+            memcpy(quoted, k.u.s.bytes, k.u.s.len);
+            quoted[k.u.s.len] = 0;
+            key = quoted;
+        }
+        value_free(&k);
+    }
+    if (!sub) return value_error(usage);
+    if (!strcmp(sub, "reset") && cmd->nargs == 1) { prompt_opt_reset(); return value_null(); }
+    if (!key) return value_error(usage);
+    if (!prompt_key_valid(key)) return value_error("prompt: a key is lower-case words joined by dots (dir.anchor.fg)");
+    if (!strcmp(sub, "set")) {
+        if (cmd->nargs < 3) return value_error("prompt set: needs KEY and VALUE");
+        char value[PROMPT_VALUE_MAX];
+        struct value error;
+        if (!prompt_value(cmd, 2, env, value, sizeof value, &error)) return error;
+        if (!prompt_opt_set(key, value)) return value_error("prompt set: too many options");
+        return value_null();
+    }
+    if (!strcmp(sub, "get") && cmd->nargs == 2) {
+        const char *v = prompt_opt(key);
+        return v ? value_string(v) : value_null();
+    }
+    if (!strcmp(sub, "unset") && cmd->nargs == 2) { (void)prompt_opt_unset(key); return value_null(); }
+    return value_error(usage);
 }
 
 /* -------------------------------------------------------------------------
@@ -954,6 +1043,7 @@ static const struct { const char *name; builtin_fn fn; } g_pure[] = {
     { "lines",   bi_lines   }, { "trim",    bi_trim    },
     { "upper",   bi_upper   }, { "lower",   bi_lower   },
     { "replace", bi_replace },
+    { "prompt",  bi_prompt  },
 };
 
 builtin_fn builtin_lookup(const char *name) {

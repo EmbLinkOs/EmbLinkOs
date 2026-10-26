@@ -41,16 +41,7 @@ struct edit_matches {
 /* For a completer: append one candidate (both strings are copied). */
 bool edit_matches_add(struct edit_matches *m, const char *insert, const char *show, bool dir);
 
-struct edit_host {
-    void (*write)(void *ctx, const char *bytes, size_t n);
-    /* Candidates for the word ending at `cursor`. NULL = no completion. */
-    void (*complete)(void *ctx, const char *line, size_t cursor, struct edit_matches *out);
-    /* True when `text` is an unfinished program (an open brace, a trailing
-     * pipe, an unterminated string): Enter then starts another line instead
-     * of running it. NULL = every line is complete. */
-    bool (*incomplete)(void *ctx, const char *text);
-    void *ctx;
-};
+
 
 enum edit_mode { EDIT_VT, EDIT_DUMB };
 enum edit_result {
@@ -67,8 +58,28 @@ enum edit_result {
  * has one, returns the cursor to where the prompt began (the EmbLink
  * Terminal's OSC 133;R): every redraw starts with it instead of counting rows
  * back up, so a redraw is right even when a resize moved everything while it
- * was on its way. All may be NULL. */
-struct edit_prompt { const char *mark, *text, *more, *after, *home; };
+ * was on its way. `right` is drawn against the right edge of the row the
+ * typing starts on (zsh's RPROMPT), one column in from it, and is left out
+ * while the typing would reach it. `transient` replaces the whole prompt once
+ * the line is accepted (Powerlevel10k's transient prompt), so the scrollback
+ * keeps the commands, not every full prompt. All may be NULL. */
+struct edit_prompt { const char *mark, *text, *more, *after, *home, *right, *transient; };
+
+struct edit_host {
+    void (*write)(void *ctx, const char *bytes, size_t n);
+    /* Candidates for the word ending at `cursor`. NULL = no completion. */
+    void (*complete)(void *ctx, const char *line, size_t cursor, struct edit_matches *out);
+    /* True when `text` is an unfinished program (an open brace, a trailing
+     * pipe, an unterminated string): Enter then starts another line instead
+     * of running it. NULL = every line is complete. */
+    bool (*incomplete)(void *ctx, const char *text);
+    void *ctx;
+    /* The prompt for a new width: a prompt that fills the row (a right side
+     * pushed to the edge) is built for one width, and is built again when the
+     * terminal says it has another. Fills in text, right and transient (each
+     * valid until the next call). NULL = the prompt does not depend on it. */
+    void (*reprompt)(void *ctx, int cols, struct edit_prompt *prompt);
+};
 
 struct editor;
 struct editor *edit_new(const struct edit_host *host);

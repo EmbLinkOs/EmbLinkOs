@@ -10,6 +10,7 @@
 #include "wire/wire.h"
 #include "sval/sval.h"
 #include "hist/hist.h"
+#include "prompt/prompt.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -782,6 +783,113 @@ static void test_redirect_text(void) {
     value_free(&t); wire_buf_free(&b);
 }
 
+static bool count_is(const char *line, struct scope *top, int64_t want) {
+    struct value v = run(line, value_null(), top);
+    bool ok = v.type == VAL_INT && v.u.i == want;
+    value_free(&v);
+    return ok;
+}
+static bool string_is(const char *line, struct scope *top, const char *want) {
+    struct value v = run(line, value_null(), top);
+    bool ok = v.type == VAL_STRING && v.u.s.len == strlen(want) && !memcmp(v.u.s.bytes, want, v.u.s.len);
+    value_free(&v);
+    return ok;
+}
+static bool fails(const char *line, struct scope *top) {
+    struct value v = run(line, value_null(), top);
+    bool ok = v.type == VAL_ERROR;
+    value_free(&v);
+    return ok;
+}
+static const char *after(const char *hay, const char *needle, const char *from) {
+    const char *at = strstr(from ? from : hay, needle);
+    return at ? at : NULL;
+}
+
+static void test_prompt(void) {
+    printf("the prompt: options and what they build:\n");
+    struct scope top;
+    scope_init(&top, NULL);
+    prompt_opt_reset();
+    struct value v = run("prompt set right status duration time", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("right"), "status duration time"), "set: the words are one value");
+    value_free(&v);
+    v = run("prompt set char \"\xe2\x9d\xaf\"", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("char"), "\xe2\x9d\xaf"), "a quoted string is its value");
+    value_free(&v);
+    v = run("prompt set duration.threshold 5", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("duration.threshold"), "5"), "a number too");
+    value_free(&v);
+    CHECK(string_is("prompt get char", &top, "\xe2\x9d\xaf"), "get: the value");
+    CHECK(count_is("prompt | count", &top, 3), "prompt: a table of them");
+    CHECK(fails("prompt set Dir.fg 4", &top) && fails("prompt set \"a..b\" 4", &top) && fails("prompt set \".a\" 4", &top) &&
+          fails("prompt set \"a b\" 4", &top) && fails("prompt set \"a.\" 4", &top),
+          "a key is lower-case words joined by single dots");
+    v = run("prompt set \"dir.fg\" 4", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("dir.fg"), "4") && prompt_opt_unset("dir.fg"), "and may be quoted");
+    value_free(&v);
+    CHECK(fails("prompt set right", &top) && fails("prompt frob", &top), "and usage errors say so");
+    v = run("prompt set dir.anchor.fg 39", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("dir.anchor.fg"), "39"), "a key the builder does not use yet is kept");
+    value_free(&v);
+    v = run("prompt unset char", value_null(), &top);
+    value_free(&v);
+    v = run("prompt get char", value_null(), &top);
+    CHECK(v.type == VAL_NULL && count_is("prompt | count", &top, 3), "unset: gone");
+    value_free(&v);
+    v = run("prompt reset", value_null(), &top);
+    value_free(&v);
+    CHECK(count_is("prompt | count", &top, 0), "reset: all of them");
+
+    struct prompt_state st = { "yves", "emblink", "~/src", "~/src", 1, 4200, 14, 5, 9 };
+    struct prompt_text t;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.left, "yves@emblink:~/src$") && !t.right[0] && !t.transient[0],
+          "by default: the prompt as before, nothing on the right, no transient prompt");
+    prompt_opt_set("right", "status duration time");
+    prompt_build(&st, 80, &t);
+    const char *a = after(t.right, "\xe2\x9c\x98 1", NULL), *b = a ? after(t.right, "4s", a) : NULL, *c = b ? after(t.right, "14:05:09", b) : NULL;
+    CHECK(a && b && c, "the right side: ✘ and the status, the duration, the time -- in that order");
+    prompt_opt_set("time.format", "12h");
+    st.status = 0; st.duration_ms = 500;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "\xe2\x9c\x94") && !strstr(t.right, "0s") && strstr(t.right, "02:05:09 PM"),
+          "✔ for success; a short command shows no duration; a 12-hour clock");
+    st.status = -1;
+    prompt_build(&st, 80, &t);
+    CHECK(!strstr(t.right, "\xe2\x9c") && strstr(t.right, "PM"), "before the first command: the time alone");
+    st.status = 0;
+    st.duration_ms = 3725000;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "1h 2m 5s") != NULL, "an hour and more");
+    st.duration_ms = 65000;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "1m 5s") != NULL, "a minute and more");
+    prompt_opt_set("duration.threshold", "90");
+    prompt_build(&st, 80, &t);
+    CHECK(!strstr(t.right, "1m 5s"), "under the threshold: not shown");
+    prompt_opt_set("right", "status nonsense time");
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "\xe2\x9c\x94") && !strstr(t.right, "nonsense"), "an element it does not know is left out");
+    prompt_opt_set("transient", "always");
+    prompt_opt_set("char", "\xe2\x9d\xaf");
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.transient, "\033[1;32m\xe2\x9d\xaf") && strstr(t.left, "\xe2\x9d\xaf"),
+          "transient: the prompt character alone, green after success");
+    st.status = 2;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.transient, "\033[1;31m") != NULL, "red after a failure");
+    prompt_opt_set("transient", "same-dir");
+    st.last_dir = "~";
+    prompt_build(&st, 80, &t);
+    CHECK(!t.transient[0], "same-dir: not right after the directory changed");
+    st.last_dir = "~/src";
+    prompt_build(&st, 80, &t);
+    CHECK(t.transient[0] != 0, "and again once it stays");
+    prompt_opt_reset();
+    scope_free(&top);
+}
+
 int main(void) {
     printf("=== shell host tests ===\n");
     test_lexer();
@@ -794,6 +902,7 @@ int main(void) {
     test_hist_file();
     test_incomplete();
     test_redirect_text();
+    test_prompt();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);
     return g_fail;
 }

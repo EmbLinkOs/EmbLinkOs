@@ -1294,6 +1294,7 @@ def discover_userland_objects(build_dir="build"):
                   "eval/exec.c", "eval/exec.h",
                   "edit/edit.c", "edit/edit.h", "edit/wcwidth.c", "edit/wcwidth.h",
                   "complete/complete.c", "complete/complete.h",
+                  "prompt/prompt.c", "prompt/prompt.h",
                   "builtins/builtins.c", "builtins/builtins_os.c",
                   "builtins/builtins.h",
                   "hist/hist.c", "hist/hist.h",

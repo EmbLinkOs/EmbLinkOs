@@ -26,6 +26,7 @@
 #include "hist/hist.h"
 #include "edit/edit.h"
 #include "complete/complete.h"
+#include "prompt/prompt.h"
 #include "embk.h"
 #include <unistd.h>
 #include <string.h>
@@ -34,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 
 
 #define LINE_MAX_LEN 512
@@ -344,6 +346,45 @@ static void prompt_where(char *where, size_t cap) {
         snprintf(where, cap, "%s", cwd);
 }
 
+/* The prompt (shell/prompt): built from what the shell is doing now, and
+ * built again for a new width (edit_host.reprompt) from the same state. */
+static struct prompt_state g_pstate;
+static struct prompt_text g_ptext;
+static void prompt_into(struct edit_prompt *p) {
+    p->text = g_ptext.left;
+    p->right = g_ptext.right[0] ? g_ptext.right : NULL;
+    p->transient = g_ptext.transient[0] ? g_ptext.transient : NULL;
+}
+static void reprompt(void *ctx, int cols, struct edit_prompt *p) {
+    (void)ctx;
+    prompt_build(&g_pstate, cols, &g_ptext);
+    prompt_into(p);
+}
+
+/* Whether directory `dir` lists `name`. Looking a missing file up costs a
+ * line in the kernel's log, so the start of every shell looks first. */
+static bool listed(const char *dir, const char *name) {
+    static struct embk_dirent ents[64];
+    int64_t n = embk_readdir(dir[0] ? dir : "/", ents, 64);
+    for (int64_t i = 0; i < n; i++) if (!strcmp(ents[i].name, name)) return true;
+    return false;
+}
+
+/* ~/.config/shell/rc.esh, for a session a person types into: the prompt's
+ * options (prompt set ...) and whatever else they want every time. Scripts
+ * and -c do not read it. Its errors are printed; the shell starts anyway. */
+static void source_rc(struct scope *top) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char base[200], config[224], shell[240], path[256];
+    snprintf(base, sizeof base, "%s", strcmp(home, "/") ? home : "");
+    snprintf(config, sizeof config, "%s/.config", base);
+    snprintf(shell, sizeof shell, "%s/shell", config);
+    if (!listed(base, ".config") || !listed(config, "shell") || !listed(shell, "rc.esh")) return;
+    snprintf(path, sizeof path, "%s/rc.esh", shell);
+    (void)run_script(path, top);
+}
+
 /* History lives in the user's home and is appended as lines are accepted, so
  * every Terminal tab and every session adds to the same one. */
 static void open_history(void) {
@@ -445,7 +486,8 @@ int main(int argc, char **argv) {
     puts1("EmbLink shell -- structured pipelines. `exit` leaves.\n");
     bool interactive = g_terminal_session || g_console_session;
     if (interactive) open_history();
-    struct edit_host host = { out_write, shell_complete, unfinished, &top };
+    if (interactive) source_rc(&top);
+    struct edit_host host = { out_write, shell_complete, unfinished, &top, reprompt };
     g_ed = edit_new(&host);
     /* While the line is edited the shell reads every key itself: no line
      * discipline, no echo, ^C as a byte (the editor's own), CR as CR. */
@@ -455,6 +497,8 @@ int main(int argc, char **argv) {
     editing.c_cc[VMIN] = 1;
     editing.c_cc[VTIME] = 0;
     int status = -1;                          /* the last command's; -1 before the first */
+    uint64_t duration = 0;                    /* how long it ran, ms */
+    char last_where[200] = "";                /* where the last prompt was */
     (void)scope_bind(&top, "status", value_int(0));
     char plain[LINE_MAX_LEN];
     for (;;) {
@@ -476,27 +520,31 @@ int main(int argc, char **argv) {
                 snprintf(done, sizeof done, "\033]133;D;%d\007", status);
                 puts1(done);
             }
-            char where[200], cwd[192], mark[256], text[320];
+            char where[200], cwd[192], mark[256];
             prompt_where(where, sizeof where);
             if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
             for (char *p = cwd; *p; p++) if ((unsigned char)*p < 32 || (unsigned char)*p == 127) *p = '?';
             snprintf(mark, sizeof mark, "\033]133;A;edit=shell;cwd=%s\007", cwd);
-            const char *user = getenv("USER"), *hostname = getenv("HOSTNAME");
-            snprintf(text, sizeof text, "\033[1;36m%s@%s:%s$\033[0m ",
-                     user && *user ? user : "user", hostname && *hostname ? hostname : "emblink", where);
+            time_t now = time(NULL);
+            struct tm *tm = localtime(&now);
+            g_pstate = (struct prompt_state){ getenv("USER"), getenv("HOSTNAME"), where, last_where, status, duration,
+                                              tm ? tm->tm_hour : 0, tm ? tm->tm_min : 0, tm ? tm->tm_sec : 0 };
+            prompt_build(&g_pstate, cols, &g_ptext);
             const char *program = getenv("TERM_PROGRAM");
             bool ours = program && !strcmp(program, "EmbLinkTerminal");
-            struct edit_prompt prompt = { mark, text, "\033[2m...\033[0m ", "\033]133;B\007",
-                                          ours ? "\033]133;R\007" : NULL };
+            struct edit_prompt prompt = { mark, NULL, "\033[2m...\033[0m ", "\033]133;B\007",
+                                          ours ? "\033]133;R\007" : NULL, NULL, NULL };
+            prompt_into(&prompt);
             (void)tcsetattr(0, TCSANOW, &editing);
             enum edit_result r = edit_one_line(&prompt, EDIT_VT);
             (void)tcsetattr(0, TCSANOW, &g_prompt_attr);
             puts1("\033[0 q");
+            snprintf(last_where, sizeof last_where, "%s", where);
             if (r == EDIT_EOF) break;
             if (r == EDIT_CANCEL) { status = 130; continue; }
             line = edit_line(g_ed);
         } else if (g_console_session && g_ed) {
-            struct edit_prompt prompt = { NULL, "embk> ", "...> ", NULL, NULL };
+            struct edit_prompt prompt = { NULL, "embk> ", "...> ", NULL, NULL, NULL, NULL };
             enum edit_result r = edit_one_line(&prompt, EDIT_DUMB);
             if (r == EDIT_EOF) break;
             if (r == EDIT_CANCEL) continue;
@@ -509,7 +557,9 @@ int main(int argc, char **argv) {
         if (strcmp(line, "exit") == 0) break;
         if (interactive) hist_push(line);
         if (g_terminal_session) puts1("\033]133;C\007");
+        uint64_t started = embk_uptime_ms();
         status = run_line(line, &top);
+        duration = embk_uptime_ms() - started;
         (void)scope_bind(&top, "status", value_int(status));
     }
     edit_free(g_ed);

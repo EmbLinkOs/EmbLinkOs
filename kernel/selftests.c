@@ -8631,7 +8631,7 @@ int selftests_handle_command(const char *cmd)
         kprintf("[v2] (1) building the shell from /data/src/shell\n");
         char *a1[] = { bb, "/data/src/shell/build.ebm", NULL };
         rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
-        if (rc != 0 || !emb_find(cap, "16 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }   /* 15 units + the link */
+        if (rc != 0 || !emb_find(cap, "17 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }   /* 16 units + the link */
 
         /* (2) verify the staged shell BEFORE adoption */
         if (ok) {

@@ -84,7 +84,7 @@ static int terminal_cols(void) {
 void interactive_init(struct mrsh_state *state) {
 	struct termios t;
 	if (tcgetattr(STDIN_FILENO, &t) != 0) return;     /* a pipe: plain lines */
-	struct edit_host host = { to_terminal, sh_complete, unfinished, state };
+	struct edit_host host = { to_terminal, sh_complete, unfinished, state, NULL };
 	editor = edit_new(&host);
 	const char *home = getenv("HOME");
 	if (home && home[0] && strcmp(home, "/")) {
@@ -160,7 +160,7 @@ size_t interactive_next(struct mrsh_state *state,
 	snprintf(mark, sizeof mark, "\033]133;A;edit=shell;cwd=%s\007", cwd);
 	const char *program = getenv("TERM_PROGRAM");
 	bool ours = program && !strcmp(program, "EmbLinkTerminal");
-	struct edit_prompt p = { mark, prompt, "\033[2m...\033[0m ", "\033]133;B\007", ours ? "\033]133;R\007" : NULL };
+	struct edit_prompt p = { mark, prompt, "\033[2m...\033[0m ", "\033]133;B\007", ours ? "\033]133;R\007" : NULL, NULL, NULL };
 
 	/* Every key is the editor's while the line is edited; whatever the
 	 * terminal was set to (a program before may have changed it) comes back

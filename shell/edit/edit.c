@@ -61,6 +61,7 @@ static void buf_set(struct buf *b, const char *s, size_t n) {
     b->p[n] = '\0';
 }
 static const char *buf_text(const struct buf *b) { return b->p ? b->p : ""; }
+static char *dup_or_null(const char *s) { return s ? strdup(s) : 0; }
 
 /* --- keys ------------------------------------------------------------------ */
 
@@ -92,7 +93,7 @@ enum last_action { A_OTHER, A_INSERT, A_KILL, A_YANK, A_PREFIX };
 struct editor {
     struct edit_host host;
     enum edit_mode mode;
-    char *mark, *prompt, *more, *after, *home;
+    char *mark, *prompt, *more, *after, *home, *right, *transient;
     int cols;
 
     struct buf line;          /* the text being edited, NUL-terminated */
@@ -540,6 +541,27 @@ static void render_vt(struct editor *e) {
     struct pos p = { 0, 0 }, cursor = { 0, 0 };
     buf_str(o, e->prompt);
     if (e->prompt) layout(e->prompt, strlen(e->prompt), &p, cols);
+    /* The right prompt, against the edge one column in -- while the typing
+     * on this row leaves a column between them. It is drawn now, before the
+     * typing, and the cursor comes back to where the typing starts. */
+    if (e->right && e->right[0] && !e->searching) {
+        struct pos q = p;
+        bool fits = true;
+        for (size_t i = 0; i < e->line.n && fits;) {
+            if (e->line.p[i] == '\n') break;
+            int len;
+            int w = wcwidth_cp(cp_at(e, i, &len));
+            if (w > 0) { if (q.col + w > cols) fits = false; else q.col += w; }
+            i += (size_t)len;
+        }
+        int rw = text_width(e->right), at = cols - 1 - rw;
+        if (fits && rw > 0 && q.col + 1 <= at && at > p.col) {
+            buf_fmt(o, "\033[%dC", at - p.col);
+            buf_str(o, e->right);
+            buf_str(o, "\r");
+            if (p.col > 0) buf_fmt(o, "\033[%dC", p.col);
+        }
+    }
     if (e->fresh) buf_str(o, e->after);
     for (size_t i = 0; i <= e->line.n;) {
         if (i == e->cur) cursor = settled(p, cols);
@@ -677,6 +699,12 @@ static void finish(struct editor *e, enum edit_result r, const char *note) {
     if (e->searching) search_end(e, true);
     if (e->menu) menu_close(e);
     e->cur = e->line.n;
+    /* Once a line is done its prompt is drawn the short way, if there is one:
+     * the scrollback keeps the commands, not every full prompt. */
+    if (e->mode == EDIT_VT && e->transient) {
+        free(e->prompt); e->prompt = strdup(e->transient);
+        free(e->right); e->right = 0;
+    }
     render(e);
     if (note) buf_str(&e->out, note);
     if (e->mode == EDIT_VT) buf_str(&e->out, "\033[?2004l\033[?2048l");
@@ -797,10 +825,20 @@ static bool menu_key(struct editor *e, struct key k) {
     return false;
 }
 
+/* The host's prompt for the width now (edit_host.reprompt). */
+static void reprompt(struct editor *e) {
+    if (!e->host.reprompt) return;
+    struct edit_prompt p = { e->mark, e->prompt, e->more, e->after, e->home, e->right, e->transient };
+    e->host.reprompt(e->host.ctx, e->cols, &p);
+    char *text = dup_or_null(p.text), *right = dup_or_null(p.right), *transient = dup_or_null(p.transient);
+    free(e->prompt); free(e->right); free(e->transient);
+    e->prompt = text; e->right = right; e->transient = transient;
+}
+
 static void handle(struct editor *e, struct key k) {
     if (k.kind == K_NONE) return;
     if (k.kind == K_RESIZE) {
-        if (k.cols > 0) e->cols = k.cols;
+        if (k.cols > 0 && k.cols != e->cols) { e->cols = k.cols; reprompt(e); }
         /* The first report answers turning reports on and moved nothing.
          * Every later one follows a resize: the Terminal erased the prompt
          * and the next redraw returns to where it began (home). Without home
@@ -1106,7 +1144,8 @@ struct editor *edit_new(const struct edit_host *host) {
 
 static void prompt_free(struct editor *e) {
     free(e->mark); free(e->prompt); free(e->more); free(e->after); free(e->home);
-    e->mark = e->prompt = e->more = e->after = e->home = 0;
+    free(e->right); free(e->transient);
+    e->mark = e->prompt = e->more = e->after = e->home = e->right = e->transient = 0;
 }
 
 void edit_free(struct editor *e) {
@@ -1121,7 +1160,6 @@ void edit_free(struct editor *e) {
     free(e);
 }
 
-static char *dup_or_null(const char *s) { return s ? strdup(s) : 0; }
 
 static void flush(struct editor *e) {
     if (e->out.n && e->host.write) e->host.write(e->host.ctx, e->out.p, e->out.n);
@@ -1136,6 +1174,8 @@ void edit_begin(struct editor *e, const struct edit_prompt *prompt, enum edit_mo
         e->more = dup_or_null(prompt->more);
         e->after = dup_or_null(prompt->after);
         e->home = dup_or_null(prompt->home);
+        e->right = dup_or_null(prompt->right);
+        e->transient = dup_or_null(prompt->transient);
     }
     e->mode = mode;
     if (cols > 0) e->cols = cols;
@@ -1187,7 +1227,7 @@ enum edit_result edit_escape_timeout(struct editor *e) {
 }
 
 void edit_resize(struct editor *e, int cols, bool cleared) {
-    if (cols > 0) e->cols = cols;
+    if (cols > 0 && cols != e->cols) { e->cols = cols; reprompt(e); }
     if (cleared) e->fresh = true;
     if (e->result == EDIT_MORE) { render(e); flush(e); }
 }
