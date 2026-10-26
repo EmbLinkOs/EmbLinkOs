@@ -6,6 +6,7 @@
 #include "builtins/builtins.h"
 #include "hist/hist.h"
 #include "prompt/prompt.h"
+#include "prompt/wizard_os.h"
 #include "sval/sval.h"
 #include <stdlib.h>
 #include <string.h>
@@ -915,6 +916,7 @@ static struct value bi_help(const struct command *cmd, struct value input,
         { "prompt",           "the prompt's options, as a table (~/.config/shell/rc.esh sets them)" },
         { "prompt set K V...", "set an option (prompt set right status duration time)" },
         { "prompt get/unset K", "read / forget an option; prompt reset forgets them all" },
+        { "prompt configure", "Powerlevel10k's wizard: answer questions, get a prompt" },
         { "cmd out> f / out>> f", "a command's output to a file (replace / append)" },
         { "cmd err> f / out+err> f", "its errors, or both, to a file" },
         { "cmd in< f",        "a file as the command's input" },
@@ -941,6 +943,8 @@ static struct value bi_help(const struct command *cmd, struct value input,
  *   prompt style [NAME]       -> Powerlevel10k's style NAME as the base (plain: none);
  *                                alone, the base's name
  *   prompt import-p10k FILE   -> a ~/.p10k.zsh as the base -> {parameters, ignored}
+ *   prompt configure          -> Powerlevel10k's wizard: questions, then the
+ *                                configuration written and loaded
  *
  * Keys and words are taken as written (`prompt set right status time`);
  * a quoted string or a number is its value (`prompt set char "❯"`).
@@ -1054,7 +1058,7 @@ static struct value prompt_p10k(const struct command *cmd, const char *sub, stru
 static struct value bi_prompt(const struct command *cmd, struct value input, struct scope *env) {
     value_free(&input);
     static const char usage[] = "prompt: usage: prompt | prompt set KEY VALUE... | prompt get KEY | prompt unset KEY | "
-                                "prompt reset | prompt style [NAME] | prompt import-p10k FILE";
+                                "prompt reset | prompt style [NAME] | prompt import-p10k FILE | prompt configure";
     if (cmd->nargs == 0) {
         struct value out = value_table();
         for (size_t i = 0; i < prompt_opt_count(); i++) {
@@ -1080,6 +1084,10 @@ static struct value bi_prompt(const struct command *cmd, struct value input, str
     if (!sub) return value_error(usage);
     if (!strcmp(sub, "style") || !strcmp(sub, "import-p10k")) return prompt_p10k(cmd, sub, env);
     if (!strcmp(sub, "reset") && cmd->nargs == 1) { prompt_opt_reset(); return value_null(); }
+    if (!strcmp(sub, "configure") && cmd->nargs == 1) {
+        char err[200];
+        return wizard_os_run(true, err, sizeof err) < 0 ? value_error(err) : value_null();
+    }
     if (!key) return value_error(usage);
     if (!prompt_key_valid(key)) return value_error("prompt: a key is lower-case words joined by dots (dir.anchor.fg)");
     if (!strcmp(sub, "set")) {

@@ -40,7 +40,6 @@ static void color_param(const char *c, size_t n, bool bg, char out[24]) {
 /* What the text is drawn with: the escapes change `want`, and one SGR brings
  * the terminal (`have`) there just before something is shown -- a prompt
  * string says %b%k%f at every segment, the terminal hears it once. */
-struct zpen { char fg[24], bg[24]; bool bold, ul, so; };
 struct zout { struct sb *out; struct zpen want, have; };
 
 static void flush(struct zout *z) {
@@ -122,6 +121,13 @@ void p9k_zexpand(const char *z, const struct p10k_state *st, struct sb *out) {
     struct zout o = { out, { "", "", false, false, false }, { "", "", false, false, false } };
     zexpand_n(z, strlen(z), st, &o);
     flush(&o);                                       /* how the string leaves the terminal */
+}
+
+void p9k_zexpand_on(const char *z, const struct p10k_state *st, struct sb *out, struct zpen *pen) {
+    struct zout o = { out, *pen, *pen };
+    zexpand_n(z, strlen(z), st, &o);
+    flush(&o);
+    *pen = o.have;
 }
 
 static void zexpand_n(const char *z, size_t len, const struct p10k_state *st, struct zout *o) {

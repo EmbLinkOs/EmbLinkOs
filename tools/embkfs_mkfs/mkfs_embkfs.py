@@ -1306,6 +1306,7 @@ def discover_userland_objects(build_dir="build"):
                   "prompt/p10k_zsh.c", "prompt/p10k_render.c", "prompt/p10k_import.c",
                   "prompt/icons.c", "prompt/icons.h", "prompt/colors.c", "prompt/colors.h",
                   "prompt/prompt_os.c", "prompt/prompt_os.h",
+                  "prompt/wizard.c", "prompt/wizard.h", "prompt/wizard_os.c", "prompt/wizard_os.h",
                   "builtins/builtins.c", "builtins/builtins_os.c",
                   "builtins/builtins.h",
                   "hist/hist.c", "hist/hist.h",

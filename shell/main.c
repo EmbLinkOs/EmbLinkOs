@@ -28,6 +28,7 @@
 #include "complete/complete.h"
 #include "prompt/prompt.h"
 #include "prompt/prompt_os.h"
+#include "prompt/wizard_os.h"
 #include "embk.h"
 #include <unistd.h>
 #include <string.h>
@@ -397,9 +398,11 @@ static bool listed(const char *dir, const char *name) {
     return false;
 }
 
-/* ~/.config/shell/rc.esh, for a session a person types into: the prompt's
- * options (prompt set ...) and whatever else they want every time. Scripts
- * and -c do not read it. Its errors are printed; the shell starts anyway. */
+/* ~/.config/shell/prompt.esh, then rc.esh, for a session a person types
+ * into: the prompt `prompt configure` wrote (it loads ~/.config/shell/p10k.zsh),
+ * then the person's own options (prompt set ...) and whatever else they want
+ * every time. Scripts and -c do not read them. Their errors are printed; the
+ * shell starts anyway. */
 static void source_rc(struct scope *top) {
     const char *home = getenv("HOME");
     if (!home || !home[0]) return;
@@ -407,9 +410,13 @@ static void source_rc(struct scope *top) {
     snprintf(base, sizeof base, "%s", strcmp(home, "/") ? home : "");
     snprintf(config, sizeof config, "%s/.config", base);
     snprintf(shell, sizeof shell, "%s/shell", config);
-    if (!listed(base, ".config") || !listed(config, "shell") || !listed(shell, "rc.esh")) return;
-    snprintf(path, sizeof path, "%s/rc.esh", shell);
-    (void)run_script(path, top);
+    if (!listed(base, ".config") || !listed(config, "shell")) return;
+    static const char *const files[] = { "prompt.esh", "rc.esh" };
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        if (!listed(shell, files[i])) continue;
+        snprintf(path, sizeof path, "%s/%s", shell, files[i]);
+        (void)run_script(path, top);
+    }
 }
 
 /* History lives in the user's home and is appended as lines are accepted, so
@@ -514,6 +521,8 @@ int main(int argc, char **argv) {
     bool interactive = g_terminal_session || g_console_session;
     if (interactive) open_history();
     if (interactive) source_rc(&top);
+    /* No prompt configured: Powerlevel10k's wizard, as zsh starts it */
+    if (g_terminal_session && wizard_os_wanted()) (void)wizard_os_run(false, NULL, 0);
     struct edit_host host = { out_write, shell_complete, unfinished, &top, reprompt };
     g_ed = edit_new(&host);
     /* While the line is edited the shell reads every key itself: no line

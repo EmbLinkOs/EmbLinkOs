@@ -53,5 +53,12 @@ void p9k_git_formatter(const struct p10k *cfg, const struct p10k_state *st, bool
 
 /* The zsh prompt string to SGR, and its width. */
 void p9k_zexpand(const char *z, const struct p10k_state *st, struct sb *out);
+/* What text is drawn with: the colours as SGR parameters ("38;5;39", ""
+ * for the default), bold, underline, standout. */
+struct zpen { char fg[24], bg[24]; bool bold, ul, so; };
+/* The same, for strings printed one after another as `print -P` prints them:
+ * each goes on with the pen the terminal has (`pen`, left as the string
+ * leaves it) rather than from the default. */
+void p9k_zexpand_on(const char *z, const struct p10k_state *st, struct sb *out, struct zpen *pen);
 
 #endif

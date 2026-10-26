@@ -399,6 +399,7 @@ ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
                  shell/builtins/builtins.c shell/prompt/prompt.c shell/hist/hist.c \
                  shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c \
                  shell/prompt/p10k_import.c shell/prompt/icons.c shell/prompt/colors.c shell/prompt/prompt_os.c \
+                 shell/prompt/wizard.c shell/prompt/wizard_os.c \
                  shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c \
                  shell/eval/eval_extern.c shell/builtins/builtins_os.c
 ARM_SHELL_SDK := shell/value/value.c shell/wire/wire.c shell/sval/sval.c

@@ -1499,7 +1499,7 @@ SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h \
              shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h \
              shell/prompt/prompt.h shell/prompt/p10k.h shell/prompt/p10k_int.h shell/prompt/icons.h \
-             shell/prompt/colors.h shell/prompt/prompt_os.h
+             shell/prompt/colors.h shell/prompt/prompt_os.h shell/prompt/wizard.h shell/prompt/wizard_os.h
 
 $(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1541,6 +1541,10 @@ $(BUILD)/shobj_colors.o: shell/prompt/colors.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_prompt_os.o: shell/prompt/prompt_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wizard.o: shell/prompt/wizard.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wizard_os.o: shell/prompt/wizard_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_eval_extern.o: shell/eval/eval_extern.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
@@ -1564,7 +1568,8 @@ SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o 
              $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o \
              $(BUILD)/shobj_prompt.o $(BUILD)/shobj_p10k.o $(BUILD)/shobj_p10k_zsh.o \
              $(BUILD)/shobj_p10k_render.o $(BUILD)/shobj_p10k_import.o $(BUILD)/shobj_icons.o \
-             $(BUILD)/shobj_colors.o $(BUILD)/shobj_prompt_os.o $(BUILD)/shobj_eval_extern.o \
+             $(BUILD)/shobj_colors.o $(BUILD)/shobj_prompt_os.o $(BUILD)/shobj_wizard.o \
+             $(BUILD)/shobj_wizard_os.o $(BUILD)/shobj_eval_extern.o \
              $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
 
 build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
@@ -2818,6 +2823,8 @@ PROMPT_SRC = shell/prompt/prompt.c shell/prompt/p10k.c shell/prompt/p10k_zsh.c s
 # same states on a Mac (tools/golden_prompt.py, tests/prompt/golden).
 P10K_HOST_SRC = shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c shell/prompt/p10k_import.c \
                 shell/prompt/icons.c shell/prompt/colors.c shell/edit/wcwidth.c
+# Then `prompt configure` against p10k configure, page for page and its
+# configuration line for line (tools/golden_wizard.py, tests/prompt/wizard).
 prompt-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
 	    $(P10K_HOST_SRC) tests/prompt/p10k_test.c -o $(BUILD)/p10k_test
@@ -2825,6 +2832,9 @@ prompt-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
 	    $(P10K_HOST_SRC) tests/prompt/prompt_dump.c -o $(BUILD)/prompt_dump
 	python3 tools/golden_prompt.py
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
+	    $(P10K_HOST_SRC) shell/prompt/wizard.c tests/prompt/wizard_dump.c -o $(BUILD)/wizard_dump
+	python3 tools/golden_wizard.py
 .PHONY: prompt-test
 
 # The git status daemon against gitstatusd itself (tools/gitstatus_golden.py:

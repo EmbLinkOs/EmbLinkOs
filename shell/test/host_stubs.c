@@ -5,6 +5,7 @@
  * fall through to the unknown-command error below. */
 #include "builtins/builtins.h"
 #include "eval/eval.h"
+#include "prompt/wizard_os.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -42,6 +43,13 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
     char msg[96];
     snprintf(msg, sizeof msg, "unknown command '%s' (externals need the OS)", cmd->name);
     return value_error(msg);
+}
+
+/* `prompt configure` draws on a terminal; the host tests have none. */
+int wizard_os_run(bool force, char *err, size_t cap) {
+    (void)force;
+    snprintf(err, cap, "prompt configure: it needs a terminal to draw its pages on");
+    return -1;
 }
 
 /* Paths and whole files, the host's way: what `prompt import-p10k` reads in

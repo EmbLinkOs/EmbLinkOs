@@ -954,6 +954,10 @@ static void test_prompt_p10k(void) {
           "one that does not read says where, and the prompt stays as it was");
     value_free(&v);
     remove("/tmp/emblink-broken.p10k.zsh");
+    v = run("prompt configure", value_null(), &top);
+    CHECK(v.type == VAL_ERROR && strstr(v.u.s.bytes, "terminal") && strstr(prompt_p10k_source(), "user.p10k.zsh"),
+          "configure: with no terminal to draw on it says so, and changes nothing");
+    value_free(&v);
     v = run("prompt style plain", value_null(), &top);
     value_free(&v);
     prompt_build(&st, 80, &t);
