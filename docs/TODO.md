@@ -6,8 +6,8 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [x] M0 Test probe (`g_term_probe`) and golden streams from real programs, compared with tmux.
 - [x] M1 Keys with identity: kernel queue, syscall 157, toolkit, xterm encoder; USB keyboards decoded like PS/2.
 - [x] M2 The shell owns its line: editor, persistent history, completion, OSC 133 A-D (+R), in-band resize.
-- [ ] `$status` is 0/1/130: an external program's own exit code does not reach it yet (M8 carries
-      the real code and the extended states into the prompt).
+- [ ] `$status` is 0/1/130: an external program's own exit code does not reach it yet, so the prompt's
+      status shows 1 for any failure (130, Ctrl+C, is real: typed and abandoned, or stopped while it ran).
 - [ ] History is read once per session: lines run in another tab appear after the next start
       (bash's default; zsh's share_history is not offered).
 - [ ] On the kernel console the editor works line by line: a multi-line program's earlier lines
@@ -42,7 +42,28 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [x] M8 Shell plumbing for the prompt: `~/.config/shell/rc.esh` read by interactive shells, the `prompt`
       builtin (options by Powerlevel10k's names), the editor's right prompt and transient prompt, a prompt
       built again for a new width; the Terminal passes the system's TZ so the prompt's clock agrees.
-- [ ] M9-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
+- [x] M9 Prompt engine: Powerlevel10k 1.20's segments, glue, frames, gap, directory shortening and transient
+      prompt in C (`shell/prompt/p10k*.c`); `prompt style` (lean, lean-8colors, classic, rainbow, pure, on both
+      images) and `prompt import-p10k` (a ~/.p10k.zsh read: typeset, brace lists, arrays, `if`s, the git
+      formatter's colours), options on top by p10k's names. The user's configuration and the four styles match
+      recordings of p10k itself cell for cell at 100, 60 and 36 columns (`make prompt-test`).
+- [ ] Git in the prompt is the branch (or commit) from `.git/HEAD` alone, drawn in the loading colours: the
+      counts, ahead/behind, stashes, tag and action come with M10's gitstatus.
+- [ ] Prompt segments with nothing to read here: `battery` (no battery reading reaches the shell, so it is
+      not drawn at all), `os_icon`
+      (EmbLinkOS is not an OS p10k knows, so it draws nothing, as p10k does for an unknown uname), `context`
+      only DEFAULT or ROOT (no ssh, no sudo), `prompt_char` only insert mode (the editor has no vi mode),
+      `status` without the pipe states (no per-stage exit codes). Segments for tools the system lacks
+      (direnv, asdf, kubecontext, ...) draw nothing and the import lists them; custom `prompt_*` functions
+      and `p10k segment` need zsh.
+- [ ] `prompt import-p10k` reads what p10k writes, not zsh: other functions and commands joined by `&&`/`||`
+      are skipped, conditions are `[[ == != -n -z ]]`, and an edited `my_git_formatter` keeps its colours but
+      not its logic (the wizard's is built in). Directory names past 58 bytes are compared on their first 58
+      for truncate_to_unique (readdir's name field).
+- [ ] `DIR_SHOW_WRITABLE` never shows a lock: the system's `access(2)` allows writing anything that exists, and a
+      read-only namespace binding (`/system`) cannot be asked for its mode. `truncate_with_package_name` falls
+      back to `truncate_from_right`, as p10k does without `jq`.
+- [ ] M10-M12 Git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
 - [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not

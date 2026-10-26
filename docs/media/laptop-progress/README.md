@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-181 actual EmbLinkOS captures document the original laptop work, its
+186 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, and Powerlevel10k's own engine drawing a Mac's configuration and every style. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -17,6 +17,38 @@ backlight, battery and lid readings do not come from physical hardware.
 ## Latest: the prompt, Powerlevel10k-style
 
 With the terminal real, the prompt that runs in it: the system the Mac's Powerlevel10k setup is built on, here in the native shell. First the plumbing -- `~/.config/shell/rc.esh` read by every shell a person types into, the `prompt` builtin setting options by Powerlevel10k's names, a right side the editor keeps out of the typing's way, and a transient prompt ([SHELL.md](../../SHELL.md#the-prompt)).
+
+Then the engine: Powerlevel10k 1.20's prompt ported to C in the shell, held cell for cell to recordings of p10k itself on a Mac -- 18 configurations, 288 prompts. A person's `.p10k.zsh` is read by `prompt import-p10k`, or its settings written as `prompt set` lines; `prompt style` draws the styles `p10k configure` starts from.
+
+### The Mac's prompt, on EmbLinkOS
+
+The configuration p10k configure wrote on a Mac -- lean, frame, 12-hour clock, transient -- as `prompt set` lines in rc.esh, drawn by the shell's own Powerlevel10k engine: the directory with its anchors, the branch (grey until the git status daemon answers), Ctrl+C's ✘ INT, a background job's ≡, and every accepted line kept as ❯ alone, red after a failure.
+
+![The Mac’s prompt, drawn on EmbLinkOS](182-prompt-p10k-mac-config.png)
+
+### Classic, by `prompt style`
+
+`prompt style classic`: Powerlevel10k's classic style from /system/share/powerlevel10k, its powerline segments and frame drawn in the Terminal's own Meslo Nerd Font.
+
+![Classic, by `prompt style` in EmbLinkOS](183-prompt-p10k-classic.png)
+
+### Rainbow
+
+`prompt style rainbow`: the same engine, every segment on its own background.
+
+![Rainbow in EmbLinkOS](184-prompt-p10k-rainbow.png)
+
+### Pure
+
+`prompt style pure`: the style of Pure, in Powerlevel10k's terms.
+
+![Pure in EmbLinkOS](185-prompt-p10k-pure.png)
+
+### Lean
+
+`prompt style lean`, the style the Mac's configuration began from.
+
+![Lean in EmbLinkOS](186-prompt-p10k-lean.png)
 
 ### A right side, and the short way
 

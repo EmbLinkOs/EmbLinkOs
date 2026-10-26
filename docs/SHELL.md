@@ -61,7 +61,8 @@ shell/
              width table it shares with the Terminal's screen model (§10).
   complete/  what Tab offers: builtins, defs, programs, $names, files.
   prompt/    the prompt's options (`prompt set`) and the prompt built from
-             them (pure, §10 "The prompt").
+             them: the plain one, or Powerlevel10k's (p10k*.c, pure; the
+             system's answers in prompt_os.c), §10 "The prompt".
   main.c     the REPL / -c driver (shell.elf).
   test/      host tests (make shell-test) + host stubs for the OS pieces.
 ```
@@ -77,7 +78,7 @@ shell/
   `complete_test.c`) then `test shell`, `test extern` and `test shellio` at
   the kernel serial console (live: spawn, console fds, readdir/stat, exit
   codes). `test embbuild shell` rebuilds the shell ON the OS with tcc from
-  `/data/src/shell` (`shell/build.ebm`: sixteen units, linked with tcc's
+  `/data/src/shell` (`shell/build.ebm`: twenty-three units, linked with tcc's
   `libtcc1.o`, which carries `__va_start`), checks it, adopts it as
   `/system/bin/shell.elf` and checks it again. A new source file goes in
   four lists: `SHELL_OBJS` (Makefile), `ARM_SHELL_SRC` (aarch64 arch.mk),
@@ -667,12 +668,15 @@ prompt set KEY VALUE...         set one; several words are one value
 prompt get KEY                  its value, or null
 prompt unset KEY                forget it
 prompt reset                    forget them all
+prompt style [NAME]             Powerlevel10k's style NAME as the base (below);
+                                plain for none; alone, the base's name
+prompt import-p10k FILE         a ~/.p10k.zsh as the base -> {parameters, ignored}
 ```
 
 A key is lower-case words joined by dots (`dir.anchor.fg`). It may be quoted,
-and so may a value (`prompt set char "❯"`). The names follow Powerlevel10k's
-parameters, so a configuration reads the same way. Options the prompt does
-not use yet are kept. The prompt uses these now:
+and so may a value (`prompt set char "❯"`; `12h` is one word, though the
+shell reads it as 12 and h). Without a style the prompt is the plain one,
+`user@host:dir$`, and uses these:
 
 | Option | Values | Default |
 |---|---|---|
@@ -690,17 +694,93 @@ scrollback shows the commands rather than every full prompt. A prompt built
 for one width is built again when the window is resized
 (`edit_host.reprompt`).
 
+#### Powerlevel10k
+
+`prompt style lean` (or `lean-8colors`, `classic`, `rainbow`, `pure`: the
+configurations `p10k configure` starts from, in `/system/share/powerlevel10k`)
+or `prompt import-p10k ~/.p10k.zsh` makes the prompt Powerlevel10k's. The
+engine (`shell/prompt/p10k*.c`) draws what Powerlevel10k 1.20 draws for that
+configuration: its segments, separators, heads and tails, the frame, the
+gap and the ruler of a prompt of several lines, colours by number, `#rrggbb`
+or name, icons by `POWERLEVEL9K_MODE`, the directory shortened by every
+`SHORTEN_STRATEGY` (`truncate_to_unique` against the directory listings,
+anchored at folder markers such as `.git`, as far as `DIR_MAX_LENGTH` and
+`DIR_MIN_COMMAND_COLUMNS` ask) and styled by its classes, the transient
+prompt, and the empty line above every prompt but the first. It follows p10k's own
+functions line for line, building zsh prompt strings and expanding them at
+the end, so a person's configuration draws the same prompt here as on their
+Mac.
+
+Every option set is then a Powerlevel10k parameter on top of the base, named
+without `POWERLEVEL9K_`, in lower case with dots for underscores, `fg` and
+`bg` for `FOREGROUND` and `BACKGROUND`: `dir.anchor.fg` is
+`POWERLEVEL9K_DIR_ANCHOR_FOREGROUND`, `left_prompt_elements` (or
+`left.prompt.elements`) is `POWERLEVEL9K_LEFT_PROMPT_ELEMENTS`, an array
+given as words. The plain prompt's five keep their meaning: `char` is the
+prompt character, `right` the right side's segments (`duration` is
+`command_execution_time`), `transient`, `duration.threshold` and
+`time.format` p10k's own. Values are p10k's too, with its escapes
+(`'%238F\u256D\u2500'`; single quotes keep the backslash).
+
 ```
-# ~/.config/shell/rc.esh
-prompt set right status duration time
+# ~/.config/shell/rc.esh -- lean, as the wizard answered on one Mac
+prompt style lean
+prompt set mode powerline
+prompt set right status duration background_jobs time
+prompt set multiline.first.prompt.prefix '%238F\u256D\u2500'
+prompt set multiline.last.prompt.prefix '%238F\u2570\u2500'
+prompt set left.prompt.first.segment.start.symbol ' '
+prompt set multiline.first.prompt.gap.fg 238
 prompt set time.format 12h
 prompt set transient always
 ```
 
+**The segments.** `dir`, `vcs`, `prompt_char`, `status` (extended states,
+`INT` for Ctrl+C's 130), `command_execution_time`, `background_jobs`, `time`,
+`context` and `os_icon` are drawn, and `_joined` and `newline` work as in p10k.
+Git is read from `.git/HEAD`: the branch (or the commit), in the loading
+colours p10k uses while gitstatus has not answered -- the counts come with the
+git status daemon (M10). `os_icon` shows nothing (EmbLinkOS is not an OS p10k
+knows), `context` is DEFAULT or ROOT. `battery` (no battery reading reaches
+the shell) and the segments for tools this system does not have (`direnv`,
+`asdf`, `kubecontext`... about seventy) draw nothing, and `prompt import-p10k` lists
+those a configuration names. `DIR_SHOW_WRITABLE` asks the system's
+`access(2)`, which allows writing anything that exists (EMBKFS has no
+permission bits).
+
+**The importer** reads what p10k writes: `typeset -g POWERLEVEL9K_...` with
+brace lists (`{LEFT,RIGHT}_...`), `'...'`, `"..."` and `$'...'`, arrays across
+lines with their comments, `+=`, locals and `${(j:|:)array}`, `unset -m`, and
+`if [[ ... ]]; then ... elif ... else ... fi` on parameters already set (`==`
+and `!=` with patterns, `-n`, `-z`). Other functions and commands joined by
+`&&` or `||` are zsh's business and are skipped; of `my_git_formatter` the
+importer keeps its colours (its `local meta='%f'` lines), and the formatter
+itself is built in. A file that does not read leaves the prompt as it was and
+says which line stopped it.
+
+**Tests.** `make prompt-test` holds the engine's pieces (`tests/prompt/p10k_test.c`)
+and then whole prompts to Powerlevel10k itself: `tests/prompt/golden` holds
+what p10k drew under tmux on a Mac for fourteen configurations -- a person's
+own `.p10k.zsh`, the four styles, and lean with each variant in
+`tests/prompt/configs/variants` on top (every shortening strategy, the
+directory's anchor, highlight, shortened and separator styles, classes,
+`DIR_TRUNCATE_BEFORE_MARKER`, the segments' other forms) -- in sessions at 100,
+60 and 36 columns (a directory to shorten among neighbours and past a folder
+marker, a failure, Ctrl+C, a slow command, a background job, and repositories
+as gitstatus reports them: dirty, ahead of and behind upstream with a stash and
+a wip commit, a detached HEAD, a merge stopped on a conflict).
+`tools/golden_prompt.py` renders the same states with `build/prompt_dump` and
+compares cell for cell: character, colours, bold. `tools/record_prompts.py` records them again on a Mac with
+zsh, tmux and Powerlevel10k. Live, `tools/shell_p10k_smoke.py` writes that
+configuration as `prompt set` lines into `rc.esh` and checks the prompt the
+shell draws on the OS, then draws every style.
+
 ### `$status`
 
 `$status` is the last line's result: 0 on success, 1 on an error, 130 for a
-line abandoned with Ctrl+C. The same number is the `D` mark's.
+line abandoned with Ctrl+C -- typed and not run, or stopped while it ran (a
+program it started, a loop, a `sleep`). The same number is the `D` mark's, and
+the prompt's: Powerlevel10k shows 130 as `INT`.
 
 ### The console
 
