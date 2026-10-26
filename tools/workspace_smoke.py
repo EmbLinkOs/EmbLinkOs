@@ -105,7 +105,12 @@ print('RESULT '+json.dumps(data.hex()))'''))
     def snap(self,name):
         self.g.pump(1);p=self.out.parent/(name+'.ppm');self.g.qmp.screendump(str(p));print('Capture: '+name,flush=True);return p
     def launch(self,name,title):
-        self.key('meta_l-spc');self.g.pump(2)
+        # TYPE ONLY ONCE THE LAUNCHER IS UP. The desktop drops keys while it is
+        # not (they are nobody's), and a fixed two-second wait raced it: right
+        # after login the desktop takes longer than that to answer, so "Term"
+        # was thrown away and Return launched the first app instead.
+        opened=len(self.g.seen);self.key('meta_l-spc')
+        self.g.wait(b'home: launcher OPEN',start=opened);self.g.pump(.5)
         start=len(self.g.seen);self.type(name+'\n');w=self.wait_window(title)
         self.g.wait((title+': first frame presented').encode(),start=start)
         self.g.pump(1);return w

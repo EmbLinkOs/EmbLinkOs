@@ -69,6 +69,17 @@ def perf(d):
     return out
 
 
+def windows(d):
+    """Every visible window's geometry, by title (`perf windows`)."""
+    text = d.g.command('perf windows', b'perf: end', 60)
+    out = {}
+    for line in text.splitlines():
+        if line.startswith('perf: window '):
+            pairs = dict(kv.split('=', 1) for kv in line[13:].split() if '=' in kv)
+            out[pairs['title'].replace('_', ' ')] = {k: int(v) for k, v in pairs.items() if k != 'title'}
+    return out
+
+
 def scene(d, results, name, body):
     d.g.command('perf reset', b'perf: reset', 60)
     t0 = time.monotonic()
@@ -194,6 +205,8 @@ def main():
         click(d, DOCK_SETTINGS_X, DOCK_Y)
         d.g.wait(b'Settings: first frame presented'); d.g.pump(4)
 
+        start = windows(d)['Settings']
+
         def drag():
             move(d, *SETTINGS_TITLE)
             press(d, True); d.g.pump(0.3)
@@ -201,6 +214,13 @@ def main():
             glide(d, *SETTINGS_TITLE, step=6)
             press(d, False); d.g.pump(2)
         scene(d, results, 'drag', drag)
+        # THE WINDOW STAYS WITH THE HAND. Dragged out and back to the grab
+        # point, it must end where it started: a drag that counts motion twice
+        # (or loses some) leaves it somewhere else.
+        end = windows(d)['Settings']
+        results['drag']['window_moved_by'] = [end['x'] - start['x'], end['y'] - start['y']]
+        assert abs(end['x'] - start['x']) <= 2 and abs(end['y'] - start['y']) <= 2, \
+            f"the dragged window did not come back with the pointer: {start} -> {end}"
 
         def launcher():
             d.key('meta_l-spc'); d.g.pump(4)
