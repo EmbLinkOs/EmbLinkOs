@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-167 actual EmbLinkOS captures document the original laptop work, its
+173 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen and its own fonts and renderer. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, and tabs, selection, find and links. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -95,6 +95,44 @@ ttyprobe --glyphs writes a sample in the Terminal: the four MesloLGS Nerd Font M
 ttyprobe --bench writes 1 MiB of coloured lines as fast as Terminal takes them: 13,618 lines in 145 s on this host, which emulates every x86 instruction. Each frame replaces the whole screen here, so the renderer draws every row (about 35 ms) and the window presents in full; output that changes a row presents that row.
 
 ![A screen that scrolls every frame in EmbLinkOS](167-terminal-render-bench.png)
+
+Then the window around the screen: tabs that each keep their own shell, a mouse selection that stays on its text as output scrolls, find in the scrollback, links that open in the app they belong to, a menu on the right button, and zoom ([TERMINAL.md](../../TERMINAL.md#tabs-selection-find-links)).
+
+### Two tabs, two shells
+
+Super+T opens a second tab with its own shell, screen and scrollback; the first keeps what it had. The strip of tabs shows once there are two. Ctrl+Tab moves between them, and Super+W closes one, its shell reaped and its PTY freed.
+
+![Two tabs, two shells in EmbLinkOS](168-terminal-tabs.png)
+
+### A selection made with the mouse
+
+A drag selects exactly the cells it covers, here first-tab. A double click takes the word (first-tab-42, hyphens and all) and a triple click the line; Super+C copies the selection and Super+V pastes it at the prompt.
+
+![A selection made with the mouse in EmbLinkOS](169-terminal-selection.png)
+
+### Find in the scrollback
+
+Super+F opens a field over the screen. Every match is marked, the one found more strongly, and the view follows it into the scrollback. Enter and the arrows step between matches; Escape or Done closes the field.
+
+![Find in the scrollback in EmbLinkOS](170-terminal-find.png)
+
+### A link under Super
+
+With Super held, the link under the pointer is underlined and its address shows in the title. A click opens it: a file:// folder in Files, a file in Editor, a web address in Vellum.
+
+![A link under Super in EmbLinkOS](171-terminal-link.png)
+
+### The right-button menu
+
+Copy, Paste, Select All, Find, Clear Scrollback, New Tab and Close Tab, each with its key. The title still reports the last action: Files opened /data/apps.
+
+![The right-button menu in EmbLinkOS](172-terminal-menu.png)
+
+### Zoom
+
+Super+= and Super+- change the font a pixel at a time and Super+0 puts it back. Every tab reflows to the new cell size, and the title shows it.
+
+![Zoom in EmbLinkOS](173-terminal-zoom.png)
 
 ## The native shell runs any program
 

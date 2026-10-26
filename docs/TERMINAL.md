@@ -51,8 +51,10 @@ Unix applications run here.
   a closed endpoint alive. Hard-killed threads release abandoned I/O pins during
   reaping. Rejected spawns release inherited descriptors.
 
-The bounded implementation supports 16 pairs, 4096 queued input cells and
-4096 output bytes per pair. Canonical lines retain up to 1023 bytes plus the
+Pairs are allocated as they are opened and freed with their last reference;
+up to 64 are live at once (the next open gets `ENFILE`). Each has 4096 queued
+input cells and a 32 KiB output queue -- what a terminal takes in between two
+frames. Canonical lines retain up to 1023 bytes plus the
 newline; further line bytes are discarded until an editing/termination key.
 Queue pressure returns partial writes or `EAGAIN`, or sleeps for blocking I/O.
 Canonical editing operates on bytes; Unicode-aware erase is still pending.
@@ -67,9 +69,10 @@ editor of its own any more (until 2026-10 it edited the native prompt locally
 and sent the finished line). A prompt mark with `edit=shell` says so;
 a program that marks a prompt without it simply gets its keys like any other.
 
-- Shift+PgUp/PgDn and the wheel page the scrollback.
+- Shift+PgUp/PgDn and the wheel page the scrollback; Shift+Home/End go to its
+  top and back to the live screen.
 - Escape, Ctrl+D, Ctrl+L and everything else go to the program. Once the shell
-  has exited, Escape closes the window; GUI+W closes it at any time.
+  has exited, Escape closes its tab (the window, for the last one).
 - **Clear** empties the scrollback and the screen; at a shell prompt it asks
   the shell to redraw (Ctrl+L) instead of wiping the prompt from under it.
 - **Paste** is bracketed when the program asked for it (both shells do at their
@@ -78,6 +81,52 @@ a program that marks a prompt without it simply gets its keys like any other.
 
 An interactive program can read a canonical line, disable echo, or select raw
 mode.
+
+### Tabs, selection, find, links
+
+**Tabs.** Each tab is a session of its own: its PTY, its shell, its screen,
+scrollback and selection. Super+T opens one in the directory the shown tab is
+in; Ctrl+Tab and Ctrl+Shift+Tab go between them (Super+1-6 are the spaces',
+so Super+7, 8, 9 pick the seventh, eighth and last). The strip of tabs shows
+once there are two, each named for its directory -- or for what the program
+called itself (OSC 0/2) -- with its close button and a + for a new one; the
+window's title is the shown tab's full directory. A tab whose shell exits says
+so and closes on Escape. Super+W closes the shown tab, the last one the
+window; the window's close light and Super+Q close them all -- Super+Q now
+reaches an app as its own window action (`EMBK_WIN_ACTION_QUIT`, read in a
+close hook as `em_close_reason()`), so an app with tabs can tell "this tab"
+from "everything". A closed tab's master is closed (a hangup for its shell)
+and the shell reaped once it has gone; the PTY is freed with it.
+
+**Selection** (`user/terminal/screentext.c`). With the mouse not asked for by
+the program -- or with Shift held when it is -- the left button selects: a
+drag what it covers, a double click a word (a path or URL whole; brackets and
+quotes not), a triple click the line, wrapped rows and all; Alt-drag a
+rectangle; Shift-click extends; a drag past the top or bottom moves the view.
+A selection holds rows by id, so it stays on its text as output scrolls it
+into the scrollback; a resize ends it. Copy (Super+C, Ctrl+Shift+C, the menu)
+takes the selection -- a wrapped line joined, trailing blanks dropped -- or,
+with nothing selected, the visible screen. Super+A selects everything.
+
+**Find.** Super+F opens a field over the screen. Typing finds the last match
+on the screen or in the scrollback (ASCII case ignored); Enter, Super+G and
+the up arrow find the one before, Shift+Enter, Super+Shift+G and the down
+arrow the one after, going round at the ends. Every match on the screen is
+marked, the one found more strongly, and the view moves to it. Escape or Done
+closes the field.
+
+**Links.** With Super held, a link under the pointer is underlined and named
+in the title bar; Super+click opens it. A link is an OSC 8 hyperlink or a URL
+in the text (a scheme with `://`, `mailto:`, `www.`), read across wraps, with
+the sentence's full stop and an unmatched bracket left out. http and https
+open in Vellum, a `file://` folder in Files and a file in Editor -- each given
+what it reads at start (`VELLUM_URL`, `FILES_PATH`, `EDIT_FILE`).
+
+**The menu.** The right button opens Copy, Paste, Select All, Find, Clear
+Scrollback, New Tab, Close Tab -- and Open Link and Copy Link over a link.
+
+**Zoom.** Super+= and Super+- make the font a pixel larger or smaller (8 to 32
+px at the standard interface size), Super+0 puts it back; every tab reflows.
 
 **Resizing a prompt.** A shell that edits its own line turns on DECSET 2048
 while it does. When the window is resized during such a prompt, Terminal first
@@ -288,9 +337,8 @@ two cells wide (the model and widths are right; M5 adds faces, not fonts for
 every script). Colour emoji, emoji ZWJ sequences and ligatures need shaping
 the font engine does not do. Combining marks are drawn at their base's
 origin, where both shipped mono faces place them; a mark from a proportional
-fallback may sit off-centre. Hyperlinks are kept but not yet clickable, and
-the mouse does not yet select text (M6). OSC 52 writes and bold-as-bright
-need Preferences to turn them on (M7).
+fallback may sit off-centre. OSC 52 writes and bold-as-bright need
+Preferences to turn them on (M7). Split panes come after the prompt work.
 
 Not offered: left/right margins (DECSLRM), double-width and double-height
 lines, sixel and other inline images, the kitty keyboard protocol and
@@ -310,7 +358,7 @@ SDK paths even when upstream headers with the same names are present.
 ## Verification
 
 ```
-make terminal-test terminal-screen-test terminal-golden-test terminal-render-test font-test backend-test
+make terminal-test terminal-screen-test terminal-golden-test terminal-render-test terminal-screentext-test font-test backend-test
 make shell-test declare-test em-test kit-test     # shell-test includes the line editor on the screen model
 # Boot the image, then use the serial debug console:
 test terminal
@@ -321,6 +369,7 @@ python3 tools/terminal_smoke.py
 python3 tools/terminal_screen_smoke.py
 python3 tools/terminal_xterm_smoke.py
 python3 tools/terminal_render_smoke.py
+python3 tools/terminal_tabs_smoke.py
 ```
 
 `terminal-test` compiles the production device state machine with a minimal
@@ -338,9 +387,12 @@ ASAN_OPTIONS=detect_leaks=0 /tmp/pty-host
 The guest `ttyprobe --selftest` covers canonical/raw input, EOF records,
 per-device dimensions, duplicate and inherited descriptors, hard-killed blocked
 readers/writers, nonblocking queue
-pressure, input flushing, independent sessions, blocked-read hangup, faulty
-copyout rollback and rejected-spawn cleanup. `test terminal` checks that device
-allocation returns to its baseline afterward.
+pressure (the full 32 KiB of output), input flushing, independent sessions,
+blocked-read hangup, faulty copyout rollback and rejected-spawn cleanup. It
+also fills the system's 64 pairs: one process's 64 descriptors reach only about
+30, so two `--hold` children take theirs first. The next open gets `ENFILE`,
+and freed pairs open again. `test terminal` checks that device allocation
+returns to its baseline afterward.
 
 The graphical acceptance script drives actual QMP keyboard input. `ttyprobe`
 without options demonstrates canonical editing, receives one raw key without
@@ -378,6 +430,17 @@ overwritten); `backend-test` covers image damage in the scene renderer.
 `tools/terminal_render_smoke.py` runs `ttyprobe --glyphs` (a
 Powerlevel10k-style framed prompt, frames, blocks, braille, icons) and
 `ttyprobe --bench` in the real Terminal.
+
+`make terminal-screentext-test` (under ASan/UBSan) covers logical lines
+across wraps; word, line, character and rectangle selection and their text;
+a selection kept while its rows scroll into the scrollback; find backward and
+forward, across a wrap, into the scrollback, with UTF-8 needles; and links --
+URLs with brackets and trailing punctuation, `mailto:`, `www.`, OSC 8 runs, a
+URL over three rows. `tools/terminal_tabs_smoke.py` drives the real window:
+two tabs with their own shells, a double click, a triple click and a drag,
+Copy and Paste, find into the scrollback, Super over a link and a Super-click
+opening it in Files, the menu, zoom, and Super+W closing a tab -- its shell
+gone and its PTY freed.
 
 `tools/terminal_xterm_smoke.py` runs `ttyprobe --xterm` in the real Terminal:
 a card of attributes, underline styles and colours, the 16- and 256-colour

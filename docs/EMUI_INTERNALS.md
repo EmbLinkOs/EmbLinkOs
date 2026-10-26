@@ -206,7 +206,12 @@ calls `scene_traverse` and dispatches each visited node to the right vtable
 call, tracking a **dirty-rect cache** of last frame's world-space rects per
 node so `scene_render_frame` can report back exactly which screen regions
 actually changed (`r.dirty[]`, `r.n_dirty`, `r.full`) instead of the caller
-always doing a full repaint. `font.c` is a from-scratch TrueType rasterizer
+always doing a full repaint. Dirty rects are rounded outward to whole pixels.
+A pixel is repainted only when its centre lies in a rect. A node at a
+fractional place still stains the pixel its edge partly covers, through
+anti-aliasing or through text's truncated pen. Without the rounding, that pixel
+outlived the node: a shrinking window title left a one-pixel sliver of its old
+first letter (`backend_test.c` T9). `font.c` is a from-scratch TrueType rasterizer
 (glyf outlines only — no CFF, no hinting, no kerning) with a glyph atlas
 cache; `font_install_backend()` is what actually plugs `draw_text` into the
 CPU backend (it's `NULL` until called, which is why every app calls it right
@@ -442,6 +447,15 @@ press-then-release across the app's next two polls, because
 `sys_win_input`/`embk_win_input` is a **state poll, not an event queue** — a
 click that happens between two polls with no ongoing signal recording it
 would otherwise be silently eaten.
+
+Each window also remembers whether the app's last poll handed it the button
+**down** (`sent_left`). The app can see one press live, and then that press's
+release and the next press can both happen before it polls again. In that case
+the replay hands it the release first and the press on the poll after.
+Otherwise the replayed "down" follows a "down", which is no edge, and the click
+is lost. That happened under emulation: the third click of a triple click, and
+sometimes the second click of a double. When the live path delivers a latched
+press, the press still carries the time it was made, not the time of the poll.
 
 ## Adding a new component
 

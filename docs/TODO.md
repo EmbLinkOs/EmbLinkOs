@@ -25,7 +25,13 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       glyphs and caches in LRU atlas pages.
 - [ ] No CJK or emoji font on the image (boxes, two cells wide), no colour emoji, ZWJ sequences or
       ligatures: the font engine does not shape.
-- [ ] M6 Tabs, mouse selection, find, links, zoom; dynamic PTYs.
+- [x] M6 Tabs with their own sessions, mouse selection (word, line, rectangle, kept while scrolling),
+      find in the scrollback, links (OSC 8 and URLs, opened in Vellum/Files/Editor), the menu, zoom;
+      PTYs allocated on demand (64, 32 KiB output); Super+Q its own window action.
+      A double or triple click no longer loses a click under emulation: the compositor hands an app
+      that still holds the last press its release before replaying the next one.
+      Damage rects are rounded out to whole pixels, so a title that shrinks leaves no sliver of the old one.
+- [ ] Tabs cannot be dragged to reorder or into a window of their own; no Super+N for a new window.
 - [ ] M7 Profiles, Preferences and translucency (Clear Dark default); OSC 52 writes and bold-as-bright as options.
 - [ ] M8-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
@@ -42,7 +48,8 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [x] Screen copy, safe native-prompt paste and application bracketed paste.
 - [x] Shared controls receive paste commands without key-queue truncation.
 - [x] Modified-key identity: the key behind every byte, F-keys, the keypad, xterm PC-style encoding.
-- [ ] Terminal range selection (M6) and complete grapheme rendering (M5: font fallback, composing marks).
+- [x] Terminal range selection (M6) and grapheme rendering (M5: font fallback, combining marks); the
+      shaping it still lacks (emoji ZWJ, ligatures) is in the roadmap above.
 - [x] Mouse reporting and an xterm-compatible screen (`TERM=xterm-256color`), see the roadmap above.
 - [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
 - [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
