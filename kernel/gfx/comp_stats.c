@@ -19,6 +19,7 @@
 #include "include/spinlock.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
+#include "process/process.h"     /* sched_precise_lead_ns */
 
 #define RING     512           /* recent composes kept for percentiles */
 #define FRAME_RING 256         /* recent frame intervals */
@@ -42,7 +43,8 @@ static struct {
     uint64_t frame_t[FRAME_RING];          /* when each recent frame finished */
     uint32_t interval[FRAME_RING];         /* and the gap before it, when it had one */
     uint32_t frame_head, frame_count, interval_count, interval_head;
-    uint32_t display_mhz, vrr_min_mhz, vrr_max_mhz, rate_mhz, frame_cost_us;
+    uint32_t display_mhz, vrr_min_mhz, vrr_max_mhz, rate_mhz, frame_cost_us, rate_peak_mhz;
+    uint32_t late[FRAME_RING], late_head, late_count;
 } g;
 
 static uint32_t us_of(uint64_t ns)
@@ -100,6 +102,16 @@ void comp_stats_rate(uint32_t display_mhz, uint32_t vrr_min_mhz, uint32_t vrr_ma
     spin_lock(&g_lock);
     g.display_mhz = display_mhz; g.vrr_min_mhz = vrr_min_mhz; g.vrr_max_mhz = vrr_max_mhz;
     g.rate_mhz = rate_mhz; g.frame_cost_us = frame_cost_us;
+    if (rate_mhz > g.rate_peak_mhz) g.rate_peak_mhz = rate_mhz;
+    spin_unlock(&g_lock);
+}
+
+void comp_stats_late(uint64_t late_ns)
+{
+    spin_lock(&g_lock);
+    g.late[g.late_head] = us_of(late_ns);
+    g.late_head = (g.late_head + 1) % FRAME_RING;
+    if (g.late_count < FRAME_RING) g.late_count++;
     spin_unlock(&g_lock);
 }
 
@@ -208,6 +220,14 @@ void comp_stats_snapshot(struct embk_comp_stats *out)
     out->interval_p50_us = rank(scratch, g.interval_count, 50);
     out->interval_p95_us = rank(scratch, g.interval_count, 95);
     out->interval_max_us = g.interval_count ? scratch[g.interval_count - 1] : 0;
+    for (uint32_t i = 0; i < g.late_count; i++) scratch[i] = g.late[i];
+    out->lates = g.late_count;
+    sort_u32(scratch, g.late_count);
+    out->late_p50_us = rank(scratch, g.late_count, 50);
+    out->late_p95_us = rank(scratch, g.late_count, 95);
+    out->late_max_us = g.late_count ? scratch[g.late_count - 1] : 0;
+    out->lead_us = us_of(sched_precise_lead_ns());
+    out->rate_peak_mhz = g.rate_peak_mhz;
     spin_unlock(&g_lock);
 
     const fb_info_t *fi = fb_get_info();
@@ -262,14 +282,16 @@ static void dump(void)
             " ptr_n=%u ptr_p50_us=%u ptr_p95_us=%u ptr_max_us=%u"
             " screen=%ux%u gpu=%u frames=%lu period_us=%u intervals=%u"
             " interval_p50_us=%u interval_p95_us=%u interval_max_us=%u"
-            " display_mhz=%u vrr_min_mhz=%u vrr_max_mhz=%u rate_mhz=%u frame_cost_us=%u\n",
+            " display_mhz=%u vrr_min_mhz=%u vrr_max_mhz=%u rate_mhz=%u frame_cost_us=%u"
+            " lates=%u late_p50_us=%u late_p95_us=%u late_max_us=%u lead_us=%u rate_peak_mhz=%u\n",
             (unsigned long)(span / 1000000u), (unsigned long)s.composes,
             (unsigned long)(s.compose_ns / 1000u), (unsigned long)(s.pixels / 1000u),
             (unsigned long)s.full_screen, s.p50_us, s.p95_us, s.max_us, s.recent,
             s.ptr_samples, s.ptr_p50_us, s.ptr_p95_us, s.ptr_max_us,
             s.screen_w, s.screen_h, s.gpu, (unsigned long)s.frames, s.period_us, s.intervals,
             s.interval_p50_us, s.interval_p95_us, s.interval_max_us,
-            s.display_mhz, s.vrr_min_mhz, s.vrr_max_mhz, s.rate_mhz, s.frame_cost_us);
+            s.display_mhz, s.vrr_min_mhz, s.vrr_max_mhz, s.rate_mhz, s.frame_cost_us,
+            s.lates, s.late_p50_us, s.late_p95_us, s.late_max_us, s.lead_us, s.rate_peak_mhz);
     for (int i = 0; i < EMBK_COMP_SRCS; i++)
         kprintf("perf: src=%s composes=%lu compose_us=%lu kpx=%lu\n", g_src_name[i],
                 (unsigned long)s.src_composes[i], (unsigned long)(s.src_ns[i] / 1000u),
@@ -297,6 +319,14 @@ int comp_stats_command(const char *cmd)
     if (!strcmp(cmd, "perf")) { dump(); return 1; }
     if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
     if (!strcmp(cmd, "perf windows")) { compositor_print_windows(); return 1; }
+    if (!strncmp(cmd, "perf beat ", 10)) {
+        uint32_t n = 0;
+        for (const char *p = cmd + 10; *p >= '0' && *p <= '9'; p++) n = n * 10 + (uint32_t)(*p - '0');
+        if (!n || n > 60) { kprintf("perf: beat <seconds, 1-60>\n"); return 1; }
+        compositor_beat_test(n);
+        kprintf("perf: beat %u s\n", n);
+        return 1;
+    }
     if (!strcmp(cmd, "perf cursor hw") || !strcmp(cmd, "perf cursor sw")) {
         compositor_cursor_plane(cmd[12] == 'h');
         kprintf("perf: cursor %s\n", cmd + 12);

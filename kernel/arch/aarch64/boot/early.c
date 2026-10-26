@@ -1225,10 +1225,12 @@ void arch_early_main(uint64_t dtb_phys) {
             if (wrr >= 0 && wrr < 10)
                 kprintf("  [info] round-robin's worst was only %d ms -- the load\n"
                         "         did not contend, so this is not evidence\n", wrr);
+            /* ring 3's: the compositor's frame thread reserves for itself
+             * while frames keep coming, and it is not the test's to free */
             kprintf("  [%s] no reservation outlived its thread (%u permille)\n",
-                    sched_reserved_permille() == 0 ? " ok " : "FAIL",
-                    sched_reserved_permille());
-            if (sched_reserved_permille() != 0)
+                    sched_reserved_permille_user() == 0 ? " ok " : "FAIL",
+                    sched_reserved_permille_user());
+            if (sched_reserved_permille_user() != 0)
                 selftest_fails++;
         }
     }

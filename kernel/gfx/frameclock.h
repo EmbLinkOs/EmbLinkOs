@@ -54,4 +54,13 @@ uint64_t fc_period_ns(uint32_t rate_mhz);
  * so the beat does not drift by each frame's cost. */
 uint64_t fc_next_due(uint64_t last_due_ns, uint64_t period_ns, uint64_t now_ns);
 
+/* THE FRAME THREAD'S RESERVATION, in whole milliseconds of each period: what
+ * it asks the deadline scheduler to promise it. What a frame costs (a recent
+ * bad one) and half again, plus the timer lead it spins out, at least 1 ms,
+ * at most half the period. Not simply half: a promise is admission capacity
+ * every other periodic thread is refused once it is gone -- a flat half held
+ * 500 of the 700 permille the machine gives out, while the compositor sat
+ * blocked with nothing to compose. */
+uint32_t fc_budget_ms(uint32_t period_ms, uint32_t frame_cost_us, uint32_t lead_us);
+
 #endif

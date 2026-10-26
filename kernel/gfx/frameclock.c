@@ -50,6 +50,14 @@ uint64_t fc_next_due(uint64_t last_due_ns, uint64_t period_ns, uint64_t now_ns) 
     return last_due_ns + period_ns;
 }
 
+uint32_t fc_budget_ms(uint32_t period_ms, uint32_t frame_cost_us, uint32_t lead_us) {
+    uint64_t need_us = (uint64_t)frame_cost_us * 3 / 2 + lead_us;
+    uint64_t ms = (need_us + 999) / 1000;
+    uint32_t top = period_ms / 2 ? period_ms / 2 : 1;
+    if (ms < 1) ms = 1;
+    return ms > top ? top : (uint32_t)ms;
+}
+
 uint64_t fc_period_ns(uint32_t rate_mhz) {
     if (!rate_mhz) rate_mhz = FC_UNKNOWN_MHZ;
     return 1000000000000ull / rate_mhz;

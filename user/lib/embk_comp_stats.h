@@ -14,7 +14,7 @@
  * layout without a version dance beyond `version`. */
 #include <stdint.h>
 
-#define EMBK_COMP_STATS_VERSION 3
+#define EMBK_COMP_STATS_VERSION 4
 
 #define EMBK_COMP_SRC_PRESENT 0   /* an application presented new pixels        */
 #define EMBK_COMP_SRC_MOVE    1   /* a window was moved, placed or resized       */
@@ -65,6 +65,16 @@ struct embk_comp_stats {
      * cost the governor weighed (frameclock.h). */
     uint32_t display_mhz, vrr_min_mhz, vrr_max_mhz, rate_mhz;
     uint32_t frame_cost_us, reserved2;
+
+    /* THE CLOCK'S OWN PRECISION (version 4): how late the frame thread began
+     * a frame that was due on the beat -- what the timer controls, apart from
+     * how long the frame then took. And the lead: how early the kernel wakes
+     * it to cover its timer's own lateness, spun out to the instant -- the CPU
+     * that precision costs per frame (0 on hardware with an exact timer).
+     * And the fastest rate composed at since the reset: rate_mhz is only the
+     * rate now, which on a still desktop is the slow one. */
+    uint32_t lates, late_p50_us, late_p95_us, late_max_us;
+    uint32_t lead_us, rate_peak_mhz;
 };
 
 /* A FRAME, as the compositor's frame thread kept it (embk_win_frame). An

@@ -53,6 +53,16 @@ static inline uint64_t cntvct(void) {
     return v;
 }
 
+/* A PRECISE SLEEPER (sched_sleep_until_ns) due before `target`: the counter
+ * value of its nanosecond instead. */
+static uint64_t precise_target(uint64_t now, uint64_t target) {
+    uint64_t due = sched_next_precise_wake_ns();
+    if (!due) return target;
+    uint64_t now_ns = time_get_ns();
+    uint64_t at = due <= now_ns ? now + 1 : now + ((due - now_ns) * timer_freq) / 1000000000ull;
+    return at < target ? at : target;
+}
+
 static void timer_tick(uint32_t intid) {
     (void)intid;
 
@@ -105,6 +115,7 @@ static void timer_tick(uint32_t intid) {
         uint64_t early = now + ((uint64_t)timer_freq * wake) / 1000u;
         if (early < target) target = early;
     }
+    target = precise_target(now, target);
 
     __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(target));
 
@@ -181,9 +192,25 @@ void timer_arm_this_cpu_ms(uint32_t ms) {
     if (ms == 0) ms = 1;
     uint64_t delta = ((uint64_t)timer_freq * ms) / 1000u;
     if (delta == 0) delta = 1;
-    next_deadline[cpu] = cntvct() + delta;
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline[cpu]));
+    uint64_t now = cntvct();
+    next_deadline[cpu] = now + delta;
+    /* core 0 also for a precise sleeper; the others keep their skewed sleep
+     * (sched_idle_next_ms) so idle cores do not all wake on the same beat */
+    uint64_t target = cpu == 0 || cpu == (sched_precise_wake_cpu() & (MAX_CPUS - 1))
+                          ? precise_target(now, next_deadline[cpu]) : next_deadline[cpu];
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(target));
     __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1));  /* ENABLE, unmasked */
+    __asm__ volatile("isb" ::: "memory");
+}
+
+void timer_arm_precise_now(uint64_t due_ns) {
+    if (!timer_freq) return;
+    uint64_t now = cntvct(), now_ns = time_get_ns();
+    uint64_t at = due_ns <= now_ns ? now + 1 : now + ((due_ns - now_ns) * timer_freq) / 1000000000ull;
+    uint64_t cval;
+    __asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(cval));
+    if (at >= cval) return;                       /* already due sooner */
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(at));
     __asm__ volatile("isb" ::: "memory");
 }
 

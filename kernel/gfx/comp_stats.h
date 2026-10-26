@@ -21,6 +21,8 @@ void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint
 /* What the display can do and the rate chosen for it (frameclock.h). */
 void comp_stats_rate(uint32_t display_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz,
                      uint32_t rate_mhz, uint32_t frame_cost_us);
+/* The frame thread began a beat's frame `late_ns` after it was due. */
+void comp_stats_late(uint64_t late_ns);
 /* The frame thread finished a frame at `t_ns`, keeping a beat of `period_ns`. */
 void comp_stats_frame(uint64_t t_ns, uint64_t period_ns);
 /* The pointer moved at some instant and a compose showed it `ns` later. */

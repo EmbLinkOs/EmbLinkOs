@@ -43,6 +43,10 @@ uint64_t timer_sched_ticks(void);
  * aarch64 generic timer is CNTV_CVAL, and the LAPIC is one-shot the moment the
  * PERIODIC bit is cleared. */
 void timer_arm_this_cpu_ms(uint32_t ms);
+/* Bring THIS core's timer forward to fire at `due_ns` (time_get_ns()) if that
+ * is sooner than it is armed for; never later. For a precise sleep
+ * (sched_sleep_until_ns): an early fire is not a tick, the handlers re-arm. */
+void timer_arm_precise_now(uint64_t due_ns);
 
 /* The scheduler quantum, in milliseconds -- what a core arms when it has work
  * to run. One name for the number both the timer and the scheduler mean. */

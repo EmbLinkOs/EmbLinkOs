@@ -3493,6 +3493,7 @@ static uint64_t g_fc_read_ns;
 static uint32_t g_power_cap_mhz;
 static uint32_t g_frame_cost_us;            /* a recent bad frame, fading */
 static uint64_t g_frame_cost_ns;            /* when it last faded */
+static int      g_periodic;                 /* frames keep coming: motion, or an app asked */
 static uint32_t g_rate_mhz = FC_DEFAULT_MHZ;
 
 /* ANIMATING APPLICATIONS: a process waiting for frames is drawing motion, and
@@ -3569,6 +3570,7 @@ static void comp_rate_update(uint64_t now) {
         .power_cap_mhz = g_power_cap_mhz,
     };
     g_rate_mhz = fc_rate_mhz(&g_fc_display, &in);
+    g_periodic = in.motion || in.request_mhz;
     g_frame_period_ns = fc_period_ns(g_rate_mhz);
     struct fc_display disp = g_fc_display;
     comp_unlock();
@@ -3630,26 +3632,52 @@ int compositor_frame_wait(int pid, struct embk_frame_info *out, uint32_t timeout
     return 0;
 }
 
-/* Work that keeps frames coming without a kick: window motion in flight. */
-static int comp_continuous(void) { return g_anim.kind != ANIM_NONE; }
+/* `perf beat N`: the frame thread keeps its beat for N seconds as if in
+ * motion, composing nothing -- the clock alone, measured (comp_stats'
+ * intervals), with no input rate or app in the way. */
+static volatile uint64_t g_beat_until_ns;
+void compositor_beat_test(uint32_t seconds) {
+    __atomic_store_n(&g_beat_until_ns, time_get_ns() + (uint64_t)seconds * 1000000000ull, __ATOMIC_RELAXED);
+    comp_wake();
+}
+
+/* Work that keeps frames coming without a kick: window motion in flight, or
+ * a beat being measured. */
+static int comp_continuous(void) {
+    return g_anim.kind != ANIM_NONE || time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
+}
 
 static void comp_thread_main(void) {
-    /* A deadline, not a priority: a frame that is late is a frame dropped, and
-     * one that is early buys nothing. Half the period is what it may spend at
-     * deadline priority; past that it competes like anyone else. */
-    uint32_t period_ms = (uint32_t)(g_frame_period_ns / 1000000u);
-    int rc = sched_declare_period(period_ms, period_ms / 2);
+    /* A DEADLINE, not a priority: a frame that is late is a frame dropped,
+     * and one that is early buys nothing. Reserved only while frames keep
+     * coming -- motion, or an app that asked for a rate -- and given back when
+     * the desktop is still: a reservation is admission capacity every other
+     * periodic thread is refused while it is held, and a compositor blocked
+     * on a still desktop is using none of it. What it may spend at deadline
+     * priority is what its frames cost (fc_budget_ms); past that it competes
+     * like anyone else, and so does a frame a refused reservation left it. */
+    uint32_t period_ms = 0, budget_ms = 0;
     spin_lock(&g_comp_lock);
     g_comp_thread = current_thread;
     comp_unlock();
-    kprintf("compositor: frame thread running, %u ms period%s\n", period_ms,
-            rc ? " (no deadline reservation: admission refused)" : ", deadline reserved");
+    kprintf("compositor: frame thread running; it reserves time while frames keep coming\n");
     for (;;) {
         sched_lock();
-        if (!__atomic_load_n(&g_kicked, __ATOMIC_ACQUIRE) && !comp_continuous())
-            sched_block_current_locked(&g_comp_wq);       /* returns unlocked */
-        else
+        if (__atomic_load_n(&g_kicked, __ATOMIC_ACQUIRE) || comp_continuous()) {
             sched_unlock();
+        } else if (!budget_ms) {
+            sched_block_current_locked(&g_comp_wq);       /* returns unlocked */
+        } else {
+            /* STILL, BUT RESERVED: blocked until the hold that keeps the
+             * reservation runs out at the latest, so it is given back then --
+             * nothing else would wake a compositor on a still desktop. */
+            sched_block_timeout_locked(&g_comp_wq, timer_uptime_ms() + MOTION_HOLD_NS / 1000000u + 1);
+            if (!__atomic_load_n(&g_kicked, __ATOMIC_ACQUIRE) && !comp_continuous()) {
+                comp_rate_update(time_get_ns());
+                if (!g_periodic) { sched_declare_period(0, 0); period_ms = budget_ms = 0; }
+                continue;                                 /* no frame was asked for */
+            }
+        }
         __atomic_store_n(&g_kicked, 0, __ATOMIC_RELEASE);
 
         /* ON THE BEAT, OR AT ONCE. A desktop that has been still for a period
@@ -3657,17 +3685,26 @@ static void comp_thread_main(void) {
          * one a hand is waiting for. One that is moving composes a period
          * after the last frame was due, phase-locked rather than measured
          * from when that frame finished, so the beat does not drift by the
-         * cost of each frame. The scheduler sleeps in milliseconds, so a beat
-         * lands within one of where it is due. */
+         * cost of each frame. */
         uint64_t now = time_get_ns();
         comp_rate_update(now);
-        uint32_t want_ms = (uint32_t)(g_frame_period_ns / 1000000u);
-        if (want_ms < SCHED_MIN_PERIOD_MS) want_ms = SCHED_MIN_PERIOD_MS;
-        if (want_ms != period_ms && !sched_declare_period(want_ms, want_ms / 2)) period_ms = want_ms;
+        uint32_t want_ms = 0, want_budget = 0;
+        if (g_periodic) {
+            want_ms = (uint32_t)(g_frame_period_ns / 1000000u);
+            if (want_ms < SCHED_MIN_PERIOD_MS) want_ms = SCHED_MIN_PERIOD_MS;
+            want_budget = fc_budget_ms(want_ms, g_frame_cost_us,
+                                       (uint32_t)(sched_precise_lead_ns() / 1000u));
+        }
+        if ((want_ms != period_ms || want_budget != budget_ms) &&
+            !sched_declare_period(want_ms, want_budget)) {
+            period_ms = want_ms; budget_ms = want_budget;
+        }
         g_frame_due_ns = fc_next_due(g_frame_due_ns, g_frame_period_ns, now);
+        /* to the nanosecond: the timer is armed for the beat itself */
         if (g_frame_due_ns > now) {
-            uint64_t ms = (g_frame_due_ns - now + 500000u) / 1000000u;
-            if (ms) sched_sleep_ms(ms);
+            sched_sleep_until_ns(g_frame_due_ns);
+            uint64_t woke = time_get_ns();
+            comp_stats_late(woke > g_frame_due_ns ? woke - g_frame_due_ns : 0);
         }
         comp_frame();
     }
@@ -3684,6 +3721,7 @@ void compositor_start(void) {
     mouse_set_notify(compositor_input_kick);
     ui_events_init();
     sched_timed_queue(&g_frame_wq);
+    sched_timed_queue(&g_comp_wq);
     if (!process_create_kthread(comp_thread_main, NULL))
         kprintf("compositor: no frame thread; composing inline\n");
 }

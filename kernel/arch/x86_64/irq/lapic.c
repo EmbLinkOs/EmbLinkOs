@@ -22,6 +22,7 @@ extern void idt_set_entry(uint8_t vector, uint64_t handler, uint8_t type_attr);
 
 static volatile uint8_t *lapic_base = NULL; // virtual address of local APIC registers
 static uint32_t lapic_timer_ticks_per_ms = 0; // calibrated timer ticks per millisecond for the local APIC timer
+static int lapic_arm_precise(uint32_t ms);
 static volatile uint64_t lapic_ticks = 0;
 
 /* Timer mode selected at init. TSC-deadline (when the CPU has it) arms an
@@ -407,7 +408,7 @@ void lapic_timer_handler(void){
     uint32_t wake = sched_next_wake_in_ms();
     if (wake && wake < arm) arm = wake;
 
-    lapic_timer_arm_ms(arm);
+    if (!lapic_arm_precise(arm)) lapic_timer_arm_ms(arm);
 
     if (real_tick)cpu_power_poll();
     if (real_tick)
@@ -459,6 +460,21 @@ void lapic_timer_handler(void){
  * deadline) and is untested here -- QEMU's TCG APIC does not advertise it, as
  * lapic_timer_init explains at length -- so this handles the LVT count path
  * and defers to that one where it is live. */
+/* A PRECISE SLEEPER (sched_sleep_until_ns) due within `ms`: arm for its
+ * nanosecond instead and return 1. One-shot count mode only (the deadline
+ * mode is not used: LAPIC_TRY_TSC_DEADLINE). */
+static int lapic_arm_precise(uint32_t ms) {
+    uint64_t due = sched_next_precise_wake_ns();
+    if (!due || lapic_timer_tsc_deadline || !lapic_timer_ticks_per_ms) return 0;
+    uint64_t now_ns = time_get_ns();
+    uint64_t left = due > now_ns ? due - now_ns : 0;
+    if (left >= (uint64_t)ms * 1000000u) return 0;
+    uint64_t count = (uint64_t)lapic_timer_ticks_per_ms * left / 1000000u;
+    if (count == 0) count = 1;
+    lapic_write(LAPIC_REG_TIMER_INIT, (uint32_t)count);
+    return 1;
+}
+
 void lapic_timer_arm_ms(uint32_t ms) {
     if (lapic_timer_tsc_deadline) {
         lapic_timer_arm_tsc_deadline();
@@ -474,7 +490,26 @@ void lapic_timer_arm_ms(uint32_t ms) {
     lapic_write(LAPIC_REG_TIMER_INIT, (uint32_t)count);
 }
 
-void timer_arm_this_cpu_ms(uint32_t ms) { lapic_timer_arm_ms(ms); }
+/* Core 0 also for a precise sleeper (lapic_arm_precise); the others keep the
+ * skewed sleep sched_idle_next_ms gave them, so idle cores do not all wake on
+ * the same beat. */
+void timer_arm_this_cpu_ms(uint32_t ms) {
+    uint32_t cpu = this_cpu()->cpu_index;
+    if ((cpu == 0 || cpu == sched_precise_wake_cpu()) && lapic_arm_precise(ms)) return;
+    lapic_timer_arm_ms(ms);
+}
+
+void timer_arm_precise_now(uint64_t due_ns) {
+    if (lapic_timer_tsc_deadline || !lapic_timer_ticks_per_ms) return;
+    uint64_t now_ns = time_get_ns();
+    uint64_t left = due_ns > now_ns ? due_ns - now_ns : 0;
+    uint64_t count = (uint64_t)lapic_timer_ticks_per_ms * left / 1000000u;
+    if (count == 0) count = 1;
+    uint32_t current = lapic_read(LAPIC_REG_TIMER_CURRENT);
+    if (current && count >= current) return;      /* already due sooner */
+    if (count > 0xFFFFFFFFull) count = 0xFFFFFFFFull;
+    lapic_write(LAPIC_REG_TIMER_INIT, (uint32_t)count);
+}
 
 uint64_t lapic_timer_get_ticks(void) {
     return lapic_ticks;

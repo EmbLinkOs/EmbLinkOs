@@ -1013,6 +1013,31 @@ static volatile uint64_t g_earliest_wake_ms;
  * That is the same rule the deadline policy's scan follows: do not charge every
  * machine for a feature it is not using. */
 static volatile uint64_t g_earliest_periodic_wake_ms;
+/* PRECISE WAKES: the earliest nanosecond sleeper (time_get_ns()), kept for the
+ * timer-arming code; recomputed by every drain, set by every precise sleep. */
+static volatile uint64_t g_precise_wake_ns;
+static volatile uint32_t g_precise_cpu;     /* the core that slept for it last */
+/* THE TIMER'S OWN LATENESS. An interrupt armed for an instant arrives some
+ * time after it: microseconds on hardware, but a virtual machine's host puts
+ * an idle vCPU to sleep on a timer of its own, and coalesces it -- under HVF
+ * on macOS the interrupt came 0.9 ms late on average and 2.2 ms at worst,
+ * while the kernel then took 25 us to run the sleeper. That lateness alone
+ * held a 120 Hz beat's p95 3 ms off the period. So the drain learns how late
+ * it wakes precise sleepers, a precise sleeper is woken that much early, and
+ * it spins out the rest (sched_sleep_until_ns): a little CPU for the instant,
+ * the bargain Linux's haltpoll makes for KVM guests. The estimate climbs fast
+ * and decays slowly, so it sits near the late end of what was seen; on
+ * hardware it settles at microseconds and nothing spins to speak of. */
+static volatile uint64_t g_precise_lead_ns;
+#define PRECISE_LEAD_MAX_NS 3000000ull      /* never spin longer than this */
+
+static void precise_learn(uint64_t late_ns) {
+    uint64_t lead = g_precise_lead_ns;
+    if (late_ns > lead) lead += (late_ns - lead) / 2;
+    else lead -= (lead - late_ns) / 32;
+    __atomic_store_n(&g_precise_lead_ns, lead < PRECISE_LEAD_MAX_NS ? lead : PRECISE_LEAD_MAX_NS,
+                     __ATOMIC_RELAXED);
+}
 
 void sched_sleep_ms(uint64_t ms) {
     if (ms == 0) {
@@ -1054,6 +1079,52 @@ void sched_sleep_ms(uint64_t ms) {
         /* Cancellation is per-PROCESS (docs/INTERRUPTION.md): a cancelled
          * process must not be held in a sleep it asked for before it was told
          * to stop. Kernel threads have a process too, so this is uniform. */
+        if (t->proc && t->proc->cancelled) {
+            t->wake_at_ms = 0;
+            return;
+        }
+    }
+}
+
+void sched_sleep_until_ns(uint64_t due_ns) {
+    for (;;) {
+        /* woken early by what the timer is known to be late by (above) */
+        uint64_t lead = __atomic_load_n(&g_precise_lead_ns, __ATOMIC_RELAXED);
+        uint64_t t_ns = due_ns > lead ? due_ns - lead : 0;
+        uint64_t now_ns = time_get_ns();
+        if (now_ns >= t_ns) {
+            while (time_get_ns() < due_ns) arch_cpu_relax();
+            return;
+        }
+        /* the millisecond deadline is the fallback, never earlier than the
+         * nanosecond: rounded up, on the uptime clock the drain reads */
+        uint64_t left_ms = (t_ns - now_ns + 999999u) / 1000000u;
+        uint64_t deadline = timer_uptime_ms() + left_ms;
+        sched_lock();
+        struct thread *t = current_thread;
+        if (!t) {
+            sched_unlock();
+            timer_delay_ms((uint32_t)left_ms);
+            return;
+        }
+        t->wake_at_ms = deadline;
+        t->wake_at_ns = t_ns;
+        if (!g_earliest_wake_ms || deadline < g_earliest_wake_ms)
+            __atomic_store_n(&g_earliest_wake_ms, deadline, __ATOMIC_RELAXED);
+        if (t->period_ms &&
+            (!g_earliest_periodic_wake_ms || deadline < g_earliest_periodic_wake_ms))
+            __atomic_store_n(&g_earliest_periodic_wake_ms, deadline, __ATOMIC_RELAXED);
+        if (!g_precise_wake_ns || t_ns < g_precise_wake_ns)
+            __atomic_store_n(&g_precise_wake_ns, t_ns, __ATOMIC_RELAXED);
+        /* THIS CORE'S TIMER, NOW, for the instant itself. Otherwise nothing
+         * arms for it until a core next re-arms -- its tick, up to a quantum
+         * away, or an idle entry that rounds to milliseconds -- and the beat
+         * lands milliseconds late. The core that slept for it keeps watching
+         * it when it goes idle (timer_arm_this_cpu_ms). */
+        __atomic_store_n(&g_precise_cpu, this_cpu()->cpu_index, __ATOMIC_RELAXED);
+        timer_arm_precise_now(t_ns);
+        sched_block_current_locked(&g_sleep_wq);          /* returns unlocked */
+        t->wake_at_ns = 0;
         if (t->proc && t->proc->cancelled) {
             t->wake_at_ms = 0;
             return;
@@ -1256,15 +1327,22 @@ void sched_block_timeout_locked(struct wait_queue *wq, uint64_t deadline_ms) {
     t->wake_at_ms = 0;              /* woken by the event or the clock: done either way */
 }
 
-/* One queue's expired sleepers made runnable; the rest's deadlines folded in. */
-static void wake_expired_on(struct wait_queue *wq, uint64_t now, bool *woke,
-                            uint64_t *earliest, uint64_t *earliest_p) {
+uint64_t sched_precise_lead_ns(void) { return __atomic_load_n(&g_precise_lead_ns, __ATOMIC_RELAXED); }
+uint64_t sched_next_precise_wake_ns(void) { return __atomic_load_n(&g_precise_wake_ns, __ATOMIC_RELAXED); }
+uint32_t sched_precise_wake_cpu(void) { return __atomic_load_n(&g_precise_cpu, __ATOMIC_RELAXED); }
+
+/* One queue's expired sleepers made runnable; the rest's deadlines folded in.
+ * A precise sleeper is due at its nanosecond, or -- the fallback, should no
+ * timer have been armed for it -- at the millisecond after. */
+static void wake_expired_on(struct wait_queue *wq, uint64_t now, uint64_t now_ns, bool *woke,
+                            uint64_t *earliest, uint64_t *earliest_p, uint64_t *earliest_ns) {
     struct thread *t = wq->head;
     while (t) {
         struct thread *next = t->wait_next;
-        if (t->wake_at_ms && now >= t->wake_at_ms) {
+        if ((t->wake_at_ms && now >= t->wake_at_ms) || (t->wake_at_ns && now_ns >= t->wake_at_ns)) {
             wait_queue_remove(wq, t);
-            t->wake_at_ms = 0;
+            if (t->wake_at_ns) precise_learn(now_ns > t->wake_at_ns ? now_ns - t->wake_at_ns : 0);
+            t->wake_at_ms = 0; t->wake_at_ns = 0;
             sched_set_ready(t);
             *woke = true;
         } else if (t->wake_at_ms) {
@@ -1272,6 +1350,8 @@ static void wake_expired_on(struct wait_queue *wq, uint64_t now, bool *woke,
                 *earliest = t->wake_at_ms;
             if (t->period_ms && (!*earliest_p || t->wake_at_ms < *earliest_p))
                 *earliest_p = t->wake_at_ms;
+            if (t->wake_at_ns && (!*earliest_ns || t->wake_at_ns < *earliest_ns))
+                *earliest_ns = t->wake_at_ns;
         }
         t = next;
     }
@@ -1283,12 +1363,13 @@ static void wake_expired_locked(void) {
     if (!any)
         return;                        /* the common case, and now lock-free */
 
-    uint64_t now = timer_uptime_ms();
+    uint64_t now = timer_uptime_ms(), now_ns = time_get_ns();
     bool woke = false;
-    uint64_t earliest = 0, earliest_p = 0;
-    wake_expired_on(&g_sleep_wq, now, &woke, &earliest, &earliest_p);
+    uint64_t earliest = 0, earliest_p = 0, earliest_ns = 0;
+    wake_expired_on(&g_sleep_wq, now, now_ns, &woke, &earliest, &earliest_p, &earliest_ns);
     for (int i = 0; i < g_ntimed_queues; i++)
-        wake_expired_on(g_timed_queues[i], now, &woke, &earliest, &earliest_p);
+        wake_expired_on(g_timed_queues[i], now, now_ns, &woke, &earliest, &earliest_p, &earliest_ns);
+    __atomic_store_n(&g_precise_wake_ns, earliest_ns, __ATOMIC_RELAXED);
     /* Recomputed from the walk we were doing anyway -- the caches are exact
      * again here, whatever they drifted to between drains. */
     __atomic_store_n(&g_earliest_wake_ms, earliest, __ATOMIC_RELAXED);
@@ -3748,6 +3829,20 @@ uint32_t sched_reserved_permille(void) {
     uint32_t v = reserved_permille_locked(NULL);
     spin_unlock(&g_sched_lock);
     return v;
+}
+
+uint32_t sched_reserved_permille_user(void) {
+    uint64_t kernel_pml4 = vmm_get_kernel_pml4();
+    uint32_t sum = 0;
+    spin_lock(&g_sched_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const struct thread *t = &thread_table[i];
+        if (t->state == PROCESS_UNUSED || t->state == PROCESS_ZOMBIE) continue;
+        if (!t->period_ms || !t->proc || t->proc->pml4_phys == kernel_pml4) continue;
+        sum += (uint32_t)((uint64_t)t->budget_ms * 1000u / t->period_ms);
+    }
+    spin_unlock(&g_sched_lock);
+    return sum;
 }
 
 int sched_declare_period(uint32_t period_ms, uint32_t budget_ms) {

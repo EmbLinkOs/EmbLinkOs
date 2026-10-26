@@ -233,6 +233,10 @@ struct thread {
      * this thread is not waiting on a deadline -- an ordinary blocked thread
      * waits for an event, and no clock will ever wake it. */
     uint64_t wake_at_ms;
+    /* ...and, for a PRECISE sleep (sched_sleep_until_ns), the nanosecond it is
+     * due on the time_get_ns() clock -- what a frame clock needs and a
+     * millisecond cannot say. 0: a millisecond sleeper, or none. */
+    uint64_t wake_at_ns;
 
     /* Which futex this thread is waiting on, or 0. A futex bucket holds every
      * lock that hashes to it, so a wake has to be able to tell which sleepers
@@ -947,6 +951,21 @@ void sched_sleep_ms(uint64_t ms);
  * sched_block_current_locked. The caller re-checks its own condition: a wake
  * says something happened or time ran out, not which. */
 void sched_timed_queue(struct wait_queue *wq);
+
+/* SLEEP UNTIL A NANOSECOND (time_get_ns()), not a millisecond. The timer is
+ * armed for the instant itself (sched_next_precise_wake_ns), so a beat of
+ * 8.33 ms lands on 8.33 ms rather than wherever a millisecond tick rounds it
+ * -- less what the timer has been late by, which is spun out (the lead, in
+ * process.c). Callable only from a schedulable context. */
+void sched_sleep_until_ns(uint64_t t_ns);
+/* The earliest precise sleeper's due time (time_get_ns()), 0 when none: for
+ * the code that arms each core's timer. A hint, read without the lock. */
+uint64_t sched_next_precise_wake_ns(void);
+/* The core whose thread slept for it last: it, like core 0, arms for the
+ * precise wake when it goes idle. */
+uint32_t sched_precise_wake_cpu(void);
+/* How early precise sleepers are woken, to be spun out (see process.c). */
+uint64_t sched_precise_lead_ns(void);
 void sched_block_timeout_locked(struct wait_queue *wq, uint64_t deadline_ms);
 
 /* --- tickless idle --------------------------------------------------------
@@ -1192,6 +1211,10 @@ uint32_t sched_declared_count(void);
 
 /* How much of the machine is promised away right now, in permille. */
 uint32_t sched_reserved_permille(void);
+/* ...of it to ring-3 threads: what a test of reservations dying with their
+ * threads can expect back, whatever the kernel's own -- the compositor's frame
+ * thread, which reserves while frames keep coming -- do meanwhile. */
+uint32_t sched_reserved_permille_user(void);
 
 /* The ceiling. Not 1000: EDF only guarantees the set is feasible at 100%
  * utilisation if the deadline threads are the ONLY threads, and they are not

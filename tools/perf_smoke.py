@@ -13,6 +13,8 @@ long they took and why (the serial `perf` command, kernel/gfx/comp_stats.c):
   openclose a Terminal opened from the dock, then closed with GUI+W
   drag120   the drag again, the frame clock told the display is 120 Hz
   dragvrr   and again on a variable-rate display, 48-120 Hz
+  beat60    three seconds of frames on the clock alone, at 60 Hz
+  beat120   and at 120 Hz: the intervals are the clock's precision
 
 The last two use `perf display`, a display that is not there: the frame clock
 keeps its beat for it, so the beat and the rate it chose are the measure.
@@ -98,8 +100,11 @@ def scene(d, results, name, body):
           f"p95 {stats['p95_us'] / 1000:6.2f} ms  ptr p95 {stats['ptr_p95_us'] / 1000:6.2f} ms  "
           + (f"{stats.get('frames', 0)} frames beat p50 {stats.get('interval_p50_us', 0) / 1000:5.2f} "
              f"p95 {stats.get('interval_p95_us', 0) / 1000:5.2f} ms  " if 'frames' in stats else '')
-          + (f"rate {stats['rate_mhz'] / 1000:.0f}/{(stats['vrr_max_mhz'] or stats['display_mhz'] or 60000) / 1000:.0f} Hz  "
+          + (f"rate {stats.get('rate_peak_mhz', stats['rate_mhz']) / 1000:.0f}/"
+             f"{(stats['vrr_max_mhz'] or stats['display_mhz'] or 60000) / 1000:.0f} Hz  "
              if 'rate_mhz' in stats else '')
+          + (f"late p50 {stats['late_p50_us'] / 1000:.2f} p95 {stats['late_p95_us'] / 1000:.2f} ms "
+             f"lead {stats['lead_us'] / 1000:.2f} ms  " if stats.get('lates') else '')
           + ' '.join(f"{k}={v['composes']}" for k, v in stats['src'].items() if v['composes']),
           flush=True)
 
@@ -183,6 +188,7 @@ def main():
     ap.add_argument('--out')
     ap.add_argument('--arch', choices=('x86_64', 'aarch64'), default='x86_64')
     ap.add_argument('--accel', choices=('hvf', 'tcg'), default='hvf', help='aarch64 only')
+    ap.add_argument('--beat', action='store_true', help="only the beat scenes: the clock's own precision")
     args = ap.parse_args()
     out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix='emblink-perf-'))
     out.mkdir(parents=True, exist_ok=True)
@@ -200,6 +206,9 @@ def main():
         S._pos[0] = None
         move(d, 640, 400)
         d.g.pump(5)
+        if args.beat:
+            beats(d, results)
+            return finish(d, results, args, out)
 
         scene(d, results, 'idle', lambda: d.g.pump(10))
 
@@ -257,13 +266,32 @@ def main():
         d.g.command('perf display 48-120', b'perf: display', 60)
         scene(d, results, 'dragvrr', drag)
         came_back('dragvrr')
-        d.g.command('perf display auto', b'perf: display', 60)
+
+        beats(d, results)
 
         d.g.command('perf hud', b'perf: hud on', 60)
         d.g.pump(3)
         results['capture'] = str(d.g.capture(out / 'perf-hud.ppm'))
     finally:
         d.g.close()
+    finish(d, results, args, out)
+
+
+def beats(d, results):
+    """THE BEAT ITSELF: three seconds of frames on the clock alone, at the
+    display's rate and at a simulated 120 -- what the intervals say is the
+    clock's precision, with no input rate or app in the way."""
+    def beat():
+        d.g.command('perf beat 3', b'perf: beat', 60)
+        d.g.pump(3.5)
+    d.g.command('perf display 60', b'perf: display', 60)
+    scene(d, results, 'beat60', beat)
+    d.g.command('perf display 120', b'perf: display', 60)
+    scene(d, results, 'beat120', beat)
+    d.g.command('perf display auto', b'perf: display', 60)
+
+
+def finish(d, results, args, out):
     results['label'] = args.label
     results['arch'] = args.arch + ('' if args.arch == 'x86_64' else '/' + args.accel)
     (out / 'perf.json').write_text(json.dumps(results, indent=2) + '\n')

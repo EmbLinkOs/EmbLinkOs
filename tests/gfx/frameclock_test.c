@@ -67,6 +67,13 @@ int main(void) {
     CHECK(drift == 0, "600 frames later the beat is exactly where it was due -- no drift from frame cost");
     CHECK(fc_next_due(due, 8333333, due + 2000000) == due + 8333333, "the period can change between frames: 60 to 120");
 
+    /* the reservation */
+    CHECK(fc_budget_ms(16, 0, 0) == 1, "reservation: nothing measured yet asks 1 ms, not half the period");
+    CHECK(fc_budget_ms(16, 2600, 0) == 4, "reservation: a 2.6 ms frame asks 4 ms (half again, rounded up)");
+    CHECK(fc_budget_ms(8, 1900, 1100) == 4, "reservation: the timer lead it spins is part of the frame");
+    CHECK(fc_budget_ms(33, 23000, 0) == 16, "reservation: a 23 ms frame (TCG) is held to half its period");
+    CHECK(fc_budget_ms(1, 5000, 0) == 1, "reservation: never 0, whatever the period");
+
     printf("=== frameclock: %u checks, %u failures ===\n", checks, failures);
     return failures ? 1 : 0;
 }
