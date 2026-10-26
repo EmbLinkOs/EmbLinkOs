@@ -19,6 +19,7 @@
 #include "gfx/backdrop.h"      /* the blur behind a window that shows through */
 #include "include/errno.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: the window-motion clock */
+#include "gfx/comp_stats.h"     /* what each compose costs, and why it was asked */
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -151,6 +152,18 @@ struct comp_window {
 
 static struct comp_window g_wins[COMP_MAX_WINDOWS];
 static spinlock_t g_comp_lock = SPINLOCK_INIT;
+/* WHY the compose in progress was asked for, charged to it in comp_stats.
+ * Set by the entry points that take the lock for a reason (a present, a move,
+ * the pointer, window motion, the overlay) and put back to OTHER by every
+ * unlock, so a cause can never leak into the next caller's composes. */
+static unsigned g_src = EMBK_COMP_SRC_OTHER;
+/* Pixels the compose in progress repainted, counted where the repaint is
+ * finally decided (after the growth for corners and materials). */
+static uint64_t g_paint_px;
+static inline void comp_unlock(void) {
+    g_src = EMBK_COMP_SRC_OTHER;
+    spin_unlock(&g_comp_lock);
+}
 static uint32_t   g_next_id = 1;
 /* z bands: desktop = 0; widgets in [1, WIDGET_Z_TOP); app windows above it. */
 #define WIDGET_Z_TOP 1000000
@@ -512,7 +525,7 @@ uint32_t compositor_focused_pid(void) {
      * input. It must outrank the application it visibly covers. */
     if(desk && (!best || desk->z>best->z))best=desk;
     if (best) pid = (uint32_t)best->pid;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return pid;
 }
 
@@ -1505,11 +1518,78 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
     return 0;
 }
 
+/* ---- the statistics overlay (GUI+Shift+P, serial `perf hud`) ------------ *
+ * What composing costs, on the screen it is costing: drawn by the compositor
+ * over every window and under the cursor, at the primary output's top right,
+ * just below the bar. The text is formatted at the refresh (hud_tick), never
+ * inside a compose, and the overlay's own repaints are charged to
+ * EMBK_COMP_SRC_HUD, which the totals leave out -- turning it on does not move
+ * the numbers it shows. Plain 8x16 text on purpose: it is an instrument. */
+#define HUD_ROWS       COMP_STATS_HUD_ROWS
+#define HUD_W          (COMP_STATS_HUD_COLS * 8 + 16)
+#define HUD_H          (HUD_ROWS * 16 + 12)
+#define HUD_REFRESH_MS 500
+static volatile int g_hud_want;          /* asked for, from any context       */
+static int          g_hud_on;            /* on screen (compositor lock)       */
+static uint64_t     g_hud_at;            /* uptime ms of the last refresh     */
+static char         g_hud_rows[HUD_ROWS][COMP_STATS_HUD_COLS + 1];
+
+static void hud_rect(int *x0, int *y0, int *x1, int *y1) {
+    outputs_whole(fb_get_info());
+    const struct layout_rect *o = &g_outs[0];
+    *x1 = o->x + (int)o->w - 12; *x0 = *x1 - HUD_W;
+    *y0 = o->y + WORK_TOP + 8;   *y1 = *y0 + HUD_H;
+}
+
+/* Into the backbuffer, clipped to the region. 1 if anything was drawn. */
+static int hud_draw(int rx0, int ry0, int rx1, int ry1) {
+    if (!g_hud_on) return 0;
+    int x0, y0, x1, y1; hud_rect(&x0, &y0, &x1, &y1);
+    int cx0 = imax(x0, rx0), cy0 = imax(y0, ry0), cx1 = imin(x1, rx1), cy1 = imin(y1, ry1);
+    if (cx1 <= cx0 || cy1 <= cy0) return 0;
+    fb_set_clip(cx0, cy0, cx1, cy1);
+    fb_fill_rect(x0, y0, x1 - x0, y1 - y0, FB_RGB(0x10, 0x14, 0x18));
+    fb_color_t edge = g_desktop.accent;
+    fb_fill_rect(x0, y0, x1 - x0, 1, edge); fb_fill_rect(x0, y1 - 1, x1 - x0, 1, edge);
+    fb_fill_rect(x0, y0, 1, y1 - y0, edge); fb_fill_rect(x1 - 1, y0, 1, y1 - y0, edge);
+    for (int i = 0; i < HUD_ROWS; i++)
+        fb_draw_string(g_hud_rows[i], x0 + 8, y0 + 6 + i * 16,
+                       0xec, 0xf0, 0xec, 0x10, 0x14, 0x18);
+    fb_reset_clip();
+    return 1;
+}
+
+int compositor_hud_toggle(void) {
+    g_hud_want = !g_hud_want;
+    return g_hud_want;
+}
+int compositor_hud_shown(void) { return g_hud_on; }
+
+/* From the kernel loop: bring the overlay up or down as asked, and refresh it
+ * twice a second while it is up. The text is made before the lock is taken --
+ * comp_stats asks the compositor which renderer it has. */
+void compositor_hud_tick(void) {
+    if (!g_active || (!g_hud_want && !g_hud_on)) return;
+    uint64_t now = timer_uptime_ms();
+    int want = g_hud_want;
+    if (want == g_hud_on && now - g_hud_at < HUD_REFRESH_MS) return;
+    char rows[HUD_ROWS][COMP_STATS_HUD_COLS + 1];
+    if (want) comp_stats_hud_text(rows);
+    spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_HUD;
+    if (want) memcpy(g_hud_rows, rows, sizeof rows);
+    g_hud_on = want; g_hud_at = now;
+    int x0, y0, x1, y1; hud_rect(&x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    comp_unlock();
+}
+
 /* paint_region on the GPU. 0: drawn and shown; -1: the GPU could not. */
 static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
     const struct gpu_compose *gc = g_gc;
     const fb_info_t *fi = fb_get_info();
     int W = (int)fi->width, H = (int)fi->height;
+    g_paint_px += (uint64_t)(rx1 - rx0) * (uint64_t)(ry1 - ry0);
     for (unsigned i = 0; i < g_gpu_ndoomed; i++) gc->image_destroy(g_gpu_doomed[i]);
     g_gpu_ndoomed = 0;
     if (gpu_canvas(fi)) return -1;
@@ -1571,6 +1651,19 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         }
     }
 
+    /* the overlay is drawn by the CPU into the canvas, as a title bar is */
+    if (hud_draw(rx0, ry0, rx1, ry1)) {
+        int x0, y0, x1, y1; hud_rect(&x0, &y0, &x1, &y1);
+        x0 = imax(imax(x0, rx0), 0); y0 = imax(imax(y0, ry0), 0);
+        x1 = imin(imin(x1, rx1), W); y1 = imin(imin(y1, ry1), H);
+        if (x1 > x0 && y1 > y0) {
+            struct gpu_rect r = { x0, y0, x1 - x0, y1 - y0 };
+            gc->image_update(g_canvas_img, &r);
+            struct gpu_draw d = { .image = g_canvas_img, .src = r, .dst = r, .opaque = 1, .opacity = 255 };
+            gc->draw(&d);
+        }
+    }
+
     if (g_cursor_valid) {
         struct gpu_draw d = { .image = g_cursor_img, .src = { 0, 0, CURSOR_W, CURSOR_H },
                               .dst = { g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H }, .opaque = 0, .opacity = 255 };
@@ -1579,7 +1672,22 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
     return gc->end();
 }
 
+static void paint_region_now(int rx0, int ry0, int rx1, int ry1);
+
+/* Every compose goes through here, so every compose is measured: its time from
+ * the first pixel to the presentation, its area, and the cause in g_src. */
 static void paint_region(int rx0, int ry0, int rx1, int ry1) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return;
+    g_paint_px = 0;
+    uint64_t t0 = time_get_ns();
+    paint_region_now(rx0, ry0, rx1, ry1);
+    if (!g_paint_px) return;                  /* clipped away: nothing composed */
+    uint64_t screen = (uint64_t)fi->width * fi->height;
+    comp_stats_record(g_src, t0, time_get_ns(), g_paint_px, g_paint_px * 10 >= screen * 9);
+}
+
+static void paint_region_now(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     int W = (int)fi->width, H = (int)fi->height;
@@ -1609,6 +1717,7 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
 static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     int W = (int)fi->width, H = (int)fi->height;
+    g_paint_px += (uint64_t)(rx1 - rx0) * (uint64_t)(ry1 - ry0);
 
     /* Remove the software cursor before changing the composed framebuffer.
      * This also guarantees that its saved background never contains a previous
@@ -1659,6 +1768,9 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
                                    (uint32_t)sw_, (uint32_t)alpha, rx0, ry0, rx1, ry1);
         }
     }
+
+    /* 2c) the statistics overlay, above everything but the cursor */
+    hud_draw(rx0, ry0, rx1, ry1);
 
     /* 3) save the fresh pixels below the cursor, then put it back on top. */
     cursor_capture_and_draw();
@@ -1740,10 +1852,10 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     int slot = -1;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++)
         if (!g_wins[i].used) { slot = i; break; }
-    if (slot < 0) { spin_unlock(&g_comp_lock); return -EMBK_ENOMEM; }
+    if (slot < 0) { comp_unlock(); return -EMBK_ENOMEM; }
 
     uint32_t *buf = (uint32_t *)kmalloc((size_t)cw * ch * 4);
-    if (!buf) { spin_unlock(&g_comp_lock); return -EMBK_ENOMEM; }
+    if (!buf) { comp_unlock(); return -EMBK_ENOMEM; }
     /* start opaque black so an un-presented window isn't garbage */
     for (size_t i = 0; i < (size_t)cw * ch; i++) buf[i] = 0xFF000000u;
 
@@ -1782,7 +1894,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
         paint_region(fx0, fy0, fx1, fy1);
     }
     enforce_focus();   /* the new window is now front; demote the old front */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     kprintf("compositor: window %u created (%ux%u) for pid %d\n",
             (unsigned)id, (unsigned)cw, (unsigned)ch, pid);
     return (int64_t)id;
@@ -1842,7 +1954,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     int slot = -1;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) if (!g_wins[i].used) { slot = i; break; }
     if (slot < 0) {
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         for (uint32_t i = 0; i < npages; i++) vmm_unmap_in(client->pml4_phys, cva + (uint64_t)i * PAGE_SIZE);
         vmm_kunmap_pages(kview, npages);
         for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
@@ -1894,7 +2006,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     if (!g_active) { g_active = 1; paint_region(0, 0, (int)fi->width, (int)fi->height); }
     else { int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1); paint_region(fx0, fy0, fx1, fy1); }
     enforce_focus();
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     if (out_client_va) *out_client_va = cva;
     kprintf("compositor: %s window %u created (%ux%u, %u pages) for pid %d\n",
             desktop ? "desktop" : "shared",
@@ -1932,9 +2044,9 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
      * intercepting clicks after its menu was dismissed. */
     spin_lock(&g_comp_lock);
     struct comp_window *owner=win_find((int)client->pid,id);
-    if (!owner || !owner->shared) {spin_unlock(&g_comp_lock);return -EMBK_ENOENT;}
+    if (!owner || !owner->shared) {comp_unlock();return -EMBK_ENOENT;}
     uint32_t min_h=owner->translucent ? 24u : 90u;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     if (nw < 120 || nh < min_h || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
 
     /* new backing first (outside the lock: pmm/vmm work) */
@@ -1974,7 +2086,7 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find((int)client->pid, id);
     if (!w || !w->shared) {
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         for (uint32_t i = 0; i < npages; i++) vmm_unmap_in(client->pml4_phys, cva + (uint64_t)i * PAGE_SIZE);
         vmm_kunmap_pages(kview, npages);
         for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
@@ -1999,8 +2111,9 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
     gpu_image_doom(&w->gimg);                    /* it was over the old pages */
     win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);   /* new footprint */
+    g_src = EMBK_COMP_SRC_MOVE;
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 
     /* free the OLD backing (nobody references it any more) */
     if (ophys) {
@@ -2057,7 +2170,7 @@ int compositor_win_is_shared(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     int s = w ? w->shared : 0;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return s;
 }
 
@@ -2066,15 +2179,17 @@ uint32_t *compositor_win_content(int pid, uint32_t id, uint32_t *cw, uint32_t *c
     struct comp_window *w = win_find(pid, id);
     uint32_t *buf = 0;
     if (w) { buf = w->content; if (cw) *cw = w->cw; if (ch) *ch = w->ch; }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return buf;
 }
 
 int64_t compositor_win_damage(int pid, uint32_t id,
                               uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) {
     spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_PRESENT;
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
+    comp_stats_present(pid, w->desktop ? "(desktop)" : w->title, (uint64_t)(rw ? rw : w->cw) * (rh ? rh : w->ch));
     if (rw == 0 || rh == 0) { rx = 0; ry = 0; rw = w->cw; rh = w->ch; }
     if (rx > w->cw) rx = w->cw; if (ry > w->ch) ry = w->ch;
     if (rx + rw > w->cw) rw = w->cw - rx;
@@ -2094,18 +2209,19 @@ int64_t compositor_win_damage(int pid, uint32_t id,
         anim_start(w, ANIM_OPEN);
         int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
         paint_region(fx0, fy0, fx1, fy1);
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         return 0;
     }
     paint_region(sx0, sy0, sx0 + (int)rw, sy0 + (int)rh);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
 static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int raise) {
     spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_MOVE;
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
     int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
     const fb_info_t *fi = fb_get_info();
     /* A translucent bar IS the top-strip chrome, so it may sit above WORK_TOP
@@ -2126,7 +2242,7 @@ static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int rais
     /* repaint the union of old and new footprints in one region */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
     if(raise)enforce_focus();   /* automatic reflow preserves focus */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2141,21 +2257,21 @@ int64_t compositor_win_where(int pid,uint32_t id,struct comp_win_geometry *out) 
     spin_lock(&g_comp_lock);
     struct comp_window *w=win_find(pid,id);
     if(w)*out=(struct comp_win_geometry){w->x,w->y,w->cw,w->ch};
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return w?0:-EMBK_ENOENT;
 }
 
 int64_t compositor_win_destroy(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
     int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
     win_free_backing(w);                       /* frees copy buf OR unmaps+frees shared pages */
     w->used = 0; w->visible = 0;
     if (id == g_top_id) g_top_id = 0;          /* force focus recompute below */
     paint_region(fx0, fy0, fx1, fy1);          /* expose whatever was behind */
     enforce_focus();                           /* promote the new front window */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2184,7 +2300,7 @@ void compositor_exit_pid(int pid) {
         found = 1;
     }
     if (found) enforce_focus();
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* An app parking ITSELF. Chromeless windows (every EmUI V4 app) have no kernel
@@ -2194,7 +2310,7 @@ void compositor_exit_pid(int pid) {
 int compositor_win_minimize(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w || w->desktop) { spin_unlock(&g_comp_lock); return -1; }
+    if (!w || w->desktop) { comp_unlock(); return -1; }
     if (!w->minimized) {
         w->minimized = 1;
         if (w->id == g_top_id) g_top_id = 0;
@@ -2204,7 +2320,7 @@ int compositor_win_minimize(int pid, uint32_t id) {
         paint_region(x0, y0, x1, y1);
         enforce_focus();
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2233,7 +2349,7 @@ void compositor_repaint_all(void) {
     if (!fi) return;
     spin_lock(&g_comp_lock);
     paint_region(0, 0, (int)fi->width, (int)fi->height);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 int compositor_desktop_front(int pid, int on) {
@@ -2269,7 +2385,7 @@ int compositor_desktop_front(int pid, int on) {
         }
         break;
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return rc;
 }
 
@@ -2324,7 +2440,7 @@ int compositor_win_list(struct comp_win_info *out, int max) {
         out[j + 1] = key;
     }
 
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }
 
@@ -2351,7 +2467,7 @@ int compositor_cycle_window(void) {
         if (!w->used || !on_workspace(w) || w->desktop || w->widget || w->translucent || !w->title[0]) continue;
         if (!front || w->z > front->z) front = w;
     }
-    if (!front) { spin_unlock(&g_comp_lock); return 0; }
+    if (!front) { comp_unlock(); return 0; }
 
     /* The highest z BELOW the front one; with nothing below, the front stays. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
@@ -2360,7 +2476,7 @@ int compositor_cycle_window(void) {
         if (w->desktop || w->widget || w->translucent || !w->title[0]) continue;
         if (w->z < front->z && (!next || w->z > next->z)) next = w;
     }
-    if (!next) { spin_unlock(&g_comp_lock); return 0; }
+    if (!next) { comp_unlock(); return 0; }
 
     if (next->minimized) {
         next->minimized = 0;
@@ -2373,7 +2489,7 @@ int compositor_cycle_window(void) {
         paint_region(x0, y0, x1, y1);
     }
     enforce_focus();
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 1;
 }
 
@@ -2419,7 +2535,7 @@ int compositor_close_overdue(int *out, int max) {
 
         out[n++] = w->pid;
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }
 
@@ -2433,7 +2549,7 @@ int compositor_close_front(void) {
         if (!w || c->z > w->z) w = c;
     }
     if (w) win_ask_close(w);                   /* ask; the grace timer kills */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2467,13 +2583,13 @@ int compositor_quit_front(void) {
             n++;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }
 
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
-    if(session_input_owner() || !session_ui_allowed(pid)){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+    if(session_input_owner() || !session_ui_allowed(pid)){comp_unlock();return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].pid==pid &&
        !g_wins[i].desktop && !g_wins[i].widget && !g_wins[i].translucent) {
         if(g_desktop.workspace!=g_wins[i].workspace) {
@@ -2504,7 +2620,7 @@ int compositor_restore_pid(int pid) {
     if (changed) enforce_focus();
     const fb_info_t *fi=fb_get_info();
     if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return changed;
 }
 
@@ -2526,7 +2642,7 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
     /* composed on the GPU: the screen is there, not in the backbuffer -- read
      * it back into the backbuffer first (the scanout's own pages) */
     if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         return -1;
     }
     for (int yy = y0; yy < y1; yy += stepy) {
@@ -2537,7 +2653,7 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
             n++;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n ? (int)(sum / n) : -1;
 }
 
@@ -2567,13 +2683,13 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
     uint32_t n = 0;
     spin_lock(&g_comp_lock);
     if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {   /* see backdrop_luma */
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         return -1;
     }
     for (int yy = y0; yy < y1; yy++)
         for (int xx = x0; xx < x1; xx++)
             out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return (int)n;
 }
 
@@ -2583,18 +2699,18 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
 int compositor_win_close_ack(int pid,uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w=win_find(pid,id);
-    if (!w) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    if (!w) {comp_unlock();return -EMBK_EINVAL;}
     w->asked_close_ms=0;
-    spin_unlock(&g_comp_lock);return 0;
+    comp_unlock();return 0;
 }
 
 int compositor_win_menu(int pid,uint32_t id,int active) {
     if (active != 0 && active != 1) return -EMBK_EINVAL;
     spin_lock(&g_comp_lock);
     struct comp_window *w=win_find(pid,id);
-    if (!w || !w->translucent) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    if (!w || !w->translucent) {comp_unlock();return -EMBK_EINVAL;}
     w->menu_keyboard=active;
-    spin_unlock(&g_comp_lock);return 0;
+    comp_unlock();return 0;
 }
 
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
@@ -2602,12 +2718,12 @@ int compositor_win_menu(int pid,uint32_t id,int active) {
 int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -1; }
+    if (!w) { comp_unlock(); return -1; }
     w->blur_set = (w_ > 0 && h_ > 0);
     w->blur_x = x; w->blur_y = y; w->blur_w = w_; w->blur_h = h_;
     int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
     paint_region(x0, y0, x1, y1);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2615,15 +2731,15 @@ int compositor_win_set_material(int pid, uint32_t id, int alpha, int blur) {
     if (blur < 0 || blur > COMP_MAT_BLUR_MAX) return -EMBK_EINVAL;
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
-    if (w->desktop || w->widget || w->translucent || w->glass) { spin_unlock(&g_comp_lock); return -EMBK_EINVAL; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
+    if (w->desktop || w->widget || w->translucent || w->glass) { comp_unlock(); return -EMBK_EINVAL; }
     w->mat_alpha = alpha ? 1 : 0;
     w->mat_blur = alpha ? (uint8_t)blur : 0;
     if (!w->mat_blur) backdrop_free(w);
     w->bd_valid = 0;                         /* a new radius: blurred again, all of it */
     int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
     paint_region(x0, y0, x1, y1);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2641,7 +2757,7 @@ void compositor_reap_pid(int pid) {
             if (g_wins[i].id == g_top_id) g_top_id = 0;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* Advance any running window motion by one frame. Called from the boot CPU's
@@ -2652,10 +2768,11 @@ void compositor_reap_pid(int pid) {
 void compositor_anim_tick(void) {
     if (g_anim.kind == ANIM_NONE) return;        /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
-    if (g_anim.kind == ANIM_NONE) { spin_unlock(&g_comp_lock); return; }
+    if (g_anim.kind == ANIM_NONE) { comp_unlock(); return; }
+    g_src = EMBK_COMP_SRC_ANIM;
 
     int num, den; anim_progress(&num, &den);
-    if (num >= den) { anim_finish(); spin_unlock(&g_comp_lock); return; }
+    if (num >= den) { anim_finish(); comp_unlock(); return; }
 
     int x0, y0, x1, y1;
     anim_dirty(&x0, &y0, &x1, &y1);
@@ -2663,7 +2780,7 @@ void compositor_anim_tick(void) {
     for (int i = 0; i < 4; i++) g_anim.last[i] = r[i];
     g_anim.have_last = 1;
     paint_region(x0, y0, x1, y1);            /* draws the ghost itself */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* IS SOMETHING BEING DRAGGED, and by whom.
@@ -2693,7 +2810,7 @@ void compositor_drag_set(int on, uint32_t pid) {
     spin_lock(&g_comp_lock);
     g_drag_on = on ? 1 : 0;
     g_drag_pid = on ? pid : 0;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* Take the drop pending for `pid`, if any. 1 and the details, or 0. */
@@ -2710,7 +2827,7 @@ int compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly) {
         got = 1;
         break;
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return got;
 }
 
@@ -2725,6 +2842,7 @@ void compositor_pointer_tick(void) {
     }
 
     spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_POINTER;
     struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
     if(g_cap_pid && (!captured || !captured->visible || !on_workspace(captured) || !session_ui_allowed(captured->pid)))
         reset_pointer_capture_locked();
@@ -2901,9 +3019,18 @@ void compositor_pointer_tick(void) {
             if (near_) paint_region(imin(x, ocx), imin(y, ocy), imax(x, ocx) + CURSOR_W, imax(y, ocy) + CURSOR_H);
             else { paint_region(ocx, ocy, ocx + CURSOR_W, ocy + CURSOR_H); paint_region(x, y, x + CURSOR_W, y + CURSOR_H); }
         } else {
+            /* the cursor alone, on the CPU: a compose too, and measured as one */
+            uint64_t t0 = time_get_ns();
             cursor_capture_and_draw();
             fb_present();
+            comp_stats_record(EMBK_COMP_SRC_POINTER, t0, time_get_ns(), (uint64_t)CURSOR_W * CURSOR_H * 2, 0);
         }
+    }
+    /* how long the pointer's motion took to reach the screen: from the driver
+     * noticing it to the compose above that drew the cursor there */
+    if (cursor_moved) {
+        uint64_t moved = mouse_take_motion_ns();
+        if (moved) comp_stats_pointer(time_get_ns() - moved);
     }
     if (raised) enforce_focus();   /* demote whoever used to be front */
 
@@ -2965,7 +3092,7 @@ void compositor_pointer_tick(void) {
 
     g_prev_buttons = b;
     #undef DIRTY
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 
     /* A close-button click terminates the owning process OUTSIDE g_comp_lock:
      * process_kill -> process_reap_slot -> compositor_reap_pid re-takes
@@ -3069,7 +3196,7 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
             break;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return focused;
 }
 
@@ -3082,7 +3209,7 @@ void compositor_session_changed(void) {
         if(g_wins[i].used && g_wins[i].pid==owner)g_wins[i].presented=false;
     const fb_info_t *fi=fb_get_info();
     if(fi)paint_region(0,0,fi->width,fi->height);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* The shell publishes geometry and bounded appearance. Workspace changes only
@@ -3094,20 +3221,20 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
     /* Session transitions also take this lock before completing. A request
      * queued before a lock must recheck ownership when it actually runs. */
     if(operation && (!session_ui_allowed(pid) || session_input_owner())) {
-        spin_unlock(&g_comp_lock);return -EMBK_EPERM;
+        comp_unlock();return -EMBK_EPERM;
     }
     int reset_capture=0;
     if(operation==EMBK_DESKTOP_CONFIGURE) {
         uint32_t owns=0;
         for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && g_wins[i].pid==pid)owns=g_wins[i].id;
         const fb_info_t *fi=fb_get_info();
-        if(!owns){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+        if(!owns){comp_unlock();return -EMBK_EPERM;}
         if(!fi || state->left+state->right>fi->width/2 || state->top+state->bottom>fi->height/2 ||
            state->left>256 || state->right>256 || state->top>256 || state->bottom>256 ||
            state->radius>12 || state->shadows>2 || state->decoration>2 || state->cursor_style>2 ||
            state->cursor_size>1 || state->shortcut_modifier>1 || state->blur>16 || state->opacity<127 || state->opacity>255 || state->workspace_count<1 || state->workspace_count>6 ||
            state->flags&~7u || state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
-            spin_unlock(&g_comp_lock);return -EMBK_EINVAL;
+            comp_unlock();return -EMBK_EINVAL;
         }
         if(g_anim.kind!=ANIM_NONE)anim_finish();
         unsigned before=g_desktop.workspace;
@@ -3119,8 +3246,8 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
         keyboard_set_shortcut_modifier(state->shortcut_modifier);
         cursor_layers_ready=0;
     } else if(operation) {
-        if(g_desktop_front){spin_unlock(&g_comp_lock);return -EMBK_EBUSY;}
-        if(state->workspace>=g_desktop.workspace_count){spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+        if(g_desktop_front){comp_unlock();return -EMBK_EBUSY;}
+        if(state->workspace>=g_desktop.workspace_count){comp_unlock();return -EMBK_EINVAL;}
         if(g_anim.kind!=ANIM_NONE)anim_finish();
         if(operation==EMBK_DESKTOP_MOVE_FRONT) {
             struct comp_window *front=front_app_window();
@@ -3136,16 +3263,16 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
         enforce_focus();const fb_info_t *fi=fb_get_info();
         if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
     }
-    *state=g_desktop;spin_unlock(&g_comp_lock);return 0;
+    *state=g_desktop;comp_unlock();return 0;
 }
 
 int compositor_request_launcher(void) {
     spin_lock(&g_comp_lock);
-    if(session_input_owner()){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+    if(session_input_owner()){comp_unlock();return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && session_ui_allowed(g_wins[i].pid)) {
-        g_wins[i].pending_action=7;spin_unlock(&g_comp_lock);return 0;
+        g_wins[i].pending_action=7;comp_unlock();return 0;
     }
-    spin_unlock(&g_comp_lock);return -EMBK_ENOENT;
+    comp_unlock();return -EMBK_ENOENT;
 }
 /* target -1/-2 walk backward/forward; nonnegative targets are direct spaces. */
 int compositor_workspace_key(int target,int move) {
@@ -3157,7 +3284,7 @@ int compositor_workspace_key(int target,int move) {
         next=(int)g_desktop.workspace+(target==-1?-1:1);
         if(g_desktop.flags&EMBK_DESKTOP_WRAP)next=(next+(int)g_desktop.workspace_count)%(int)g_desktop.workspace_count;
     }
-    state.workspace=(unsigned)next;spin_unlock(&g_comp_lock);
+    state.workspace=(unsigned)next;comp_unlock();
     if(!pid)return -EMBK_ENOENT;
     return compositor_desktop_control(pid,move?EMBK_DESKTOP_MOVE_FRONT:EMBK_DESKTOP_SWITCH,&state);
 }
@@ -3172,7 +3299,7 @@ int compositor_desktop_healthy(void) {
         if(w->desktop)desktop=1;
         if(!strcmp(w->title,"TopBar"))strip=1;
     }
-    spin_unlock(&g_comp_lock);return desktop && strip;
+    comp_unlock();return desktop && strip;
 }
 
 /* What composes the desktop: 1 and its name when a GPU does, else 0. */
@@ -3180,12 +3307,12 @@ int compositor_renderer(char *name, unsigned len) {
     spin_lock(&g_comp_lock);
     const struct gpu_compose *gc = g_gc;
     if (name && len) snprintf(name, len, "%s", gc ? gc->name : "Software");
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return gc != 0;
 }
 
 void compositor_display_lock(void) {spin_lock(&g_comp_lock);}
-void compositor_display_unlock(void) {spin_unlock(&g_comp_lock);}
+void compositor_display_unlock(void) {comp_unlock();}
 /* A new surface -- and, with several monitors, a new arrangement of them.
  * Windows on an output that went away move to the primary; every window is
  * kept inside the work area of the output it is on now. */
@@ -3250,7 +3377,7 @@ struct fb_surface *compositor_select_layout(struct fb_surface *next, const struc
         g_prev_layout=now;
         paint_region(0,0,fi->width,fi->height);
     }
-    spin_unlock(&g_comp_lock);return old;
+    comp_unlock();return old;
 }
 struct fb_surface *compositor_select_display(struct fb_surface *next) {
     return compositor_select_layout(next,0,0,0);
@@ -3260,6 +3387,6 @@ unsigned compositor_outputs(struct layout_rect *out,unsigned max) {
     outputs_whole(fb_get_info());
     unsigned n=g_nouts<max?g_nouts:max;
     for(unsigned i=0;i<n;i++)out[i]=g_outs[i];
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }

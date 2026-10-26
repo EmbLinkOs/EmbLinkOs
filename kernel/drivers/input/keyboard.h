@@ -90,6 +90,7 @@ enum {
     SYSKEY_QUIT_APP,
     SYSKEY_LAUNCHER, SYSKEY_SPACE_PREVIOUS, SYSKEY_SPACE_NEXT,
     SYSKEY_KERNEL_LOG,       /* GUI+K: show/hide the kernel log on screen */
+    SYSKEY_PERF_HUD,         /* GUI+Shift+P: the compositor's statistics overlay */
     SYSKEY_SPACE_1=16, SYSKEY_MOVE_SPACE_1=32,
 };
 /* Take the pending system shortcut, if any, and clear it. */

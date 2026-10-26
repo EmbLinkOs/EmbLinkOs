@@ -153,6 +153,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/ipc/pipe.c \
                   kernel/gfx/surface.c \
                   kernel/gfx/compositor.c \
+                  kernel/gfx/comp_stats.c \
                   kernel/gfx/backdrop.c \
                   kernel/kworker/kworker.c \
                   kernel/tty/tty.c kernel/tty/pty.c \

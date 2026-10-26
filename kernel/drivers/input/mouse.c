@@ -45,6 +45,18 @@ static spinlock_t pointer_state_lock=SPINLOCK_INIT;
 #define PKT_Y_SIGN   0x20
 
 static volatile int32_t  g_x, g_y;
+/* When the pointer first moved since the compositor last drew it (ns, 0 = it
+ * has not): the start of the motion-to-screen latency comp_stats reports. The
+ * OLDEST unshown motion, so a burst of packets is timed from its first. */
+static volatile uint64_t g_motion_ns;
+static inline void note_motion(int32_t nx, int32_t ny) {
+    if ((nx != g_x || ny != g_y) && !g_motion_ns) g_motion_ns = time_get_ns();
+}
+uint64_t mouse_take_motion_ns(void) {
+    uint64_t t = g_motion_ns;
+    g_motion_ns = 0;
+    return t;
+}
 static volatile uint32_t g_buttons;
 static volatile int32_t  g_wheel;        /* accumulated scroll notches (IntelliMouse Z) */
 
@@ -156,6 +168,7 @@ static void apply_motion(void) {
     int32_t ny = g_y - dy;                     /* PS/2 y is up-positive; screen is down */
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
+    note_motion(nx, ny);
     g_x = nx; g_y = ny;
     buttons_set(g_pkt[0] & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE));
 }
@@ -175,6 +188,7 @@ void mouse_set_absolute_inner(int32_t x, int32_t y, int32_t range,
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     if(g_x!=nx || g_y!=ny || wheel || buttons!=g_buttons)POINTER_ACTIVITY();
+    note_motion(nx, ny);
     g_x = nx; g_y = ny;
     buttons_set(buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
     if (wheel) g_wheel += wheel;
@@ -192,6 +206,7 @@ void mouse_move_relative_inner(int32_t dx, int32_t dy, uint32_t buttons, int32_t
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     if(g_x!=nx || g_y!=ny || wheel || buttons!=g_buttons)POINTER_ACTIVITY();
+    note_motion(nx, ny);
     g_x = nx; g_y = ny;
     buttons_set(buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
     if (wheel) g_wheel += wheel;

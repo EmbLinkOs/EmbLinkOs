@@ -48,6 +48,12 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
  * MOUSE_BTN_*; wheel is a delta to accumulate (+up). */
 void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel);
 
+/* The uptime (ns) at which the pointer first moved since this was last taken,
+ * or 0 if it has not -- and clear it. The compositor takes it when it has drawn
+ * the cursor at its new place, which makes the difference the time the motion
+ * took to reach the screen. */
+uint64_t mouse_take_motion_ns(void);
+
 /* Put the cursor at (x, y), clamped to the bounds. For the compositor, which
  * keeps it off the parts of a multi-monitor desktop no monitor shows. */
 void mouse_warp(int32_t x, int32_t y);

@@ -19,6 +19,7 @@
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick() -- cursor/focus/drag */
+#include "gfx/comp_stats.h"   /* the serial `perf` command */
 #include "drivers/timer/timer.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/rtc.h"
@@ -1784,6 +1785,7 @@ static void kernel_handle_line_command(const char *cmd)
         kprintf("Recovery commands: recovery check, recovery report, install list, install plan <disk>, poweroff, reboot\n");return;
     }
     if(wifi_command(cmd))return;
+    if(comp_stats_command(cmd))return;
 
     if (shell_handle_process_command(cmd))
         return;
@@ -2383,6 +2385,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             else if(sk>=SYSKEY_MOVE_SPACE_1 && sk<SYSKEY_MOVE_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_MOVE_SPACE_1,1);
             else if(sk==SYSKEY_SPACE_PREVIOUS || sk==SYSKEY_SPACE_NEXT)compositor_workspace_key(sk==SYSKEY_SPACE_PREVIOUS?-1:-2,0);
             else if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_PERF_HUD) compositor_hud_toggle();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
@@ -2394,6 +2397,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         update_service_health(compositor_desktop_healthy());
         session_refresh_screen();
         compositor_anim_tick();
+        compositor_hud_tick();
         if(boot_recovery_mode())fb_present();
         // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
         // to userspace now (the launcher, and the shell that reads fd 0); the

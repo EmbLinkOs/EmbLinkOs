@@ -1,0 +1,249 @@
+/* kernel/gfx/comp_stats.c -- what composing the desktop costs (comp_stats.h).
+ *
+ * Nothing here decides anything. It exists because the desktop's speed had
+ * only ever been judged by eye, under TCG, where everything is slow and
+ * nothing can be compared: a change that halves a compose and one that does
+ * nothing look the same through an emulator's 5 fps. The compositor now says
+ * how many composes it did, of how many pixels, how long each took, and why
+ * it was asked -- and the pointer's motion is timed from the driver noticing
+ * it to the compose that showed it.
+ *
+ * Integer only (the kernel keeps no FPU state). Percentiles come from a ring
+ * of the most recent composes, sorted on demand: the reader pays, never the
+ * compositor. */
+
+#include "gfx/comp_stats.h"
+#include "gfx/compositor.h"
+#include "drivers/timer/timer.h"
+#include "drivers/video/framebuffer.h"
+#include "include/spinlock.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
+
+#define RING     512           /* recent composes kept for percentiles */
+#define PTR_RING 256           /* recent pointer latencies */
+
+struct sample { uint64_t t1; uint32_t us; uint32_t kpx; };
+#define PRESENTERS 8
+struct presenter { int pid; char title[24]; uint64_t n, px; };
+
+static spinlock_t g_lock = SPINLOCK_INIT;
+static struct {
+    uint64_t since;
+    uint64_t composes, ns, px, full;
+    uint64_t src_n[EMBK_COMP_SRCS], src_px[EMBK_COMP_SRCS], src_ns[EMBK_COMP_SRCS];
+    struct sample ring[RING];
+    uint32_t head, count;
+    uint32_t ptr[PTR_RING];
+    uint32_t ptr_head, ptr_count;
+    struct presenter pres[PRESENTERS];
+} g;
+
+static uint32_t us_of(uint64_t ns)
+{
+    uint64_t us = ns / 1000u;
+    return us > 0xffffffffu ? 0xffffffffu : (uint32_t)us;
+}
+
+void comp_stats_record(unsigned src, uint64_t t0, uint64_t t1, uint64_t px, int full)
+{
+    if (src >= EMBK_COMP_SRCS) src = EMBK_COMP_SRC_OTHER;
+    uint64_t ns = t1 > t0 ? t1 - t0 : 0;
+    spin_lock(&g_lock);
+    if (!g.since) g.since = t0;
+    g.src_n[src]++; g.src_px[src] += px; g.src_ns[src] += ns;
+    if (src != EMBK_COMP_SRC_HUD) {
+        g.composes++; g.ns += ns; g.px += px;
+        if (full) g.full++;
+        struct sample *s = &g.ring[g.head];
+        s->t1 = t1; s->us = us_of(ns);
+        s->kpx = (uint32_t)((px + 999u) / 1000u);
+        g.head = (g.head + 1) % RING;
+        if (g.count < RING) g.count++;
+    }
+    spin_unlock(&g_lock);
+}
+
+void comp_stats_present(int pid, const char *title, uint64_t px)
+{
+    char name[sizeof g.pres[0].title];
+    unsigned k = 0;
+    for (; title && title[k] && k < sizeof name - 1; k++)
+        name[k] = (title[k] == ' ' || title[k] == '=') ? '_' : title[k];
+    name[k] = 0;
+    spin_lock(&g_lock);
+    struct presenter *p = 0, *least = &g.pres[0];
+    for (int i = 0; i < PRESENTERS; i++) {
+        struct presenter *q = &g.pres[i];
+        if (q->n && q->pid == pid && !strcmp(q->title, name)) { p = q; break; }
+        if (q->n < least->n) least = q;
+    }
+    if (!p) {                    /* a newcomer displaces the quietest */
+        p = least;
+        p->pid = pid; p->n = 0; p->px = 0;
+        memcpy(p->title, name, sizeof name);
+    }
+    p->n++; p->px += px;
+    spin_unlock(&g_lock);
+}
+
+void comp_stats_pointer(uint64_t ns)
+{
+    spin_lock(&g_lock);
+    g.ptr[g.ptr_head] = us_of(ns);
+    g.ptr_head = (g.ptr_head + 1) % PTR_RING;
+    if (g.ptr_count < PTR_RING) g.ptr_count++;
+    spin_unlock(&g_lock);
+}
+
+void comp_stats_reset(void)
+{
+    spin_lock(&g_lock);
+    memset(&g, 0, sizeof g);
+    g.since = time_get_ns();
+    spin_unlock(&g_lock);
+}
+
+/* Shell sort: a few hundred values, read rarely, no allocation. */
+static void sort_u32(uint32_t *v, uint32_t n)
+{
+    static const uint32_t gaps[] = { 132, 57, 23, 10, 4, 1 };
+    for (unsigned k = 0; k < sizeof gaps / sizeof gaps[0]; k++) {
+        uint32_t gap = gaps[k];
+        for (uint32_t i = gap; i < n; i++) {
+            uint32_t x = v[i], j = i;
+            while (j >= gap && v[j - gap] > x) { v[j] = v[j - gap]; j -= gap; }
+            v[j] = x;
+        }
+    }
+}
+
+/* Nearest-rank percentile of a sorted run. */
+static uint32_t rank(const uint32_t *v, uint32_t n, uint32_t pct)
+{
+    if (!n) return 0;
+    uint32_t i = (n * pct + 99u) / 100u;
+    return v[i ? i - 1 : 0];
+}
+
+void comp_stats_snapshot(struct embk_comp_stats *out)
+{
+    static uint32_t scratch[RING];          /* under g_lock: one reader at a time */
+    memset(out, 0, sizeof *out);
+    out->version = EMBK_COMP_STATS_VERSION;
+    uint64_t now = time_get_ns();
+    spin_lock(&g_lock);
+    out->now_ns = now;
+    out->since_ns = g.since;
+    out->composes = g.composes; out->compose_ns = g.ns; out->pixels = g.px; out->full_screen = g.full;
+    for (int i = 0; i < EMBK_COMP_SRCS; i++) {
+        out->src_composes[i] = g.src_n[i];
+        out->src_pixels[i] = g.src_px[i];
+        out->src_ns[i] = g.src_ns[i];
+    }
+    uint64_t kpx = 0;
+    for (uint32_t i = 0; i < g.count; i++) {
+        const struct sample *s = &g.ring[i];
+        scratch[i] = s->us;
+        if (s->t1 + 1000000000ull > now) { out->sec_composes++; kpx += s->kpx; }
+    }
+    out->sec_kpixels = kpx > 0xffffffffu ? 0xffffffffu : (uint32_t)kpx;
+    out->recent = g.count;
+    sort_u32(scratch, g.count);
+    out->p50_us = rank(scratch, g.count, 50);
+    out->p95_us = rank(scratch, g.count, 95);
+    out->max_us = g.count ? scratch[g.count - 1] : 0;
+    for (uint32_t i = 0; i < g.ptr_count; i++) scratch[i] = g.ptr[i];
+    out->ptr_samples = g.ptr_count;
+    sort_u32(scratch, g.ptr_count);
+    out->ptr_p50_us = rank(scratch, g.ptr_count, 50);
+    out->ptr_p95_us = rank(scratch, g.ptr_count, 95);
+    out->ptr_max_us = g.ptr_count ? scratch[g.ptr_count - 1] : 0;
+    spin_unlock(&g_lock);
+
+    const fb_info_t *fi = fb_get_info();
+    if (fi) { out->screen_w = fi->width; out->screen_h = fi->height; }
+    char name[8];
+    out->gpu = (uint32_t)compositor_renderer(name, sizeof name);
+    out->hud = (uint32_t)compositor_hud_shown();
+}
+
+/* "12.34" from microseconds, as milliseconds. */
+static void ms_text(char *b, unsigned n, uint32_t us)
+{
+    snprintf(b, n, "%u.%02u", us / 1000u, (us % 1000u) / 10u);
+}
+
+int comp_stats_hud_text(char rows[COMP_STATS_HUD_ROWS][COMP_STATS_HUD_COLS + 1])
+{
+    struct embk_comp_stats s;
+    comp_stats_snapshot(&s);
+    char a[16], b[16], c[16];
+    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s  %ux%u",
+             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h);
+    uint32_t mpx10 = s.sec_kpixels / 100u;   /* tenths of a megapixel */
+    snprintf(rows[1], COMP_STATS_HUD_COLS + 1, "%3u composes/s %u.%u Mpx/s",
+             s.sec_composes, mpx10 / 10u, mpx10 % 10u);
+    ms_text(a, sizeof a, s.p50_us); ms_text(b, sizeof b, s.p95_us); ms_text(c, sizeof c, s.max_us);
+    snprintf(rows[2], COMP_STATS_HUD_COLS + 1, "ms %s p95 %s max %s", a, b, c);
+    ms_text(a, sizeof a, s.ptr_p50_us); ms_text(b, sizeof b, s.ptr_p95_us);
+    snprintf(rows[3], COMP_STATS_HUD_COLS + 1, "pointer %s p95 %s ms", a, b);
+    snprintf(rows[4], COMP_STATS_HUD_COLS + 1, "P%lu M%lu C%lu A%lu O%lu",
+             (unsigned long)s.src_composes[EMBK_COMP_SRC_PRESENT],
+             (unsigned long)s.src_composes[EMBK_COMP_SRC_MOVE],
+             (unsigned long)s.src_composes[EMBK_COMP_SRC_POINTER],
+             (unsigned long)s.src_composes[EMBK_COMP_SRC_ANIM],
+             (unsigned long)s.src_composes[EMBK_COMP_SRC_OTHER]);
+    return COMP_STATS_HUD_ROWS;
+}
+
+static const char *const g_src_name[EMBK_COMP_SRCS] = {
+    "present", "move", "pointer", "anim", "other", "hud",
+};
+
+/* One line a test can parse: key=value pairs, integers only. */
+static void dump(void)
+{
+    struct embk_comp_stats s;
+    comp_stats_snapshot(&s);
+    uint64_t span = s.now_ns > s.since_ns && s.since_ns ? s.now_ns - s.since_ns : 0;
+    kprintf("perf: span_ms=%lu composes=%lu compose_us=%lu kpx=%lu full=%lu"
+            " p50_us=%u p95_us=%u max_us=%u recent=%u"
+            " ptr_n=%u ptr_p50_us=%u ptr_p95_us=%u ptr_max_us=%u"
+            " screen=%ux%u gpu=%u\n",
+            (unsigned long)(span / 1000000u), (unsigned long)s.composes,
+            (unsigned long)(s.compose_ns / 1000u), (unsigned long)(s.pixels / 1000u),
+            (unsigned long)s.full_screen, s.p50_us, s.p95_us, s.max_us, s.recent,
+            s.ptr_samples, s.ptr_p50_us, s.ptr_p95_us, s.ptr_max_us,
+            s.screen_w, s.screen_h, s.gpu);
+    for (int i = 0; i < EMBK_COMP_SRCS; i++)
+        kprintf("perf: src=%s composes=%lu compose_us=%lu kpx=%lu\n", g_src_name[i],
+                (unsigned long)s.src_composes[i], (unsigned long)(s.src_ns[i] / 1000u),
+                (unsigned long)(s.src_pixels[i] / 1000u));
+    struct presenter pres[PRESENTERS];
+    spin_lock(&g_lock);
+    memcpy(pres, g.pres, sizeof pres);
+    spin_unlock(&g_lock);
+    for (int i = 0; i < PRESENTERS; i++) {          /* busiest first */
+        int best = -1;
+        for (int j = 0; j < PRESENTERS; j++)
+            if (pres[j].n && (best < 0 || pres[j].n > pres[best].n)) best = j;
+        if (best < 0) break;
+        kprintf("perf: win=%s pid=%d presents=%lu kpx=%lu\n", pres[best].title[0] ? pres[best].title : "?",
+                pres[best].pid, (unsigned long)pres[best].n, (unsigned long)(pres[best].px / 1000u));
+        pres[best].n = 0;
+    }
+    kprintf("perf: end\n");
+}
+
+int comp_stats_command(const char *cmd)
+{
+    if (!strcmp(cmd, "perf")) { dump(); return 1; }
+    if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
+    if (!strcmp(cmd, "perf hud")) {
+        int on = compositor_hud_toggle();
+        kprintf("perf: hud %s\n", on ? "on" : "off");
+        return 1;
+    }
+    return 0;
+}

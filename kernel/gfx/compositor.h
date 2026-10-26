@@ -194,6 +194,11 @@ void compositor_repaint_all(void);
 int compositor_renderer(char *name, unsigned len);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
+/* The statistics overlay (comp_stats.h): toggle it (returns 1 if it is now
+ * wanted), whether it is on screen, and the kernel loop's refresh of it. */
+int  compositor_hud_toggle(void);
+int  compositor_hud_shown(void);
+void compositor_hud_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */

@@ -56,6 +56,7 @@
 #include "tty/pty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
+#include "gfx/comp_stats.h"
 #include "ipc/clipboard.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
@@ -1928,6 +1929,13 @@ static int64_t sys_win_where(const struct sysargs *a) {
     if(rc)return rc;
     return copy_to_user((void *)(uintptr_t)a->arg[1],&g,sizeof g)?-EMBK_EFAULT:0;
 }
+/* arg 0 = struct embk_comp_stats * (out). Anyone may ask: it says how long
+ * composing takes and why, nothing about what any window shows. */
+static int64_t sys_comp_stats(const struct sysargs *a) {
+    struct embk_comp_stats s;
+    comp_stats_snapshot(&s);
+    return copy_to_user((void *)(uintptr_t)a->arg[0], &s, sizeof s) ? -EMBK_EFAULT : 0;
+}
 static int64_t sys_win_place(const struct sysargs *a) {
     return compositor_win_place((int)current_process->pid,(uint32_t)a->arg[0],(int32_t)a->arg[1],(int32_t)a->arg[2]);
 }
@@ -2913,6 +2921,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_monitor] = sys_monitor,
     [SYS_win_place] = sys_win_place,
     [SYS_win_where] = sys_win_where,
+    [SYS_comp_stats] = sys_comp_stats,
     [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_win_focused] = sys_win_focused,
     [SYS_win_set_material] = sys_win_set_material,

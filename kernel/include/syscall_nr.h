@@ -354,6 +354,7 @@
 #define SYS_key_poll_key 157 /* () -> packed key | 0: key_poll_input plus WHICH key (keyboard.h) */
 #define SYS_win_focused 158  /* () -> 1 if the caller's window has the keyboard, else 0 */
 #define SYS_win_set_material 159 /* (id, alpha, blur) -> 0 | -err: the window shows through, blurred */
+#define SYS_comp_stats 160 /* (struct embk_comp_stats *out) -> 0 | -err: what composing costs */
 
 
 

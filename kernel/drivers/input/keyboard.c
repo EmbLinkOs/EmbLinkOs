@@ -538,6 +538,8 @@ void kbd_translate(uint8_t make, int pressed) {
         /* GUI+K: THE KERNEL LOG, ON SCREEN. The one question a machine with no
          * serial port and no working mouse can still be asked. */
         if(system=='k'){g_syskey=SYSKEY_KERNEL_LOG;return;}
+        /* GUI+Shift+P: what composing costs, on the screen (comp_stats.h). */
+        if(system=='p' && (g_mods&EKM_SHIFT)){g_syskey=SYSKEY_PERF_HUD;return;}
     }
     if (g_mods & EKM_GUI) {
         uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;

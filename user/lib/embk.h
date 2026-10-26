@@ -1196,6 +1196,13 @@ static inline int embk_win_where(int id, struct embk_win_geometry *out) {
     return (int)embk_syscall2(EMBK_SYS_win_where, id, (int64_t)(intptr_t)out);
 }
 
+/* What composing the desktop costs: composes, pixels, time, causes, and the
+ * pointer's motion-to-screen latency (embk_comp_stats.h). */
+#include "embk_comp_stats.h"
+static inline int embk_comp_stats(struct embk_comp_stats *out) {
+    return (int)embk_syscall1(EMBK_SYS_comp_stats, (int64_t)(intptr_t)out);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);
