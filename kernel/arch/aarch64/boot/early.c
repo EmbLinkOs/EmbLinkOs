@@ -44,6 +44,8 @@
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/console.h"
 #include "gfx/compositor.h"
+#include "gfx/comp_stats.h"
+#include "drivers/char/serial.h"
 #include "drivers/input/virtio_input.h"
 #include "net/net.h"             /* net_init: still not called here -- see below */
 #include "drivers/input/mouse.h"
@@ -1678,6 +1680,7 @@ void arch_early_main(uint64_t dtb_phys) {
             else if(sk>=SYSKEY_MOVE_SPACE_1 && sk<SYSKEY_MOVE_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_MOVE_SPACE_1,1);
             else if(sk==SYSKEY_SPACE_PREVIOUS || sk==SYSKEY_SPACE_NEXT)compositor_workspace_key(sk==SYSKEY_SPACE_PREVIOUS?-1:-2,0);
             else if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_PERF_HUD) compositor_hud_toggle();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
@@ -1685,6 +1688,24 @@ void arch_early_main(uint64_t dtb_phys) {
             }
         }
         compositor_anim_tick();
+        compositor_hud_tick();
+        /* The serial console's `perf`, `perf reset` and `perf hud`, as on x86
+         * (kernel/main.c). Only those: this arch has no kernel shell to hand
+         * any other line to, and a desktop measured under HVF is the point --
+         * it runs at the host's own speed, which TCG never shows. */
+        {
+            static char line[64];
+            static unsigned n;
+            while (serial_has_char()) {
+                char c = serial_read_char();
+                if (c == '\r' || c == '\n') {
+                    line[n] = 0;
+                    if (n && !comp_stats_command(line)) kprintf("[cmd] unknown command: %s\n", line);
+                    n = 0;
+                } else if ((c == '\b' || c == 127) && n) n--;
+                else if (c >= 32 && c <= 126 && n + 1 < sizeof line) line[n++] = c;
+            }
+        }
         arch_cpu_idle();
     }
 }
