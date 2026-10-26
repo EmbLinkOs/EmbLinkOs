@@ -516,7 +516,15 @@ float em_animate(const char *id, float target, float rate) {
     return g_anim[slot].cur;
 }
 
+/* THE DRAG ZONES this frame built (WindowBar, AppBar, DragHandle), for the
+ * runtime to hand to the compositor (em_window_drag_rects). Once it has taken
+ * them, the compositor drags the window and em_window_drag_ only watches. */
+#define EM_DRAG_ZONES 4
+static struct instance_handle g_drag_zones[EM_DRAG_ZONES];
+static int g_drag_zone_n, g_drag_by_compositor;
+
 void em_new_frame(void) {
+    g_drag_zone_n = 0;
     if(!g_ov_now)g_ov_escape=0;
     g_tip_seen=0;g_menu_button_count=0;
     g_now_ms = em_now_ms();
@@ -1201,6 +1209,19 @@ void em_window_bind(int win, int32_t x, int32_t y) {
 /* Read-and-clear: did the bound window move since the last poll? The app runtime
  * force-repaints on a move so a drag/snap can't leave dirty-rect ghost trails. */
 int em_window_moved(void) { int m = g_win_moved; g_win_moved = 0; return m; }
+int em_window_drag_rects(int32_t (*out)[4], int max) {
+    int n = 0;
+    for (int i = 0; i < g_drag_zone_n && n < max; i++) {
+        float x, y, w, h;
+        if (!ui_rect_of(g_drag_zones[i], &x, &y, &w, &h) || w < 1 || h < 1) continue;
+        out[n][0] = (int32_t)x; out[n][1] = (int32_t)y;
+        out[n][2] = (int32_t)(w + 0.5f); out[n][3] = (int32_t)(h + 0.5f);
+        n++;
+    }
+    return n;
+}
+void em_window_set_compositor_drag(int on) { g_drag_by_compositor = on; }
+
 /* Programmatically move the bound window (e.g. a pin/snap-to-anchor control). */
 void em_window_move_to(int32_t x, int32_t y) {
     if (!g_win_bound || !g_win_mover || (x == g_win_x && y == g_win_y)) return;
@@ -1361,7 +1382,8 @@ void em_window_end_(void) {
  * one step (after the move the kernel re-references the pointer to the new
  * origin, so the grab point stays put). See the plan's drag derivation. */
 static void em_window_drag_(void) {
-    if (!g_win_bound) return;
+    if (g_drag_zone_n < EM_DRAG_ZONES) g_drag_zones[g_drag_zone_n++] = ui_open();
+    if (!g_win_bound || g_drag_by_compositor) return;
     if (ui_is_active()) {          /* pressed on the drag zone, button still held */
         float px, py; ui_pointer_pos(&px, &py);
         if (!g_win_dragging) { g_win_dragging = 1; g_win_grab_x = px; g_win_grab_y = py; }

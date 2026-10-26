@@ -450,6 +450,11 @@ int  em_window_take_close(void);       /* 1 the frame the close gesture committe
 int  em_window_pulling(void);          /* 1 while a close pull is animating (fade/slide) */
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y));
 void em_window_bind(int win, int32_t x, int32_t y);
+/* The drag zones the last frame laid out, as content-local {x, y, w, h}: for
+ * the runtime to give the compositor, which then drags the window itself --
+ * after em_window_set_compositor_drag(1), the zones only watch. */
+int  em_window_drag_rects(int32_t (*out)[4], int max);
+void em_window_set_compositor_drag(int on);
 void em_window_move_to(int32_t x, int32_t y);   /* snap/pin the bound window */
 void em_window_pos(int32_t *x, int32_t *y);     /* current bound-window top-left */
 int  em_window_moved(void);                     /* read-and-clear: window moved since last poll */

@@ -373,6 +373,27 @@ static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
  * window, many times a second, for nothing (docs/DESKTOP_PERFORMANCE.md). The
  * renderer reports overflow as r->full, so an empty list means unchanged. */
 
+
+/* THE DRAG ZONES, TO THE COMPOSITOR. Whenever the laid-out title bars move or
+ * change, the compositor is told where they are and drags the window by them
+ * itself -- in the frame the pointer moves, with no round trip through this
+ * loop, and even while this app is busy. None while a modal covers the
+ * window: its scrim takes those presses. A kernel without the call leaves
+ * the toolkit dragging, as before. */
+static void declare_drag_zones(int win) {
+    static int32_t last[4][4];
+    static int last_n = -1;
+    int32_t now[4][4];
+    int n = em_overlay_active() ? 0 : em_window_drag_rects(now, 4);
+    if (n == last_n && !memcmp(now, last, (size_t)n * sizeof now[0])) return;
+    /* the compositor drags only by zones it was given: with none -- a modal
+     * up, or no bar laid out -- the toolkit keeps the drag it always had */
+    int taken = embk_win_drag_regions(win, (const int32_t (*)[4])now, (unsigned)n);
+    em_window_set_compositor_drag(n > 0 && taken == n);
+    memcpy(last, now, (size_t)n * sizeof now[0]);
+    last_n = n;                  /* asked once per change, whatever the answer */
+}
+
 /* THE TWO WAITS between frames (docs/DESKTOP_PERFORMANCE.md). Idle: until a UI
  * event or `ms`. In motion: until the compositor's next frame. Each falls back
  * to sleeping on a kernel without them. */
@@ -731,6 +752,13 @@ int em_app_run(const EmApp *app) {
          * which to notice -- an idle app builds none, and the drop would sit
          * unread while the drag looked like it had done nothing. */
         if (in.win == EMBK_WIN_ACTION_DROP) em_request_frame();
+        /* the compositor dragged us by a declared zone and the button is up:
+         * learn where we are, and let the snap below look at it */
+        if (in.win == EMBK_WIN_ACTION_MOVED) {
+            struct embk_win_geometry g;
+            if (embk_win_where(win, &g) == 0) em_window_bind(win, g.x, g.y);
+            drag_pending = 1; em_request_frame();
+        }
 
         if (!have_want && in.win == EMBK_WIN_ACTION_MAXIMIZE) {
             /* The kernel chrome's zoom button is a TOGGLE, because it has no
@@ -967,6 +995,7 @@ int em_app_run(const EmApp *app) {
         ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         if (g_em_post_layout) g_em_post_layout();
+        if (chromeless) declare_drag_zones(win);
         rt.clear_dirty = translucent || g_mat_alpha;     /* the material can change at any time */
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
