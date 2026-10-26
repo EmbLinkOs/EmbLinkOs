@@ -355,6 +355,8 @@
 #define SYS_win_focused 158  /* () -> 1 if the caller's window has the keyboard, else 0 */
 #define SYS_win_set_material 159 /* (id, alpha, blur) -> 0 | -err: the window shows through, blurred */
 #define SYS_comp_stats 160 /* (struct embk_comp_stats *out) -> 0 | -err: what composing costs */
+#define SYS_ui_wait 161    /* (uint32_t *seq, timeout_ms) -> 1 event | 0 timeout | -err */
+#define SYS_win_frame 162  /* (struct embk_frame_info *out, timeout_ms) -> 0 | -err: the next frame */
 
 
 

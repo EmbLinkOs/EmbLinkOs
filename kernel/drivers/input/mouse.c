@@ -126,6 +126,8 @@ int mouse_take_press(uint32_t *when_ms) {
     spin_unlock(&pointer_state_lock);return result;
 }
 
+int mouse_presses_pending(void) { return g_press_n != 0; }
+
 void mouse_discard_presses(void) {
     spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;spin_unlock(&pointer_state_lock);
 }

@@ -154,6 +154,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/gfx/surface.c \
                   kernel/gfx/compositor.c \
                   kernel/gfx/comp_stats.c \
+                  kernel/gfx/ui_events.c \
                   kernel/gfx/backdrop.c \
                   kernel/gfx/pix.c \
                   kernel/kworker/kworker.c \

@@ -20,6 +20,7 @@
 #include "include/errno.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: the window-motion clock */
 #include "gfx/comp_stats.h"     /* what each compose costs, and why it was asked */
+#include "gfx/ui_events.h"      /* telling waiting applications something changed */
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -191,6 +192,11 @@ static int g_need_kick;                     /* this critical section left damage
 static struct thread *volatile g_comp_thread;   /* the frame clock, once it runs */
 static struct wait_queue g_comp_wq;         /* where it waits for work */
 static volatile int g_kicked;               /* work arrived since it last looked */
+/* This critical section changed what an application would answer -- where the
+ * pointer is over whom, focus, a window asked to close: post a UI event at the
+ * unlock (ui_events.h). Set only under the lock, like g_need_kick, so the reap
+ * path's unlock under the scheduler lock never finds it set. */
+static int g_post_ui;
 
 /* Tell the frame thread there is work. Any context but under g_comp_lock --
  * the mouse interrupt included. A kick is a hint, not a payload: the frame
@@ -205,12 +211,13 @@ static void comp_wake(void) {
 }
 
 static inline void comp_unlock(void) {
-    int kick = g_need_kick;
-    g_need_kick = 0;
+    int kick = g_need_kick, post = g_post_ui;
+    g_need_kick = 0; g_post_ui = 0;
     g_src = EMBK_COMP_SRC_OTHER;
     spin_unlock(&g_comp_lock);
     /* the frame thread composes its own damage in the frame that made it */
     if (kick && current_thread != g_comp_thread) comp_wake();
+    if (post) ui_event_post();
 }
 static uint32_t   g_next_id = 1;
 /* z bands: desktop = 0; widgets in [1, WIDGET_Z_TOP); app windows above it. */
@@ -1906,6 +1913,7 @@ static void enforce_focus(void) {
     if (nt == g_top_id) return;
     struct comp_window *old = win_by_id(g_top_id);   /* previously focused */
     g_top_id = nt;
+    g_post_ui = 1;                                   /* both apps' `focused` flipped */
     /* Repaint both windows' footprints (grown by the shadow band) so DEPTH
      * follows focus: the window losing focus redraws with the shallow shadow,
      * the one gaining it with the deep one. That difference is now the focus
@@ -2348,6 +2356,14 @@ static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int rais
      * because this clamp put the window back under it. */
     if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi)
         clamp_to_work(w, &x, &y);
+    /* THE POINTER, AS THIS WINDOW SEES IT, MOVES THE OTHER WAY. The content-
+     * local position an app reads (compositor_win_input) was worked out by the
+     * last frame against where the window WAS; an app dragging itself reads
+     * it, moves the window, and reads again -- and until the next frame
+     * re-derives it, that second read is against the old place, so the drag
+     * counts the same motion twice and the window runs away from the hand.
+     * Shift it with the window, now. */
+    if (g_ptr_pid == pid && g_ptr_win == id) { g_ptr_lx -= x - w->x; g_ptr_ly -= y - w->y; }
     w->x = x; w->y = y;
     if(raise)w->z = w->widget ? g_widget_z++ : g_next_z++;   /* explicit moves raise */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
@@ -2610,12 +2626,14 @@ int compositor_cycle_window(void) {
 /* Ask a window to close, and remember when we asked. */
 static void win_ask_close(struct comp_window *w) {
     w->pending_action = 2;                     /* EMBK_WIN_ACTION_CLOSE */
+    g_post_ui = 1;
     if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
 }
 /* The same ask for the whole app (GUI+Q), named so it is not taken for one
  * of its tabs. */
 static void win_ask_quit(struct comp_window *w) {
     w->pending_action = 8;                     /* EMBK_WIN_ACTION_QUIT */
+    g_post_ui = 1;
     if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
 }
 
@@ -2957,6 +2975,10 @@ static void pointer_frame(void) {
 
     spin_lock(&g_comp_lock);
     g_src = EMBK_COMP_SRC_POINTER;
+    /* the pointer moved or a button changed: whichever app it is over (or was)
+     * has something to read. Pending presses and the wheel are input too. */
+    { static int32_t sx = -1, sy = -1; static uint32_t sb;
+      if (x != sx || y != sy || b != sb || mouse_presses_pending()) { sx = x; sy = y; sb = b; g_post_ui = 1; } }
     struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
     if(g_cap_pid && (!captured || !captured->visible || !on_workspace(captured) || !session_ui_allowed(captured->pid)))
         reset_pointer_capture_locked();
@@ -3202,7 +3224,7 @@ static void pointer_frame(void) {
     }
     /* drain the scroll wheel every tick; route it to the hovered window's app */
     int32_t wheel = mouse_take_wheel();
-    if (wheel && g_ptr_pid && !suppressed) g_ptr_wheel += wheel;
+    if (wheel && g_ptr_pid && !suppressed) { g_ptr_wheel += wheel; g_post_ui = 1; }
 
     g_prev_buttons = b;
     #undef DIRTY
@@ -3323,15 +3345,53 @@ static uint64_t g_frame_seq;           /* frames composed since boot           *
 static uint64_t g_frame_due_ns;        /* when the frame in progress was due    */
 static uint64_t g_frame_period_ns = 16666667;  /* 60 Hz until an output says otherwise */
 
+/* FRAME WAITERS (compositor_frame_wait). The frame's number and time are
+ * published after the unlock and every waiter woken under the scheduler lock,
+ * which is also where a waiter checks before it blocks -- so a waiter either
+ * sees the frame it wanted or is on the queue when the wake comes. */
+static struct wait_queue g_frame_wq;
+static volatile uint64_t g_frame_done, g_frame_done_ns;
+
 static void comp_frame(void) {
     pointer_frame();
     anim_frame();
     spin_lock(&g_comp_lock);
     compose_pending_locked();
-    g_frame_seq++;
+    uint64_t seq = ++g_frame_seq;
     uint64_t now = time_get_ns();
     comp_unlock();
     comp_stats_frame(now, g_frame_period_ns);
+    __atomic_store_n(&g_frame_done_ns, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_frame_done, seq, __ATOMIC_RELEASE);
+    sched_lock();
+    wait_queue_wake_all(&g_frame_wq);
+    sched_unlock();
+}
+
+/* Block until the frame thread finishes a frame after this call -- asking for
+ * one, so it comes whether or not anything changed. -EMBK_ENOSYS before the
+ * frame thread runs (the caller paces itself), -EMBK_ETIMEDOUT if no frame
+ * came within `timeout_ms` (0: 100 ms), -EMBK_ECANCELED if told to stop. */
+int compositor_frame_wait(struct embk_frame_info *out, uint32_t timeout_ms) {
+    if (!g_comp_thread) return -EMBK_ENOSYS;
+    uint64_t target = __atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE) + 1;
+    comp_wake();
+    uint64_t deadline = timer_uptime_ms() + (timeout_ms ? timeout_ms : 100);
+    for (;;) {
+        sched_lock();
+        if (__atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE) >= target) { sched_unlock(); break; }
+        if (timer_uptime_ms() >= deadline) { sched_unlock(); return -EMBK_ETIMEDOUT; }
+        sched_block_timeout_locked(&g_frame_wq, deadline);        /* returns unlocked */
+        struct thread *t = current_thread;
+        if (t && t->proc && t->proc->cancelled) return -EMBK_ECANCELED;
+    }
+    if (out) {
+        out->seq = __atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE);
+        out->frame_ns = __atomic_load_n(&g_frame_done_ns, __ATOMIC_RELAXED);
+        out->period_ns = g_frame_period_ns;
+        out->next_ns = out->frame_ns + out->period_ns;
+    }
+    return 0;
 }
 
 /* Work that keeps frames coming without a kick: window motion in flight. */
@@ -3386,8 +3446,26 @@ void compositor_start(void) {
     if (started) return;
     started = 1;
     mouse_set_notify(compositor_input_kick);
+    ui_events_init();
+    sched_timed_queue(&g_frame_wq);
     if (!process_create_kthread(comp_thread_main, NULL))
         kprintf("compositor: no frame thread; composing inline\n");
+}
+
+/* `perf windows`: where every visible titled window is, for a test that drags
+ * one and wants to know it came back. */
+void compositor_print_windows(void) {
+    spin_lock(&g_comp_lock);
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        const struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->visible || !w->title[0] || w->desktop) continue;
+        char name[COMP_TITLE_MAX + 1]; int k = 0;
+        for (; w->title[k] && k < COMP_TITLE_MAX; k++) name[k] = w->title[k] == ' ' ? '_' : w->title[k];
+        name[k] = 0;
+        kprintf("perf: window title=%s x=%d y=%d w=%u h=%u\n", name, (int)w->x, (int)w->y, w->cw, w->ch);
+    }
+    comp_unlock();
+    kprintf("perf: end\n");
 }
 
 /* The mouse moved, a button changed or the wheel turned (mouse.c). From any
@@ -3470,7 +3548,7 @@ int compositor_request_launcher(void) {
     spin_lock(&g_comp_lock);
     if(session_input_owner()){comp_unlock();return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && session_ui_allowed(g_wins[i].pid)) {
-        g_wins[i].pending_action=7;comp_unlock();return 0;
+        g_wins[i].pending_action=7;g_post_ui=1;comp_unlock();return 0;
     }
     comp_unlock();return -EMBK_ENOENT;
 }

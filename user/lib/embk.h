@@ -1203,6 +1203,23 @@ static inline int embk_comp_stats(struct embk_comp_stats *out) {
     return (int)embk_syscall1(EMBK_SYS_comp_stats, (int64_t)(intptr_t)out);
 }
 
+/* Wait until something an interface answers happens -- a key, the pointer
+ * over or clicking a window, focus, a window asked to close -- or `timeout_ms`
+ * passes. *seq is the last sequence seen (start at 0); returns 1 when it moved
+ * (and updates it), 0 on timeout. Poll the input afterwards to learn what:
+ * the wake may have been for another window. */
+static inline int embk_ui_wait(uint32_t *seq, uint32_t timeout_ms) {
+    return (int)embk_syscall2(EMBK_SYS_ui_wait, (int64_t)(intptr_t)seq, timeout_ms);
+}
+
+/* Wait for the compositor's next frame (asking for one). For motion: draw,
+ * present, wait, draw the next for info.next_ns. 0, or -EMBK_ENOSYS when the
+ * kernel has no frame clock (pace yourself), -EMBK_ETIMEDOUT after
+ * `timeout_ms` (0: 100 ms) with no frame. */
+static inline int embk_win_frame(struct embk_frame_info *info, uint32_t timeout_ms) {
+    return (int)embk_syscall2(EMBK_SYS_win_frame, (int64_t)(intptr_t)info, timeout_ms);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);

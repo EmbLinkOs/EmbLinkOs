@@ -32,6 +32,8 @@ int32_t mouse_take_wheel(void);   /* consume accumulated scroll delta (+up/-down
  * ticks are, which on a busy kernel loop is wider than any double-click
  * window. */
 int mouse_take_press(uint32_t *when_ms);
+/* Whether a press is waiting to be taken (a racy peek: a hint for a waker). */
+int mouse_presses_pending(void);
 /* Drop the complete queued press history when input ownership changes. */
 void mouse_discard_presses(void);
 

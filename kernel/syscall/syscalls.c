@@ -57,6 +57,7 @@
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
 #include "gfx/comp_stats.h"
+#include "gfx/ui_events.h"
 #include "ipc/clipboard.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
@@ -1936,6 +1937,23 @@ static int64_t sys_comp_stats(const struct sysargs *a) {
     comp_stats_snapshot(&s);
     return copy_to_user((void *)(uintptr_t)a->arg[0], &s, sizeof s) ? -EMBK_EFAULT : 0;
 }
+/* arg 0 = uint32_t *seq (in/out), arg 1 = timeout ms. Until something an
+ * interface answers happens (gfx/ui_events.h), or the timeout. */
+static int64_t sys_ui_wait(const struct sysargs *a) {
+    uint32_t seq;
+    if (copy_from_user(&seq, (const void *)(uintptr_t)a->arg[0], sizeof seq) != EMBK_OK) return -EMBK_EFAULT;
+    int rc = ui_event_wait(&seq, (uint32_t)a->arg[1]);
+    if (rc > 0 && copy_to_user((void *)(uintptr_t)a->arg[0], &seq, sizeof seq)) return -EMBK_EFAULT;
+    return rc;
+}
+/* arg 0 = struct embk_frame_info * (out, may be 0), arg 1 = timeout ms. */
+static int64_t sys_win_frame(const struct sysargs *a) {
+    struct embk_frame_info fi;
+    int rc = compositor_frame_wait(&fi, (uint32_t)a->arg[1]);
+    if (rc) return rc;
+    if (a->arg[0] && copy_to_user((void *)(uintptr_t)a->arg[0], &fi, sizeof fi)) return -EMBK_EFAULT;
+    return 0;
+}
 static int64_t sys_win_place(const struct sysargs *a) {
     return compositor_win_place((int)current_process->pid,(uint32_t)a->arg[0],(int32_t)a->arg[1],(int32_t)a->arg[2]);
 }
@@ -2922,6 +2940,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_place] = sys_win_place,
     [SYS_win_where] = sys_win_where,
     [SYS_comp_stats] = sys_comp_stats,
+    [SYS_ui_wait] = sys_ui_wait,
+    [SYS_win_frame] = sys_win_frame,
     [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_win_focused] = sys_win_focused,
     [SYS_win_set_material] = sys_win_set_material,

@@ -316,6 +316,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/surface.c \
              kernel/gfx/compositor.c \
              kernel/gfx/comp_stats.c \
+             kernel/gfx/ui_events.c \
              kernel/gfx/backdrop.c \
              kernel/gfx/pix.c \
              kernel/lib/kstring.c \

@@ -1,3 +1,8 @@
+#include "gfx/ui_events.h"
+/* Set while a self-test pushes its own keys through the live rings: they are
+ * not anyone's input, so no application is woken for them -- a woken focused
+ * app would poll the test's keys away from it. */
+static volatile int g_selftest_quiet;
 #include "include/kstring.h"
 #if defined(__x86_64__)
 #include "power/policy.h"
@@ -1046,6 +1051,7 @@ int keyboard_input_snapshot_selftest(void) {
 int keyboard_key_ring_selftest(void) {
     static char bytes[KBD_BUFFER_SIZE]; static uint8_t mods[KBD_BUFFER_SIZE], flags[KBD_BUFFER_SIZE];
     static uint16_t codes[KBD_BUFFER_SIZE]; static struct key_event events[KBD_EVENT_RING];
+    g_selftest_quiet = 1;
     spin_lock(&input_state_lock);sched_lock();
     memcpy(bytes,kbd_buffer,sizeof bytes);memcpy(mods,kbd_buffer_mods,sizeof mods);
     memcpy(codes,kbd_buffer_code,sizeof codes);memcpy(flags,kbd_buffer_flags,sizeof flags);
@@ -1112,6 +1118,7 @@ int keyboard_key_ring_selftest(void) {
     memcpy(ev_ring,events,sizeof events);
     buf_head=head;buf_tail=tail;ev_head=eh;ev_tail=et;g_mods=held;g_side=side;
     sched_unlock();spin_unlock(&input_state_lock);
+    g_selftest_quiet = 0;
     return ok;
 }
 
@@ -1141,6 +1148,7 @@ static void keyboard_deliver_key_only(uint16_t code, uint8_t flags) {
     buffer_push_entry(0, (uint8_t)(KBF_KEYONLY | flags));
     wait_queue_wake_one(&kbd_wait_queue);
     sched_unlock();
+    if (!g_selftest_quiet) ui_event_post();   /* an application waiting for input (ui_events.h) */
 }
 
 /* Every push site goes through here. The lock makes {push -> wake} atomic
@@ -1245,6 +1253,7 @@ static void keyboard_deliver(char c) {
     buffer_push(c);   /* the kernel shell will read it */
     wait_queue_wake_one(&kbd_wait_queue);
     sched_unlock();
+    if (!g_selftest_quiet) ui_event_post();   /* an application waiting for input (ui_events.h) */
 }
 
 /* --- keyboard grab -------------------------------------------------------

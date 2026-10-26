@@ -280,6 +280,7 @@ int comp_stats_command(const char *cmd)
 {
     if (!strcmp(cmd, "perf")) { dump(); return 1; }
     if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
+    if (!strcmp(cmd, "perf windows")) { compositor_print_windows(); return 1; }
     if (!strcmp(cmd, "perf hud")) {
         int on = compositor_hud_toggle();
         kprintf("perf: hud %s\n", on ? "on" : "off");

@@ -201,6 +201,11 @@ void compositor_anim_tick(void);
 void compositor_start(void);
 /* The pointer changed -- wake the frame thread. Any context, IRQ included. */
 void compositor_input_kick(void);
+/* `perf windows` on the serial console: every visible window's geometry. */
+void compositor_print_windows(void);
+/* Wait for the next frame (asking for one); see compositor.c. */
+struct embk_frame_info;
+int compositor_frame_wait(struct embk_frame_info *out, uint32_t timeout_ms);
 /* The statistics overlay (comp_stats.h): toggle it (returns 1 if it is now
  * wanted), whether it is on screen, and the kernel loop's refresh of it. */
 int  compositor_hud_toggle(void);

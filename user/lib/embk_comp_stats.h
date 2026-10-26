@@ -61,4 +61,15 @@ struct embk_comp_stats {
     uint32_t intervals, interval_p50_us, interval_p95_us, interval_max_us;
 };
 
+/* A FRAME, as the compositor's frame thread kept it (embk_win_frame). An
+ * application drawing motion waits for the next one rather than sleeping a
+ * guess: its frames land on the compositor's beat, and `next_ns` is when the
+ * one after is due -- the time to draw motion FOR. */
+struct embk_frame_info {
+    uint64_t seq;                 /* frames composed since boot */
+    uint64_t frame_ns;            /* uptime (ns) when this one finished */
+    uint64_t period_ns;           /* the beat */
+    uint64_t next_ns;             /* when the next is due */
+};
+
 #endif
