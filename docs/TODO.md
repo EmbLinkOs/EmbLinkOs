@@ -13,10 +13,15 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [ ] On the kernel console the editor works line by line: a multi-line program's earlier lines
       cannot be edited there, and Ctrl+Q/R/S/T/B/E are the console's arrows and Home/End.
 - [x] M3 `sh` on the editor (its own history, POSIX completion); Terminal's local prompt removed.
-- [ ] M4 Screen model v2 (xterm-compatible, dynamic size, compact scrollback, palette-indexed cells).
+- [x] M4 Screen model v2: 8-byte cells with interned styles (palette index or RGB, underline style and
+      colour, links), any size to 1000 x 500, logical-line scrollback capped at 8 MB, reflow on every
+      resize, a DEC parser with xterm's sequences and replies, mouse/focus reporting (syscall 158),
+      `TERM=xterm-256color`; the golden corpus matches tmux on all nine cases.
+- [ ] Left/right margins (DECSLRM), double-width/height lines, sixel and inline images.
+- [ ] No terminfo database on the image: a ported ncurses program would not find xterm-256color.
 - [ ] M5 Fonts and renderer (cmap 12, fallback, four faces, procedural box/powerline glyphs, damage).
 - [ ] M6 Tabs, mouse selection, find, links, zoom; dynamic PTYs.
-- [ ] M7 Profiles, Preferences and translucency (Clear Dark default).
+- [ ] M7 Profiles, Preferences and translucency (Clear Dark default); the OSC 52 write permission.
 - [ ] M8-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
@@ -32,8 +37,8 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [x] Screen copy, safe native-prompt paste and application bracketed paste.
 - [x] Shared controls receive paste commands without key-queue truncation.
 - [x] Modified-key identity: the key behind every byte, F-keys, the keypad, xterm PC-style encoding.
-- [ ] Terminal range selection and complete grapheme rendering.
-- [ ] Terminfo/application compatibility and mouse reporting.
+- [ ] Terminal range selection (M6) and complete grapheme rendering (M5: font fallback, composing marks).
+- [x] Mouse reporting and an xterm-compatible screen (`TERM=xterm-256color`), see the roadmap above.
 - [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
 - [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
 - [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.

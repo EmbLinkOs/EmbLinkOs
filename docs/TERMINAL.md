@@ -141,27 +141,67 @@ its shell. Appearance and display scaling follow the Contour desktop.
 
 ## Screen model and interactions
 
-`user/terminal/vt.c` is a UI-independent streaming parser and cell model. The
-renderer paints fixed-width glyphs into retained bitmaps and redraws when screen,
-input, size or appearance changes. Logical row rotation keeps ordinary scrolling
-from copying an entire screen. Output work is bounded per event-loop iteration.
+The screen model (`user/terminal/`) is UI-free and host-tested: `vt_parse.c`
+turns bytes into operations, `vt_grid.c` holds the cells, the two screens and
+the scrollback, `vt_keys.c` encodes keys, mouse and focus events. The renderer
+paints into retained bitmaps and redraws only when the model, input, size or
+appearance changed. Output work is bounded per event-loop iteration.
 
-Implemented screen operations include:
+**Cells.** A cell is 8 bytes: a codepoint (or the id of a cluster -- a base
+character and up to seven combining marks), a style id, a width (1, 2, or 0 for
+a wide character's right half) and flags. Styles are interned per terminal:
+foreground, background and underline colour each kept as the program named it
+(the default, a palette index, or RGB), the attributes, the underline style and
+an OSC 8 link. Because a palette index stays an index, a palette change -- a
+theme switch, OSC 4 -- recolours text already on the screen. When the style
+table (65,535 looks) fills, unused ones are dropped and the rest renumbered;
+if that frees too little, the oldest half of the scrollback goes, so a
+scrollback full of truecolour images costs one pass per thousands of new
+looks, not one per character. Erased cells keep only the pen's background
+(xterm's BCE).
 
-- Cursor positioning, save/restore, pending autowrap, tabs, erasure, character
-  insertion/deletion, line insertion/deletion and scroll regions with origin mode.
-- Separate primary and alternate screens (`47`, `1047`, `1049`), cursor visibility
-  and static outline/bar/underline styles. Alternate output never enters history.
-- Normal/bright ANSI, 256-colour and RGB SGR, bold, dim, underline, inverse,
-  conceal and strike. Concealed cells are also masked when copying text.
-- Streaming UTF-8 with replacement for malformed sequences, basic wide cells,
-  up to two combining marks per cell and DEC line-drawing characters.
-- Up to 220 columns, 60 rows and 300 primary history rows. Streaming primary
-  text reflows on resize; coordinate-addressed screens retain coordinates and
-  clip/pad so applications can redraw after querying their new dimensions.
-- Device status/cursor-position replies, primary device attributes, application
-  cursor keys and bracketed paste. Unknown bounded OSC/DCS/APC/PM payloads are
-  consumed without appearing as output. OSC clipboard writes are ignored.
+**The screen.** Any size up to 1000 columns by 500 rows. The primary screen's
+rows that scroll off its top join the **scrollback as logical lines**: a line
+that wrapped is stored once, unwrapped, and read back laid out at the current
+width. The scrollback is capped in bytes (8 MB by default), not lines. A resize
+**reflows** the primary screen every time -- after `clear`, after cursor
+addressing, whatever ran -- and re-wraps the scrollback; the cursor keeps its
+character, the shell's prompt mark keeps its row, rows that no longer fit above
+the cursor go to the scrollback, and a full screen that grows taller brings
+scrollback lines back. The alternate screen has no scrollback and keeps its
+coordinates (clipped and padded); its program redraws on the new size.
+
+**The parser** follows DEC's state machine (vt100.net): C0 controls act
+anywhere, `;` separates parameters and `:` the sub-parameters of one, private
+markers and intermediates are collected, `ESC` inside a sequence starts over,
+CAN/SUB cancel, and OSC/DCS/SOS/PM/APC strings end at ST or BEL. Text is UTF-8;
+a malformed sequence is one U+FFFD.
+
+| Area | Sequences |
+| --- | --- |
+| Cursor and editing | CUU/CUD/CUF/CUB (stopping at the margins), CNL/CPL, CHA/HPA/HPR, CUP/HVP, VPA/VPR, CHT/CBT, HT, IND/NEL/RI, DECSC/DECRC, SCOSC/SCORC, ED (0-3), EL, ECH, ICH, DCH, IL/DL, SU/SD, DECSTBM, TBC/HTS, REP, DECALN (`ESC # 8`) |
+| SGR | bold, dim, italic, underline with styles `4:0`-`4:5` and `21`, blink (5, 6), inverse, conceal, strike, overline (53/55), 16/256/RGB colours for text, background and underline (`38`/`48`/`58`, both `;` and `:` forms), and their resets |
+| Modes | IRM, LNM; DECCKM, DECSCNM, DECOM, DECAWM, cursor blink (12), DECTCEM, 47/1047/1048/1049, DECNKM (66), DECBKM (67), mouse 9/1000/1002/1003 with encodings 1005/1006/1015/1016, focus 1004, alternate scroll 1007, Alt sends ESC 1036/1039, bracketed paste 2004, synchronized output 2026, in-band resize 2048; XTSAVE/XTRESTORE; DECSTR soft reset; RIS |
+| Replies | DSR 5/6, DECXCPR, DA1 (a VT220 with ANSI colour), DA2, DA3, XTVERSION (`EmbLinkTerminal(1.0)`), DECRQM for ANSI and DEC modes, DECRQSS (`m`, `r`, ` q`, `"p`, `"q`), XTGETTCAP (TN, colours, RGB, styled underlines, synchronized output...), window reports `CSI 11/13/14/16/18/19 t`, the title stack (`CSI 22/23 t`) |
+| OSC | 0/1/2 titles, 4 palette (set and query), 7 working directory, 8 hyperlinks, 10/11/12 colours (set and query, answered with the query's terminator), 52 clipboard write (off unless allowed; never read), 104 and 110-112 resets, 133 shell marks |
+| Charsets | G0-G3 designation, SO/SI, LS2/LS3, DEC special graphics |
+
+Programs that try to move, resize or retitle-report the window (`CSI 3/4/8/21
+t`) are not answered: that is the person's window, not the program's.
+
+`TERM=xterm-256color` and `COLORTERM=truecolor` name what this is;
+`TERM_PROGRAM=EmbLinkTerminal` and `TERM_PROGRAM_VERSION` say which one. The
+native shell turns colour on for any `TERM` but an unset one or `dumb`.
+
+**Mouse and focus.** A program that asks for mouse reports (DECSET
+9/1000/1002/1003) gets presses, releases, drags, motion and the wheel in the
+encoding it chose, for all three buttons; Shift keeps the mouse for Terminal.
+With reporting off, the wheel pages the scrollback -- or, in the alternate
+screen (less, man, vim), sends Up and Down, as Terminal.app does. Focus
+reports (DECSET 1004) say when the window gains and loses the keyboard
+(`embk_win_focused`, syscall 158). DECSET 2026 holds the picture while a
+program draws a frame in parts, for at most 200 ms. BEL flashes a frame
+around the screen.
 
 **Copy screen** exports the visible grid as UTF-8 text, without terminal escape
 sequences. **Paste** removes unsafe control bytes; an application that enables
@@ -187,15 +227,18 @@ buffer and accepts multiline text up to the 64 KiB clipboard limit.
 
 ### Compatibility limits
 
-Keep `TERM=emlink`: this is a tested subset, not xterm/terminfo compatibility.
-Mouse reporting, range selection, full grapheme/emoji shaping and bidirectional
-layout are not implemented. Italic attributes are parsed but use the regular
-face. Cursor styles stay static without animation. Basic combining/wide-cell
-support does not promise every glyph is present in the installed fonts.
+The renderer is the next piece (docs/TODO.md, M5): italic draws upright,
+blinking text does not blink, a glyph the font lacks (CJK, emoji) is a box,
+combining marks are not composed onto their base, and cursor styles stay
+static. Hyperlinks are kept but not yet clickable, and the mouse does not yet
+select text (M6). OSC 52 writes need Preferences to allow them (M7).
 
-Resize dimensions are queryable; there is no `SIGWINCH` yet. Keys follow
-xterm's PC-style encoding; the kitty keyboard protocol and `modifyOtherKeys`
-are not offered.
+Not offered: left/right margins (DECSLRM), double-width and double-height
+lines, sixel and other inline images, the kitty keyboard protocol and
+`modifyOtherKeys` (keys follow xterm's PC-style encoding), and bidirectional
+text. Grapheme clusters are a base character and its combining marks; emoji
+ZWJ sequences are separate cells. Resize dimensions are queryable and
+reported in-band (DECSET 2048); there is no `SIGWINCH` yet.
 
 ## Installed development headers
 
@@ -217,6 +260,7 @@ test kbd ring
 # Graphical acceptance with QEMU, GDB and the existing cloud build environment:
 python3 tools/terminal_smoke.py
 python3 tools/terminal_screen_smoke.py
+python3 tools/terminal_xterm_smoke.py
 ```
 
 `terminal-test` compiles the production device state machine with a minimal
@@ -244,11 +288,26 @@ Enter, restores cooked input and finishes on Ctrl+D. It verifies prompt
 history/editing, foreground Ctrl+C, shell-loop interruption and independent
 Terminal windows, and records real screenshots.
 
-The screen-model host suite covers cursor/edit operations, colours, margins,
-primary/alternate isolation, streaming Unicode, wide-cell resize, replies, key
-modes, split-input equivalence and randomized parser/resize invariants. Run it
-with AddressSanitizer/UBSan by compiling `vt.c` and `tests/tty/vt_test.c` with
-`-Iuser/terminal -fsanitize=address,undefined -fno-omit-frame-pointer`.
+The screen-model host suite (`make terminal-screen-test`) drives every
+sequence above and checks it against what xterm does: cursor and editing,
+margins and the scrollback's byte cap, both screens, every SGR form, palette
+changes and queries, clusters and wide cells, reflow (wide to narrow and back,
+after `clear`, the cursor, the prompt mark, the scrollback, pulling lines back,
+the alternate screen clipped), every reply, OSC 4/7/8/10-12/52/104/133, mouse
+encodings, keys, more than 65,535 styles at once, and split input giving the
+same state as whole input. The same suite runs again under
+AddressSanitizer/UBSan with 20,000 rounds of structured random input, random
+resizes up to 1000 x 500, resets and history-limit changes, checking the
+model's invariants (row ownership, wide-cell pairing, style and cluster ids,
+scrollback accounting) as it goes.
+
+`tools/terminal_xterm_smoke.py` runs `ttyprobe --xterm` in the real Terminal:
+a card of attributes, underline styles and colours, the 16- and 256-colour
+palettes, truecolour, wide cells and a link, checked cell by cell through the
+probe; seven questions programs ask the terminal (DA1, DA2, XTVERSION, DECRQM,
+OSC 10, XTGETTCAP, `CSI 18 t`), each answer checked by the program; left,
+right and wheel events and focus out and back, reported to the program; and a
+long line and the scrollback re-wrapped when the window narrows.
 
 ### Golden streams
 
@@ -272,7 +331,7 @@ screen with tmux's cell by cell: text, colours resolved through the model's
 palette, attributes, cursor, visibility, screen and title.
 `tests/tty/golden/xfail.txt` names what the model is known to get wrong, with
 the reason; a listed case that starts passing fails the run until it is taken
-off, so the list only shrinks.
+off, so the list only shrinks. It is empty: all nine cases match tmux.
 
 ### Terminal probe
 

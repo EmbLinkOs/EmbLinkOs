@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-161 actual EmbLinkOS captures document the original laptop work, its
+165 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and the start of a real Terminal. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing and an xterm-compatible screen. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -55,6 +55,32 @@ The Terminal was closed and a new one opened: its shell lists what the first one
 With both shells editing their own lines, the Terminal's own line editor is gone: it is a screen. The POSIX sh port edits its line with the native shell's editor: a loop typed one line at a time continues under '...' until done closes it, and Tab completes from sh's builtins and the programs on the system.
 
 ![sh on the same editor in EmbLinkOS](161-sh-edit.png)
+
+Then the screen itself: the model behind the Terminal is now xterm-compatible -- the sequences programs send, the answers they expect, colours kept by palette index, a scrollback of logical lines, and text that re-wraps on every resize ([TERMINAL.md](../../TERMINAL.md#screen-model-and-interactions)).
+
+### What a program can draw, and what the terminal answers
+
+ttyprobe --xterm runs with TERM=xterm-256color and COLORTERM=truecolor. Its card shows bold, dim, strike, inverse and overline; single, double, curly, dotted and dashed underlines, two of them in their own colours (58); the 16- and 256-colour palettes; a truecolour gradient; and an OSC 8 link. The model holds italic, the CJK cells and the combining accent too: the renderer draws them in M5. Below the card are seven questions programs ask a terminal (DA1, DA2, XTVERSION, DECRQM, OSC 10, XTGETTCAP, CSI 18 t), each answer checked by the program.
+
+![What a program can draw, and what the terminal answers in EmbLinkOS](162-terminal-xterm-card.png)
+
+### Mouse and focus reports
+
+With mouse reporting on (1000, SGR encoding 1006), a left click, a right click and the wheel both ways reach the program with the cell they happened on. Focus reports (1004) say when another window takes the keyboard and when it comes back.
+
+![Mouse and focus reports in EmbLinkOS](163-terminal-xterm-mouse-focus.png)
+
+### Text re-wraps when the window narrows
+
+Narrowed from 156 columns to 74, the 233-character line re-wraps from two rows to four. The cursor stays at the prompt, and the rows that no longer fit above it moved into the scrollback.
+
+![Text re-wraps when the window narrows in EmbLinkOS](164-terminal-xterm-reflow.png)
+
+### The scrollback re-wraps too
+
+Shift+PgUp pages back to the top of the card. The scrollback stores logical lines, not rows, so what was written at 156 columns is read back laid out at 74, with its colours and underlines kept.
+
+![The scrollback re-wraps too in EmbLinkOS](165-terminal-xterm-scrollback.png)
 
 ## The native shell runs any program
 
