@@ -5,17 +5,36 @@ at 60-120 Hz with the rate adapting as macOS does, on any hardware (no machine i
 the default target). Measured before and after every step
 ([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)).
 
-- [ ] P0 Measure, and quick wins.
-  - [x] The compositor measures each compose (cause, time, area, presenter) and the pointer's
-        motion-to-screen latency: GUI+Shift+P overlay, serial `perf`, syscall 160;
+- [x] P0 Measure, and quick wins (241cb9d..ec0718b; [DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)).
+  - [x] The compositor measures each compose (cause, time, area, presenter and its rect) and the
+        pointer's motion-to-screen latency: GUI+Shift+P overlay, serial `perf`, syscall 160;
         `tools/perf_smoke.py` measures five scenes (baseline at 241cb9d).
-  - [ ] An idle desktop composes 10 times a second: the desktop process presents about 8 times a
-        second and the top bar twice, with nothing changing.
-  - [ ] A dragged window re-presents all of itself on every move (`em_app.c` force_full on a move).
-  - [ ] The kernel's pixel loops at `-O2`, two channels per multiply, bit-exact with today's output.
-  - [ ] Blur allocates two screen-sized buffers on every call (`fb_blur_region`).
-  - [ ] Real-speed numbers: the same scenes on arm64 under HVF, which needs the arm64 boot to reach
-        the desktop (see the arm64 boot test's first-boot setup item).
+  - [x] An idle desktop composed 10 times a second; now none. A glass box and an idle menu button
+        were dirty on every frame, and apps and the desktop presented their whole window when a
+        frame changed nothing.
+  - [x] A dragged window re-presented all of itself on every move; now nothing.
+  - [x] The kernel's pixel loops at `-O2`, two channels per multiply, bit-exact (`make pix-test`).
+  - [x] Blur allocated two region-sized buffers on every call (`fb_blur_region` keeps them now).
+        `backdrop_blur` still allocates per call -- its host test asserts the memory is given back;
+        it is replaced by P3's blur.
+  - [x] Real-speed numbers: the same scenes on arm64 under HVF (`perf_smoke.py --arch aarch64`,
+        which types first-boot setup as the x86 scenes do).
+  - [x] System shortcuts and GUI editing commands were decided only for PS/2 keyboards; on arm64's
+        virtio keyboard GUI+Space typed a space. Decided for every keyboard now.
+- [ ] **The arm64 desktop's text sits wrong**: in Settings the sidebar icons fall below their
+      labels, segmented buttons are tall with their text at the top, the top bar's text is cut
+      off at the top edge and the dock's label is an empty box. The same with the P0 UI changes
+      reverted, so it predates them; x86 draws the same build correctly. Not investigated --
+      a text metric (char signedness in the font parser is the first suspect) differs between
+      the two userlands. Seen in the arm64 perf captures (gallery 210).
+- [ ] **Two desktop smokes fail before any of this work** (6eed0ad, checked by building it):
+      `menu_smoke.py` clicks (916,195) for Settings' Light appearance, which is now at about
+      (1005,426), so the light menu never comes; `desktop_smoke.py`'s mute click at (1000,306)
+      misses the same way (volume stays 100). Their coordinates predate the current Settings
+      layout.
+- [ ] A drag step still recomposes the window's old and new footprints (about 0.7 Mpx for
+      Settings): 2 ms a step on an M5 core, an order more on slow ones. P1's compositor-owned
+      drag and exposed-strip repaint replace it.
 - [ ] P1 Frame clock: a compositor thread on a deadline reservation, nanosecond timer, region damage,
       one late compose per frame, frame callbacks and frame-rate requests, rate adapting to motion
       (divisors of the refresh on fixed displays, the refresh itself on VRR ones), a simulated

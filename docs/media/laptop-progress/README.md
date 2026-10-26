@@ -1,6 +1,6 @@
 # Laptop progress captures
 
-208 actual EmbLinkOS captures document the original laptop work, its
+210 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
 interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs. PNG exports preserve
@@ -23,6 +23,18 @@ The first step of the fluid desktop: before anything is made faster, the composi
 GUI+Shift+P: the compositor's own account at the top right -- CPU composing 1280 × 800, composes and megapixels in the last second, compose time (median, 95th percentile, worst), the pointer's motion-to-screen latency, and composes by cause. The baseline at 241cb9d, after `tools/perf_smoke.py`'s five scenes, under TCG.
 
 ![The EmbLinkOS desktop with Settings open and the compositor statistics overlay at the top right](208-perf-hud.png)
+
+### Nothing to compose, so nothing composed
+
+The same five scenes after P0: the overlay reads 0 composes a second on a desktop where nothing changes, where the baseline composed ten. The pixel loops run -O2, and nothing is presented that did not change. Under TCG.
+
+![The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 0 composes a second](209-perf-after-p0.png)
+
+### A real core composing
+
+arm64 under HVF, on the host's own core: window motion at about 100 frames a second (A31 -- 31 frames to open and close a Terminal), a compose median of 2.7 ms in that scene, the pointer reaching the screen in 0.2 ms. The text layout here is wrong -- icons below their labels, the top bar cut off -- and was before P0; it is recorded in [TODO.md](../../TODO.md).
+
+![The EmbLinkOS desktop on arm64 with the compositor statistics overlay; Settings' sidebar icons sit below their labels](210-perf-arm64-hvf.png)
 
 ## The prompt, Powerlevel10k-style
 

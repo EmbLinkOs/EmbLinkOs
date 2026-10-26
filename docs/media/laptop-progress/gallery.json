@@ -4097,6 +4097,46 @@
       "featured": false,
       "milestone": "Fluid desktop P0: the desktop measures itself",
       "historical": false
+    },
+    {
+      "id": "209-perf-after-p0",
+      "phase": "Fluid desktop",
+      "title": "Nothing to compose, so nothing composed",
+      "caption": "The same five scenes after P0: the overlay reads 0 composes a second on a desktop where nothing changes, where the baseline (208) composed ten. The pixel loops run -O2, and nothing is presented that did not change. Under TCG.",
+      "alt": "The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 0 composes a second",
+      "file": "209-perf-after-p0.png",
+      "capture_date": "2026-10-26",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP by tools/perf_smoke.py",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "bcb1b15ef74965a9a7a96593e35d7bbf91676468db4a751ae3258d3d82e55161",
+      "source_capture": "emblink-perf-u_0kjvt0/perf-hud.ppm",
+      "source_sha256": "20a9e13151b1a22a84ef9a4b890376c17f692b63dfdcc273752887b2fe055cae",
+      "source_commit": "ec0718b",
+      "featured": false,
+      "milestone": "Fluid desktop P0: measure, and quick wins",
+      "historical": false
+    },
+    {
+      "id": "210-perf-arm64-hvf",
+      "phase": "Fluid desktop",
+      "title": "A real core composing",
+      "caption": "arm64 under HVF, on the host's own core: window motion at about 100 frames a second (A31 -- 31 frames to open and close a Terminal), a compose median of 2.7 ms in that scene, the pointer reaching the screen in 0.2 ms. The text layout here is wrong -- icons below their labels, the top bar cut off -- and was before P0; it is recorded in TODO.md.",
+      "alt": "The EmbLinkOS desktop on arm64 with the compositor statistics overlay; Settings' sidebar icons sit below their labels",
+      "file": "210-perf-arm64-hvf.png",
+      "capture_date": "2026-10-26",
+      "environment": "QEMU aarch64 virt under HVF on an Apple M5 host, 4 CPUs; virtio-gpu 1280 × 800; CPU composition; driven over QMP by tools/perf_smoke.py --arch aarch64",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "a22642f99cfd1adba67aa08c79f05280b53cb7a38029bcfb6035e63c766bb1bf",
+      "source_capture": "emblink-perf-fcpebxvm/perf-hud.ppm",
+      "source_sha256": "18636855332ae2c68e8a10e0d633edc0bdacfaf6adc2ab21fb57b41563107c22",
+      "source_commit": "ec0718b",
+      "featured": false,
+      "milestone": "Fluid desktop P0: measure, and quick wins",
+      "historical": false
     }
   ]
 }

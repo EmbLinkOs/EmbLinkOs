@@ -83,3 +83,80 @@ What it says:
   takes 11.4 ms for a 1280 × 800 screen as the kernel builds it (`-O0`), and
   0.7 ms at `-O2` with two channels per multiply. Its box blur takes 28 ms.
   Every number in the table above carries that factor.
+
+**Correction.** The 0.7 ms quoted above for the blend at `-O2` was measured with
+the host compiler vectorising the loop (NEON on the M5). The kernel is built
+without SSE or NEON and can never do that. Scalar, as the kernel builds it
+(`make pix-bench`), the blend goes from 11.6 ms to 2.4 ms and the box blur from
+17.2 ms to 4.5 ms. The real gain is five times, not sixteen.
+
+## After P0 (ec0718b)
+
+What changed:
+
+- **The pixel loops** (`kernel/gfx/pix.c`) are compiled `-O2` with
+  `framebuffer.c`, `backdrop.c` and `soft_compose.c`; the rest of the kernel
+  stays `-O0`. They are bit-exact with the old ones (`make pix-test`).
+- **Nothing dirty is presented as nothing.** `em_app_run`, widgets and the
+  desktop presented their whole window whenever a frame they built changed no
+  pixel.
+- **A glass box and an idle menu button are no longer dirty on every frame.**
+  Each set a property twice per frame (`make em-test` covers both).
+- **A moved window is not repainted whole.** Its pixels do not change when it
+  moves.
+- **Shortcuts work on arm64.** System shortcuts and GUI commands are decided
+  for every keyboard, not only PS/2.
+- **The arm64 kernel reads `perf`**, and `tools/perf_smoke.py --arch aarch64`
+  measures the same scenes under HVF.
+
+### x86 under TCG, against the baseline
+
+| Scene | Composes | Pixels | App presents | Compose p95 | Pointer p95 |
+|---|---|---|---|---|---|
+| Idle, 10 s | 104 → **0** | 2.9 → 0 Mpx | 104 → 0 | 15.4 ms → — | — |
+| Pointer sweep | 929 → 453 | 14.5 → 1.1 Mpx | 477 → 1 | 15.3 → 0.3 ms | 18.6 → 0.7 ms |
+| Drag Settings | 97 → 184 | 20.2 → 79.8 Mpx | 54 → 1 | 221.9 → 23.8 ms | 308.0 → 23.8 ms |
+| Launcher | 29 → 6 | 10.9 → 5.5 Mpx | 25 → 2 | 279.4 → 31.4 ms | — |
+| Terminal open + close | 100 → 44 | 24.8 → 10.6 Mpx | 88 → 16 | 287.6 → 32.9 ms | 211.4 → 14.1 ms |
+
+Reading the drag row:
+
+- The window now follows the pointer more often in the same time: 111 move
+  composes against 10. Each one recomposes the window's old and new
+  footprints, about 0.7 Mpx.
+- Its median compose time rose for a different reason: the small idle presents
+  that used to pad the median are gone.
+
+### arm64 under HVF: a real core composing
+
+QEMU virt under HVF on the same Apple M5 host, 4 CPUs, virtio-gpu at
+1280 × 800, CPU composition. The guest runs on the host's own core, so these
+are the times of a real CPU, not an emulator's.
+
+| Scene | Composes | Per second | Compose p50 | Compose p95 | Pointer p95 | Window motion |
+|---|---|---|---|---|---|---|
+| Idle, 10 s | 0 | 0 | — | — | — | — |
+| Pointer sweep | 453 | 9.6 | 0.05 ms | 0.12 ms | 0.10 ms | — |
+| Drag Settings | 462 | 55.2 | 1.97 ms | 2.33 ms | 1.89 ms | — |
+| Launcher | 10 (8 full screen) | 1.3 | 2.23 ms | 2.46 ms | — | — |
+| Terminal open + close | 51 | 6.0 | 2.73 ms | 3.07 ms | 0.23 ms | 31 frames |
+
+What it says about the frame budget:
+
+- **A full 1280 × 800 compose takes about 2.2 ms on one M5 core.** That is a
+  fast core.
+- **At 1920 × 1080 on a typical laptop core, the same compose would take about
+  9–13 ms.** That estimate scales by pixels (×2) and by core speed (×2–3); it
+  is not a measurement. That fits within 60 Hz (16.7 ms) and does not fit
+  within 120 Hz (8.3 ms).
+- **What P1 has to do next:**
+  - compose only the damage, with one compose per frame on a frame clock;
+  - make window drags and the cursor cheap, so motion never needs a full
+    compose;
+  - let the rate governor hold an even 60 Hz where 120 Hz will not fit.
+- **The open and close motions run at about 100 frames a second here, 31
+  frames in all.** Under TCG they show 4. The motion itself was never the
+  problem; the emulator was.
+
+The arm64 desktop's text layout is wrong in these captures, and it is the same
+before this work: see TODO.md.
