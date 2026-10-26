@@ -385,6 +385,41 @@ static void t8_image_damage(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* T9: a node at a FRACTIONAL place leaves no sliver when it moves. Its
+ * anti-aliased edge partly covers the pixel left of its x, and that pixel's
+ * centre lies outside the old footprint's exact rect -- repainted only when
+ * damage is rounded out to whole pixels. A window title that shrank kept one
+ * grey column of its old first letter this way. */
+static void t9_fractional_edge(void) {
+    printf("T9 a fractional edge leaves no sliver:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 64, 64);
+    struct paint grey; grey.kind = PAINT_SOLID; grey.solid = (struct color){0.5f,0.5f,0.5f,1}; grey.n_stops = 0;
+    scene_set_paint(&a, bg, &grey);
+    struct node_handle rect = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, rect, 8, 8); scene_set_transform(&a, rect, 10.6f,10,0, 0,0,0,1, 1,1,1);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, rect, &redp);
+
+    scene_render_frame(&r, &a, root, &rt);
+    int grey_r = red_at(&rt, 4, 14);
+    CHECK(red_at(&rt, 10, 14) > grey_r + 20, "frame 1: the edge partly covers pixel 10");
+    scene_set_transform(&a, rect, 40,10,0, 0,0,0,1, 1,1,1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 10, 14) <= grey_r + 2, "frame 2: pixel 10 restored (no sliver)");
+    int whole = r.n_dirty >= 1;
+    for (int i = 0; i < r.n_dirty; i++)
+        whole = whole && r.dirty[i].x == floorf(r.dirty[i].x) && r.dirty[i].w == floorf(r.dirty[i].w);
+    CHECK(whole, "dirty rects are whole pixels");
+
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -395,6 +430,7 @@ int main(void) {
     t6_destroyed();
     t7_layers();
     t8_image_damage();
+    t9_fractional_edge();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

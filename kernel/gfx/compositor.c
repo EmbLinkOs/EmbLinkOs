@@ -106,6 +106,10 @@ struct comp_window {
     uint8_t   pend_head;          /* ring read index */
     uint8_t   pend_count;         /* how many presses are waiting */
     uint8_t   pend_phase;         /* 0 = the press replays next, 1 = the release */
+    /* WHAT THE APP LAST SAW: whether the last win_input poll handed it the left
+     * button down. A press replayed to an app that still thinks the button is
+     * held is no edge at all, so it gets the release first -- see the replay. */
+    uint8_t   sent_left;
 
     /* A DROP LANDED HERE. Set when the button comes up over this window while
      * a drag is in flight, and taken once by the owning process. The position
@@ -1578,7 +1582,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->widget = 0;
     w->glass = 0;
     w->translucent = 0;
-    w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->content = buf;
@@ -1689,7 +1693,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->widget = widget;
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
-    w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
@@ -2198,6 +2202,12 @@ static void win_ask_close(struct comp_window *w) {
     w->pending_action = 2;                     /* EMBK_WIN_ACTION_CLOSE */
     if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
 }
+/* The same ask for the whole app (GUI+Q), named so it is not taken for one
+ * of its tabs. */
+static void win_ask_quit(struct comp_window *w) {
+    w->pending_action = 8;                     /* EMBK_WIN_ACTION_QUIT */
+    if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
+}
 
 /* Windows that were asked to close and have not gone. Returns how many pids it
  * wrote to `out` -- the caller kills them OUTSIDE the compositor lock, because
@@ -2271,7 +2281,7 @@ int compositor_quit_front(void) {
             struct comp_window *c = &g_wins[i];
             if (!c->used || c->pid != pid) continue;
             if (c->desktop || c->widget) continue;   /* not a window of its own */
-            win_ask_close(c);
+            win_ask_quit(c);
             n++;
         }
     }
@@ -2794,18 +2804,36 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
      * button is still physically down on that window, drop the latch instead
      * (the real-time path is already delivering it; replaying would double-
      * fire), which also keeps slider drags on real button state. */
+    uint32_t sent = focused ? g_ptr_buttons : 0;   /* what this poll hands the app */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
         if (!w->used || w->pid != pid || !w->pend_count) continue;
         struct comp_click *q = &w->pend_q[w->pend_head];
-        if (w->pend_phase == 0) {
+        if (w->pend_phase == 0 && w->sent_left) {
+            /* THE APP STILL HOLDS THE LAST PRESS. It saw that one live, then
+             * the release and this press both came and went between its polls.
+             * Handing it "down" again is no edge, and the click is lost --
+             * measured: the third click of a triple, and now and then the
+             * second of a double, under emulation. The release goes first;
+             * the press itself follows on the next poll. */
+            if (lx) *lx = q->x;
+            if (ly) *ly = q->y;
+            if (buttons) *buttons = 0;
+            if (win) *win = w->id;
+            if (when) *when = q->t;
+            focused = 1;
+            sent = 0;
+        } else if (w->pend_phase == 0) {
             /* The live path is already delivering this one if the button is
              * STILL DOWN on this window and there is nothing queued behind it
              * -- replaying would double-fire, and would also break slider drags
              * by feeding them a synthetic release. With more than one waiting,
-             * the extras are by definition presses the app has not seen. */
+             * the extras are by definition presses the app has not seen. The
+             * latch still knows when this press was made, and the live state
+             * does not. */
             if (w->pend_count == 1 && focused && w->id == g_ptr_win &&
                 (g_ptr_buttons & MOUSE_BTN_LEFT)) {
+                if (when) *when = q->t;
                 w->pend_count = 0;
             } else {
                 if (lx) *lx = q->x;
@@ -2814,6 +2842,7 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
                 if (win) *win = w->id;
                 if (when) *when = q->t;         /* when the press really happened */
                 focused = 1;
+                sent = MOUSE_BTN_LEFT;
                 w->pend_phase = 1;              /* release replays next poll */
             }
         } else {
@@ -2823,12 +2852,16 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
             if (win) *win = w->id;
             if (when) *when = q->t;
             focused = 1;
+            sent = 0;
             w->pend_head = (uint8_t)((w->pend_head + 1) % COMP_CLICK_Q);
             w->pend_count--;
             w->pend_phase = 0;
         }
         break;
     }
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++)
+        if (g_wins[i].used && g_wins[i].pid == pid)
+            g_wins[i].sent_left = (sent & MOUSE_BTN_LEFT) != 0;
     /* Window-manager commands share the otherwise ordinary `win` result.
      * The high bit distinguishes them without changing the stable syscall ABI. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {

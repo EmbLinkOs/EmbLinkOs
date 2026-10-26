@@ -75,6 +75,15 @@ static int child(const char *mode) {
         if (write(1,"ready",5)!=5) return 27;
         unsigned char c; return read(0,&c,1)==0?0:28;
     }
+    if (!strcmp(mode,"--hold")) {
+        /* as many pairs as this process's descriptors reach, held until the
+         * hangup; the count follows "ready" as two digits */
+        int p[2],held=0; char msg[8];
+        while (held<99 && embk_openpty(p)==0) held++;
+        snprintf(msg,sizeof msg,"ready%02d",held);
+        if (write(1,msg,7)!=7) return 38;
+        unsigned char c; return read(0,&c,1)==0?0:39;
+    }
     return 29;
 }
 static long spawn_child(int slave,const char *mode) {
@@ -167,18 +176,31 @@ static int selftest(void) {
     CHECK(write(a[0],large,sizeof large)==sizeof large);
     CHECK(write(a[0],"x",1)==-1 && errno==EAGAIN);
     CHECK(read(a[1],copy,sizeof copy)==sizeof copy && !memcmp(copy,large,sizeof copy));
-    CHECK(write(a[1],large,sizeof large)==sizeof large);
+    for (int i=0;i<8;i++) CHECK(write(a[1],large,sizeof large)==sizeof large);   /* output queues 32 KiB */
     CHECK(write(a[1],"x",1)==-1 && errno==EAGAIN);
-    CHECK(read(a[0],copy,sizeof copy)==sizeof copy && !memcmp(copy,large,sizeof copy));
+    for (int i=0;i<8;i++) CHECK(read(a[0],copy,sizeof copy)==sizeof copy && !memcmp(copy,large,sizeof copy));
     CHECK(tcgetattr(a[1],&t)==0); t.c_lflag=ICANON;
     CHECK(tcsetattr(a[1],TCSANOW,&t)==0 && write(a[0],"discard",7)==7);
     cfmakeraw(&t); CHECK(tcsetattr(a[1],TCSAFLUSH,&t)==0);
     CHECK(read(a[1],buf,1)==-1 && errno==EAGAIN);
     close(a[0]); close(a[1]);
-    int pairs[16][2],count=0;
-    while (count<16 && embk_openpty(pairs[count])==0) count++;
-    CHECK(count==16 && embk_openpty(a)==-23);
+    /* 64 pairs in the system, less whatever terminals are open elsewhere. One
+     * process's 64 descriptors hold about 30, so two children hold theirs
+     * first; then the next is refused for the system, not the process, and
+     * freed ones open again */
+    int holder[2][2],held=2,pairs[32][2],count=0; long hold[2];
+    for (int i=0;i<2;i++) {
+        char msg[8]={0}; ssize_t got=0;
+        CHECK(embk_openpty(holder[i])==0);
+        hold[i]=spawn_child(holder[i][1],"--hold"); CHECK(hold[i]>=0); close(holder[i][1]);
+        while (got<7 && readable(holder[i][0])) { ssize_t n=read(holder[i][0],msg+got,(size_t)(7-got)); if (n<=0) break; got+=n; }
+        CHECK(got==7 && !memcmp(msg,"ready",5));
+        held+=(msg[5]-'0')*10+(msg[6]-'0');
+    }
+    while (count<32 && embk_openpty(pairs[count])==0) count++;
+    CHECK(held+count>=48 && embk_openpty(a)==-23);
     for (int i=0;i<count;i++) { close(pairs[i][0]); close(pairs[i][1]); }
+    for (int i=0;i<2;i++) { close(holder[i][0]); CHECK(embk_wait((int)hold[i])==0); }
     CHECK(embk_openpty(a)==0); close(a[0]); close(a[1]);
     printf("ttyprobe: %d/%d checks passed\n",checks-failures,checks); return failures?1:0;
 }
@@ -393,7 +415,7 @@ static int glyphs(void) {
     for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) printf("%s\n", lines[i]);
     return 0;
 }
-/* Throughput: the emulator drains a 4 KiB PTY queue, so how fast this loop
+/* Throughput: the emulator drains a 32 KiB PTY queue, so how fast this loop
  * finishes is how fast the terminal parses and keeps up. Coloured lines, as
  * real output is; the frame count to compare with is in Terminal's probe. */
 static int bench(const char *megabytes) {

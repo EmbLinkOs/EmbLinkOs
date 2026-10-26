@@ -211,12 +211,51 @@ static void decorations(struct term_render *r, const struct look *k, int x, int 
 
 static uint64_t fnv(uint64_t h, uint64_t v) { return (h ^ v) * 1099511628211ull; }
 
+/* --- marks ------------------------------------------------------------------------- */
+
+#define FIND_SPANS 16
+struct marks { int sel0, sel1, nfind, f0[FIND_SPANS], f1[FIND_SPANS], cur0, cur1, link0, link1; };
+static void span_of(const struct term_match *m, int64_t id, int cols, int *x0, int *x1) {
+    *x0 = *x1 = 0;
+    if (id < m->start.row || id > m->end.row) return;
+    *x0 = id == m->start.row ? m->start.col : 0;
+    *x1 = id == m->end.row ? m->end.col : cols;
+}
+static void marks_of(const struct vt *v, const struct term_frame *fr, int row, struct marks *m) {
+    memset(m, 0, sizeof *m);
+    int64_t id = vt_row_id(v, row, fr->back);
+    if (fr->selection && !term_select_span(fr->selection, v, id, v->cols, &m->sel0, &m->sel1)) m->sel0 = m->sel1 = 0;
+    if (fr->find && fr->find[0]) m->nfind = term_find_spans(v, fr->find, id, m->f0, m->f1, FIND_SPANS);
+    if (fr->find_current_set) span_of(&fr->find_current, id, v->cols, &m->cur0, &m->cur1);
+    if (fr->link_set) span_of(&fr->link, id, v->cols, &m->link0, &m->link1);
+}
+static bool in(int x, int x0, int x1) { return x >= x0 && x < x1; }
+/* A cell's look with what is marked on it. */
+static struct look marked(struct look k, const struct marks *m, const struct term_frame *fr, int x) {
+    bool found = false;
+    for (int i = 0; i < m->nfind && !found; i++) found = in(x, m->f0[i], m->f1[i]);
+    if (in(x, m->cur0, m->cur1)) { k.bg = fr->find_current_bg; k.fg = fr->find_fg; }
+    else if (found) { k.bg = fr->find_bg; k.fg = fr->find_fg; }
+    else if (in(x, m->sel0, m->sel1)) k.bg = fr->selection_bg;
+    if (in(x, m->link0, m->link1) && !k.underline) { k.underline = VT_UL_SINGLE; k.ul = k.fg; }
+    return k;
+}
+static uint64_t marks_signature(uint64_t h, const struct marks *m, const struct term_frame *fr) {
+    h = fnv(h, (uint64_t)(unsigned)m->sel0 << 32 | (unsigned)m->sel1);
+    for (int i = 0; i < m->nfind; i++) h = fnv(h, (uint64_t)(unsigned)m->f0[i] << 32 | (unsigned)m->f1[i]);
+    h = fnv(h, (uint64_t)(unsigned)m->cur0 << 32 | (unsigned)m->cur1);
+    h = fnv(h, (uint64_t)(unsigned)m->link0 << 32 | (unsigned)m->link1);
+    if (m->sel1 > m->sel0 || m->nfind || m->cur1 > m->cur0)
+        h = fnv(h, (uint64_t)fr->selection_bg << 32 | fr->find_bg), h = fnv(h, (uint64_t)fr->find_current_bg << 32 | fr->find_fg);
+    return h;
+}
+
 /* What a row shows, as a number: its cells and their styles as the program
  * set them, the palette they resolve through (one hash a frame), the cursor
  * if it is on the row, the blink phase if anything on it blinks. */
 static uint64_t row_signature(const struct vt *v, const struct vt_cell *cells, int cols,
-                              const struct term_frame *fr, int y, uint64_t palette, bool *blinks) {
-    uint64_t h = palette;
+                              const struct term_frame *fr, int y, uint64_t palette, const struct marks *m, bool *blinks) {
+    uint64_t h = marks_signature(palette, m, fr);
     for (int x = 0; x < cols; x++) {
         const struct vt_cell *c = &cells[x];
         const struct vt_style *s = vt_style_of(v, c);
@@ -243,7 +282,7 @@ static uint64_t palette_signature(const struct vt *v, const struct term_frame *f
 }
 
 static void paint_row(struct term_render *r, const struct vt *v, const struct vt_cell *cells,
-                      const struct term_frame *fr, int row) {
+                      const struct term_frame *fr, const struct marks *m, int row) {
     int y = row * r->cell_h, cols = r->cols < v->cols ? r->cols : v->cols;
     struct look k;
     /* the ground, then the glyphs over all of it (a glyph may lean into the
@@ -252,7 +291,7 @@ static void paint_row(struct term_render *r, const struct vt *v, const struct vt
     for (int x = 0; x < cols; x++) {
         const struct vt_cell *c = &cells[x];
         if (!c->width) continue;
-        k = look_of(v, vt_style_of(v, c), fr);
+        k = marked(look_of(v, vt_style_of(v, c), fr), m, fr, x);
         fill(r, x * r->cell_w, y, (x + c->width) * r->cell_w, y + r->cell_h, k.bg);
     }
     bool cursor_here = fr->cursor && fr->cursor_y == row && fr->cursor_x >= 0 && fr->cursor_x < cols;
@@ -267,7 +306,7 @@ static void paint_row(struct term_render *r, const struct vt *v, const struct vt
         const struct vt_cell *c = &cells[x];
         if (!c->width) continue;
         const struct vt_style *s = vt_style_of(v, c);
-        k = look_of(v, s, fr);
+        k = marked(look_of(v, s, fr), m, fr, x);
         if (!k.text) continue;
         int face = ((s->attrs & VT_BOLD) ? 1 : 0) | ((s->attrs & VT_ITALIC) ? 2 : 0);
         uint32_t fg = block && x == cx ? k.bg : k.fg;      /* the character under a block cursor */
@@ -276,7 +315,7 @@ static void paint_row(struct term_render *r, const struct vt *v, const struct vt
     for (int x = 0; x < cols; x++) {
         const struct vt_cell *c = &cells[x];
         if (!c->width) continue;
-        k = look_of(v, vt_style_of(v, c), fr);
+        k = marked(look_of(v, vt_style_of(v, c), fr), m, fr, x);
         if (k.text || (k.attrs & (VT_BLINK | VT_RAPID)) == 0) decorations(r, &k, x * r->cell_w, y, c->width * r->cell_w);
     }
     if (cursor_here && !block) {
@@ -302,8 +341,10 @@ bool term_render_frame(struct term_render *r, const struct vt *v, const struct t
     uint64_t palette = palette_signature(v, fr);
     uint32_t ground = vt_rgb(v, VT_COLOR_DEFAULT, v->reverse_video);
     for (int row = 0; row < r->rows; row++) {
+        struct marks mk = {0};
+        if (row < rows) marks_of(v, fr, row, &mk);       /* first: it reads other rows */
         const struct vt_cell *cells = row < rows ? vt_view_row(v, row, fr->back) : NULL;
-        sig[row] = cells ? row_signature(v, cells, v->cols, fr, row, palette, &r->blink_text)
+        sig[row] = cells ? row_signature(v, cells, v->cols, fr, row, palette, &mk, &r->blink_text)
                          : 0x9e3779b97f4a7c15ull ^ ground;
     }
     /* A scroll: last frame's rows, moved up. Move their pixels too, and paint
@@ -328,8 +369,10 @@ bool term_render_frame(struct term_render *r, const struct vt *v, const struct t
     }
     for (int row = 0; row < r->rows; row++) {
         if (!r->all && r->painted[row] == sig[row]) continue;
+        struct marks mk = {0};
+        if (row < rows) marks_of(v, fr, row, &mk);
         const struct vt_cell *cells = row < rows ? vt_view_row(v, row, fr->back) : NULL;
-        if (cells) paint_row(r, v, cells, fr, row);
+        if (cells) paint_row(r, v, cells, fr, &mk, row);
         else fill(r, 0, row * r->cell_h, r->width, (row + 1) * r->cell_h, ground);
         r->painted[row] = sig[row];
         r->rows_painted++;

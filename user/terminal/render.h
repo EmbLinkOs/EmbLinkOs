@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "vt.h"
+#include "screentext.h"
 #include "font.h"
 
 enum { TERM_FACE_REGULAR, TERM_FACE_BOLD, TERM_FACE_ITALIC, TERM_FACE_BOLD_ITALIC };
@@ -30,6 +31,14 @@ struct term_frame {
     bool cursor_hollow;         /* the window does not have the keyboard: an outline */
     bool blink_on;              /* blinking text shows in this phase */
     bool bold_is_bright;        /* bold ANSI colours 0-7 draw as 8-15 */
+    /* what is marked, over the cells' own colours: the selection, the
+     * matches of a search (the one found last stronger), the link under the
+     * pointer (underlined) */
+    const struct term_selection *selection;
+    const char *find;
+    bool find_current_set, link_set;
+    struct term_match find_current, link;
+    uint32_t selection_bg, find_bg, find_current_bg, find_fg;
 };
 
 struct term_mask { uint32_t cp; int w, h; uint8_t *m; };

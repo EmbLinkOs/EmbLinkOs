@@ -1309,6 +1309,10 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * still comes from embk_drop_take. */
 #define EMBK_WIN_ACTION_DROP      0x80000003u
 #define EMBK_WIN_ACTION_LAUNCHER  0x80000007u
+/* QUIT THE APP (GUI+Q): asked of every window the front app has, and timed
+ * like CLOSE. Told apart from CLOSE (GUI+W, which may mean "this tab") so an
+ * app with tabs or documents can close all of them, not one. */
+#define EMBK_WIN_ACTION_QUIT      0x80000008u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *

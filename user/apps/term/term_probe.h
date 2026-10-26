@@ -15,10 +15,12 @@
 #include <stdint.h>
 
 #define TERM_PROBE_MAGIC   0x504d5254u          /* "TRMP" */
-#define TERM_PROBE_VERSION 2u
+#define TERM_PROBE_VERSION 3u
 #define TERM_PROBE_LINE    1024                 /* the local prompt line */
 #define TERM_PROBE_TEXT    65536                /* one screen as UTF-8 */
 #define TERM_PROBE_CELLS   16384                /* cols*rows of the shown screen */
+#define TERM_PROBE_TABS    16
+#define TERM_PROBE_SELECTION 4096
 
 /* One cell of the shown screen: its first codepoint, its colours resolved to
  * 0xRRGGBB -- TERM_PROBE_DEFAULT where the profile's default applies -- and
@@ -55,6 +57,19 @@ struct term_probe {
     char text[TERM_PROBE_TEXT];                 /* rows joined by '\n', trailing blanks dropped */
     char primary[TERM_PROBE_TEXT];              /* the primary screen, also while the alternate one shows */
     struct term_probe_cell cells[TERM_PROBE_CELLS];
+    /* version 3: tabs, the selection, find, the font, the link under the pointer */
+    uint32_t tabs, tab;                         /* how many tabs, which one is shown */
+    int32_t tab_shell[TERM_PROBE_TABS];         /* each tab's shell (its spawn handle); -1 once it has exited */
+    char tab_title[TERM_PROBE_TABS][64];
+    uint32_t selection_len;
+    char selection[TERM_PROBE_SELECTION];       /* the selected text, as Copy puts it on the clipboard */
+    uint32_t find_open, find_found;             /* the find bar is open; its text was found */
+    int32_t find_row, find_col;                 /* that match on the screen, or -1 */
+    char find[128];
+    float font_px; int32_t cell_w, cell_h;
+    uint32_t link_len;
+    char link[256];                             /* the link under the pointer while GUI is held */
+    int32_t origin_x, origin_y;                 /* the screen's top-left cell, in the window */
 };
 
 _Static_assert(sizeof(struct term_probe_cell) == 16, "probe cell layout");
@@ -69,4 +84,12 @@ _Static_assert(offsetof(struct term_probe, input) == 344, "probe layout");
 _Static_assert(offsetof(struct term_probe, text) == 1368, "probe layout");
 _Static_assert(offsetof(struct term_probe, primary) == 66904, "probe layout");
 _Static_assert(offsetof(struct term_probe, cells) == 132440, "probe layout");
+_Static_assert(offsetof(struct term_probe, tabs) == 394584, "probe layout");
+_Static_assert(offsetof(struct term_probe, tab_title) == 394656, "probe layout");
+_Static_assert(offsetof(struct term_probe, selection_len) == 395680, "probe layout");
+_Static_assert(offsetof(struct term_probe, find_open) == 399780, "probe layout");
+_Static_assert(offsetof(struct term_probe, find) == 399796, "probe layout");
+_Static_assert(offsetof(struct term_probe, font_px) == 399924, "probe layout");
+_Static_assert(offsetof(struct term_probe, link) == 399940, "probe layout");
+_Static_assert(offsetof(struct term_probe, origin_x) == 400196, "probe layout");
 #endif

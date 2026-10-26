@@ -86,7 +86,15 @@ static struct frect subtree_bounds(struct scene_arena *a, struct node_handle h,
 static void dirty_add(struct scene_renderer *r, struct frect f) {
     if (r->full || frect_is_empty(f)) return;
     if (r->n_dirty >= 16) { r->full = 1; return; }   /* Section 0 cap -> full-screen */
-    struct clip_rect c = { f.x, f.y, f.w, f.h, 0.0f };
+    /* WHOLE PIXELS, rounded outward. A pixel is repainted when its CENTRE is in
+     * a dirty rect, but a node at a fractional place stains the pixel its edge
+     * only partly covers: an anti-aliased edge does, and text does more, its
+     * pen truncated to the pixel at or left of its x. A title at x 480.6 inked
+     * pixel 480, its old footprint's rect began at 480.6 and missed 480.5, and
+     * a sliver of the old title stayed beside the new one. */
+    float x0 = floorf(f.x), y0 = floorf(f.y);
+    float x1 = ceilf(f.x + f.w), y1 = ceilf(f.y + f.h);
+    struct clip_rect c = { x0, y0, x1 - x0, y1 - y0, 0.0f };
     r->dirty[r->n_dirty++] = c;
 }
 static int dirty_hits(struct scene_renderer *r, struct frect f) {

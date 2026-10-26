@@ -807,6 +807,24 @@ const struct vt_cell *vt_view_row(const struct vt *v,int row,unsigned back) {
     if (row<0 || row>=v->rows) return NULL;
     return view_row(v,row,back,NULL);
 }
+int64_t vt_row_id(const struct vt *v,int row,unsigned back) {
+    if (v->alt) back=0;
+    if (back>v->history_rows) back=v->history_rows;
+    return (int64_t)v->scrolls-(int64_t)back+row;
+}
+const struct vt_cell *vt_row_cells(const struct vt *v,int64_t id,bool *wrapped) {
+    int64_t rel=id-(int64_t)v->scrolls;
+    bool w=false;const struct vt_cell *cells=NULL;
+    if (rel>=0) {
+        if (rel<v->rows) cells=view_row(v,(int)rel,0,&w);
+    } else if (!v->alt && -rel<=(int64_t)v->history_rows) cells=view_row(v,0,(unsigned)-rel,&w);
+    if (wrapped) *wrapped=cells && w;
+    return cells;
+}
+int vt_row_in_view(const struct vt *v,int64_t id,unsigned back) {
+    int64_t row=id-vt_row_id(v,0,back);
+    return row>=0 && row<v->rows?(int)row:-1;
+}
 bool vt_view_wrapped(const struct vt *v,int row,unsigned back) {
     bool w=false;
     if (row>=0 && row<v->rows) view_row(v,row,back,&w);

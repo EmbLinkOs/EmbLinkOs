@@ -764,6 +764,13 @@ void em_key_hook_wants_key_only(int on);
  * compositor request, so waiting for the user has no forced-kill deadline.
  * After Save/Discard, call request_exit again; the hook must then allow it. */
 void em_set_close_hook(int (*fn)(void));
+/* Why the window is closing, for a close hook that treats them differently
+ * (an app with tabs closes one on a request, all of them on a quit):
+ * EM_CLOSE_REQUEST -- GUI+W or the compositor asking; EM_CLOSE_QUIT -- GUI+Q,
+ * the whole app; EM_CLOSE_BUTTON -- the window's close light; EM_CLOSE_OTHER
+ * -- the app itself, Escape, a gesture. */
+enum { EM_CLOSE_OTHER = 1, EM_CLOSE_REQUEST, EM_CLOSE_QUIT, EM_CLOSE_BUTTON };
+int em_close_reason(void);
 void em_set_idle_hook(void (*fn)(void));
 /* Runs after LAYOUT and before the frame is rendered -- the only moment at
  * which every node's resolved position is known and the pixels have not been

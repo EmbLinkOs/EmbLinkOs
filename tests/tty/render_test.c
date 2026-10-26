@@ -265,6 +265,42 @@ int main(int argc, char **argv) {
     for (int y = cy0(2); y < cy0(3); y++) for (int x = 0; x < cx0(5); x++) curly += px(x, y) == red;
     CHECK(curly > 2 * r.cell_w, "the curly underline in its own colour");
 
+    printf("marks: selection, matches, link:\n");
+    start(30, 6);
+    feed("one needle\r\ntwo\r\nthree needle\r\nsee https://a.invalid/x\r\n");
+    struct term_selection sel = {0};
+    struct term_point p0 = { vt_row_id(&v, 1, 0), 0 }, p1 = { vt_row_id(&v, 1, 0), 3 };
+    term_select_start(&sel, &v, p0, TERM_SELECT_CHARS);
+    term_select_extend(&sel, &v, p1);
+    fr = (struct term_frame){ .blink_on = true, .selection = &sel, .selection_bg = 0x335577, .find = "needle",
+                              .find_bg = 0xaa8800, .find_current_bg = 0xff6600, .find_fg = 0x101010 };
+    term_render_invalidate(&r); frame();
+    CHECK(px(cx0(0), cy0(1)) == 0x335577 && px(cx0(3), cy0(1)) == BG, "the selection's cells take its colour, and stop where it stops");
+    CHECK(px(cx0(4), cy0(0)) == 0xaa8800 && px(cx0(4), cy0(2) + 1) == BG && px(cx0(6), cy0(2)) == 0xaa8800,
+          "every match is marked");
+    struct term_match found;
+    struct term_point bottom = { vt_row_id(&v, 5, 0), 30 };
+    CHECK(term_find(&v, "needle", bottom, true, &found), "the last match found");
+    fr.find_current = found; fr.find_current_set = true;
+    CHECK(term_render_frame(&r, &v, &fr) && r.rows_painted == 1 && px(cx0(6), cy0(2)) == 0xff6600 && px(cx0(4), cy0(0)) == 0xaa8800,
+          "the current one is stronger, and only its row repaints");
+    struct term_match link;
+    char url[64];
+    struct term_point on = { vt_row_id(&v, 3, 0), 8 };
+    CHECK(term_link_at(&v, on, url, sizeof url, &link), "a link under the pointer");
+    fr.link = link; fr.link_set = true;
+    frame();
+    int under = 0;
+    for (int x = cx0(4); x < cx0(23); x++) under += px(x, cy0(3) + r.underline) == FG;
+    CHECK(r.rows_painted == 1 && under == cx0(23) - cx0(4), "it is underlined, its row alone repainted");
+    p1.row = vt_row_id(&v, 2, 0); p1.col = 5;
+    term_select_extend(&sel, &v, p1);
+    frame();
+    CHECK(r.rows_painted == 2 && px(cx0(10), cy0(1)) == 0x335577, "a selection that grows repaints the rows it changes");
+    term_select_clear(&sel);
+    frame();
+    CHECK(r.rows_painted == 2 && px(cx0(0), cy0(1)) == BG, "and cleared, those rows again");
+
     printf("procedural glyphs at other sizes:\n");
     uint8_t mask[64 * 128];
     int ok = 1;

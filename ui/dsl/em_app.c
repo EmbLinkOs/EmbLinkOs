@@ -33,6 +33,8 @@ static int g_app_exit_requested;
 static int g_app_exit_code;
 static int (*g_em_close_hook)(void);
 static int g_key_modifiers,g_key_code,g_key_flags,g_key_only_wanted;
+static int g_close_reason;      /* EM_CLOSE_*: why the window is being closed */
+int em_close_reason(void) { return g_close_reason ? g_close_reason : em_window_closed() ? EM_CLOSE_BUTTON : EM_CLOSE_OTHER; }
 int em_key_modifiers(void) { return g_key_modifiers; }
 int em_key_code(void) { return g_key_code; }
 int em_key_flags(void) { return g_key_flags; }
@@ -614,7 +616,8 @@ int em_app_run(const EmApp *app) {
          * An app that wants to ask "save first?" installs a close hook.
          * Acknowledge immediately so drawing its prompt cannot race the
          * compositor's grace timeout. Apps without a hook retain that backstop. */
-        if (in.win == EMBK_WIN_ACTION_CLOSE) {
+        if (in.win == EMBK_WIN_ACTION_CLOSE || in.win == EMBK_WIN_ACTION_QUIT) {
+            g_close_reason = in.win == EMBK_WIN_ACTION_QUIT ? EM_CLOSE_QUIT : EM_CLOSE_REQUEST;
             if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
             em_app_request_exit(0);
         }
@@ -834,7 +837,8 @@ int em_app_run(const EmApp *app) {
                 embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
                 struct embk_win_input pin;
                 embk_win_input(&pin);
-                if (pin.win == EMBK_WIN_ACTION_CLOSE) {
+                if (pin.win == EMBK_WIN_ACTION_CLOSE || pin.win == EMBK_WIN_ACTION_QUIT) {
+                    g_close_reason = pin.win == EMBK_WIN_ACTION_QUIT ? EM_CLOSE_QUIT : EM_CLOSE_REQUEST;
                     if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
                     em_app_request_exit(0); break;
                 }
@@ -894,6 +898,7 @@ int em_app_run(const EmApp *app) {
             em_request_frame();
             closing = 0;
         }
+        if (!closing) g_close_reason = 0;
         if (closing) {
             /* Give the reservation back before leaving. The thread dying would
              * do it too, but em_app_run RETURNS -- an app that goes on to do

@@ -1711,11 +1711,13 @@ build/wcwidth.o: shell/edit/wcwidth.c shell/edit/wcwidth.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 # The renderer and its drawn glyphs: Terminal's own, beside the screen model
 # (user/apps/*/*.c would each be taken for a program of their own).
-TERM_UI_OBJS := build/term_render.o build/term_glyphs.o
-build/term_render.o: user/terminal/render.c user/terminal/render.h user/terminal/glyphs.h $(VT_HDRS) | $(BUILD)
+TERM_UI_OBJS := build/term_render.o build/term_glyphs.o build/term_screentext.o
+build/term_render.o: user/terminal/render.c user/terminal/render.h user/terminal/glyphs.h user/terminal/screentext.h $(VT_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/terminal -c $< -o $@
 build/term_glyphs.o: user/terminal/glyphs.c user/terminal/glyphs.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term_screentext.o: user/terminal/screentext.c user/terminal/screentext.h $(VT_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
 build/term.o: user/terminal/vt.h user/terminal/render.h user/apps/term/term_probe.h
 build/term.elf: build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o \
@@ -2727,9 +2729,16 @@ terminal-screen-test: | $(BUILD)
 # DejaVu as the fallback) on real screens from the screen model.
 terminal-render-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -g -Iuser/terminal -Iui/backend -Iui/scene \
-	    user/terminal/render.c user/terminal/glyphs.c $(VT_SRC) shell/edit/wcwidth.c \
+	    user/terminal/render.c user/terminal/glyphs.c user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c \
 	    ui/backend/font.c ui/backend/cpu_backend.c ui/scene/scene.c tests/tty/render_test.c -lm -o $(BUILD)/render_test
 	$(BUILD)/render_test $(RENDER_SAMPLE)
+
+.PHONY: terminal-screentext-test
+# Selection, find and links over the screen model.
+terminal-screentext-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Iuser/terminal \
+	    user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c tests/tty/screentext_test.c -o $(BUILD)/screentext_test
+	$(BUILD)/screentext_test
 
 .PHONY: terminal-golden-test
 # Real programs' output (tests/tty/golden, made by tools/record_golden.py on a

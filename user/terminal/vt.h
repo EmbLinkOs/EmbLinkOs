@@ -186,6 +186,16 @@ const struct vt_cell *vt_view_cell(const struct vt *, int row, int col, unsigned
 /* A whole row of the view: `cols` cells, valid until the next view read or
  * change. NULL outside the grid. */
 const struct vt_cell *vt_view_row(const struct vt *, int row, unsigned back);
+/* A row's id: the same number for the same text while output scrolls it up
+ * into the scrollback (a selection or a search match holds rows by id). A
+ * resize re-wraps the rows and ends what ids meant. */
+int64_t vt_row_id(const struct vt *, int row, unsigned back);
+/* The cells of the row with that id (cols long, valid until the next view
+ * read or change), and whether it wraps into the next; NULL when the row is
+ * no longer kept or not yet written. */
+const struct vt_cell *vt_row_cells(const struct vt *, int64_t id, bool *wrapped);
+/* Where row `id` is in a view `back` rows into the scrollback, or -1. */
+int vt_row_in_view(const struct vt *, int64_t id, unsigned back);
 bool vt_view_wrapped(const struct vt *, int row, unsigned back);
 const struct vt_style *vt_style_of(const struct vt *, const struct vt_cell *);
 /* The cell's text as UTF-8 (base and marks); returns the bytes written. */

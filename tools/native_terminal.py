@@ -9,9 +9,11 @@ that moved while it was being read) is read again.
 """
 import struct
 
-MAGIC, VERSION = 0x504d5254, 2
+MAGIC, VERSION = 0x504d5254, 3
 TEXT, PRIMARY, CELLS, CELL = 1368, 66904, 132440, 16
 HEADER = struct.Struct('<4I4i4B5i3I2i3I')
+# version 3: tabs, the selection, find, the font, the link under the pointer
+V3, V3_SIZE, TABS = 394584, 400204 - 394584, 16
 
 
 class TerminalState:
@@ -40,6 +42,21 @@ class TerminalState:
                  'local_edit': bool(flags & 1), 'edit_shell': bool(flags & 2), 'inband_size': bool(flags & 4),
                  'cwd': head[88:344].split(b'\0', 1)[0].decode('utf-8', 'replace')}
             if text:
+                v3 = self._raw(w, V3_SIZE, V3)
+                cstr = lambda b: b.split(b'\0', 1)[0].decode('utf-8', 'replace')
+                tabs, tab = struct.unpack_from('<2I', v3, 0)
+                shells = struct.unpack_from(f'<{TABS}i', v3, 8)
+                sel_len, = struct.unpack_from('<I', v3, 395680 - V3)
+                find_open, find_found, find_row, find_col = struct.unpack_from('<2I2i', v3, 399780 - V3)
+                font_px, cell_w, cell_h, link_len = struct.unpack_from('<f2iI', v3, 399924 - V3)
+                origin = struct.unpack_from('<2i', v3, 400196 - V3)
+                p.update({'tabs': tabs, 'tab': tab, 'tab_shells': list(shells[:tabs]),
+                          'tab_titles': [cstr(v3[72 + 64 * i:72 + 64 * (i + 1)]) for i in range(tabs)],
+                          'selection': v3[395684 - V3:395684 - V3 + sel_len].decode('utf-8', 'replace'),
+                          'find_open': bool(find_open), 'find_found': bool(find_found), 'find_at': (find_row, find_col),
+                          'find': cstr(v3[399796 - V3:399796 - V3 + 128]), 'font_px': font_px, 'cell': (cell_w, cell_h),
+                          'link': v3[399940 - V3:399940 - V3 + link_len].decode('utf-8', 'replace'),
+                          'origin': origin})
                 p['text'] = self._raw(w, text_len, TEXT).decode('utf-8', 'replace').split('\n') if text_len else ['']
                 p['primary'] = self._raw(w, primary_len, PRIMARY).decode('utf-8', 'replace').split('\n') if primary_len else ['']
             if cells:
