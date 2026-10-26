@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-203 actual EmbLinkOS captures document the original laptop work, its
+207 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, and Powerlevel10k's configuration wizard. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -21,6 +21,32 @@ With the terminal real, the prompt that runs in it: the system the Mac's Powerle
 Then the engine: Powerlevel10k 1.20's prompt ported to C in the shell, held cell for cell to recordings of p10k itself on a Mac -- 18 configurations, 288 prompts. A person's `.p10k.zsh` is read by `prompt import-p10k`, or its settings written as `prompt set` lines; `prompt style` draws the styles `p10k configure` starts from.
 
 Then the wizard: `prompt configure` is p10k configure, its questions and pages held cell for cell to recordings of p10k's own (454 pages), and the configuration it writes line for line. A new account's first Terminal starts it by itself; the answers from the Mac's own header make the Mac's prompt.
+
+And the line itself, as the Mac's zsh-autosuggestions and zsh-syntax-highlighting draw it: the rest of a history line suggested after the cursor, and the colours of what is typed -- held cell for cell to the two plugins under zsh.
+
+### A suggestion from history
+
+Two letters typed, and the rest of the newest line in history that starts with them follows the cursor in colour 8, as zsh-autosuggestions draws it; ec itself is red until it is a command.
+
+![A suggestion from history, in the EmbLinkOS Terminal](204-line-suggestion.png)
+
+### Right takes it
+
+At the end of the line Right takes the whole suggestion: echo is a command, green, and the quoted text yellow.
+
+![Right takes it, in the EmbLinkOS Terminal](205-line-suggestion-taken.png)
+
+### Colours as the line is typed
+
+zsh-syntax-highlighting's default styles on this shell's language: ls and where green, the directory that is there underlined, the string yellow, the comment bold -- nothing run yet.
+
+![Colours as the line is typed, in the EmbLinkOS Terminal](206-line-colours.png)
+
+### A word on its way to a file
+
+read is not a file, but readme.txt is: while the word ends the line it is underlined, as zsh-syntax-highlighting's path_prefix is.
+
+![A word on its way to a file, in the EmbLinkOS Terminal](207-line-path-on-its-way.png)
 
 ### The wizard, on its own, in a new account's first shell
 

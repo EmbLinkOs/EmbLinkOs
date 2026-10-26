@@ -75,7 +75,10 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
       prompt.esh); it starts by itself in the first shell that finds no prompt configuration, outside Live
       sessions. 454 pages and 13 configurations match p10k configure 1.20 (`make prompt-test`). Instant prompt
       and the .zshrc question are zsh's and are not asked.
-- [ ] M12 autosuggestions, highlighting.
+- [x] M12 suggestions from history and colours as the line is typed, as zsh-autosuggestions 0.7.1 and
+      zsh-syntax-highlighting 0.8.0 draw them by default: 26 lines match the plugins under zsh
+      (`make shell-test`). Only their defaults: no other suggestion strategies (completion, match_prev_cmd), no
+      styles to set, and the other highlighters (brackets, pattern, cursor) are not there.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
 - [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not

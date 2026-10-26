@@ -599,6 +599,10 @@ Emacs bindings, as readline and zle have them:
 | Ctrl+L | clear the screen, keep the line |
 | Ctrl+C | abandon the line (shown with `^C`; `$status` becomes 130) |
 
+With a suggestion showing (below), Right, End, Ctrl+F and Ctrl+E at the end of
+the line take it whole, and Alt+F and Ctrl+Right take it up to the end of its
+next word.
+
 **Unfinished programs** (`program_incomplete()` in `parse.c`): an open `{`
 or `(`, a trailing `|`, an unclosed `$(`, a string that runs off the end.
 Enter then adds a line under a `...` prompt instead of reporting an error, so
@@ -614,6 +618,57 @@ else, files and directories (hidden ones only for a word starting with `.`).
 A name the lexer would not read as one word -- a space, a leading digit -- is
 offered in double quotes; inside an open quote the quoted word completes, and
 a directory leaves it open to go on into.
+
+### Suggestions and colours
+
+As a Mac's zsh does with **zsh-autosuggestions** and
+**zsh-syntax-highlighting** (their defaults), the Terminal's line is drawn
+with a suggestion and in colour. Neither happens on the kernel console, which
+draws no colour.
+
+**The suggestion** is the rest of the newest history line that starts with
+everything typed, after the cursor in colour 8 (zsh-autosuggestions' `fg=8`).
+It follows zsh-autosuggestions 0.7.1's widgets key for key (`widget()` in
+`shell/edit/edit.c`). Typing along it keeps the rest of it, and so does moving
+the cursor. Changing the line looks again. The history keys (Up, Down, Ctrl+P,
+Ctrl+N, PgUp, PgDn) and Enter drop it: Enter runs what was typed. A search with
+Ctrl+R or the completion menu hides it while open. Ctrl+C leaves the line as it
+was shown, suggestion and all. A word of a suggestion ends where Alt+F stops,
+at the end of a word as in readline; zsh's `forward-word` goes on to the start
+of the next one.
+
+**The colours** are zsh-syntax-highlighting 0.8.0's default styles, on what
+this shell's lexer reads (`shell/complete/highlight.c`):
+
+| What | Drawn |
+|---|---|
+| a command the shell would run where a command goes -- a builtin, a `def`, a program in /system/bin or /data/apps, a path to a file -- and `exit` | green |
+| a word there that names none (or a path to nothing) | red, bold |
+| `if` `else` `while` `for` `def` `let` `return` `break` `continue`, and `{` `}` | yellow (`in` is not, as in zsh) |
+| quoted text, and a redirection (`out>`, `err>`, `in<` ...) | yellow |
+| a double quote's escapes (`\"`, `\n` ...) | cyan |
+| `$(` and its `)` | magenta |
+| a word that names a file or directory that is there -- and while it ends the line, one on its way to a name that is | underlined |
+| a comment | bold black |
+| a `}` or `)` that closes nothing | red, bold |
+
+Everything else -- options, `$names`, numbers, operators -- is drawn plain.
+Files are looked for in directory listings, never by opening a name that may
+not be there, and the programs are listed once per prompt.
+
+**Tests.** `make shell-test` holds the line to the two plugins themselves:
+`tests/edit/highlight.json` holds what zsh drew under tmux on a Mac for 26
+lines that mean the same in both shells (`tools/record_highlight.py`) --
+commands, an unknown one, quotes and an escape, a pipe, a separator, a
+comment, files there and not, a directory, a word on its way to a file's name,
+`$( )`, `for`, and a suggestion shown, typed along, taken by Right and Ctrl+E,
+kept while the cursor moves, dropped by Up and Enter, and none at all.
+`tools/golden_highlight.py` types the same keys into the editor
+(`build/highlight_dump`, the shell's highlighter, the Terminal's screen model)
+and compares the row cell for cell. `shell/test/edit_test.c` and
+`complete_test.c` hold the rest (Alt+F, Ctrl+C, the search, this language's
+keywords, braces, redirections, `def`s), and `tools/shell_highlight_smoke.py`
+checks them live in the Terminal.
 
 ### History
 
