@@ -853,6 +853,12 @@ void em_app_set_refresh(int ms);
  * em_request_frame() itself when the state changes. */
 void em_request_frame(void);
 int  em_take_frame_request(void);   /* runtime-internal: read-and-clear */
+int  em_frame_requested(void);      /* runtime-internal: a peek -- is motion still wanted? */
+/* The waits between frames, for a host loop of its own (the desktop's):
+ * em_wait_input until a UI event or `ms`; em_wait_frame until the compositor's
+ * next frame, or `pace` ms on a kernel without a frame clock. */
+void em_wait_input(int ms);
+void em_wait_frame(int pace);
 
 /* --- resources ----------------------------------------------------------- *
  * Path-keyed caches for fonts and images, IO-agnostic: the host installs an

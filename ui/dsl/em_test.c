@@ -196,6 +196,14 @@ static uint8_t *icon_asset(const char *path,size_t *len) {
     if(n<=0 || !p || fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return NULL;}
     fclose(f);*len=(size_t)n;return p;
 }
+/* A mover like the compositor's: the window goes where it may (here, never
+ * above y = 20, as the bar keeps it), and the runtime is told where it went. */
+static int32_t mv_x, mv_y;
+static void clamp_mover(int win, int32_t x, int32_t y) {
+    if (y < 20) y = 20;
+    mv_x = x; mv_y = y;
+    em_window_bind(win, x, y);
+}
 static bool chrome_closed;
 static void chrome_frame(void) {
     ui_frame_begin();em_new_frame();
@@ -602,6 +610,22 @@ int main(void) {
     em_feed_pointer(20,18,1,0,0,1);chrome_frame();
     CHECK(chrome_closed,"leaving the layout board for Close does not swallow the close press");
     em_feed_pointer(20,18,0,0,0,1);chrome_frame();
+
+    /* A WINDOW DRAGGED INTO A CLAMP COMES BACK WITH THE HAND. The drag has to
+     * take the window's place from the mover, or every pixel the clamp
+     * refused is added to the next step and the window stays pinned while
+     * the pointer goes home. The pointer an app sees is relative to where the
+     * window really is, so the test hands it that. */
+    em_window_set_mover(clamp_mover); em_window_bind(7,100,40);
+    mv_x=100; mv_y=40;
+    int gx=100+200, gy=40+18;
+    em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),0,0,0,1);chrome_frame();
+    em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),1,0,0,1);chrome_frame();
+    for(int k=0;k<8;k++){gy-=5;em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),1,0,0,1);chrome_frame();}
+    int pinned=mv_y;
+    for(int k=0;k<8;k++){gy+=5;em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),1,0,0,1);chrome_frame();}
+    em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),0,0,0,1);chrome_frame();
+    CHECK(pinned==20 && mv_x==100 && mv_y==40,"a window dragged against the bar comes back with the pointer");
 
     em_res_set_loader(icon_asset);
     uint32_t iw=0,ih=0;

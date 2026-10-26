@@ -97,7 +97,14 @@ static uint8_t *emapp_load(const char *path, size_t *out_len) {
     return buf;
 }
 
-static void emapp_mover(int win, int32_t x, int32_t y) { embk_win_move(win, x, y); }
+/* Move the window, then believe the compositor about where it went: it keeps a
+ * window clear of the bar and the dock, and a drag that went on believing its
+ * own number would keep adding the part it was refused (em_window_drag_). */
+static void emapp_mover(int win, int32_t x, int32_t y) {
+    embk_win_move(win, x, y);
+    struct embk_win_geometry g;
+    if (embk_win_where(win, &g) == 0) em_window_bind(win, g.x, g.y);
+}
 
 /* --- terminal-shaped runtime hooks (V8; see em.h) ------------------------ */
 static int  (*g_em_key_hook)(int ch)  = 0;
@@ -365,6 +372,19 @@ static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
  * window whenever such a frame changed no pixel -- a full compose of the
  * window, many times a second, for nothing (docs/DESKTOP_PERFORMANCE.md). The
  * renderer reports overflow as r->full, so an empty list means unchanged. */
+
+/* THE TWO WAITS between frames (docs/DESKTOP_PERFORMANCE.md). Idle: until a UI
+ * event or `ms`. In motion: until the compositor's next frame. Each falls back
+ * to sleeping on a kernel without them. */
+static uint32_t g_ui_seq;
+void em_wait_input(int ms) {
+    if (ms < 0) ms = 0;
+    if (embk_ui_wait(&g_ui_seq, (uint32_t)ms) < 0) embk_sleep_ms(ms < 5 ? (uint32_t)ms : 5);
+}
+void em_wait_frame(int pace) {
+    if (embk_win_frame(0, 100) < 0) embk_sleep_ms((uint32_t)pace);
+}
+
 static void present_changes(int win, uint32_t *px, const uint32_t *back, int winw, int winh,
                             const struct scene_renderer *r, bool full) {
     if (full || r->full) {
@@ -563,6 +583,7 @@ int em_app_run(const EmApp *app) {
     uint64_t screen_next=0;
     int display_pending=0;
     struct cadence cad; memset(&cad, 0, sizeof cad);
+    int built_motion = 0;
 
     for (;;) {
         /* THE WHOLE ACTIVE PART OF AN ITERATION, IN CPU RATHER THAN WALL TIME.
@@ -890,30 +911,24 @@ int em_app_run(const EmApp *app) {
                     em_overlay_active() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
         if (!build) {
             cad_idle_tick(&cad);
-            /* SAMPLE THE POINTER WHILE IDLING, in slices, rather than sleeping
-             * through it. A frame here can be far apart from the next under an
-             * emulator, and a press and release that both happen in the gap
-             * were simply never seen: the click did not arrive late, it did not
-             * arrive. Feeding the toolkit during the wait turns those into real
-             * press edges, which it counts. */
-            for (int slept = 0; slept < pace; slept += 5) {
-                embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
-                struct embk_win_input pin;
-                embk_win_input(&pin);
-                if (pin.win == EMBK_WIN_ACTION_CLOSE || pin.win == EMBK_WIN_ACTION_QUIT) {
-                    g_close_reason = pin.win == EMBK_WIN_ACTION_QUIT ? EM_CLOSE_QUIT : EM_CLOSE_REQUEST;
-                    if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
-                    em_app_request_exit(0); break;
-                }
-                if (pin.win == EMBK_WIN_ACTION_DROP || pin.wheel) em_request_frame();
-                ui_pointer_at_time(pin.when);
-                em_feed_pointer((float)pin.x, (float)pin.y,
-                                pin.buttons & EMBK_MOUSE_LEFT,
-                                pin.buttons & EMBK_MOUSE_RIGHT,
-                                pin.wheel, pin.focused);
-                if ((pin.buttons & EMBK_MOUSE_LEFT) != (in.buttons & EMBK_MOUSE_LEFT))
-                    { em_request_frame(); break; }
+            /* NOTHING TO DRAW: WAIT FOR SOMETHING TO ANSWER. This used to sample
+             * the pointer every 5 ms -- six still windows woke the machine twelve
+             * hundred times a second to learn nothing had happened. It waits for
+             * a UI event now (a key, the pointer over or clicking this window,
+             * focus, a close request), or for this loop's own next job: the
+             * display re-check, a refresh tick, or -- with an idle hook, the
+             * terminal's pipes -- the pace. A press and release in the gap are
+             * still both seen: the compositor queues presses and replays them
+             * one per poll. */
+            uint64_t now = em_now_ms();
+            int64_t wait = screen_next > now ? (int64_t)(screen_next - now) : 0;
+            if (g_em_idle_hook && wait > pace) wait = pace;
+            if (rms > 0) {
+                uint64_t due = last_app_tick + (uint64_t)rms;
+                int64_t left = due > now ? (int64_t)(due - now) : 0;
+                if (left < wait) wait = left;
             }
+            em_wait_input((int)wait);
             continue;
         }
 
@@ -995,6 +1010,8 @@ int em_app_run(const EmApp *app) {
             char b[96]; snprintf(b, sizeof b, "%s: first frame presented (+%lums)\n", title,
                                  (unsigned long)(embk_uptime_ms() - t0)); embk_puts(1, b);
         }
+        built_motion = em_frame_requested() || em_nav_transitioning() || em_overlay_active() ||
+                       em_window_pulling();
 
         /* grip released with a real delta -> re-back the window at the new
          * size; the old pixel pointer dies inside embk_win_resize. */
@@ -1033,7 +1050,13 @@ int em_app_run(const EmApp *app) {
                 char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
             }
         }
-        embk_sleep_ms(pace);
+        /* THE NEXT FRAME, ON THE COMPOSITOR'S BEAT. Something is moving -- a
+         * frame was asked for, a page fades, a modal debounces, the window is
+         * being pulled -- so wait for the compositor's next frame rather than
+         * sleeping a guess at one: the motion lands on the frames that show
+         * it. Nothing moving: straight back to the top, where an idle loop
+         * waits for input. */
+        if (built_motion) em_wait_frame(pace);
     }
 }
 
@@ -1117,7 +1140,18 @@ int em_widget_run(const EmWidget *wg) {
         }
         int build = first || input_edge || tick || em_take_frame_request() ||
                     em_ui_epoch() != prev_epoch;
-        if (!build) { cad_idle_tick(&cad); embk_sleep_ms(pace); continue; }
+        if (!build) {
+            /* nothing to draw: wait for input, or the next refresh tick (a
+             * clock); a widget with neither waits a second at a time */
+            cad_idle_tick(&cad);
+            int64_t wait = 1000;
+            if (wg->refresh_ms > 0) {
+                uint64_t due = last_tick + (uint64_t)wg->refresh_ms;
+                wait = due > now ? (int64_t)(due - now) : 0;
+            }
+            em_wait_input((int)wait);
+            continue;
+        }
         if (tick) last_tick = now;
 
         ui_pointer_at_time(in.when);   /* when it HAPPENED, not when we noticed */
@@ -1152,22 +1186,8 @@ int em_widget_run(const EmWidget *wg) {
         cad_frame(&cad, pace, (embk_thread_cpu_ns() - frame_c0) / 1000000u, title);
 
         if (first) { first = 0; char b[64]; snprintf(b, sizeof b, "%s: widget first frame\n", title); embk_puts(1, b); }
-        /* The same slicing as the idle path above, and for the same reason:
-         * this sleep sits between two rendered frames, which is exactly where a
-         * fast second or third click lands. Sleeping through it loses the press
-         * entirely -- a double click arrives as one. */
-        for (int slept = 0; slept < pace; slept += 5) {
-            embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
-            struct embk_win_input pin;
-            embk_win_input(&pin);
-            if(pin.wheel)em_request_frame();
-            ui_pointer_at_time(pin.when);
-            em_feed_pointer((float)pin.x, (float)pin.y,
-                            pin.buttons & EMBK_MOUSE_LEFT,
-                            pin.buttons & EMBK_MOUSE_RIGHT,
-                            pin.wheel, pin.focused);
-            if ((pin.buttons & EMBK_MOUSE_LEFT) != (in.buttons & EMBK_MOUSE_LEFT))
-                { em_request_frame(); break; }
-        }
+        /* motion on the compositor's beat, as em_app_run; otherwise back to
+         * the top, which waits for input or the next refresh */
+        if (em_frame_requested()) em_wait_frame(pace);
     }
 }

@@ -444,6 +444,7 @@ void em_structure_changed(void) { g_em_epoch++; }
 static int g_frame_req = 1;   /* first frame always builds */
 void em_request_frame(void) { g_frame_req = 1; }
 int  em_take_frame_request(void) { int r = g_frame_req; g_frame_req = 0; return r; }
+int  em_frame_requested(void) { return g_frame_req; }
 
 static uint64_t (*g_clock)(void);
 static uint64_t g_now_ms, g_prev_ms;
@@ -1368,8 +1369,13 @@ static void em_window_drag_(void) {
             int nx = g_win_x + (int)(px - g_win_grab_x);
             int ny = g_win_y + (int)(py - g_win_grab_y);
             if ((nx != g_win_x || ny != g_win_y) && g_win_mover) {
-                g_win_mover(g_win_id, nx, ny);
+                /* the mover may correct this to where the window really went
+                 * (kept out of the bar or the dock): a drag that remembered
+                 * the number it asked for instead would add every refused
+                 * pixel to the next step, and the window would not come back
+                 * when the hand did */
                 g_win_x = nx; g_win_y = ny; g_win_moved = 1;
+                g_win_mover(g_win_id, nx, ny);
             }
         }
     } else {

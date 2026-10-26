@@ -2071,7 +2071,19 @@ int main(int argc, char **argv, char **envp) {
          * owner has walked away. */
         if (g_launch && !g_locked) spawn_app(g_launch, g_launch_dir);
 
-        embk_sleep_ms(15);   /* pace ~60Hz while YIELDING -- never starve the apps */
+        /* THE NEXT PASS. Something moving -- a frame asked for (a tooltip, a
+         * toast, a caret), an icon being dragged, the surface still to be
+         * pushed whole -- waits for the compositor's next frame. Nothing
+         * moving waits for input, or for the next of this loop's own polls:
+         * the display check every 200 ms is the soonest. This loop rebuilt
+         * and laid out the desktop every 15 ms whatever happened; still, it
+         * now wakes five times a second. */
+        if (em_take_frame_request() || g_drag || g_invalidate > 0 || g_full_present > 0)
+            em_wait_frame(15);
+        else {
+            uint64_t now = embk_uptime_ms();
+            em_wait_input(screen_next > now ? (int)(screen_next - now) : 0);
+        }
     }
     return 0;
 }
