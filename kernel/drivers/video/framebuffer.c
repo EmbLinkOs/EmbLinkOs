@@ -12,6 +12,7 @@
 #include "drivers/video/rawcon.h"
 #include "include/spinlock.h"
 #include "boot/boot_protocol.h"
+#include "gfx/pix.h"   /* the 32 bpp loops: two channels per multiply, bit-exact */
 
 
 static fb_info_t fb;
@@ -118,6 +119,12 @@ static inline uint32_t fb_load(const uint8_t *p) {
     default: return *p;
     }
 }
+
+/* 32 bpp scanouts, in either byte order, take pix.h's rows; every other depth
+ * keeps the per-pixel path each primitive below carries. `swap`: the scanout
+ * is R,G,B,X, so a 0x00RRGGBB source has its red and blue exchanged first. */
+static inline bool fb_fast(void) { return fb.bpp == 32; }
+static inline int  fb_swap(void) { return fb.format != FB_FORMAT_BGR; }
 
 // Clip a rect against the screen. Returns false when nothing remains.
 /* What drawing may touch besides the screen: everything, unless a caller
@@ -426,10 +433,8 @@ void fb_blit(int32_t x, int32_t y, int32_t w, int32_t h,
 
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
     for (int32_t j = 0; j < ch; j++) {
-        if (fb.bpp == 32 && fb.format == FB_FORMAT_BGR) {
-            // Native layout matches 0x00RRGGBB stores directly.
-            uint32_t *p = (uint32_t *)row;
-            for (int32_t i = 0; i < cw; i++) p[i] = src[i] & 0x00FFFFFFU;
+        if (fb_fast()) {
+            pix_copy_row((uint32_t *)row, src, cw, fb_swap());
         } else {
             uint8_t *p = row;
             for (int32_t i = 0; i < cw; i++, p += fb_bypp)
@@ -467,6 +472,12 @@ void fb_blit_blend(int32_t x, int32_t y, int32_t w, int32_t h,
     const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
 
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    if (fb_fast()) {
+        for (int32_t j = 0; j < ch; j++, src += stride, row += fb.pitch)
+            pix_blend_row((uint32_t *)row, src, cw, fb_swap());
+        fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+        return;
+    }
     for (int32_t j = 0; j < ch; j++) {
         uint8_t *p = row;
         for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
@@ -498,6 +509,12 @@ void fb_blit_over(int32_t x, int32_t y, int32_t w, int32_t h,
     if (!fb_clip(&cx, &cy, &cw, &ch)) return;
     const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    if (fb_fast()) {
+        for (int32_t j = 0; j < ch; j++, src += stride, row += fb.pitch)
+            pix_over_row((uint32_t *)row, src, cw, fb_swap());
+        fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+        return;
+    }
     for (int32_t j = 0; j < ch; j++) {
         uint8_t *p = row;
         for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
@@ -531,6 +548,12 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
     uint32_t inv = 255 - alpha;
     const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    if (fb_fast()) {
+        for (int32_t j = 0; j < ch; j++, src += stride, row += fb.pitch)
+            pix_mix_row((uint32_t *)row, src, cw, alpha, fb_swap());
+        fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+        return;
+    }
     for (int32_t j = 0; j < ch; j++) {
         uint8_t *p = row;
         for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
@@ -572,6 +595,23 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
     uint32_t stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
     uint32_t inv = 255 - alpha;
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
+    if (fb_fast()) {
+        int swap = fb_swap();
+        for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+            uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
+            if (sy >= (uint32_t)sh) sy = (uint32_t)sh - 1;
+            const uint32_t *srow = argb + (uint64_t)sy * stride;
+            uint32_t sx_fx = (uint32_t)(x0 - dx) * stepx, *p = (uint32_t *)row;
+            for (int32_t x = x0; x < x1; x++, p++, sx_fx += stepx) {
+                uint32_t sx = sx_fx >> 16;
+                if (sx >= (uint32_t)sw) sx = (uint32_t)sw - 1;
+                uint32_t sp = swap ? pix_swap_rb(srow[sx]) : srow[sx];
+                *p = alpha >= 255 ? (sp & 0x00FFFFFFu) : pix_mix(sp, *p, alpha);
+            }
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
 
     for (int32_t y = y0; y < y1; y++) {
         uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
@@ -601,11 +641,55 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
 // In-place separable box blur of an fb_draw region (the backdrop behind a glass
 // window). Two passes (H then V) with a rolling per-channel sum ~= a small
 // Gaussian. Clamped-edge sampling. Silently no-ops if scratch can't be had.
+/* The blur's working memory, KEPT: it used to be two fresh kmallocs of the
+ * region on every call, which on a glass window is every compose. Grown when a
+ * bigger region asks, never shrunk; its own lock, though only the compositor
+ * (under its lock) blurs today. */
+static spinlock_t fb_blur_lock = SPINLOCK_INIT;
+static uint32_t  *fb_blur_px, *fb_blur_tmp, *fb_blur_col;
+static uint64_t   fb_blur_cap, fb_blur_colcap;
+
+static bool fb_blur_scratch(uint64_t n, uint64_t cols) {
+    if (n > fb_blur_cap) {
+        uint32_t *a = kmalloc(n * 4), *b = a ? kmalloc(n * 4) : 0;
+        if (!a || !b) { if (a) kfree(a); return false; }
+        if (fb_blur_px) { kfree(fb_blur_px); kfree(fb_blur_tmp); }
+        fb_blur_px = a; fb_blur_tmp = b; fb_blur_cap = n;
+    }
+    if (cols * 3 > fb_blur_colcap) {
+        uint32_t *c = kmalloc(cols * 3 * 4);
+        if (!c) return false;
+        if (fb_blur_col) kfree(fb_blur_col);
+        fb_blur_col = c; fb_blur_colcap = cols * 3;
+    }
+    return true;
+}
+
 void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius) {
     if (radius < 1) return;
     int32_t cx = x, cy = y, cw = w, ch = h;
     if (!fb_clip(&cx, &cy, &cw, &ch)) return;
     if (cw <= 1 || ch <= 1) return;
+    /* Blurring treats every channel alike, so the scanout's own words are
+     * blurred as they are, whichever their byte order. */
+    if (fb_fast() && 2 * radius + 1 <= PIX_BOX_MAX_WIN) {
+        spin_lock(&fb_blur_lock);
+        if (fb_blur_scratch((uint64_t)cw * (uint64_t)ch, (uint64_t)cw)) {
+            for (int32_t j = 0; j < ch; j++) {
+                const uint32_t *p = (const uint32_t *)fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j));
+                uint32_t *o = fb_blur_px + (uint64_t)j * cw;
+                for (int32_t i = 0; i < cw; i++) o[i] = p[i] & 0x00FFFFFFu;
+            }
+            pix_box_blur(fb_blur_px, cw, ch, radius, fb_blur_tmp, fb_blur_col);
+            for (int32_t j = 0; j < ch; j++)
+                memcpy(fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j)),
+                       fb_blur_px + (uint64_t)j * cw, (uint64_t)cw * 4);
+            spin_unlock(&fb_blur_lock);
+            fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+            return;
+        }
+        spin_unlock(&fb_blur_lock);   /* no memory: the old path, which tries its own */
+    }
     uint32_t *a = (uint32_t *)kmalloc((size_t)cw * ch * 4);
     if (!a) return;
     uint32_t *b = (uint32_t *)kmalloc((size_t)cw * ch * 4);
@@ -669,6 +753,31 @@ void fb_glow_rect(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t gw
     if (bx1 > (int32_t)fb.width)  bx1 = (int32_t)fb.width;
     if (by1 > (int32_t)fb.height) by1 = (int32_t)fb.height;
     int32_t gw2 = gw * gw;
+    if (fb_fast() && gw <= 255) {
+        /* the falloff by distance, once per call rather than a divide a pixel */
+        uint8_t fall[256];
+        for (int32_t d = 0; d < gw; d++) {
+            int32_t t = gw - d;
+            fall[d] = (uint8_t)((uint32_t)max_a * (uint32_t)(t * t) / (uint32_t)gw2);
+        }
+        uint32_t c = FB_RGB(cr, cg, cb);
+        if (fb_swap()) c = pix_swap_rb(c);
+        for (int32_t y = by0; y < by1; y++) {
+            uint32_t *p = (uint32_t *)fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
+            int32_t dy = y < fy0 ? fy0 - y : (y >= fy1 ? y - (fy1 - 1) : 0);
+            for (int32_t x = bx0; x < bx1; x++, p++) {
+                if (!dy && x >= fx0 && x < fx1) { p += fx1 - x - 1; x = fx1 - 1; continue; }  /* window covers */
+                int32_t dx = x < fx0 ? fx0 - x : (x >= fx1 ? x - (fx1 - 1) : 0);
+                int32_t d = dx > dy ? dx : dy;
+                if (d >= gw) continue;
+                uint32_t ea = fall[d];
+                if (!ea) continue;
+                *p = pix_mix(c, *p, ea);
+            }
+        }
+        fb_mark_dirty((uint32_t)bx0, (uint32_t)by0, (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+        return;
+    }
     for (int32_t y = by0; y < by1; y++) {
         uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
         for (int32_t x = bx0; x < bx1; x++, row += fb_bypp) {

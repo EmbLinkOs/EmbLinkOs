@@ -317,6 +317,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/compositor.c \
              kernel/gfx/comp_stats.c \
              kernel/gfx/backdrop.c \
+             kernel/gfx/pix.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
              kernel/lib/random.c \
@@ -2033,8 +2034,20 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 # coarse (any header touch rebuilds the whole kernel) but the kernel is one
 # compile anyway, so the granularity is already all-or-nothing; correctness wins.
 KERNEL_HDRS := $(shell find kernel -name '*.h')
-$(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
+# THE PIXEL LOOPS ARE OPTIMISED; the rest of the kernel is not. -O0 keeps every
+# local where GDB (and the smokes that read kernel state through it) expect it,
+# and that matters for policy code. It costs nothing there and a great deal in
+# the loops every compose runs: the same blend measured five times slower
+# (docs/DESKTOP_PERFORMANCE.md). These files are compiled on their own, -O2 --
+# still no SSE: the kernel keeps no FPU state, and pix.h is integer by design.
+KERNEL_FAST_SRC = kernel/gfx/pix.c kernel/drivers/video/framebuffer.c kernel/gfx/backdrop.c kernel/gfx/soft_compose.c
+KERNEL_FAST_OBJ = $(patsubst %.c,$(BUILD)/kfast/%.o,$(KERNEL_FAST_SRC))
+$(BUILD)/kfast/%.o: %.c $(FB_STAMP) $(KERNEL_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -O2 -c $< -o $@
+
+$(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(KERNEL_FAST_OBJ) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(filter-out $(KERNEL_FAST_SRC),$(KERNEL_SRC)) $(KERNEL_FAST_OBJ) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 	@# AND DOES IT STILL FIT WHERE IT IS LOADED? The kernel is placed at a
 	@# fixed physical address by both boot paths, and firmware reserves low
 	@# memory wherever it likes. A kernel that has grown past that is a
@@ -2783,6 +2796,20 @@ terminal-screentext-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Iuser/terminal \
 	    user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c tests/tty/screentext_test.c -o $(BUILD)/screentext_test
 	$(BUILD)/screentext_test
+
+.PHONY: pix-test pix-bench
+# The compositor's pixel loops (kernel/gfx/pix.c): every row bit-exact with
+# the framebuffer's old per-pixel arithmetic; pix-bench times old against new,
+# both SCALAR as the kernel builds them -- a host compiler left to vectorise
+# would time NEON/SSE the kernel can never use.
+pix-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Ikernel tests/gfx/pix_test.c kernel/gfx/pix.c -o $(BUILD)/pix_test
+	$(BUILD)/pix_test
+pix-bench: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -fno-tree-vectorize -fno-tree-slp-vectorize \
+	    -Ikernel tests/gfx/pix_test.c kernel/gfx/pix.c -o $(BUILD)/pix_bench
+	$(BUILD)/pix_bench --bench
 
 .PHONY: backdrop-test
 # The compositor's backdrop blur: any part of a picture blurs to exactly the

@@ -155,6 +155,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/gfx/compositor.c \
                   kernel/gfx/comp_stats.c \
                   kernel/gfx/backdrop.c \
+                  kernel/gfx/pix.c \
                   kernel/kworker/kworker.c \
                   kernel/tty/tty.c kernel/tty/pty.c \
                   kernel/acpi/acpi.c \
@@ -266,8 +267,16 @@ endif
 # kernel as compile-time defines, and a prerequisite list of source files alone
 # would rebuild nothing when they change -- so `make FB_W=1280` would silently
 # boot the OLD cap. The stamp's mtime moves only when the pair actually changes.
-$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_KBUILD)
-	$(AARCH64_CC) $(ARM_CFLAGS) $(ARM_BOARD_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
+# The pixel loops -O2, as on x86 (the Makefile's KERNEL_FAST_SRC says why);
+# per board, because a board's defines reach them too.
+ARM_FAST_SRC := $(filter kernel/gfx/pix.c kernel/drivers/video/framebuffer.c kernel/gfx/backdrop.c,$(ARM_SHARED_SRC))
+ARM_FAST_OBJ := $(patsubst %.c,$(ARM_KBUILD)/kfast/%.o,$(ARM_FAST_SRC))
+$(ARM_KBUILD)/kfast/%.o: %.c $(FB_STAMP) $(ARM_HDRS)
+	@mkdir -p $(dir $@)
+	$(AARCH64_CC) $(ARM_CFLAGS) $(filter-out -Wl%,$(ARM_BOARD_CFLAGS)) -O2 -c $< -o $@
+
+$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_FAST_OBJ) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_KBUILD)
+	$(AARCH64_CC) $(ARM_CFLAGS) $(ARM_BOARD_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(filter-out $(ARM_FAST_SRC),$(ARM_SHARED_SRC)) $(ARM_FAST_OBJ)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
 # -- it exists because a real ARM board loads a headerless blob at a fixed
