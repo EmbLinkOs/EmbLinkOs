@@ -213,6 +213,7 @@
 #define EMBK_SYS_win_where 156
 #define EMBK_SYS_key_poll_key 157
 #define EMBK_SYS_win_focused 158
+#define EMBK_SYS_win_set_material 159   /* (win, alpha, blur) -> the window shows through, blurred */
 
 
 

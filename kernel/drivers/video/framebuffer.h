@@ -87,6 +87,10 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             const uint32_t *argb, int32_t sw, int32_t sh,
                             uint32_t stride, uint32_t alpha,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
+// The composed pixels of a rect, as 0x00RRGGBB, into `dst` (stride in pixels):
+// the backdrop a window that shows through keeps. The part off the screen is
+// left as it was; returns 0 when none of it is on the screen.
+int fb_read_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t *dst, uint32_t stride);
 // In-place box blur of a framebuffer region (the backdrop behind a glass window).
 void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius);
 // Soft accent glow band around the OUTSIDE of a rect (the focused-window halo),

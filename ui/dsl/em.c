@@ -1210,6 +1210,12 @@ static int g_rz_active, g_rz_pend;
 static float g_rz_grab_x, g_rz_grab_y, g_rz_dx, g_rz_dy;
 void em_window_set_resizable(int on) { g_win_resizable = on; }
 void em_window_set_glass(int on) { g_win_glass = on; }
+/* A window that shows through (em_window_material): a Window background it
+ * gives as clear (alpha 0) is clear -- not "unset", which is the theme's, and
+ * which under a translucent screen made the window as opaque as ever, the
+ * theme's colour where the desktop should have been. */
+static int g_win_clear;
+void em_window_set_clear(int on) { g_win_clear = on; }
 int em_window_take_resize(int *dw, int *dh) {
     if (!g_rz_pend) return 0;
     g_rz_pend = 0;
@@ -1286,7 +1292,7 @@ void em_window_(const char *title, EmProps p) {
     /* the app renders opaque (the compositor makes a glass window translucent
      * and frosts the desktop behind it); a glass window just gets a faint accent
      * cast in its bg so the frost reads as EmbLink's, not a neutral gray. */
-    Color bg = p.background.a > 0 ? p.background : t->bg;
+    Color bg = p.background.a > 0 || g_win_clear ? p.background : t->bg;
     if (g_win_glass) { Color a = t->accent;
         bg = (Color){ bg.r * 0.92f + a.r * 0.08f, bg.g * 0.92f + a.g * 0.08f,
                       bg.b * 0.92f + a.b * 0.08f, 1.0f }; }

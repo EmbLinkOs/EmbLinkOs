@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 #define TERM_PROBE_MAGIC   0x504d5254u          /* "TRMP" */
-#define TERM_PROBE_VERSION 3u
+#define TERM_PROBE_VERSION 4u
 #define TERM_PROBE_LINE    1024                 /* the local prompt line */
 #define TERM_PROBE_TEXT    65536                /* one screen as UTF-8 */
 #define TERM_PROBE_CELLS   16384                /* cols*rows of the shown screen */
@@ -70,6 +70,12 @@ struct term_probe {
     uint32_t link_len;
     char link[256];                             /* the link under the pointer while GUI is held */
     int32_t origin_x, origin_y;                 /* the screen's top-left cell, in the window */
+    /* version 4: the profile */
+    char profile[64];                           /* its name */
+    uint32_t prefs_open, see_through;           /* Preferences is open; the window shows through */
+    float opacity; int32_t blur;                /* the background's opacity; the blur radius asked for */
+    int32_t prefs_edit;                         /* the colour Preferences is editing (0-15, then text, bold,
+                                                 * background, selection, cursor), or -1 */
 };
 
 _Static_assert(sizeof(struct term_probe_cell) == 16, "probe cell layout");
@@ -92,4 +98,7 @@ _Static_assert(offsetof(struct term_probe, find) == 399796, "probe layout");
 _Static_assert(offsetof(struct term_probe, font_px) == 399924, "probe layout");
 _Static_assert(offsetof(struct term_probe, link) == 399940, "probe layout");
 _Static_assert(offsetof(struct term_probe, origin_x) == 400196, "probe layout");
+_Static_assert(offsetof(struct term_probe, profile) == 400204, "probe layout");
+_Static_assert(offsetof(struct term_probe, opacity) == 400276, "probe layout");
+_Static_assert(sizeof(struct term_probe) == 400288, "probe layout");
 #endif

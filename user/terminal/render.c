@@ -16,9 +16,15 @@ bool term_render_fonts(struct term_render *r, struct font *const faces[4],
     r->size = size_px;
     float scale = size_px / (float)f->units_per_em;
     struct glyph_cache_entry *m = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'M', size_px);
-    r->cell_w = m ? round_px(m->advance_px) : round_px(size_px * .6f);
-    r->cell_h = round_px((f->ascent + f->descent + f->line_gap) * scale);
-    r->baseline = round_px((f->ascent + f->line_gap / 2.0f) * scale);
+    /* the font's own cell, then widened or heightened by the spacing: the
+     * glyph centred across, the extra height split above and below */
+    float line = r->line_spacing > 0 ? r->line_spacing : 1, letter = r->letter_spacing > 0 ? r->letter_spacing : 1;
+    int natural_w = round_px(m ? m->advance_px : size_px * .6f);
+    int natural_h = round_px((f->ascent + f->descent + f->line_gap) * scale);
+    r->cell_w = round_px((float)natural_w * letter);
+    r->cell_h = round_px((float)natural_h * line);
+    r->baseline = round_px((f->ascent + f->line_gap / 2.0f) * scale) + (r->cell_h - natural_h) / 2;
+    r->glyph_dx = (r->cell_w - natural_w) / 2;
     if (r->cell_w < 1) r->cell_w = 1;
     if (r->cell_h < 2) r->cell_h = 2;
     r->line = round_px(size_px / 14.0f);
@@ -31,9 +37,20 @@ bool term_render_fonts(struct term_render *r, struct font *const faces[4],
     return true;
 }
 
+void term_render_spacing(struct term_render *r, float line, float letter) {
+    r->line_spacing = line; r->letter_spacing = letter;
+}
+
 bool term_render_resize(struct term_render *r, int cols, int rows) {
+    return term_render_layout(r, cols, rows, cols * r->cell_w, rows * r->cell_h, 0, 0);
+}
+
+bool term_render_layout(struct term_render *r, int cols, int rows, int w, int h, int ox, int oy) {
     if (cols < 1 || rows < 1 || !r->cell_w) return false;
-    int w = cols * r->cell_w, h = rows * r->cell_h;
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+    if (w < ox + cols * r->cell_w) w = ox + cols * r->cell_w;
+    if (h < oy + rows * r->cell_h) h = oy + rows * r->cell_h;
     uint32_t *p = r->pixels;
     if (w != r->width || h != r->height || !p) {
         p = malloc((size_t)w * h * sizeof *p);
@@ -44,7 +61,7 @@ bool term_render_resize(struct term_render *r, int cols, int rows) {
     uint64_t *painted = realloc(r->painted, (size_t)rows * sizeof *painted);
     if (!painted) return false;
     r->painted = painted;
-    r->cols = cols; r->rows = rows; r->width = w; r->height = h;
+    r->cols = cols; r->rows = rows; r->width = w; r->height = h; r->ox = ox; r->oy = oy;
     r->all = true;
     return true;
 }
@@ -66,16 +83,26 @@ struct font *term_render_font_for(const struct term_render *r, uint32_t cp, int 
 
 /* --- pixels ---------------------------------------------------------------------- */
 
-static void fill(struct term_render *r, int x0, int y0, int x1, int y1, uint32_t rgb) {
+static void fill_px(struct term_render *r, int x0, int y0, int x1, int y1, uint32_t px) {
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > r->width) x1 = r->width;
     if (y1 > r->height) y1 = r->height;
-    uint32_t px = 0xff000000u | rgb;
     for (int y = y0; y < y1; y++) {
         uint32_t *row = r->pixels + (size_t)y * r->width;
         for (int x = x0; x < x1; x++) row[x] = px;
     }
+}
+static void fill(struct term_render *r, int x0, int y0, int x1, int y1, uint32_t rgb) {
+    fill_px(r, x0, y0, x1, y1, 0xff000000u | rgb);
+}
+/* The ground's pixel: its colour at the frame's opacity, premultiplied. */
+static uint32_t ground_px(const struct term_frame *fr, uint32_t rgb) {
+    unsigned a = 255u - fr->ground_transparency;
+    if (a >= 255) return 0xff000000u | rgb;
+    uint32_t out = (uint32_t)a << 24;
+    for (int shift = 16; shift >= 0; shift -= 8) out |= ((((rgb >> shift) & 255) * a + 127) / 255) << shift;
+    return out;
 }
 /* Coverage blended in (approximately) linear light, as the toolkit's text is:
  * light text on a dark ground keeps its weight. Integers only: under
@@ -91,10 +118,12 @@ static void gamma_tables(void) {
         g_delin[k] = (uint8_t)v;
     }
 }
+/* Over a translucent ground the destination is premultiplied: its colour
+ * blends the same way, and the coverage adds to its alpha. */
 static uint32_t blend(uint32_t dst, uint32_t fg, unsigned a) {
     if (a >= 255) return 0xff000000u | fg;
     unsigned inv = 255 - a;
-    uint32_t out = 0xff000000u;
+    uint32_t out = (uint32_t)(a + ((dst >> 24) * inv + 127) / 255) << 24;
     for (int shift = 16; shift >= 0; shift -= 8) {
         uint32_t v = ((uint32_t)g_lin[(fg >> shift) & 255] * a + (uint32_t)g_lin[(dst >> shift) & 255] * inv) / 255;
         out |= (uint32_t)g_delin[v >> 4] << shift;
@@ -121,15 +150,21 @@ static void blit(struct term_render *r, const uint8_t *cov, int stride, int gw, 
 
 static uint32_t mix(uint32_t a, uint32_t b) { return ((a & 0xfefefeu) >> 1) + ((b & 0xfefefeu) >> 1); }
 
-struct look { uint32_t fg, bg, ul; uint16_t attrs; uint8_t underline; bool text; };
+/* ground: the cell's background is the screen's own, the one a translucent
+ * window shows through */
+struct look { uint32_t fg, bg, ul; uint16_t attrs; uint8_t underline; bool text, ground; };
 static struct look look_of(const struct vt *v, const struct vt_style *s, const struct term_frame *fr) {
     struct look k;
     uint32_t fgc = s->fg;
     if (fr->bold_is_bright && (s->attrs & VT_BOLD) && VT_COLOR_KIND(fgc) == 1 && (fgc & 0xff) < 8)
         fgc = VT_COLOR_INDEX((fgc & 0xff) + 8);
-    k.fg = vt_rgb(v, fgc, true); k.bg = vt_rgb(v, s->bg, false);
+    k.fg = fr->bold_fg_set && (s->attrs & VT_BOLD) && fgc == VT_COLOR_DEFAULT ? fr->bold_fg : vt_rgb(v, fgc, true);
+    k.bg = vt_rgb(v, s->bg, false);
     /* DECSCNM swaps the whole screen; a cell's own inverse swaps it back */
-    if (((s->attrs & VT_INVERSE) != 0) != v->reverse_video) { uint32_t t = k.fg; k.fg = k.bg; k.bg = t; }
+    bool swap = ((s->attrs & VT_INVERSE) != 0) != v->reverse_video;
+    if (swap) { uint32_t t = k.fg; k.fg = k.bg; k.bg = t; }
+    k.ground = v->reverse_video ? swap && s->fg == VT_COLOR_DEFAULT && !(s->attrs & VT_BOLD && fr->bold_fg_set)
+                                : !swap && s->bg == VT_COLOR_DEFAULT;
     if (s->attrs & VT_DIM) k.fg = mix(k.fg, k.bg);
     k.ul = s->ul == VT_COLOR_DEFAULT ? k.fg : vt_rgb(v, s->ul, true);
     k.attrs = s->attrs; k.underline = s->underline;
@@ -169,8 +204,9 @@ static void glyph(struct term_render *r, uint32_t cp, int face, int x, int y, in
     const uint8_t *cov = glyph_coverage(atlas, e);
     if (!cov) return;
     /* a face other than the terminal's: its own baseline, centred in the cells */
-    int dx = x + e->bearing_x, dy = y + r->baseline - e->bearing_y;
+    int dx = x + e->bearing_x + r->glyph_dx, dy = y + r->baseline - e->bearing_y;
     if (f != r->face[face] && f != r->face[0]) {
+        dx -= r->glyph_dx;
         int adv = round_px(e->advance_px);
         if (adv > 0 && adv < w) dx += (w - adv) / 2;
     }
@@ -234,9 +270,9 @@ static bool in(int x, int x0, int x1) { return x >= x0 && x < x1; }
 static struct look marked(struct look k, const struct marks *m, const struct term_frame *fr, int x) {
     bool found = false;
     for (int i = 0; i < m->nfind && !found; i++) found = in(x, m->f0[i], m->f1[i]);
-    if (in(x, m->cur0, m->cur1)) { k.bg = fr->find_current_bg; k.fg = fr->find_fg; }
-    else if (found) { k.bg = fr->find_bg; k.fg = fr->find_fg; }
-    else if (in(x, m->sel0, m->sel1)) k.bg = fr->selection_bg;
+    if (in(x, m->cur0, m->cur1)) { k.bg = fr->find_current_bg; k.fg = fr->find_fg; k.ground = false; }
+    else if (found) { k.bg = fr->find_bg; k.fg = fr->find_fg; k.ground = false; }
+    else if (in(x, m->sel0, m->sel1)) { k.bg = fr->selection_bg; k.ground = false; }
     if (in(x, m->link0, m->link1) && !k.underline) { k.underline = VT_UL_SINGLE; k.ul = k.fg; }
     return k;
 }
@@ -278,21 +314,23 @@ static uint64_t palette_signature(const struct vt *v, const struct term_frame *f
     h = fnv(h, (uint64_t)v->reverse_video << 1 | fr->bold_is_bright);
     for (int i = 0; i < 256; i++) h = fnv(h, vt_rgb(v, VT_COLOR_INDEX(i), true));
     h = fnv(h, (uint64_t)vt_rgb(v, VT_COLOR_DEFAULT, true) << 32 | vt_rgb(v, VT_COLOR_DEFAULT, false));
+    h = fnv(h, (uint64_t)fr->bold_fg_set << 40 | (uint64_t)fr->ground_transparency << 32 | fr->bold_fg);
     return fnv(h, vt_cursor_rgb(v));
 }
 
 static void paint_row(struct term_render *r, const struct vt *v, const struct vt_cell *cells,
                       const struct term_frame *fr, const struct marks *m, int row) {
-    int y = row * r->cell_h, cols = r->cols < v->cols ? r->cols : v->cols;
+    int y = r->oy + row * r->cell_h, cols = r->cols < v->cols ? r->cols : v->cols;
     struct look k;
     /* the ground, then the glyphs over all of it (a glyph may lean into the
      * next cell), then lines, then the cursor */
-    fill(r, 0, y, r->width, y + r->cell_h, vt_rgb(v, VT_COLOR_DEFAULT, v->reverse_video));
+    fill_px(r, 0, y, r->width, y + r->cell_h, ground_px(fr, vt_rgb(v, VT_COLOR_DEFAULT, v->reverse_video)));
     for (int x = 0; x < cols; x++) {
         const struct vt_cell *c = &cells[x];
         if (!c->width) continue;
         k = marked(look_of(v, vt_style_of(v, c), fr), m, fr, x);
-        fill(r, x * r->cell_w, y, (x + c->width) * r->cell_w, y + r->cell_h, k.bg);
+        fill_px(r, r->ox + x * r->cell_w, y, r->ox + (x + c->width) * r->cell_w, y + r->cell_h,
+                k.ground ? ground_px(fr, k.bg) : 0xff000000u | k.bg);
     }
     bool cursor_here = fr->cursor && fr->cursor_y == row && fr->cursor_x >= 0 && fr->cursor_x < cols;
     int shape = fr->cursor_shape, cx = fr->cursor_x;
@@ -300,7 +338,7 @@ static void paint_row(struct term_render *r, const struct vt *v, const struct vt
     uint32_t cursor_rgb = vt_cursor_rgb(v);
     if (block) {
         int cw = cells[cx].width == 2 ? 2 : 1;
-        fill(r, cx * r->cell_w, y, (cx + cw) * r->cell_w, y + r->cell_h, cursor_rgb);
+        fill(r, r->ox + cx * r->cell_w, y, r->ox + (cx + cw) * r->cell_w, y + r->cell_h, cursor_rgb);
     }
     for (int x = 0; x < cols; x++) {
         const struct vt_cell *c = &cells[x];
@@ -310,16 +348,16 @@ static void paint_row(struct term_render *r, const struct vt *v, const struct vt
         if (!k.text) continue;
         int face = ((s->attrs & VT_BOLD) ? 1 : 0) | ((s->attrs & VT_ITALIC) ? 2 : 0);
         uint32_t fg = block && x == cx ? k.bg : k.fg;      /* the character under a block cursor */
-        cell_text(r, v, c, face, x * r->cell_w, y, c->width * r->cell_w, fg);
+        cell_text(r, v, c, face, r->ox + x * r->cell_w, y, c->width * r->cell_w, fg);
     }
     for (int x = 0; x < cols; x++) {
         const struct vt_cell *c = &cells[x];
         if (!c->width) continue;
         k = marked(look_of(v, vt_style_of(v, c), fr), m, fr, x);
-        if (k.text || (k.attrs & (VT_BLINK | VT_RAPID)) == 0) decorations(r, &k, x * r->cell_w, y, c->width * r->cell_w);
+        if (k.text || (k.attrs & (VT_BLINK | VT_RAPID)) == 0) decorations(r, &k, r->ox + x * r->cell_w, y, c->width * r->cell_w);
     }
     if (cursor_here && !block) {
-        int x0 = cx * r->cell_w, w = (cells[cx].width == 2 ? 2 : 1) * r->cell_w, t = r->line;
+        int x0 = r->ox + cx * r->cell_w, w = (cells[cx].width == 2 ? 2 : 1) * r->cell_w, t = r->line;
         if (fr->cursor_hollow && shape <= 2) {
             fill(r, x0, y, x0 + w, y + t, cursor_rgb); fill(r, x0, y + r->cell_h - t, x0 + w, y + r->cell_h, cursor_rgb);
             fill(r, x0, y, x0 + t, y + r->cell_h, cursor_rgb); fill(r, x0 + w - t, y, x0 + w, y + r->cell_h, cursor_rgb);
@@ -340,6 +378,13 @@ bool term_render_frame(struct term_render *r, const struct vt *v, const struct t
     r->next = sig;
     uint64_t palette = palette_signature(v, fr);
     uint32_t ground = vt_rgb(v, VT_COLOR_DEFAULT, v->reverse_video);
+    /* the margins around the cells: the ground, when everything is painted
+     * (they change only with the ground's colour, which repaints everything) */
+    if (palette != r->palette) { r->palette = palette; r->all = true; }
+    if (r->all && (r->ox || r->oy || r->width > r->cols * r->cell_w || r->height > r->rows * r->cell_h)) {
+        fill_px(r, 0, 0, r->width, r->height, ground_px(fr, ground));
+        r->dmg_y0 = 0; r->dmg_y1 = r->height;
+    }
     for (int row = 0; row < r->rows; row++) {
         struct marks mk = {0};
         if (row < rows) marks_of(v, fr, row, &mk);       /* first: it reads other rows */
@@ -360,10 +405,11 @@ bool term_render_frame(struct term_render *r, const struct vt *v, const struct t
         }
         if (best_k && best > still && best >= (r->rows - best_k) / 2) {
             size_t row_px = (size_t)r->cell_h * r->width;
-            memmove(r->pixels, r->pixels + best_k * row_px, (size_t)(r->rows - best_k) * row_px * sizeof *r->pixels);
+            uint32_t *top = r->pixels + (size_t)r->oy * r->width;
+            memmove(top, top + best_k * row_px, (size_t)(r->rows - best_k) * row_px * sizeof *r->pixels);
             memmove(r->painted, r->painted + best_k, (size_t)(r->rows - best_k) * sizeof *r->painted);
             for (int y = r->rows - best_k; y < r->rows; y++) r->painted[y] = ~sig[y];
-            r->dmg_y0 = 0; r->dmg_y1 = (r->rows - best_k) * r->cell_h;
+            r->dmg_y0 = r->oy; r->dmg_y1 = r->oy + (r->rows - best_k) * r->cell_h;
             r->rows_moved = r->rows - best_k;
         }
     }
@@ -372,12 +418,13 @@ bool term_render_frame(struct term_render *r, const struct vt *v, const struct t
         struct marks mk = {0};
         if (row < rows) marks_of(v, fr, row, &mk);
         const struct vt_cell *cells = row < rows ? vt_view_row(v, row, fr->back) : NULL;
+        int y0 = r->oy + row * r->cell_h, y1 = y0 + r->cell_h;
         if (cells) paint_row(r, v, cells, fr, &mk, row);
-        else fill(r, 0, row * r->cell_h, r->width, (row + 1) * r->cell_h, ground);
+        else fill_px(r, 0, y0, r->width, y1, ground_px(fr, ground));
         r->painted[row] = sig[row];
         r->rows_painted++;
-        if (row * r->cell_h < r->dmg_y0) r->dmg_y0 = row * r->cell_h;
-        if ((row + 1) * r->cell_h > r->dmg_y1) r->dmg_y1 = (row + 1) * r->cell_h;
+        if (y0 < r->dmg_y0) r->dmg_y0 = y0;
+        if (y1 > r->dmg_y1) r->dmg_y1 = y1;
     }
     r->all = false;
     return r->dmg_y1 > r->dmg_y0;

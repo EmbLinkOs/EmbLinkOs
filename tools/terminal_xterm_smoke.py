@@ -67,7 +67,8 @@ def main():
         assert not cells[row('Underlines:')][18]['flags']&UNDERLINE,'the space between is plain'
         tc=cells[row('Truecolour:')]
         assert tc[12]['bg']!=tc[58]['bg'] and 0xffffffff not in (tc[12]['bg'],tc[58]['bg']),'truecolour gradient'
-        assert cells[row('16 colours:')][12]['bg']==0x30343b and cells[row('16 colours:')][12+3*9]['bg']==0xf58b91,'16-colour palette'
+        # the profile's sixteen: Clear Dark's black and bright red (user/terminal/profile.c)
+        assert cells[row('16 colours:')][12]['bg']==0x35424c and cells[row('16 colours:')][12+3*9]['bg']==0xdf6c5a,'16-colour palette'
         wide=cells[row('Wide, marks:')];assert wide[13]['width']==2 and wide[14]['width']==0,'wide character'
         d.snap('xterm-card')
         # mouse: left and right clicks, the wheel both ways; focus out and back

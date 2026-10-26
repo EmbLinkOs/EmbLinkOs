@@ -1431,6 +1431,18 @@ static inline int embk_win_blur_rect(int win, int x, int y, int w, int h) {
     return (int)embk_syscall5(EMBK_SYS_win_blur_rect, win, x, y, w, h);
 }
 
+/* An ordinary app window that shows through: with `alpha` set its pixels are
+ * composited by their own (premultiplied) alpha, over what is behind it
+ * blurred by `blur` pixels (0 sharp, at most 32); alpha 0 makes it opaque
+ * again. Unlike EMBK_WINF_TRANSLUCENT it stays a normal window -- its own
+ * workspace, its shadow, its place in the layout -- and can change at any
+ * time (a terminal's opacity setting). The compositor keeps the blur and
+ * redoes only where the backdrop changed. */
+#define EMBK_WIN_BLUR_MAX 32
+static inline int embk_win_set_material(int win, int alpha, int blur) {
+    return (int)embk_syscall3(EMBK_SYS_win_set_material, win, alpha, blur);
+}
+
 /* Bring back an app you started: un-minimizes any window it parked and raises
  * its windows to the front. Takes the SPAWN HANDLE (like embk_proc_alive), not
  * a pid -- a launcher never learns pids, and going through the handle keeps

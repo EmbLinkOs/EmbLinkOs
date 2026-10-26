@@ -636,6 +636,20 @@ int main(void) {
     CHECK(dialog && dialog->data.rect.fill.kind==PAINT_SOLID && dialog->data.rect.fill.solid.a==1,
           "a default Dialog retains an opaque readable surface");
 
+    /* a clear Window background: the theme's on an opaque window, clear on
+     * one that shows through (the Terminal at 60% was the theme's colour) */
+    for (int clear=0;clear<2;clear++) {
+        em_window_set_clear(clear);
+        ui_frame_begin();em_new_frame();Window("Clear",.background=(Color){0,0,0,0}) {Spacer();}
+        em_flush();ui_frame_end();ui_run_layout(400,300);
+        struct scene_node *win=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_root())));
+        bool painted=win && win->data.rect.fill.kind==PAINT_SOLID && win->data.rect.fill.solid.a>0;
+        CHECK(clear?!painted:painted && win->data.rect.fill.solid.a==1,
+              clear?"a window that shows through keeps a clear background clear"
+                   :"an opaque window's clear background is the theme's");
+    }
+    em_window_set_clear(0);
+
     struct ui_appearance calm={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
     ui_theme_configure(&calm);em_set_clock(fake_clock);g_ms+=10000;em_toast("Ready",Success);
     ui_frame_begin();em_new_frame();VStack(.key="calm-toast") {em_toast_host();}

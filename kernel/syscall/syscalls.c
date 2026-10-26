@@ -1552,6 +1552,14 @@ static int64_t sys_win_menu(const struct sysargs *a) {
                                (uint32_t)a->arg[0],(int)a->arg[1]);
 }
 
+/* A window that shows through what is behind it: its pixels by their own
+ * alpha, over that blurred by arg2 pixels (compositor_win_set_material). */
+static int64_t sys_win_set_material(const struct sysargs *a) {
+    if (a->arg[0] > UINT32_MAX || a->arg[1] > 1 || a->arg[2] > COMP_MAT_BLUR_MAX) return -EMBK_EINVAL;
+    return compositor_win_set_material(current_process ? (int)current_process->pid : 0,
+                                       (uint32_t)a->arg[0], (int)a->arg[1], (int)a->arg[2]);
+}
+
 static int64_t sys_win_blur_rect(const struct sysargs *a) {
     return compositor_win_blur_rect(current_process ? (int)current_process->pid : 0,
                                     (uint32_t)a->arg[0], (int)a->arg[1], (int)a->arg[2],
@@ -2907,6 +2915,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_where] = sys_win_where,
     [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_win_focused] = sys_win_focused,
+    [SYS_win_set_material] = sys_win_set_material,
     [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,

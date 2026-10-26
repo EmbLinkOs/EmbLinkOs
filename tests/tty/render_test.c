@@ -325,6 +325,69 @@ int main(int argc, char **argv) {
     printf("  full repaint of 120 x 30: %.2f ms on this host\n", ms);
     CHECK(ms < 100, "a full repaint stays well inside a frame");
 
+    printf("a profile's look: bold colour, a translucent ground, spacing:\n");
+    start(10, 3);
+    feed("\033[1mB\033[m \033[1;31mR\033[m");
+    fr.bold_fg_set = true; fr.bold_fg = 0x00ff00;
+    frame();
+    int greenish = 0, reddish = 0;
+    for (int y = cy0(0); y < cy0(1); y++) for (int x = cx0(0); x < cx0(1); x++) greenish += px(x, y) == 0x00ff00;
+    for (int y = cy0(0); y < cy0(1); y++) for (int x = cx0(2); x < cx0(3); x++) reddish += px(x, y) == vt_rgb(&v, VT_COLOR_INDEX(1), true);
+    CHECK(greenish > 10 && reddish > 10, "bold in the default colour takes the bold colour; a coloured bold keeps its own");
+    start(10, 3);
+    feed("a \033[41m \033[m\033[7m \033[m");
+    fr.ground_transparency = 128;
+    frame();
+    uint32_t ground = r.pixels[(size_t)cy0(0) * r.width + cx0(5)];
+    unsigned ga = ground >> 24;
+    CHECK(ga == 127 && ((ground >> 16) & 255) <= ga && ((ground >> 8) & 255) <= ga && (ground & 255) <= ga,
+          "the ground shows through: alpha 127, its colour premultiplied");
+    CHECK(r.pixels[(size_t)cy0(0) * r.width + cx0(2)] >> 24 == 255 && r.pixels[(size_t)cy0(0) * r.width + cx0(3)] >> 24 == 255,
+          "a coloured cell and an inverse one stay opaque");
+    unsigned most = 0;
+    for (int y = cy0(0); y < cy0(1); y++) for (int x = cx0(0); x < cx0(1); x++) {
+        unsigned a = r.pixels[(size_t)y * r.width + x] >> 24;
+        if (a > most) most = a;
+    }
+    CHECK(most == 255, "text over the ground is opaque where it covers");
+    struct term_selection all = {0};
+    term_select_all(&all, &v);
+    fr.selection = &all; fr.selection_bg = 0x335577;
+    frame();
+    CHECK(r.pixels[(size_t)cy0(0) * r.width + cx0(5)] >> 24 == 255, "a selected cell is opaque");
+    fr.selection = NULL;
+    term_render_spacing(&r, 1.5f, 1.25f);
+    term_render_fonts(&r, faces, fallback, nfallback, 14);
+    CHECK(r.cell_w == 10 && r.cell_h == 27 && r.glyph_dx == 1, "line spacing 1.5 and letter spacing 1.25: 10 x 27 cells");
+    start(4, 2);
+    feed("M");
+    frame();
+    int minx = r.cell_w, maxx = -1;
+    for (int y = 0; y < r.cell_h; y++) for (int x = 0; x < r.cell_w; x++)
+        if (px(x, y) != BG) { if (x < minx) minx = x; if (x > maxx) maxx = x; }
+    int margin_l = minx, margin_r = r.cell_w - 1 - maxx;
+    CHECK(maxx >= 0 && abs(margin_l - margin_r) <= 1, "the glyph sits in the middle of the wider cell");
+    term_render_spacing(&r, 1, 1);
+    term_render_fonts(&r, faces, fallback, nfallback, 14);
+    CHECK(r.cell_w == 8 && r.cell_h == 18 && r.glyph_dx == 0, "and back to the font's own cell");
+
+    printf("the cells inside margins:\n");
+    start(4, 2);
+    term_render_layout(&r, 4, 2, 4 * r.cell_w + 23, 2 * r.cell_h + 31, 10, 12);
+    fr.ground_transparency = 51;
+    feed("\033[41mX");
+    frame();
+    CHECK(r.width == 4 * r.cell_w + 23 && r.height == 2 * r.cell_h + 31 && r.dmg_y0 == 0 && r.dmg_y1 == r.height,
+          "the picture is the size asked, and the first frame is all of it");
+    uint32_t corner = r.pixels[0], edge_px = r.pixels[(size_t)20 * r.width + r.width - 1];
+    CHECK(corner >> 24 == 204 && corner == edge_px, "the margins are the ground, translucent too");
+    CHECK(r.pixels[(size_t)12 * r.width + 10] == (0xff000000u | vt_rgb(&v, VT_COLOR_INDEX(1), false)) &&
+          r.pixels[(size_t)11 * r.width + 10] == corner && r.pixels[(size_t)12 * r.width + 9] == corner,
+          "the first cell starts at (10, 12)");
+    feed("\r\nY");
+    frame();
+    CHECK(r.dmg_y0 == 12 + r.cell_h && r.dmg_y1 == 12 + 2 * r.cell_h, "a changed row is damaged where it is drawn");
+
     if (argc > 1) {
         start(84, 16);
         fr = (struct term_frame){ .blink_on = true, .cursor = true, .cursor_shape = 2, .bold_is_bright = false };

@@ -315,6 +315,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/kworker/kworker.c \
              kernel/gfx/surface.c \
              kernel/gfx/compositor.c \
+             kernel/gfx/backdrop.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
              kernel/lib/random.c \
@@ -1711,14 +1712,18 @@ build/wcwidth.o: shell/edit/wcwidth.c shell/edit/wcwidth.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 # The renderer and its drawn glyphs: Terminal's own, beside the screen model
 # (user/apps/*/*.c would each be taken for a program of their own).
-TERM_UI_OBJS := build/term_render.o build/term_glyphs.o build/term_screentext.o
+TERM_UI_OBJS := build/term_render.o build/term_glyphs.o build/term_screentext.o build/term_profile.o build/term_profile_store.o
 build/term_render.o: user/terminal/render.c user/terminal/render.h user/terminal/glyphs.h user/terminal/screentext.h $(VT_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/terminal -c $< -o $@
 build/term_glyphs.o: user/terminal/glyphs.c user/terminal/glyphs.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/term_screentext.o: user/terminal/screentext.c user/terminal/screentext.h $(VT_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
-build/term.o: user/terminal/vt.h user/terminal/render.h user/apps/term/term_probe.h
+build/term_profile.o: user/terminal/profile.c user/terminal/profile.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term_profile_store.o: user/terminal/profile_store.c user/terminal/profile_store.h user/terminal/profile.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term.o: user/terminal/vt.h user/terminal/render.h user/terminal/profile_store.h user/apps/term/term_probe.h
 build/term.elf: build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
@@ -2740,6 +2745,22 @@ terminal-screentext-test: | $(BUILD)
 	    user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c tests/tty/screentext_test.c -o $(BUILD)/screentext_test
 	$(BUILD)/screentext_test
 
+.PHONY: backdrop-test
+# The compositor's backdrop blur: any part of a picture blurs to exactly the
+# whole picture's pixels there, so only what changed is blurred again.
+backdrop-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ikernel \
+	    tests/gfx/backdrop_host.c -o $(BUILD)/backdrop_test
+	$(BUILD)/backdrop_test
+
+.PHONY: terminal-profile-test
+# Terminal's profiles: the presets, the parser's limits, rewriting a file
+# without losing what it does not understand.
+terminal-profile-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Iuser/terminal \
+	    user/terminal/profile.c tests/tty/profile_test.c -lm -o $(BUILD)/profile_test
+	$(BUILD)/profile_test
+
 .PHONY: terminal-golden-test
 # Real programs' output (tests/tty/golden, made by tools/record_golden.py on a
 # Mac) replayed into the screen model and compared with tmux, cell by cell.
@@ -2798,7 +2819,7 @@ html-test:
 	$(BUILD)/html_test
 
 backend-test:
-	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend \
+	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -Iui/scene -Iui/backend \
 	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/scene_render.c \
 	    ui/backend/backend_test.c -lm -o $(BUILD)/backend_test
 	$(BUILD)/backend_test

@@ -420,6 +420,27 @@ static void t9_fractional_edge(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* T10: clearing the dirty rects of a canvas that starts transparent (a
+ * window that shows through) when a rect lies past the target's edge. It
+ * cleared (x1 - x0) * 4 bytes of a NEGATIVE width -- most of the address
+ * space -- and the Terminal died opening its Preferences beside the screen. */
+static void t10_clear_outside(void) {
+    printf("T10 clearing a dirty rect past the edge:\n");
+    struct render_target rt = make_target(32, 32);
+    rt.clear_dirty = 1;
+    for (int i = 0; i < 32 * 32; i++) ((uint32_t *)rt.pixels)[i] = 0xff123456u;
+    struct clip_rect d[4] = { { 40, 4, 10, 10, 0 }, { 4, 40, 10, 10, 0 }, { 30.5f, 2, 8, 4, 0 }, { 4, 10, 10, 5, 0 } };
+    const struct render_backend *be = cpu_backend_get();
+    be->begin_frame(&rt, d, 4);
+    be->end_frame(&rt);
+    uint32_t *px = rt.pixels;
+    CHECK(px[2 * 32 + 30] == 0 && px[2 * 32 + 29] == 0xff123456u && px[20 * 32 + 20] == 0xff123456u,
+          "only the part inside is cleared, and nothing past the edge is touched");
+    CHECK(px[10 * 32 + 4] == 0 && px[14 * 32 + 13] == 0 && px[15 * 32 + 8] == 0xff123456u && px[12 * 32 + 14] == 0xff123456u,
+          "a whole-pixel rect clears itself exactly: not the row or column after it");
+    free(rt.pixels);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -431,6 +452,7 @@ int main(void) {
     t7_layers();
     t8_image_damage();
     t9_fractional_edge();
+    t10_clear_outside();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -16,6 +16,7 @@
 #include "mm/vmm.h"            /* vmm_kmap_pages / vmm_map_in for shared windows */
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
+#include "gfx/backdrop.h"      /* the blur behind a window that shows through */
 #include "include/errno.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: the window-motion clock */
 
@@ -110,6 +111,19 @@ struct comp_window {
      * button down. A press replayed to an app that still thinks the button is
      * held is no edge at all, so it gets the release first -- see the replay. */
     uint8_t   sent_left;
+    /* A WINDOW THAT SHOWS THROUGH (compositor_win_set_material): an ordinary
+     * app window -- its workspace, shadow and place in the layout -- whose
+     * pixels are composited by their own alpha, over what is behind it
+     * blurred by `mat_blur`. The blur is KEPT: bd_sharp is what was behind
+     * the window when it was last painted and bd_blur that blurred, so a
+     * repaint blurs again only where the backdrop changed, reading past the
+     * change so there is no seam (backdrop.h). bd_v* is the part of the
+     * window that was on the screen, the blur's domain. */
+    uint8_t   mat_alpha, mat_blur;
+    uint32_t *bd_sharp, *bd_blur;
+    uint32_t  bd_w, bd_h;
+    int       bd_vx0, bd_vy0, bd_vx1, bd_vy1;
+    uint8_t   bd_valid;
 
     /* A DROP LANDED HERE. Set when the button comes up over this window while
      * a drag is in flight, and taken once by the owning process. The position
@@ -938,6 +952,140 @@ static void draw_titlebar(struct comp_window *w, int focused, int rx0, int ry0, 
 }
 
 /* Draw one window's chrome + content clipped to region [rx0,ry0)-(rx1,ry1). */
+/* ---- a window that shows through: its backdrop ------------------------- */
+
+static void backdrop_free(struct comp_window *w) {
+    if (w->bd_sharp) kfree(w->bd_sharp);
+    if (w->bd_blur) kfree(w->bd_blur);
+    w->bd_sharp = w->bd_blur = 0;
+    w->bd_w = w->bd_h = 0; w->bd_valid = 0;
+}
+
+/* The part of a window's content on the screen, in window coordinates; 0 if
+ * none of it is. */
+static int mat_visible(const struct comp_window *w, int *vx0, int *vy0, int *vx1, int *vy1) {
+    const fb_info_t *fi = fb_get_info();
+    int cx0 = w->x, cy0 = w->y + win_titlebar_h(w);
+    *vx0 = imax(0, -cx0); *vy0 = imax(0, -cy0);
+    *vx1 = imin((int)w->cw, (int)fi->width - cx0); *vy1 = imin((int)w->ch, (int)fi->height - cy0);
+    return *vx1 > *vx0 && *vy1 > *vy0;
+}
+/* Hidden whole by one opaque window above it -- its rect, less the corners
+ * it rounds off: what is behind a window nobody can see is not worth a blur.
+ * Measured: a Terminal behind Settings re-blurred the desktop on every one of
+ * its frames while the display changed, and under emulation that held the
+ * compositor long enough for the desktop to miss its own redraw. */
+static int mat_hidden(const struct comp_window *w) {
+    int x0, y0, x1, y1;
+    win_frame_rect(w, &x0, &y0, &x1, &y1);
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        const struct comp_window *o = &g_wins[i];
+        if (o == w || !o->used || !o->visible || !o->presented || o->z <= w->z) continue;
+        if (o->mat_alpha || o->translucent || o->glass || o->desktop || o->widget) continue;   /* not opaque */
+        if (!session_ui_allowed(o->pid) || !on_workspace(o)) continue;
+        int ox0, oy0, ox1, oy1, r = win_shadows(o) ? WIN_RADIUS : 0;
+        win_frame_rect(o, &ox0, &oy0, &ox1, &oy1);
+        if (x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1) continue;
+        /* clear of its rounded corners: within its straight edges one way or the other */
+        if ((x0 >= ox0 + r && x1 <= ox1 - r) || (y0 >= oy0 + r && y1 <= oy1 - r)) return 1;
+    }
+    return 0;
+}
+static int mat_blurs(const struct comp_window *w) {
+    return w->used && w->visible && w->presented && w->mat_alpha && w->mat_blur && w->content &&
+           session_ui_allowed(w->pid) && on_workspace(w);
+}
+
+/* A repaint the backdrop asks for after this one: the blur of a change
+ * reaches past what was repainted. paint_region does it before returning. */
+static int g_mat_more, g_mat_x0, g_mat_y0, g_mat_x1, g_mat_y1;
+static void mat_more(int x0, int y0, int x1, int y1) {
+    if (!g_mat_more) { g_mat_x0 = x0; g_mat_y0 = y0; g_mat_x1 = x1; g_mat_y1 = y1; g_mat_more = 1; return; }
+    g_mat_x0 = imin(g_mat_x0, x0); g_mat_y0 = imin(g_mat_y0, y0);
+    g_mat_x1 = imax(g_mat_x1, x1); g_mat_y1 = imax(g_mat_y1, y1);
+}
+
+/* A repaint touching a window whose blur is not known whole -- new, resized,
+ * moved on or off the screen -- or (on the GPU, which keeps no copy) any
+ * window that blurs, covers all of that window: the blur reads all of what
+ * is behind it, and only a repaint of all of it has that in hand. */
+static void region_grow_material(int *rx0, int *ry0, int *rx1, int *ry1, int gpu) {
+    for (int pass = 0; pass < 2; pass++) {
+        int grew = 0;
+        for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+            struct comp_window *w = &g_wins[i];
+            int vx0, vy0, vx1, vy1;
+            if (!mat_blurs(w) || !mat_visible(w, &vx0, &vy0, &vx1, &vy1) || mat_hidden(w)) continue;
+            int cx0 = w->x, cy0 = w->y + win_titlebar_h(w);
+            int x0 = cx0 + vx0, y0 = cy0 + vy0, x1 = cx0 + vx1, y1 = cy0 + vy1;
+            if (x1 <= *rx0 || x0 >= *rx1 || y1 <= *ry0 || y0 >= *ry1) continue;
+            int known = !gpu && w->bd_valid && w->bd_w == w->cw && w->bd_h == w->ch &&
+                        w->bd_vx0 == vx0 && w->bd_vy0 == vy0 && w->bd_vx1 == vx1 && w->bd_vy1 == vy1;
+            if (known) continue;
+            if (x0 < *rx0) { *rx0 = x0; grew = 1; }
+            if (y0 < *ry0) { *ry0 = y0; grew = 1; }
+            if (x1 > *rx1) { *rx1 = x1; grew = 1; }
+            if (y1 > *ry1) { *ry1 = y1; grew = 1; }
+        }
+        if (!grew) break;
+    }
+}
+
+/* What is behind the window, where this repaint covers it: read before the
+ * window draws anything (its own shadow included), compared with what was
+ * there, and blurred again where it changed. */
+static uint32_t g_bd_row[8192];
+static void mat_capture(struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
+    int vx0, vy0, vx1, vy1;
+    if (!mat_visible(w, &vx0, &vy0, &vx1, &vy1)) return;
+    /* hidden: nothing to blur, and what it keeps goes stale -- the repaint
+     * that shows it again covers all of it (region_grow_material) */
+    if (mat_hidden(w)) { w->bd_valid = 0; return; }
+    int cx0 = w->x, cy0 = w->y + win_titlebar_h(w), cw = (int)w->cw;
+    int ix0 = imax(vx0, rx0 - cx0), iy0 = imax(vy0, ry0 - cy0);
+    int ix1 = imin(vx1, rx1 - cx0), iy1 = imin(vy1, ry1 - cy0);
+    if (ix1 <= ix0 || iy1 <= iy0 || ix1 - ix0 > (int)(sizeof g_bd_row / sizeof *g_bd_row)) return;
+    if (!w->bd_sharp || w->bd_w != w->cw || w->bd_h != w->ch) {
+        backdrop_free(w);
+        w->bd_sharp = kmalloc((uint64_t)w->cw * w->ch * 4);
+        w->bd_blur = w->bd_sharp ? kmalloc((uint64_t)w->cw * w->ch * 4) : 0;
+        if (!w->bd_sharp || !w->bd_blur) { backdrop_free(w); return; }   /* no memory: no blur */
+        w->bd_w = w->cw; w->bd_h = w->ch;
+    }
+    if (w->bd_vx0 != vx0 || w->bd_vy0 != vy0 || w->bd_vx1 != vx1 || w->bd_vy1 != vy1) {
+        w->bd_valid = 0;
+        w->bd_vx0 = vx0; w->bd_vy0 = vy0; w->bd_vx1 = vx1; w->bd_vy1 = vy1;
+    }
+    int n = ix1 - ix0, chx0 = ix1, chy0 = iy1, chx1 = ix0, chy1 = iy0;
+    for (int y = iy0; y < iy1; y++) {
+        fb_read_rect(cx0 + ix0, cy0 + y, n, 1, g_bd_row, (uint32_t)n);
+        uint32_t *kept = w->bd_sharp + (size_t)y * cw + ix0;
+        int a = 0, b = n - 1;
+        if (w->bd_valid) {
+            while (a < n && kept[a] == g_bd_row[a]) a++;
+            if (a == n) continue;
+            while (b > a && kept[b] == g_bd_row[b]) b--;
+        }
+        memcpy(kept + a, g_bd_row + a, (size_t)(b - a + 1) * 4);
+        chx0 = imin(chx0, ix0 + a); chx1 = imax(chx1, ix0 + b + 1);
+        chy0 = imin(chy0, y); chy1 = imax(chy1, y + 1);
+    }
+    if (!w->bd_valid) {
+        /* region_grow_material made this repaint cover all of it */
+        if (ix0 != vx0 || iy0 != vy0 || ix1 != vx1 || iy1 != vy1) return;
+        if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, vx0, vy0, vx1, vy1, w->mat_blur) == 0)
+            w->bd_valid = 1;
+        return;
+    }
+    if (chx1 <= chx0) return;                                    /* nothing behind it changed */
+    int m = backdrop_reach(w->mat_blur);
+    int ex0 = imax(vx0, chx0 - m), ey0 = imax(vy0, chy0 - m), ex1 = imin(vx1, chx1 + m), ey1 = imin(vy1, chy1 + m);
+    if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, ex0, ey0, ex1, ey1, w->mat_blur)) {
+        w->bd_valid = 0; return;
+    }
+    if (ex0 < ix0 || ey0 < iy0 || ex1 > ix1 || ey1 > iy1) mat_more(cx0 + ex0, cy0 + ey0, cx0 + ex1, cy0 + ey1);
+}
+
 static void paint_window(struct comp_window *w, int focused,
                          int rx0, int ry0, int rx1, int ry1) {
     int fx0, fy0, fx1, fy1;
@@ -957,6 +1105,9 @@ static void paint_window(struct comp_window *w, int focused,
      * for the first real frame anyway, simply don't draw the window until it
      * has one: the desktop stays whole, and then the window grows in. */
     if (!w->presented || (!session_ui_allowed(w->pid) || !on_workspace(w))) return;
+
+    /* what is behind a window that shows through, before it casts its shadow */
+    if (mat_blurs(w)) mat_capture(w, rx0, ry0, rx1, ry1);
 
     /* the drop shadow: drawn first (outside the frame) so the window content
      * lands on top of it, offset downward, and deeper while focused. */
@@ -1002,6 +1153,12 @@ static void paint_window(struct comp_window *w, int focused,
                 fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
             else
                 fb_blit_uniform(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw, GLASS_ALPHA);
+        } else if (w->mat_alpha) {
+            /* a window that shows through: its own alpha, over the kept blur
+             * of what is behind it (or the sharp backdrop, with no blur) */
+            if (w->mat_blur && w->bd_valid && w->bd_blur)
+                fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, w->bd_blur + (size_t)src_y * w->cw + src_x, w->cw);
+            fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else if (w->desktop || w->translucent) {
             /* the home desktop and a translucent bar render a transparent canvas
              * with only some opaque pixels; composite per-pixel over the SHARP
@@ -1322,6 +1479,16 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
             if (w->widget && GLASS_ALPHA == 255) gc->fill(&shown, g_desktop.background);
             if (w->widget) d.opaque = 0;
             else d.opacity = (uint8_t)GLASS_ALPHA;
+        } else if (w->mat_alpha) {
+            /* the repaint covers all of the window (region_grow_material), so
+             * the blur reads all of what is behind it: two box passes of half
+             * the radius, the tent the CPU's backdrop_blur draws */
+            if (w->mat_blur) {
+                uint32_t half = (uint32_t)(w->mat_blur + 1) / 2;
+                gc->blur(&shown, half, 0, 0);
+                gc->blur(&shown, half, round ? &frame : 0, radius);
+            }
+            d.opaque = 0;
         } else if (w->desktop || w->translucent) {
             if (w->blur_set && GLASS_BLUR > 0) {
                 int bx0 = imax(sx0, cx0 + w->blur_x), by0 = imax(sy0, cy0 + w->blur_y);
@@ -1416,15 +1583,27 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     int W = (int)fi->width, H = (int)fi->height;
+    int gpu = gpu_compose_now() != 0;
+    region_grow_material(&rx0, &ry0, &rx1, &ry1, gpu);
     region_grow_corners(&rx0, &ry0, &rx1, &ry1);
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;
     if (rx1 > W) rx1 = W; if (ry1 > H) ry1 = H;
     if (rx1 <= rx0 || ry1 <= ry0) return;
-    if (gpu_compose_now()) {
+    if (gpu) {
         if (paint_region_gpu(rx0, ry0, rx1, ry1)) gpu_fall_back("a frame could not be drawn");
         return;
     }
+    g_mat_more = 0;
     paint_region_cpu(rx0, ry0, rx1, ry1);
+    /* the margin a changed backdrop's blur reaches: blurred already, shown
+     * now (twice at most -- a second round finds nothing changed) */
+    for (int round = 0; round < 2 && g_mat_more; round++) {
+        int x0 = imax(g_mat_x0, 0), y0 = imax(g_mat_y0, 0), x1 = imin(g_mat_x1, W), y1 = imin(g_mat_y1, H);
+        g_mat_more = 0;
+        region_grow_corners(&x0, &y0, &x1, &y1);
+        x0 = imax(x0, 0); y0 = imax(y0, 0); x1 = imin(x1, W); y1 = imin(y1, H);
+        if (x1 > x0 && y1 > y0) paint_region_cpu(x0, y0, x1, y1);
+    }
 }
 
 static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
@@ -1525,6 +1704,7 @@ static void enforce_focus(void) {
  * the client first and freed exactly once here (not again by the client's
  * address-space teardown). */
 static void win_free_backing(struct comp_window *w) {
+    backdrop_free(w);
     gpu_image_doom(&w->gimg);
     w->gimg_px = 0;
     if (w->shared) {
@@ -1585,6 +1765,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
+    w->mat_alpha = w->mat_blur = 0;
     w->content = buf;
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
@@ -1693,6 +1874,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->widget = widget;
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
+    w->mat_alpha = w->mat_blur = 0;
     w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
@@ -2423,6 +2605,22 @@ int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_)
     if (!w) { spin_unlock(&g_comp_lock); return -1; }
     w->blur_set = (w_ > 0 && h_ > 0);
     w->blur_x = x; w->blur_y = y; w->blur_w = w_; w->blur_h = h_;
+    int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    spin_unlock(&g_comp_lock);
+    return 0;
+}
+
+int compositor_win_set_material(int pid, uint32_t id, int alpha, int blur) {
+    if (blur < 0 || blur > COMP_MAT_BLUR_MAX) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (w->desktop || w->widget || w->translucent || w->glass) { spin_unlock(&g_comp_lock); return -EMBK_EINVAL; }
+    w->mat_alpha = alpha ? 1 : 0;
+    w->mat_blur = alpha ? (uint8_t)blur : 0;
+    if (!w->mat_blur) backdrop_free(w);
+    w->bd_valid = 0;                         /* a new radius: blurred again, all of it */
     int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
     paint_region(x0, y0, x1, y1);
     spin_unlock(&g_comp_lock);

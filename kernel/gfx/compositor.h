@@ -200,6 +200,12 @@ int  compositor_backdrop_luma(int x, int y, int w, int h);
 int compositor_win_menu(int pid,uint32_t id,int active);
 int compositor_win_close_ack(int pid,uint32_t id);
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
+/* A window that shows through: alpha=1 composites its pixels by their own
+ * alpha, over what is behind it blurred by `blur` pixels (0 sharp, at most
+ * COMP_MAT_BLUR_MAX). An ordinary app window otherwise; alpha=0 makes it
+ * opaque again. */
+#define COMP_MAT_BLUR_MAX 32
+int  compositor_win_set_material(int pid, uint32_t id, int alpha, int blur);
 /* `when` is the millisecond the reported button state was MADE, which for a
  * replayed press is when the finger went down and not when this poll happened.
  * Anything timing a double-click needs that: replayed clicks arrive one per

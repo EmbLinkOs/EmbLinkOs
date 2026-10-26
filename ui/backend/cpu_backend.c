@@ -365,11 +365,19 @@ static void cpu_begin_frame(struct render_target *rt, const struct clip_rect *di
                 memset((uint8_t *)rt->pixels + (size_t)y * rt->stride, 0, (size_t)rt->width * 4);
         } else {
             for (uint32_t i = 0; i < n; i++) {
-                int x0 = (int)dirty[i].x, y0 = (int)dirty[i].y;
-                int x1 = (int)(dirty[i].x + dirty[i].w) + 1, y1 = (int)(dirty[i].y + dirty[i].h) + 1;
-                if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+                /* the pixels the rect touches, and no more: one row past it
+                 * (what a "+ 1" cleared) is a row nothing repaints, left
+                 * transparent across a window that shows through */
+                int x0 = (int)floorf(dirty[i].x), y0 = (int)floorf(dirty[i].y);
+                int x1 = (int)ceilf(dirty[i].x + dirty[i].w), y1 = (int)ceilf(dirty[i].y + dirty[i].h);
+                if (x0 < 0) x0 = 0;
+                if (y0 < 0) y0 = 0;
                 if (x1 > (int)rt->width)  x1 = (int)rt->width;
                 if (y1 > (int)rt->height) y1 = (int)rt->height;
+                /* a rect beyond the right or bottom edge clears nothing --
+                 * not (x1 - x0) * 4 bytes of a negative width, which memset
+                 * reads as most of the address space */
+                if (x1 <= x0 || y1 <= y0) continue;
                 for (int y = y0; y < y1; y++)
                     memset((uint8_t *)rt->pixels + (size_t)y * rt->stride + (size_t)x0 * 4,
                            0, (size_t)(x1 - x0) * 4);

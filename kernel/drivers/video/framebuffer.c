@@ -441,6 +441,25 @@ void fb_blit(int32_t x, int32_t y, int32_t w, int32_t h,
     fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
 }
 
+int fb_read_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t *dst, uint32_t stride) {
+    int32_t cx = x, cy = y, cw = w, ch = h;
+    if (!fb_clip(&cx, &cy, &cw, &ch)) return 0;
+    uint32_t *out = dst + (uint64_t)(cy - y) * stride + (cx - x);
+    const uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    for (int32_t j = 0; j < ch; j++) {
+        if (fb.bpp == 32 && fb.format == FB_FORMAT_BGR) {
+            const uint32_t *p = (const uint32_t *)row;
+            for (int32_t i = 0; i < cw; i++) out[i] = p[i] & 0x00FFFFFFU;
+        } else {
+            const uint8_t *p = row;
+            for (int32_t i = 0; i < cw; i++, p += fb_bypp) out[i] = fb_unpack(fb_load((uint8_t *)p)) & 0xFFFFFFu;
+        }
+        out += stride;
+        row += fb.pitch;
+    }
+    return 1;
+}
+
 void fb_blit_blend(int32_t x, int32_t y, int32_t w, int32_t h,
                    const uint32_t *argb, uint32_t stride) {
     int32_t cx = x, cy = y, cw = w, ch = h;

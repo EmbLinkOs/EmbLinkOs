@@ -31,6 +31,12 @@ struct term_frame {
     bool cursor_hollow;         /* the window does not have the keyboard: an outline */
     bool blink_on;              /* blinking text shows in this phase */
     bool bold_is_bright;        /* bold ANSI colours 0-7 draw as 8-15 */
+    bool bold_fg_set;           /* bold text in the default colour draws in bold_fg */
+    uint32_t bold_fg;
+    /* How much of the default background shows through: 0 opaque (the
+     * default), 255 none of it. Only the ground itself -- text, coloured
+     * cells, the marks and the cursor stay opaque. */
+    uint8_t ground_transparency;
     /* what is marked, over the cells' own colours: the selection, the
      * matches of a search (the one found last stronger), the link under the
      * pointer (underlined) */
@@ -47,9 +53,13 @@ struct term_render {
     struct font *face[4];       /* a missing bold/italic falls back to regular */
     struct font *fallback[TERM_FALLBACK_MAX]; int nfallback;
     float size;                 /* pixels */
+    float line_spacing, letter_spacing;   /* the cell, as a multiple of the font's own (0: 1) */
+    int glyph_dx;               /* the glyph's offset in a cell widened by letter spacing */
     int cell_w, cell_h, baseline, underline, line;   /* baseline/underline: from the cell's top */
     int cols, rows, width, height;
-    uint32_t *pixels;           /* width*height, BGRA, opaque */
+    int ox, oy;                 /* the first cell's place in the pixels: the rest is margin, the ground */
+    uint64_t palette;           /* the last frame's colours: a change repaints the margins too */
+    uint32_t *pixels;           /* width*height, BGRA premultiplied: opaque but for a translucent ground */
     uint64_t *painted;          /* per row: the signature it was painted with */
     uint64_t *next;             /* this frame's signatures (scratch) */
     bool all;                   /* repaint every row next frame */
@@ -63,7 +73,12 @@ struct term_render {
 bool term_render_fonts(struct term_render *, struct font *const faces[4],
                        struct font *const *fallback, int nfallback, float size_px);
 /* cols x rows cells: (re)allocates the pixels; everything repaints. */
+/* Line and letter spacing (1 = the font's own cell), taken by the next
+ * term_render_fonts. */
+void term_render_spacing(struct term_render *, float line, float letter);
 bool term_render_resize(struct term_render *, int cols, int rows);
+/* cols x rows cells at (ox, oy) in a w x h picture (at least the cells'). */
+bool term_render_layout(struct term_render *, int cols, int rows, int w, int h, int ox, int oy);
 /* Paint what changed since the last frame. Returns whether anything did; the
  * repainted rows are dmg_y0..dmg_y1. */
 bool term_render_frame(struct term_render *, const struct vt *, const struct term_frame *);

@@ -464,6 +464,7 @@ void em_drag_handle_end_(void);
  * collects with em_window_take_resize and applies via embk_win_resize. */
 void em_window_set_resizable(int on);
 void em_window_set_glass(int on);   /* Window() renders a translucent tint for glass */
+void em_window_set_clear(int on);   /* the window shows through: a clear Window background stays clear */
 int  em_window_take_resize(int *dw, int *dh);   /* 1 if a resize is pending */
 
 /* --- new components ----------------------------------------------------- */
@@ -730,6 +731,12 @@ void  em_feed_pointer(float x, float y, int left_down, int right_down,
                       int wheel, int focused);
 void em_shell_band(int bottom, int height); /* translucent shell strip geometry */
 void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
+/* The window shows through: its canvas starts transparent, what the view
+ * paints is composited by its own alpha, over what is behind the window
+ * blurred by `blur` pixels (0-32). An ordinary window otherwise -- unlike the
+ * Translucent material, which is for the bars. Any time; false puts it back. */
+void  em_window_material(bool see_through, int blur);
+bool  em_window_see_through(void);
 float em_viewport_width(void);
 float em_viewport_height(void);
 

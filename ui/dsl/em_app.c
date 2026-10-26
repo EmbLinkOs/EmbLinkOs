@@ -54,6 +54,21 @@ void em_window_blur_rect(int x, int y, int w, int h) {
     g_blur_rect[0]=x; g_blur_rect[1]=y; g_blur_rect[2]=w; g_blur_rect[3]=h;
     g_blur_dirty = 1;
 }
+/* A window that shows through (em_window_material): wanted, and what the
+ * compositor was last told. A change clears the canvas to transparent (or
+ * back) and repaints all of it. */
+static int   g_mat_alpha, g_mat_blur, g_mat_told = -1, g_mat_full;
+void em_window_material(bool see_through, int blur) {
+    if (blur < 0) blur = 0;
+    if (blur > EMBK_WIN_BLUR_MAX) blur = EMBK_WIN_BLUR_MAX;
+    if (!see_through) blur = 0;
+    if (g_mat_alpha == (int)see_through && g_mat_blur == blur) return;
+    if (g_mat_alpha != (int)see_through) g_mat_full = 1;
+    g_mat_alpha = see_through; g_mat_blur = blur;
+    em_window_set_clear(see_through);
+    em_request_frame();
+}
+bool em_window_see_through(void) { return g_mat_alpha != 0; }
 static float g_viewport_h;
 
 void em_app_request_exit(int code) {
@@ -761,6 +776,11 @@ int em_app_run(const EmApp *app) {
                                g_blur_rect[2], g_blur_rect[3]);
             g_blur_dirty = 0;
         }
+        if (g_mat_told != (g_mat_alpha << 8 | g_mat_blur)) {
+            if (embk_win_set_material(win, g_mat_alpha, g_mat_blur) == 0 || !g_mat_alpha)
+                g_mat_told = g_mat_alpha << 8 | g_mat_blur;
+            else g_mat_alpha = g_mat_blur = 0, g_mat_told = 0, g_mat_full = 1, em_window_set_clear(0);   /* refused: opaque, as it is */
+        }
         int had_key = 0;
         for (int64_t input; (input = embk_key_poll_key()) > 0; ) {
             int c=(int)(input&255);g_key_modifiers=(int)((input>>8)&255);
@@ -863,11 +883,13 @@ int em_app_run(const EmApp *app) {
          * a close pull animates (the fade/slide moves the whole window, which the
          * dirty-rect present would otherwise ghost). */
         bool force_full = false;
-        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || win_moved) {
+        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || win_moved || g_mat_full) {
             const struct ui_theme *t = ui_theme();
-            /* translucent windows clear to fully TRANSPARENT so their empty
-             * canvas reveals the desktop; opaque/glass windows clear to bg. */
-            uint32_t bg = translucent ? 0x00000000u
+            g_mat_full = 0;
+            /* translucent windows -- and one that shows through -- clear to
+             * fully TRANSPARENT so their empty canvas reveals the desktop;
+             * opaque/glass windows clear to bg. */
+            uint32_t bg = translucent || g_mat_alpha ? 0x00000000u
                         : (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
             uint32_t *clr = back ? back : px;
@@ -880,6 +902,7 @@ int em_app_run(const EmApp *app) {
         ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         if (g_em_post_layout) g_em_post_layout();
+        rt.clear_dirty = translucent || g_mat_alpha;     /* the material can change at any time */
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
         /* Park, don't quit: the app keeps running with no pixels on screen
