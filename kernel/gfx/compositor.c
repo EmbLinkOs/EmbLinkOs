@@ -292,6 +292,7 @@ static void outputs_whole(const fb_info_t *fi)
 }
 
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
+static int      g_hw_cursor;       /* the display's cursor plane shows the pointer */
 static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
 static int      g_cursor_under_valid;
 static uint32_t g_prev_buttons;
@@ -1352,6 +1353,7 @@ static void draw_cursor(int cx, int cy) {
  * never in a window backing store.  Restoring this small snapshot avoids
  * recomposing the complete desktop for every pointer movement. */
 static void cursor_restore_under(void) {
+    if (g_hw_cursor) return;          /* nothing of ours is on the screen */
     if (!g_cursor_valid || !g_cursor_under_valid) return;
     /* One clipped blit also produces one dirty-region update.  The old
      * per-pixel restore acquired the framebuffer dirty lock hundreds of times
@@ -1362,7 +1364,7 @@ static void cursor_restore_under(void) {
 }
 
 static void cursor_capture_and_draw(void) {
-    if (!g_cursor_valid) return;
+    if (!g_cursor_valid || g_hw_cursor) return;
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     for (int y = 0; y < CURSOR_H; y++) {
@@ -1485,14 +1487,20 @@ static void cursor_layer_over(const uint32_t *layer, int ox, int oy) {
         }
 }
 
-static int gpu_cursor_image(void) {
-    if (!cursor_layers_ready) g_cursor_img_stale = 1;
+/* The cursor as one premultiplied picture in g_cursor_px. */
+static void cursor_build_px(void) {
     cursor_prepare_layers();
-    if (g_cursor_img && !g_cursor_img_stale) return 0;
     memset(g_cursor_px, 0, sizeof g_cursor_px);
     cursor_layer_over(cursor_shadow, 2, 2);
     cursor_layer_over(cursor_outer_layer, 0, 0);
     cursor_layer_over(cursor_inner_layer, 0, 0);
+}
+
+static int gpu_cursor_image(void) {
+    if (!cursor_layers_ready) g_cursor_img_stale = 1;
+    cursor_prepare_layers();
+    if (g_cursor_img && !g_cursor_img_stale) return 0;
+    cursor_build_px();
     if (g_cursor_img) g_gc->image_update(g_cursor_img, &(struct gpu_rect){ 0, 0, CURSOR_W, CURSOR_H });
     else if (g_gc->image_create(g_cursor_px, CURSOR_W, CURSOR_H, CURSOR_W * 4, &g_cursor_img)) { g_cursor_img = 0; return -1; }
     g_cursor_img_stale = 0;
@@ -1666,7 +1674,7 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         g_aurora_img = 0;
         return -1;
     }
-    if (g_cursor_valid && gpu_cursor_image()) return -1;
+    if (g_cursor_valid && !g_hw_cursor && gpu_cursor_image()) return -1;
 
     struct gpu_rect dmg = { rx0, ry0, rx1 - rx0, ry1 - ry0 };
     /* Without the aurora, the gradient is drawn on the canvas and shown from it. */
@@ -1730,7 +1738,7 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         }
     }
 
-    if (g_cursor_valid) {
+    if (g_cursor_valid && !g_hw_cursor) {
         struct gpu_draw d = { .image = g_cursor_img, .src = { 0, 0, CURSOR_W, CURSOR_H },
                               .dst = { g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H }, .opaque = 0, .opacity = 255 };
         gc->draw(&d);
@@ -2975,6 +2983,74 @@ int compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly) {
     return got;
 }
 
+/* ---- the cursor plane (gpu.h cursor_image / cursor_place) -------------------
+ * Where the display can put the pointer over the scanout itself, it does, and
+ * the pointer moving composes nothing: the mouse driver's notification places
+ * it (compositor_input_kick) the moment it moves, beat or no beat. The
+ * picture is sent once, and again when its style changes. Everywhere else --
+ * or with `perf cursor sw` -- the compositor draws it into every frame. */
+static int g_hw_cursor_off;        /* `perf cursor sw`, or the plane failed */
+static int g_hw_cursor_stale = 1;  /* the picture must be sent again */
+
+static const struct gpu_driver *cursor_driver(void) {
+    const struct gpu_driver *g = gpu_active();
+    return g && g->cursor_image && g->cursor_place && !g_hw_cursor_off ? g : 0;
+}
+
+/* The output under (x, y), the point made relative to it. */
+static unsigned cursor_output(int32_t *x, int32_t *y) {
+    for (unsigned i = 0; i < g_nouts; i++) {
+        const struct layout_rect *o = &g_outs[i];
+        if (*x >= o->x && *y >= o->y && *x < o->x + (int32_t)o->w && *y < o->y + (int32_t)o->h) {
+            *x -= o->x; *y -= o->y;
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* Bring the plane up, or its picture up to date, or -- turned off -- hand
+ * the pointer back to composition. Frame thread, under the lock. */
+static void cursor_plane_sync(int32_t x, int32_t y) {
+    const struct gpu_driver *g = cursor_driver();
+    if (!g) {
+        if (g_hw_cursor) {
+            const struct gpu_driver *a = gpu_active();
+            if (a && a->cursor_place) a->cursor_place(0, 0, 0, false, false);
+            g_hw_cursor = 0; g_cursor_under_valid = 0;
+            paint_region(g_cursor_x, g_cursor_y, g_cursor_x + CURSOR_W, g_cursor_y + CURSOR_H);
+        }
+        return;
+    }
+    if (!cursor_layers_ready) g_hw_cursor_stale = 1;
+    if (g_hw_cursor && !g_hw_cursor_stale) return;
+    cursor_build_px();
+    if (!g->cursor_image(g_cursor_px, CURSOR_W, CURSOR_H, 0, 0)) {
+        g_hw_cursor_off = 1;
+        kprintf("compositor: the cursor plane refused the pointer; drawing it\n");
+        return;
+    }
+    if (!g_hw_cursor) {
+        /* take ours off the screen before the plane's goes on */
+        cursor_restore_under();
+        g_hw_cursor = 1;
+        paint_region(g_cursor_x, g_cursor_y, g_cursor_x + CURSOR_W, g_cursor_y + CURSOR_H);
+        kprintf("compositor: the pointer is on %s's cursor plane\n", g->name);
+    }
+    g_hw_cursor_stale = 0;
+    int32_t ox = x, oy = y;
+    unsigned out = cursor_output(&ox, &oy);
+    g->cursor_place(out, ox, oy, true, true);
+}
+
+void compositor_cursor_plane(int on) {
+    spin_lock(&g_comp_lock);
+    g_hw_cursor_off = !on;
+    g_hw_cursor_stale = 1;
+    g_need_kick = 1;
+    comp_unlock();
+}
+
 static void pointer_frame(void) {
     if (!g_active) return;               /* no desktop yet -> nothing to route */
     int32_t x, y; uint32_t b;
@@ -2987,6 +3063,7 @@ static void pointer_frame(void) {
 
     spin_lock(&g_comp_lock);
     g_src = EMBK_COMP_SRC_POINTER;
+    cursor_plane_sync(x, y);
     /* the pointer moved or a button changed: whichever app it is over (or was)
      * has something to read. Pending presses and the wheel are input too. */
     { static int32_t sx = -1, sy = -1; static uint32_t sb;
@@ -3024,7 +3101,8 @@ static void pointer_frame(void) {
 
     if (!g_cursor_valid) {
         g_cursor_x = x; g_cursor_y = y; g_cursor_valid = 1;
-        if (g_gc) paint_region(x, y, x + CURSOR_W, y + CURSOR_H);
+        if (g_hw_cursor) { }
+        else if (g_gc) paint_region(x, y, x + CURSOR_W, y + CURSOR_H);
         else { cursor_capture_and_draw(); fb_present(); }
     }
 
@@ -3158,7 +3236,15 @@ static void pointer_frame(void) {
 
     /* On the GPU there is no save-under: where the cursor was is drawn again
      * from the layers, and where it is now with them. */
-    if (have) {
+    if (cursor_moved && g_hw_cursor) {
+        /* the plane carries it: put it where the frame ended up (a warp
+         * between monitors) -- the notification already moved it here */
+        const struct gpu_driver *g = gpu_active();
+        int32_t ox = x, oy = y;
+        unsigned out = cursor_output(&ox, &oy);
+        if (g && g->cursor_place) g->cursor_place(out, ox, oy, true, false);
+        if (have) paint_region(bx0, by0, bx1, by1);
+    } else if (have) {
         if (g_gc && cursor_moved) {
             DIRTY(ocx, ocy, ocx + CURSOR_W, ocy + CURSOR_H);
             DIRTY(x, y, x + CURSOR_W, y + CURSOR_H);
@@ -3441,7 +3527,9 @@ static void comp_rate_update(uint64_t now) {
         uint32_t cap = 0;
 #endif
         spin_lock(&g_comp_lock);
-        if (!g_fc_simulated) g_fc_display = (struct fc_display){ mhz, 0, 0 };
+        /* 0 is "cannot say right now" (no mode list during a change), not a
+         * display that lost its refresh: keep the last one it said */
+        if (!g_fc_simulated && mhz) g_fc_display = (struct fc_display){ mhz, 0, 0 };
         g_power_cap_mhz = cap;
         comp_unlock();
     }
@@ -3591,7 +3679,21 @@ void compositor_print_windows(void) {
 /* The mouse moved, a button changed or the wheel turned (mouse.c). From any
  * context, the interrupt included. */
 
-void compositor_input_kick(void) { comp_wake(); }
+void compositor_input_kick(void) {
+    if (g_hw_cursor) {
+        const struct gpu_driver *g = gpu_active();
+        if (g && g->cursor_place) {
+            int32_t x, y; uint32_t b;
+            mouse_get_state(&x, &y, &b);
+            unsigned out = cursor_output(&x, &y);
+            if (g->cursor_place(out, x, y, true, false)) {
+                uint64_t moved = mouse_take_motion_ns();
+                if (moved) comp_stats_pointer(time_get_ns() - moved);
+            }
+        }
+    }
+    comp_wake();
+}
 
 /* The kernel loop's ticks: the frame thread's work once it runs, and the old
  * inline pump until then (boot, or no thread). */

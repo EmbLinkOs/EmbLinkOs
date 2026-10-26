@@ -362,8 +362,16 @@ uint32_t display_refresh_mhz(void) {
     static struct embk_monitor_info info;   /* large; one caller, under the lock */
     mutex_lock(&lock);
     describe(&info);
-    uint32_t mhz=0;
-    for(unsigned i=0;i<info.mode_count;i++)if(info.modes[i].flags&EMBK_MONITOR_CURRENT)mhz=info.modes[i].refresh_millihz;
+    /* Several modes can share the current size at different rates (QEMU's own
+     * EDID lists 1280 x 800 at 60 and 75). The one the display prefers, else
+     * the fastest of them -- never whichever happened to be listed last. */
+    uint32_t mhz=0,preferred=0;
+    for(unsigned i=0;i<info.mode_count;i++) {
+        if(!(info.modes[i].flags&EMBK_MONITOR_CURRENT))continue;
+        if(info.modes[i].refresh_millihz>mhz)mhz=info.modes[i].refresh_millihz;
+        if(info.modes[i].flags&EMBK_MONITOR_PREFERRED)preferred=info.modes[i].refresh_millihz;
+    }
+    if(preferred)mhz=preferred;
     mutex_unlock(&lock);
     return mhz;
 }

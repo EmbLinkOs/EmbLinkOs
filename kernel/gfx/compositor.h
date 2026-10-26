@@ -201,6 +201,9 @@ void compositor_anim_tick(void);
 void compositor_start(void);
 /* The pointer changed -- wake the frame thread. Any context, IRQ included. */
 void compositor_input_kick(void);
+/* The pointer on the display's cursor plane (1, where there is one) or drawn
+ * by the compositor (0) -- `perf cursor hw|sw`. */
+void compositor_cursor_plane(int on);
 /* `perf windows` on the serial console: every visible window's geometry. */
 void compositor_print_windows(void);
 /* Wait for the next frame (asking for one); see compositor.c. */

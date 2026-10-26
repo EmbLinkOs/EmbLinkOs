@@ -297,6 +297,11 @@ int comp_stats_command(const char *cmd)
     if (!strcmp(cmd, "perf")) { dump(); return 1; }
     if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
     if (!strcmp(cmd, "perf windows")) { compositor_print_windows(); return 1; }
+    if (!strcmp(cmd, "perf cursor hw") || !strcmp(cmd, "perf cursor sw")) {
+        compositor_cursor_plane(cmd[12] == 'h');
+        kprintf("perf: cursor %s\n", cmd + 12);
+        return 1;
+    }
     if (!strncmp(cmd, "perf display ", 13)) {
         /* 120: a fixed 120 Hz display; 48-120: VRR from 48 to 120; auto: the real one */
         const char *p = cmd + 13;

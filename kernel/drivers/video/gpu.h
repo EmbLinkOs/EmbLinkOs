@@ -84,6 +84,15 @@ struct gpu_driver {
                       uint32_t src_x, uint32_t src_y,
                       uint32_t w, uint32_t h);
 
+    // Optional: a CURSOR PLANE -- the display puts the pointer over the
+    // scanout itself, so moving it composes nothing. cursor_image takes a
+    // premultiplied 0xAARRGGBB picture (schedulable context); cursor_place
+    // shows it on output `scanout` at (x, y) in that output's coordinates,
+    // hides it, or with `image` re-reads the picture -- from ANY context,
+    // the mouse interrupt included, and without waiting.
+    bool (*cursor_image)(const uint32_t *argb, uint32_t w, uint32_t h, uint32_t hot_x, uint32_t hot_y);
+    bool (*cursor_place)(unsigned scanout, int32_t x, int32_t y, bool visible, bool image);
+
     // Optional: the row pitch (bytes) a surface of this width needs. Absent:
     // width * 4. Intel planes need multiples of 64 bytes, which 1366 * 4 is not.
     uint32_t (*pitch)(uint32_t width);
