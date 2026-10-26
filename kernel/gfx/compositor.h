@@ -204,6 +204,10 @@ void compositor_input_kick(void);
 /* The pointer on the display's cursor plane (1, where there is one) or drawn
  * by the compositor (0) -- `perf cursor hw|sw`. */
 void compositor_cursor_plane(int on);
+/* The rects (content-local x, y, w, h; at most 4) of a window the compositor
+ * drags it by, itself, clipped to the content; n 0 clears. Returns how many it
+ * took. A drag that moved the window ends with EMBK_WIN_ACTION_MOVED. */
+int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n);
 /* `perf windows` on the serial console: every visible window's geometry. */
 void compositor_print_windows(void);
 /* Wait for the next frame (asking for one); see compositor.c. */

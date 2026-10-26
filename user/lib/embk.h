@@ -1228,6 +1228,17 @@ static inline int embk_win_frame_rate(uint32_t pref_mhz) {
     return (int)embk_syscall1(EMBK_SYS_win_frame_rate, pref_mhz);
 }
 
+/* Where the compositor drags this window by, itself: up to four content-local
+ * rects {x, y, w, h} -- a title bar's empty middle. A press there moves the
+ * window in the frame the pointer moves, with no round trip through the app,
+ * even when the app is busy; the app gets EMBK_WIN_ACTION_MOVED when a drag
+ * that moved it ends. n 0 clears. */
+/* Returns how many rects it took (clipped to the content; one wholly outside
+ * is dropped), or -err. */
+static inline int embk_win_drag_regions(int id, const int32_t (*rects)[4], unsigned n) {
+    return (int)embk_syscall3(EMBK_SYS_win_drag_regions, id, (int64_t)(intptr_t)rects, n);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);
@@ -1345,6 +1356,10 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * like CLOSE. Told apart from CLOSE (GUI+W, which may mean "this tab") so an
  * app with tabs or documents can close all of them, not one. */
 #define EMBK_WIN_ACTION_QUIT      0x80000008u
+/* YOU WERE DRAGGED. The compositor moved the window by a region the app
+ * declared (embk_win_drag_regions) and the button is up again: where it went
+ * is embk_win_where's, and a runtime snaps to an edge from there. */
+#define EMBK_WIN_ACTION_MOVED     0x80000009u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *

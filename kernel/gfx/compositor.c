@@ -137,6 +137,13 @@ struct comp_window {
      * is content-local, like every other pointer coordinate an app sees. */
     uint8_t   pend_drop;
     int16_t   drop_lx, drop_ly;
+    /* WHERE THE WINDOW IS DRAGGED BY (compositor_win_drag_regions): content-
+     * local rects -- a title bar's empty middle -- that the compositor drags
+     * the window by itself, in the frame the pointer moves, without asking the
+     * app. A window whose app has hung still moves. */
+#define COMP_DRAG_REGIONS 4
+    uint8_t   drag_n;
+    int16_t   drag_r[COMP_DRAG_REGIONS][4];
     char      title[COMP_TITLE_MAX + 1];
     uint32_t *content;      /* cw*ch, 0xAARRGGBB premultiplied. For a copy      */
                             /* window this is a kmalloc'd kernel buffer the      */
@@ -299,6 +306,8 @@ static uint32_t g_prev_buttons;
 static int g_buttons_suppressed; /* ownership/space changes wait for physical release */
 static void reset_pointer_capture_locked(void);
 static int      g_dragging;        /* a title-bar drag is in progress          */
+static int      g_drag_region;     /* ...by a region the app declared: tell it  */
+static int      g_drag_moved;      /*    when it ends (EMBK_WIN_ACTION_MOVED)   */
 static uint32_t g_drag_id;         /* which window is being dragged             */
 static int      g_drag_dx, g_drag_dy;  /* pointer offset within the window frame */
 
@@ -2000,6 +2009,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
 
     struct comp_window *w = &g_wins[slot];
     w->used = 1;
+    w->drag_n = 0;
     w->id = g_next_id++;
     w->pid = pid;
     w->x = x; w->y = y;
@@ -2100,7 +2110,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
         kfree(phys); return -EMBK_ENOMEM;
     }
     struct comp_window *w = &g_wins[slot];
-    w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid;
+    w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid; w->drag_n = 0;
     w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
     w->workspace=g_desktop.workspace;
     w->menu_keyboard = 0;
@@ -3199,12 +3209,29 @@ static void pointer_frame(void) {
             }
             if (!title_control && w->visible && y < w->y + win_titlebar_h(w)) {
                 /* grabbed the title bar (also valid when already front) */
-                g_dragging = 1; g_drag_id = w->id;
+                g_dragging = 1; g_drag_id = w->id; g_drag_region = 0; g_drag_moved = 0;
                 g_drag_dx = x - w->x; g_drag_dy = y - w->y;
+            } else if (!title_control && w->visible && w->drag_n) {
+                /* grabbed a region the app declared: the compositor drags */
+                int lx = x - w->x, ly = y - (w->y + win_titlebar_h(w));
+                for (int k = 0; k < w->drag_n; k++) {
+                    const int16_t *r = w->drag_r[k];
+                    if (lx >= r[0] && ly >= r[1] && lx < r[0] + r[2] && ly < r[1] + r[3]) {
+                        g_dragging = 1; g_drag_id = w->id; g_drag_region = 1; g_drag_moved = 0;
+                        g_drag_dx = x - w->x; g_drag_dy = y - w->y;
+                        break;
+                    }
+                }
             }
         }
     }
-    if (!left && prev) g_dragging = 0;   /* release ends any drag */
+    if (!left && prev && g_dragging) {   /* release ends any drag */
+        /* an app whose region was dragged learns where its window went, and
+         * that a drag ended -- the runtime snaps on it (em_app.c) */
+        struct comp_window *dw = win_by_id(g_drag_id);
+        if (g_drag_region && g_drag_moved && dw) { dw->pending_action = 9; g_post_ui = 1; }   /* EMBK_WIN_ACTION_MOVED */
+        g_dragging = 0; g_drag_region = 0;
+    }
 
     /* drag: move the grabbed window to follow the pointer */
     if (g_dragging && left) {
@@ -3216,6 +3243,7 @@ static void pointer_frame(void) {
                 const fb_info_t *fi = fb_get_info();
                 if (fi && !w->widget && !w->translucent)
                     clamp_to_work(w, &nx, &ny);
+                if (nx != w->x || ny != w->y) g_drag_moved = 1;
                 w->x = nx; w->y = ny;
                 int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
                 DIRTY(ox0, oy0, ox1, oy1);
@@ -3660,6 +3688,29 @@ void compositor_start(void) {
         kprintf("compositor: no frame thread; composing inline\n");
 }
 
+/* The rects of (pid,id)'s content the compositor drags it by; n 0 clears. */
+int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n) {
+    if (n > COMP_DRAG_REGIONS) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
+    w->drag_n = 0;
+    for (unsigned k = 0; k < n; k++) {
+        /* clipped to the content, not refused for reaching past it: the part
+         * inside the window is a perfectly good place to hold it by */
+        int64_t x0 = rects[k][0], y0 = rects[k][1];
+        int64_t x1 = x0 + rects[k][2], y1 = y0 + rects[k][3];
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > (int64_t)w->cw) x1 = w->cw; if (y1 > (int64_t)w->ch) y1 = w->ch;
+        if (x1 <= x0 || y1 <= y0) continue;
+        int16_t *r = w->drag_r[w->drag_n++];
+        r[0] = (int16_t)x0; r[1] = (int16_t)y0; r[2] = (int16_t)(x1 - x0); r[3] = (int16_t)(y1 - y0);
+    }
+    int taken = w->drag_n;
+    comp_unlock();
+    return taken;
+}
+
 /* `perf windows`: where every visible titled window is, for a test that drags
  * one and wants to know it came back. */
 void compositor_print_windows(void) {
@@ -3670,7 +3721,9 @@ void compositor_print_windows(void) {
         char name[COMP_TITLE_MAX + 1]; int k = 0;
         for (; w->title[k] && k < COMP_TITLE_MAX; k++) name[k] = w->title[k] == ' ' ? '_' : w->title[k];
         name[k] = 0;
-        kprintf("perf: window title=%s x=%d y=%d w=%u h=%u\n", name, (int)w->x, (int)w->y, w->cw, w->ch);
+        kprintf("perf: window title=%s x=%d y=%d w=%u h=%u drag_n=%u drag0=%d,%d,%d,%d\n", name, (int)w->x, (int)w->y,
+                w->cw, w->ch, (unsigned)w->drag_n, w->drag_n ? w->drag_r[0][0] : 0, w->drag_n ? w->drag_r[0][1] : 0,
+                w->drag_n ? w->drag_r[0][2] : 0, w->drag_n ? w->drag_r[0][3] : 0);
     }
     comp_unlock();
     kprintf("perf: end\n");

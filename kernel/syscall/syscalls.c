@@ -1954,6 +1954,17 @@ static int64_t sys_win_frame(const struct sysargs *a) {
     if (a->arg[0] && copy_to_user((void *)(uintptr_t)a->arg[0], &fi, sizeof fi)) return -EMBK_EFAULT;
     return 0;
 }
+/* arg 0 = win id, arg 1 = int32_t (*)[4] rects (content-local x, y, w, h),
+ * arg 2 = how many (at most 4). */
+static int64_t sys_win_drag_regions(const struct sysargs *a) {
+    int32_t rects[4][4];
+    unsigned n = (unsigned)a->arg[2];
+    if (n > 4) return -EMBK_EINVAL;
+    if (n && copy_from_user(rects, (const void *)(uintptr_t)a->arg[1], n * sizeof rects[0]) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return compositor_win_drag_regions(current_process ? (int)current_process->pid : -1,
+                                       (uint32_t)a->arg[0], (const int32_t (*)[4])rects, n);
+}
 /* arg 0 = the rate (mHz) this process's motion wants; 0: the display's top. */
 static int64_t sys_win_frame_rate(const struct sysargs *a) {
     return compositor_frame_rate(current_process ? (int)current_process->pid : 0, (uint32_t)a->arg[0]);
@@ -2947,6 +2958,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_ui_wait] = sys_ui_wait,
     [SYS_win_frame] = sys_win_frame,
     [SYS_win_frame_rate] = sys_win_frame_rate,
+    [SYS_win_drag_regions] = sys_win_drag_regions,
     [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_win_focused] = sys_win_focused,
     [SYS_win_set_material] = sys_win_set_material,

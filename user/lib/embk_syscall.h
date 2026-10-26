@@ -218,6 +218,7 @@
 #define EMBK_SYS_ui_wait 161
 #define EMBK_SYS_win_frame 162
 #define EMBK_SYS_win_frame_rate 163
+#define EMBK_SYS_win_drag_regions 164
 
 
 
