@@ -255,6 +255,115 @@ static int screen_witness(void) {
     if(tcsetattr(0,TCSANOW,&saved))return 42;
     puts("Alternate screen restored.");return 0;
 }
+/* --xterm: what a program sees of the terminal it runs in. A card of what the
+ * screen model draws (attributes, underline styles and colours, the palettes,
+ * truecolour, wide characters and marks, a link), the terminal's answers to
+ * the questions programs ask it -- each checked -- a line long enough to
+ * reflow, and then mouse and focus events as they arrive. q ends it. */
+static size_t reply(char *out,size_t cap) {
+    size_t n=0;
+    for (int waited=0;waited<2000 && n+1<cap;) {
+        if (!(embk_fd_poll(0,EMBK_POLLIN)&EMBK_POLLIN)) {embk_sleep_ms(5);waited+=5;continue;}
+        unsigned char c;if (read(0,&c,1)!=1) break;
+        out[n++]=(char)c;out[n]=0;
+        if (n>=3 && out[0]==27 && out[1]=='[' && c>=0x40 && c<=0x7e) break;
+        if (n>=3 && out[0]==27 && (out[1]=='P' || out[1]==']') && (c==7 || (c=='\\' && out[n-2]==27))) break;
+    }
+    out[n]=0;
+    return n;
+}
+static int verified;
+static void ask(const char *what,const char *query,bool ok_when(const char *),const char *about) {
+    char got[512];
+    printf("%s",query);fflush(stdout);
+    reply(got,sizeof got);
+    bool ok=ok_when(got);verified+=ok;
+    char shown[96];size_t k=0;
+    for (const char *p=got;*p && k+5<sizeof shown;p++) k+=(size_t)snprintf(shown+k,sizeof shown-k,(unsigned char)*p<32?"^%c":"%c",(unsigned char)*p<32?*p+64:*p);
+    printf("  %-22s %s  %s%s\r\n",what,ok?"\033[32mok\033[m":"\033[31mWRONG\033[m",about,ok?"":shown);
+}
+static bool is_da1(const char *s) {return !strcmp(s,"\033[?62;22c");}
+static bool is_da2(const char *s) {return !strcmp(s,"\033[>1;10;0c");}
+static bool is_version(const char *s) {return !strcmp(s,"\033P>|EmbLinkTerminal(1.0)\033\\");}
+static bool is_mode(const char *s) {return !strcmp(s,"\033[?2004;2$y");}
+static bool is_colour(const char *s) {return !strncmp(s,"\033]10;rgb:",9) && strlen(s)==9+14+2;}
+static bool is_tn(const char *s) {
+    const char *want="xterm-256color",*p=strstr(s,"\033P1+r544e=");
+    if (!p) return false;
+    p+=10;
+    for (;*want;want++,p+=2) {
+        unsigned v;
+        if (sscanf(p,"%2x",&v)!=1 || v!=(unsigned char)*want) return false;
+    }
+    return !strcmp(p,"\033\\");
+}
+static struct winsize g_size;
+static bool is_size(const char *s) {
+    char want[32];snprintf(want,sizeof want,"\033[8;%u;%ut",g_size.ws_row,g_size.ws_col);
+    return !strcmp(s,want);
+}
+static int xterm_witness(void) {
+    struct termios saved,t;
+    if (tcgetattr(0,&saved) || ioctl(0,TIOCGWINSZ,&g_size)) {puts("A terminal session is required.");return 60;}
+    t=saved;cfmakeraw(&t);if (tcsetattr(0,TCSANOW,&t)) return 61;
+    const char *term=getenv("TERM"),*colour=getenv("COLORTERM");
+    printf("\033[1;38;2;115;210;188mEmbLink xterm check\033[m  TERM=%s COLORTERM=%s\r\n",term?term:"(unset)",colour?colour:"(unset)");
+    printf("Attributes: \033[1mbold\033[m \033[2mdim\033[m \033[3mitalic\033[m \033[9mstrike\033[m "
+           "\033[7minverse\033[m \033[53moverline\033[m \033[8mhidden\033[m\r\n");
+    printf("Underlines: \033[4msingle\033[m \033[21mdouble\033[m \033[4:3;58:2::255:95:95mcurly\033[m "
+           "\033[4:4;58:5:39mdotted\033[m \033[4:5mdashed\033[m\r\n");
+    printf("16 colours: ");
+    for (int i=0;i<16;i++) printf("\033[48;5;%dm   ",i);
+    printf("\033[m\r\n256 colours:");
+    for (int i=0;i<36;i++) printf("\033[48;5;%dm ",16+i*6);
+    for (int i=0;i<12;i++) printf("\033[48;5;%dm ",232+i*2);
+    printf("\033[m\r\nTruecolour: ");
+    for (int i=0;i<48;i++) printf("\033[48;2;%d;%d;%dm ",255*i/47,96+i*2,255-255*i/47);
+    printf("\033[m\r\nWide, marks: \xe7\x95\x8c\xe9\x9d\xa2 caf\xc3\xa9 e\xcc\x81 \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90 \xce\xa9\r\n");
+    printf("Link:       \033]8;id=docs;https://emblink.invalid/docs\033\\\033[4mEmbLink docs\033[24m\033]8;;\033\\ (OSC 8)\r\n");
+    printf("What the terminal answers:\r\n");
+    verified=0;
+    ask("DA1 (CSI c)","\033[c",is_da1,"a VT220 with ANSI colour");
+    ask("DA2 (CSI > c)","\033[>c",is_da2,"secondary attributes");
+    ask("XTVERSION","\033[>q",is_version,"EmbLinkTerminal(1.0)");
+    ask("DECRQM 2004","\033[?2004$p",is_mode,"bracketed paste: reset");
+    ask("OSC 10 query","\033]10;?\033\\",is_colour,"the default foreground");
+    ask("XTGETTCAP TN","\033P+q544e\033\\",is_tn,"xterm-256color");
+    ask("CSI 18 t","\033[18t",is_size,"rows and columns, as TIOCGWINSZ");
+    printf("Terminal replies verified: %d/7\r\n",verified);
+    printf("Reflow: ");
+    for (int i=0;i<20;i++) printf("<%02d-456789>",i);
+    printf("<END>\r\n");
+    printf("Mouse and focus: click, scroll or switch windows; q quits.\r\n");
+    printf("\033[?1000h\033[?1006h\033[?1004h");fflush(stdout);
+    static const char *const names[3]={"left","middle","right"};
+    char seq[64];unsigned n=0;int state=0;
+    for (;;) {
+        if (embk_cancelled()) break;
+        if (!(embk_fd_poll(0,EMBK_POLLIN)&EMBK_POLLIN)) {embk_sleep_ms(10);continue;}
+        unsigned char c;if (read(0,&c,1)!=1) break;
+        if (state==0) {
+            if (c==27) {state=1;continue;}
+            if (c=='q' || c==3) break;
+            continue;
+        }
+        if (state==1) {state=c=='['?2:0;n=0;continue;}
+        if (n+1<sizeof seq) seq[n++]=(char)c;
+        if (c<0x40 || c>0x7e) continue;
+        seq[n]=0;state=0;
+        int b,x,y;char kind;
+        if (sscanf(seq,"<%d;%d;%d%c",&b,&x,&y,&kind)==4) {
+            if (b&64) printf("Mouse: wheel %s at column %d, row %d\r\n",b&1?"down":"up",x,y);
+            else printf("Mouse: %s %s at column %d, row %d\r\n",names[(b&3)<3?(b&3):0],kind=='M'?"pressed":"released",x,y);
+        } else if (!strcmp(seq,"I")) printf("Focus: regained\r\n");
+        else if (!strcmp(seq,"O")) printf("Focus: lost\r\n");
+        fflush(stdout);
+    }
+    printf("\033[?1004l\033[?1006l\033[?1000l");fflush(stdout);
+    if (tcsetattr(0,TCSANOW,&saved)) return 62;
+    puts("xterm check done.");
+    return verified==7?0:63;
+}
 /* Throughput: the emulator drains a 4 KiB PTY queue, so how fast this loop
  * finishes is how fast the terminal parses and keeps up. Coloured lines, as
  * real output is; the frame count to compare with is in Terminal's probe. */
@@ -274,6 +383,7 @@ static int bench(const char *megabytes) {
 int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--bench")) return bench(argc>2?argv[2]:NULL);
     if (argc>1 && !strcmp(argv[1],"--screen")) return screen_witness();
+    if (argc>1 && !strcmp(argv[1],"--xterm")) return xterm_witness();
     if (argc>1 && !strcmp(argv[1],"--selftest")) return selftest();
     if (argc>1) return child(argv[1]);
     return interactive();

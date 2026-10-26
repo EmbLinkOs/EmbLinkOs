@@ -36,6 +36,8 @@ static int g_key_modifiers,g_key_code,g_key_flags,g_key_only_wanted;
 int em_key_modifiers(void) { return g_key_modifiers; }
 int em_key_code(void) { return g_key_code; }
 int em_key_flags(void) { return g_key_flags; }
+static uint32_t g_pointer_buttons;
+int em_pointer_buttons(void) { return (int)g_pointer_buttons; }
 void em_key_hook_wants_key_only(int on) { g_key_only_wanted=on; }
 void em_set_close_hook(int (*fn)(void)) { g_em_close_hook=fn; }
 static float g_viewport_w;   /* mirrored into em.c via em_set_viewport */
@@ -523,6 +525,7 @@ int em_app_run(const EmApp *app) {
                                                  * the terminal's pipe poll */
         struct embk_win_input in;
         embk_win_input(&in);
+        g_pointer_buttons=in.focused?in.buttons:0;
 
         if(em_now_ms()>=screen_next) {
             screen_next=em_now_ms()+200;uint32_t nsw=0,nsh=0;embk_screen_size(&nsw,&nsh);
@@ -1052,6 +1055,7 @@ int em_widget_run(const EmWidget *wg) {
     for (;;) {
         struct embk_win_input in;
         embk_win_input(&in);
+        g_pointer_buttons=in.focused?in.buttons:0;
         int input_edge = in.focused != prev_in.focused ||
                          (in.focused && (in.x != prev_in.x || in.y != prev_in.y ||
                                          in.buttons != prev_in.buttons));

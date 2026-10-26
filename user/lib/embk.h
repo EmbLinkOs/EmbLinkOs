@@ -1048,6 +1048,10 @@ static inline int embk_key_poll_input(void) {
 static inline int64_t embk_key_poll_key(void) {
     return embk_syscall0(EMBK_SYS_key_poll_key);
 }
+/* 1 while this process's window has the keyboard (keys go to it), else 0. */
+static inline int embk_win_focused(void) {
+    return embk_syscall0(EMBK_SYS_win_focused)==1;
+}
 static inline int embk_key_mods(void) {
     return (int)embk_syscall0(EMBK_SYS_key_mods);
 }

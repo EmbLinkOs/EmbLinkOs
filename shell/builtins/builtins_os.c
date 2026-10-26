@@ -1152,7 +1152,7 @@ static struct value bi_clear(const struct command *cmd, struct value input,
     (void)cmd; (void)env;
     value_free(&input);
     const char *term=getenv("TERM");
-    if (term && !strncmp(term,"emlink",6)) write(1,"\033[2J\033[H\033[3J",11);
+    if (term && term[0] && strcmp(term,"dumb")) write(1,"\033[2J\033[H\033[3J",11);
     else write(1,"\f",1);
     return value_null();
 }

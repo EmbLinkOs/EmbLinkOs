@@ -108,8 +108,8 @@ def sgr(params, st):
 
 
 def attrs_of(st, palette):
-    """Attribute letters in vt_dump's order: B D I U<style> R H S, then K O and
-    the underline colour, which the model does not keep yet."""
+    """Attribute letters in vt_dump's order: B D I U<style> R H S K O, then
+    C<rrggbb> for an underline's own colour."""
     out = ''.join(c for c in 'BDI' if c in st['attrs'])
     if st['ulstyle']:
         out += f"U{st['ulstyle']}"

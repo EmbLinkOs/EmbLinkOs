@@ -76,7 +76,9 @@ static int cx(void) { return vt_active(&term)->cursor.x; }
 static int cy(void) { return vt_active(&term)->cursor.y; }
 
 static void start(int cols, int rows, enum edit_mode mode) {
-    vt_init(&term, cols, rows, from_screen, NULL);
+    static bool live;
+    if (live) vt_free(&term);
+    live = vt_init(&term, cols, rows, from_screen, NULL);
     nreplies = 0;
     struct edit_prompt p = { "\033]133;A;edit=shell;cwd=/home\007", "\033[1;36m$\033[0m ", "\033[2m>\033[0m ",
                              "\033]133;B\007", use_home ? "\033]133;R\007" : NULL };

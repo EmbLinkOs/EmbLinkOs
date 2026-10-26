@@ -20,12 +20,22 @@
 #define TERM_PROBE_TEXT    65536                /* one screen as UTF-8 */
 #define TERM_PROBE_CELLS   16384                /* cols*rows of the shown screen */
 
-/* One cell of the shown screen: its own colours, VT_DEFAULT (0xffffffff) where
- * the profile's default applies, and the VT_* attribute bits. */
+/* One cell of the shown screen: its first codepoint, its colours resolved to
+ * 0xRRGGBB -- TERM_PROBE_DEFAULT where the profile's default applies -- and
+ * TERM_PROBE_CELL_* attribute bits. */
 struct term_probe_cell {
     uint32_t rune, fg, bg;
     uint8_t width, flags, pad[2];
 };
+#define TERM_PROBE_DEFAULT        0xffffffffu
+#define TERM_PROBE_CELL_BOLD      0x01u
+#define TERM_PROBE_CELL_DIM       0x02u
+#define TERM_PROBE_CELL_ITALIC    0x04u
+#define TERM_PROBE_CELL_UNDERLINE 0x08u   /* any underline style */
+#define TERM_PROBE_CELL_INVERSE   0x10u
+#define TERM_PROBE_CELL_HIDDEN    0x20u
+#define TERM_PROBE_CELL_STRIKE    0x40u
+#define TERM_PROBE_CELL_BLINK     0x80u
 
 /* flags: how the line is being edited right now. */
 #define TERM_PROBE_LOCAL_EDIT   1u   /* Terminal edits the line itself (a shell without edit=shell) */

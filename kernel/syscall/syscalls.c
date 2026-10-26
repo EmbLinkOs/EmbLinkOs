@@ -1581,6 +1581,13 @@ static int64_t sys_key_poll_key(const struct sysargs *a) {
     if(focus && current_process && current_process->pid!=focus)return 0;
     return (int64_t)keyboard_poll_key();
 }
+/* Whether the caller's window is the one keys go to: a terminal tells the
+ * program in it (DECSET 1004) when it gains and loses the keyboard. */
+static int64_t sys_win_focused(const struct sysargs *a) {
+    (void)a;
+    uint32_t focus=compositor_focused_pid();
+    return focus && current_process && current_process->pid==focus;
+}
 static int64_t sys_key_poll(const struct sysargs *a) {
     (void)a;
     /* Keys belong to the FRONT window's process. The character queue is a
@@ -2899,6 +2906,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_place] = sys_win_place,
     [SYS_win_where] = sys_win_where,
     [SYS_key_poll_key] = sys_key_poll_key,
+    [SYS_win_focused] = sys_win_focused,
     [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -3064,7 +3072,7 @@ int64_t syscall_invoke(const struct sysargs *a) {
     if(caller && !session_ui_allowed(caller->pid)) {
         switch(a->nr) {
         case SYS_ui_present:case SYS_ui_present_rect:case SYS_ui_input:
-        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:case SYS_key_poll_key:
+        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:case SYS_key_poll_key:case SYS_win_focused:
         case SYS_win_input:case SYS_screen_read:case SYS_clip_set:case SYS_clip_get:
             return -EMBK_EPERM;
         case SYS_read:if(a->arg[0]==0)return -EMBK_EPERM;break;

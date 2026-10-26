@@ -429,7 +429,7 @@ ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
                  $(wildcard user/audio/mp3/*.c)) \
                user/audio/resample.c
 
-ARM_XSRC_term     := user/terminal/vt.c shell/edit/wcwidth.c
+ARM_XSRC_term     := user/terminal/vt_grid.c user/terminal/vt_parse.c user/terminal/vt_keys.c shell/edit/wcwidth.c
 $(ARM_USER)/term.o: user/terminal/vt.h
 
 ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \

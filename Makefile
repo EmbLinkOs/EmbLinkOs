@@ -1696,15 +1696,19 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
-# Terminal's screen parser/model is pure userspace and separately host-tested.
-build/vt.o: user/terminal/vt.c user/terminal/vt.h shell/edit/wcwidth.h | $(BUILD)
+# Terminal's screen model (grid, parser, key encoders) is pure userspace and
+# separately host-tested.
+VT_SRC  := user/terminal/vt_grid.c user/terminal/vt_parse.c user/terminal/vt_keys.c
+VT_HDRS := user/terminal/vt.h user/terminal/vt_internal.h shell/edit/wcwidth.h
+VT_OBJS := $(patsubst user/terminal/%.c,build/%.o,$(VT_SRC))
+$(VT_OBJS): build/%.o: user/terminal/%.c $(VT_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
 # The cell width table the shell's editor uses too: one table, both sides.
 build/wcwidth.o: shell/edit/wcwidth.c shell/edit/wcwidth.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/term.o: user/terminal/vt.h
-build/term.elf: build/term.o build/vt.o build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o build/vt.o build/wcwidth.o \
+build/term.o: user/terminal/vt.h user/apps/term/term_probe.h
+build/term.elf: build/term.o $(VT_OBJS) build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o $(VT_OBJS) build/wcwidth.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Photos -- the picture viewer. Like vellum it needs more than one object, so
@@ -2702,14 +2706,17 @@ compile-commands:
 
 .PHONY: terminal-screen-test
 terminal-screen-test: | $(BUILD)
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test
 	$(BUILD)/vt_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test_asan
+	$(BUILD)/vt_test_asan --fuzz 20000
 
 .PHONY: terminal-golden-test
 # Real programs' output (tests/tty/golden, made by tools/record_golden.py on a
 # Mac) replayed into the screen model and compared with tmux, cell by cell.
 terminal-golden-test: | $(BUILD)
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c shell/edit/wcwidth.c tests/tty/vt_dump.c -o $(BUILD)/vt_dump
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_dump.c -o $(BUILD)/vt_dump
 	python3 tools/golden_terminal.py $(BUILD)/vt_dump
 
 .PHONY: terminal-test
@@ -2730,7 +2737,7 @@ shell-test:
 	    shell/test/host_test.c -o $(BUILD)/shell_test
 	$(BUILD)/shell_test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
-	    shell/edit/edit.c shell/edit/wcwidth.c shell/hist/hist.c user/terminal/vt.c \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/hist/hist.c $(VT_SRC) \
 	    shell/test/edit_test.c -o $(BUILD)/edit_test
 	$(BUILD)/edit_test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell \

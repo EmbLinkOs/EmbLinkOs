@@ -750,6 +750,10 @@ int em_key_modifiers(void);
  * hook can tell Up from Ctrl+S, which are the same byte. */
 int em_key_code(void);
 int em_key_flags(void);
+/* The mouse buttons held (EMBK_MOUSE_LEFT|RIGHT|MIDDLE) while the pointer is
+ * over this window's content, as of this frame; 0 elsewhere. The toolkit's
+ * own widgets answer to the left one only; a terminal reports all three. */
+int em_pointer_buttons(void);
 /* Keys with no character (F1-F12, Insert, Menu) reach the key hook as
  * EM_KEY_ONLY|code only after an app asks for them: a hook written for
  * characters must never see a value it would misread as one. */

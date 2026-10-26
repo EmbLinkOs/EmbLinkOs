@@ -405,12 +405,13 @@ int main(int argc, char **argv) {
         g_console_session = 1;
     }
 
-    /* Colour is opt-IN by the display: the GUI terminal names itself via
-     * TERM=emlink and parses SGR; the serial console and plain pipes never
-     * see an escape byte. The same contract Linux uses (TERM decides). */
+    /* Colour is opt-IN by the display: the GUI terminal says what it is
+     * (TERM=xterm-256color) and parses SGR; the serial console and plain
+     * pipes never see an escape byte. The same contract Linux uses: TERM
+     * decides, and an unset TERM or "dumb" means no escapes. */
     {
         const char *t = getenv("TERM");
-        if (!g_console_session && t && strncmp(t, "emlink", 6) == 0)
+        if (!g_console_session && t && t[0] && strcmp(t, "dumb") != 0)
             sval_set_colour(1);
     }
 
