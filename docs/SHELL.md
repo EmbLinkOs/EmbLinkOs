@@ -60,6 +60,8 @@ shell/
   edit/      the line editor (pure: bytes in, screen bytes out) and the cell
              width table it shares with the Terminal's screen model (§10).
   complete/  what Tab offers: builtins, defs, programs, $names, files.
+  prompt/    the prompt's options (`prompt set`) and the prompt built from
+             them (pure, §10 "The prompt").
   main.c     the REPL / -c driver (shell.elf).
   test/      host tests (make shell-test) + host stubs for the OS pieces.
 ```
@@ -75,7 +77,7 @@ shell/
   `complete_test.c`) then `test shell`, `test extern` and `test shellio` at
   the kernel serial console (live: spawn, console fds, readdir/stat, exit
   codes). `test embbuild shell` rebuilds the shell ON the OS with tcc from
-  `/data/src/shell` (`shell/build.ebm`: fifteen units, linked with tcc's
+  `/data/src/shell` (`shell/build.ebm`: sixteen units, linked with tcc's
   `libtcc1.o`, which carries `__va_start`), checks it, adopts it as
   `/system/bin/shell.elf` and checks it again. A new source file goes in
   four lists: `SHELL_OBJS` (Makefile), `ARM_SHELL_SRC` (aarch64 arch.mk),
@@ -648,6 +650,52 @@ resized during a prompt, the Terminal erases from the prompt's first row,
 resizes, and sends `CSI 48;rows;cols;height;width t`; the editor redraws from
 that row at the new width, so a wrapped prompt is never left behind as a
 reflowed duplicate.
+
+### The prompt
+
+`~/.config/shell/rc.esh` is read when a shell starts for a person -- in the
+Terminal or on the console -- and not for a script or `-c`. It is an ordinary
+program run in the session's scope, so its `let`s and `def`s stay. A mistake
+in it is printed, and the shell starts anyway.
+
+The prompt is configured with the `prompt` builtin, usually from `rc.esh`.
+Options live for the session.
+
+```
+prompt                          the options, as a table {key, value}
+prompt set KEY VALUE...         set one; several words are one value
+prompt get KEY                  its value, or null
+prompt unset KEY                forget it
+prompt reset                    forget them all
+```
+
+A key is lower-case words joined by dots (`dir.anchor.fg`). It may be quoted,
+and so may a value (`prompt set char "❯"`). The names follow Powerlevel10k's
+parameters, so a configuration reads the same way. Options the prompt does
+not use yet are kept. The prompt uses these now:
+
+| Option | Values | Default |
+|---|---|---|
+| `char` | the prompt character | `$` |
+| `right` | what the right side shows, in order: `status` (✔, or ✘ and the code), `duration` (the last command's, `3s` / `1m 5s` / `1h 2m 3s`), `time` | nothing |
+| `duration.threshold` | seconds a command must run for its duration to show | `3` |
+| `time.format` | `24h` or `12h` | `24h` |
+| `transient` | `off`, `always`, or `same-dir` (not right after the directory changed): an accepted line keeps only the prompt character, green or red by how the last command went | `off` |
+
+The editor draws the **right side** against the edge, one column in, on the
+row where the typing starts, as zsh's RPROMPT. It stays out of the way: while
+the typing would come within a column of it, it is not drawn. A **transient
+prompt** replaces the whole prompt once Enter accepts the line, so the
+scrollback shows the commands rather than every full prompt. A prompt built
+for one width is built again when the window is resized
+(`edit_host.reprompt`).
+
+```
+# ~/.config/shell/rc.esh
+prompt set right status duration time
+prompt set time.format 12h
+prompt set transient always
+```
 
 ### `$status`
 

@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-179 actual EmbLinkOS captures document the original laptop work, its
+181 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,23 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: a real Terminal, key by key
+## Latest: the prompt, Powerlevel10k-style
+
+With the terminal real, the prompt that runs in it: the system the Mac's Powerlevel10k setup is built on, here in the native shell. First the plumbing -- `~/.config/shell/rc.esh` read by every shell a person types into, the `prompt` builtin setting options by Powerlevel10k's names, a right side the editor keeps out of the typing's way, and a transient prompt ([SHELL.md](../../SHELL.md#the-prompt)).
+
+### A right side, and the short way
+
+rc.esh, read by the new tab's shell, gives the prompt a right side -- the last command's status (✘ and its code), its duration past three seconds, the time -- and a transient prompt: lines already run keep only the prompt character, green or red by how the command before went.
+
+![A right side, and the short way in EmbLinkOS](180-prompt-right-side.png)
+
+### The prompt’s options, as commands
+
+`prompt` lists the options rc.esh set; `prompt set transient off` from the prompt itself puts the full prompt back, the right side kept as zsh keeps its RPROMPT.
+
+![The prompt’s options, as commands in EmbLinkOS](181-prompt-options.png)
+
+## A real Terminal, key by key
 
 The Terminal is being rebuilt into a real one -- then a Powerlevel10k-style prompt system on top (docs/TODO.md has the roadmap). First, keys: the character stream cannot tell Up from Ctrl+S (both 0x13) or Backspace from Ctrl+H, and F1-F12 never arrived at all. The kernel queue now records which key made every byte, USB keyboards are decoded like PS/2 ones, and the Terminal encodes keys exactly as xterm does. See [TERMINAL.md](../../TERMINAL.md#keys).
 

@@ -39,7 +39,10 @@ Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
 - [ ] A profile is the window's: its tabs cannot each have their own (Terminal.app allows it).
 - [ ] Two font families (Meslo NF, DejaVu Sans Mono): Preferences lists what the image ships, not any font
       file; no audible bell (a profile's audible bell is shown as the visual one).
-- [ ] M8-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
+- [x] M8 Shell plumbing for the prompt: `~/.config/shell/rc.esh` read by interactive shells, the `prompt`
+      builtin (options by Powerlevel10k's names), the editor's right prompt and transient prompt, a prompt
+      built again for a new width; the Terminal passes the system's TZ so the prompt's clock agrees.
+- [ ] M9-M12 Prompt engine, git status daemon, `prompt configure` wizard, autosuggestions, highlighting.
 - [ ] Split panes (after M12).
 - [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
 - [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not
