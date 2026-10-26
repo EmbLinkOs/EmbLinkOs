@@ -1,5 +1,5 @@
 # /data/src/shell/build.ebm -- v2: THE SHELL REBUILDS THE SHELL (BUILD.md §3).
-# Twenty-five units, one link (with TCC's own runtime, libtcc1.o: va_start and
+# Twenty-six units, one link (with TCC's own runtime, libtcc1.o: va_start and
 # the 64-bit float conversions are calls under TCC), and DELIBERATELY NO install stanza: shell.elf lives
 # in /system/bin, which is sealed -- EmbBuild stages, and ADOPTION is a
 # separate act (snapshot, copy, reboot) performed by the system, not by the
@@ -10,7 +10,7 @@ project: shell
 
 name: main.o
 kind: compile
-inputs: /data/src/shell/main.c /data/src/shell/lex/lex.h /data/src/shell/parse/parse.h /data/src/shell/eval/eval.h /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h /data/src/shell/hist/hist.h /data/src/shell/eval/exec.h /data/src/shell/edit/edit.h /data/src/shell/complete/complete.h /data/src/shell/prompt/prompt.h /data/src/shell/prompt/p10k.h /data/src/shell/prompt/prompt_os.h /data/src/shell/prompt/wizard_os.h /system/abi/include/embk.h /system/abi/include/embk_syscall.h
+inputs: /data/src/shell/main.c /data/src/shell/lex/lex.h /data/src/shell/parse/parse.h /data/src/shell/eval/eval.h /data/src/shell/sval/sval.h /data/src/shell/value/value.h /data/src/shell/wire/wire.h /data/src/shell/hist/hist.h /data/src/shell/eval/exec.h /data/src/shell/edit/edit.h /data/src/shell/complete/complete.h /data/src/shell/complete/highlight.h /data/src/shell/prompt/prompt.h /data/src/shell/prompt/p10k.h /data/src/shell/prompt/prompt_os.h /data/src/shell/prompt/wizard_os.h /system/abi/include/embk.h /system/abi/include/embk_syscall.h
 args: /data/apps/tcc/tcc.elf -c -I/data/src/shell -I/system/abi/include /data/src/shell/main.c -o /data/build/out/shell/main.o
 output: /data/build/out/shell/main.o
 
@@ -134,6 +134,12 @@ inputs: /data/src/shell/complete/complete.c /data/src/shell/complete/complete.h 
 args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/complete/complete.c -o /data/build/out/shell/complete.o
 output: /data/build/out/shell/complete.o
 
+name: highlight.o
+kind: compile
+inputs: /data/src/shell/complete/highlight.c /data/src/shell/complete/highlight.h /data/src/shell/edit/edit.h /data/src/shell/lex/lex.h /data/src/shell/builtins/builtins.h /data/src/shell/eval/eval.h /data/src/shell/eval/exec.h /data/src/shell/value/value.h
+args: /data/apps/tcc/tcc.elf -c -I/data/src/shell /data/src/shell/complete/highlight.c -o /data/build/out/shell/highlight.o
+output: /data/build/out/shell/highlight.o
+
 name: hist.o
 kind: compile
 inputs: /data/src/shell/hist/hist.c /data/src/shell/hist/hist.h
@@ -160,6 +166,6 @@ output: /data/build/out/shell/wire.o
 
 name: shell.elf
 kind: link
-inputs: /data/build/out/shell/main.o /data/build/out/shell/lex.o /data/build/out/shell/parse.o /data/build/out/shell/eval.o /data/build/out/shell/eval_extern.o /data/build/out/shell/builtins.o /data/build/out/shell/builtins_os.o /data/build/out/shell/exec.o /data/build/out/shell/edit.o /data/build/out/shell/wcwidth.o /data/build/out/shell/complete.o /data/build/out/shell/prompt.o /data/build/out/shell/p10k.o /data/build/out/shell/p10k_zsh.o /data/build/out/shell/p10k_render.o /data/build/out/shell/p10k_import.o /data/build/out/shell/icons.o /data/build/out/shell/colors.o /data/build/out/shell/prompt_os.o /data/build/out/shell/wizard.o /data/build/out/shell/wizard_os.o /data/build/out/shell/hist.o /data/build/out/shell/sval.o /data/build/out/shell/value.o /data/build/out/shell/wire.o /system/abi/libtcc1.o
-args: /data/apps/tcc/tcc.elf -static -nostdlib /system/abi/crt0.o /system/abi/syscalls.o /data/build/out/shell/main.o /data/build/out/shell/lex.o /data/build/out/shell/parse.o /data/build/out/shell/eval.o /data/build/out/shell/eval_extern.o /data/build/out/shell/builtins.o /data/build/out/shell/builtins_os.o /data/build/out/shell/exec.o /data/build/out/shell/edit.o /data/build/out/shell/wcwidth.o /data/build/out/shell/complete.o /data/build/out/shell/prompt.o /data/build/out/shell/p10k.o /data/build/out/shell/p10k_zsh.o /data/build/out/shell/p10k_render.o /data/build/out/shell/p10k_import.o /data/build/out/shell/icons.o /data/build/out/shell/colors.o /data/build/out/shell/prompt_os.o /data/build/out/shell/wizard.o /data/build/out/shell/wizard_os.o /data/build/out/shell/hist.o /data/build/out/shell/sval.o /data/build/out/shell/value.o /data/build/out/shell/wire.o /system/abi/libtcc1.o -lc -o /data/build/out/shell/shell.elf
+inputs: /data/build/out/shell/main.o /data/build/out/shell/lex.o /data/build/out/shell/parse.o /data/build/out/shell/eval.o /data/build/out/shell/eval_extern.o /data/build/out/shell/builtins.o /data/build/out/shell/builtins_os.o /data/build/out/shell/exec.o /data/build/out/shell/edit.o /data/build/out/shell/wcwidth.o /data/build/out/shell/complete.o /data/build/out/shell/highlight.o /data/build/out/shell/prompt.o /data/build/out/shell/p10k.o /data/build/out/shell/p10k_zsh.o /data/build/out/shell/p10k_render.o /data/build/out/shell/p10k_import.o /data/build/out/shell/icons.o /data/build/out/shell/colors.o /data/build/out/shell/prompt_os.o /data/build/out/shell/wizard.o /data/build/out/shell/wizard_os.o /data/build/out/shell/hist.o /data/build/out/shell/sval.o /data/build/out/shell/value.o /data/build/out/shell/wire.o /system/abi/libtcc1.o
+args: /data/apps/tcc/tcc.elf -static -nostdlib /system/abi/crt0.o /system/abi/syscalls.o /data/build/out/shell/main.o /data/build/out/shell/lex.o /data/build/out/shell/parse.o /data/build/out/shell/eval.o /data/build/out/shell/eval_extern.o /data/build/out/shell/builtins.o /data/build/out/shell/builtins_os.o /data/build/out/shell/exec.o /data/build/out/shell/edit.o /data/build/out/shell/wcwidth.o /data/build/out/shell/complete.o /data/build/out/shell/highlight.o /data/build/out/shell/prompt.o /data/build/out/shell/p10k.o /data/build/out/shell/p10k_zsh.o /data/build/out/shell/p10k_render.o /data/build/out/shell/p10k_import.o /data/build/out/shell/icons.o /data/build/out/shell/colors.o /data/build/out/shell/prompt_os.o /data/build/out/shell/wizard.o /data/build/out/shell/wizard_os.o /data/build/out/shell/hist.o /data/build/out/shell/sval.o /data/build/out/shell/value.o /data/build/out/shell/wire.o /system/abi/libtcc1.o -lc -o /data/build/out/shell/shell.elf
 output: /data/build/out/shell/shell.elf

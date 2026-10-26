@@ -65,6 +65,30 @@ enum edit_result {
  * keeps the commands, not every full prompt. All may be NULL. */
 struct edit_prompt { const char *mark, *text, *more, *after, *home, *right, *transient; };
 
+/* COLOURS, as the two zsh plugins a Mac's shell has draw them. A highlighter
+ * says how each byte of the line is drawn, as these bits: a colour (EDIT_FG:
+ * the palette's index + 1; 0 is the terminal's own), bold, underline. The
+ * EDIT_HL_* are zsh-syntax-highlighting's default styles, by its names. The
+ * editor itself suggests the rest of the newest history line that starts
+ * with what is typed, as zsh-autosuggestions does, and draws it
+ * EDIT_SUGGESTION: Right, End, Ctrl+F or Ctrl+E at the end take it, Alt+F or
+ * Ctrl+Right its next word. */
+#define EDIT_FG(n)            ((unsigned char)((n) + 1))
+#define EDIT_FG_MASK          0x1f
+#define EDIT_BOLD             0x20
+#define EDIT_UNDERLINE        0x40
+#define EDIT_HL_DEFAULT       0
+#define EDIT_HL_UNKNOWN       (EDIT_FG(1) | EDIT_BOLD)   /* unknown-token: fg=red,bold */
+#define EDIT_HL_RESERVED      EDIT_FG(3)                /* reserved-word: fg=yellow */
+#define EDIT_HL_COMMAND       EDIT_FG(2)                /* arg0 -- builtin, function, command: fg=green */
+#define EDIT_HL_PATH          EDIT_UNDERLINE            /* path, path_prefix: underline */
+#define EDIT_HL_SUBSTITUTION  EDIT_FG(5)                /* command-substitution-delimiter: fg=magenta */
+#define EDIT_HL_QUOTED        EDIT_FG(3)                /* single- and double-quoted-argument: fg=yellow */
+#define EDIT_HL_ESCAPE        EDIT_FG(6)                /* back-double-quoted-argument: fg=cyan */
+#define EDIT_HL_REDIRECTION   EDIT_FG(3)                /* redirection: fg=yellow */
+#define EDIT_HL_COMMENT       (EDIT_FG(0) | EDIT_BOLD)   /* comment: fg=black,bold */
+#define EDIT_SUGGESTION       EDIT_FG(8)                /* ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE: fg=8 */
+
 struct edit_host {
     void (*write)(void *ctx, const char *bytes, size_t n);
     /* Candidates for the word ending at `cursor`. NULL = no completion. */
@@ -79,6 +103,10 @@ struct edit_host {
      * terminal says it has another. Fills in text, right and transient (each
      * valid until the next call). NULL = the prompt does not depend on it. */
     void (*reprompt)(void *ctx, int cols, struct edit_prompt *prompt);
+    /* How each byte of `text` is drawn (above), into `style` (n bytes, all
+     * EDIT_HL_DEFAULT). `done`: the line is accepted -- a word at its end is
+     * no longer on its way to a file's name. NULL = no colours. */
+    void (*highlight)(void *ctx, const char *text, size_t n, bool done, unsigned char *style);
 };
 
 struct editor;

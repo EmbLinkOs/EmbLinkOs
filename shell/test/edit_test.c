@@ -221,6 +221,70 @@ static void test_history(void) {
     CHECK(last == EDIT_LINE && !strcmp(edit_line(ed), "git status"), "Enter runs the match");
 }
 
+/* The colour a cell is drawn in: its palette index, or -1. */
+static int fg_at(int x, int y) {
+    const struct vt_style *st = vt_style_of(&term, vt_view_cell(&term, y, x, 0));
+    return VT_COLOR_KIND(st->fg) == 1 ? (int)(st->fg & 0xff) : -1;
+}
+
+static void test_suggestions(void) {
+    printf("suggestions from history:\n");
+    hist_reset();
+    hist_push("echo first");
+    hist_push("git commit -m wip");
+    hist_push("echo hello world");
+    start(40, 8, EDIT_VT);
+    keys("ec");
+    CHECK(!strcmp(row(0), "$ echo hello world") && cx() == 4, "the newest line that starts with the typing, after it");
+    CHECK(fg_at(3, 0) == -1 && fg_at(4, 0) == 8 && fg_at(17, 0) == 8, "the suggestion in colour 8, the typing not");
+    keys("h");
+    CHECK(!strcmp(row(0), "$ echo hello world") && cx() == 5 && fg_at(5, 0) == 8, "typing along it keeps the rest");
+    keys("\033f");
+    CHECK(!strcmp(row(0), "$ echo hello world") && cx() == 6 && fg_at(5, 0) == -1 && fg_at(6, 0) == 8,
+          "Alt+F takes it to the end of the next word");
+    keys("\033[1;5C");
+    CHECK(cx() == 12 && fg_at(11, 0) == -1 && fg_at(12, 0) == 8, "and Ctrl+Right");
+    keys("\033[D\033[D");
+    CHECK(!strcmp(row(0), "$ echo hello world") && cx() == 10 && fg_at(12, 0) == 8, "moving the cursor keeps it");
+    keys("\033[C");
+    CHECK(cx() == 11 && fg_at(12, 0) == 8, "Right before the end only moves");
+    keys("\005");
+    CHECK(cx() == 12 && fg_at(12, 0) == 8, "Ctrl+E away from the end goes there");
+    keys("\005");
+    CHECK(!strcmp(row(0), "$ echo hello world") && cx() == 18 && fg_at(17, 0) == -1, "and at the end takes the rest");
+    keys("\037");
+    CHECK(!strcmp(row(0), "$ echo hello world") && fg_at(17, 0) == 8, "undo gives it back");
+    keys("\033[F");
+    CHECK(cx() == 18 && fg_at(17, 0) == -1, "End takes it too");
+    keys("\r");
+    CHECK(last == EDIT_LINE && !strcmp(edit_line(ed), "echo hello world"), "and Enter runs the whole line");
+
+    start(40, 8, EDIT_VT);
+    keys("ec\r");
+    CHECK(last == EDIT_LINE && !strcmp(edit_line(ed), "ec") && !strcmp(row(0), "$ ec"),
+          "Enter runs what was typed, and the suggestion goes");
+    start(40, 8, EDIT_VT);
+    keys("ec\033[A");
+    CHECK(!strcmp(row(0), "$ echo hello world") && fg_at(4, 0) == -1, "Up recalls a line, with no suggestion");
+    keys("\033[D");
+    CHECK(fg_at(17, 0) == -1, "nor after the cursor moves");
+    start(40, 8, EDIT_VT);
+    keys("xyz");
+    CHECK(!strcmp(row(0), "$ xyz"), "none when no line starts with the typing");
+    keys("\025git");
+    CHECK(!strcmp(row(0), "$ git commit -m wip"), "a new one when the typing changes");
+    keys("\022");
+    CHECK(!strcmp(row(0), "$ git") && !strcmp(row(1), "search history:"), "none while searching");
+    keys("\033");
+    nreplies = 0;
+    last = edit_escape_timeout(ed);
+    CHECK(!strcmp(row(0), "$ git commit -m wip"), "and back after");
+    keys("\003");
+    CHECK(last == EDIT_CANCEL && !strcmp(row(0), "$ git commit -m wip^C"),
+          "Ctrl+C leaves the line as it was shown, and ^C after it");
+    hist_reset();
+}
+
 static void test_completion(void) {
     printf("completion:\n");
     start(40, 8, EDIT_VT);
@@ -355,7 +419,7 @@ static void test_right_transient(void) {
 
     /* a prompt built for the width, built again when it changes */
     struct editor *saved = ed;
-    struct edit_host host = { to_screen, complete, unfinished, NULL, wide_prompt };
+    struct edit_host host = { to_screen, complete, unfinished, NULL, wide_prompt, NULL };
     ed = edit_new(&host);
     vt_free(&term);
     vt_init(&term, 24, 8, from_screen, NULL);
@@ -425,7 +489,7 @@ static void test_dumb(void) {
 }
 
 int main(void) {
-    struct edit_host host = { to_screen, complete, unfinished, NULL, NULL };
+    struct edit_host host = { to_screen, complete, unfinished, NULL, NULL, NULL };
     ed = edit_new(&host);
     if (!ed) { puts("no memory"); return 1; }
     test_typing();
@@ -441,6 +505,7 @@ int main(void) {
     printf("-- and back to the EmbLink Terminal:\n");
     test_multiline();
     test_history();
+    test_suggestions();
     test_completion();
     test_control();
     test_resize();

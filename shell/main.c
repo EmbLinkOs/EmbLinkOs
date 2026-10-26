@@ -26,6 +26,7 @@
 #include "hist/hist.h"
 #include "edit/edit.h"
 #include "complete/complete.h"
+#include "complete/highlight.h"
 #include "prompt/prompt.h"
 #include "prompt/prompt_os.h"
 #include "prompt/wizard_os.h"
@@ -523,7 +524,7 @@ int main(int argc, char **argv) {
     if (interactive) source_rc(&top);
     /* No prompt configured: Powerlevel10k's wizard, as zsh starts it */
     if (g_terminal_session && wizard_os_wanted()) (void)wizard_os_run(false, NULL, 0);
-    struct edit_host host = { out_write, shell_complete, unfinished, &top, reprompt };
+    struct edit_host host = { out_write, shell_complete, unfinished, &top, reprompt, shell_highlight };
     g_ed = edit_new(&host);
     /* While the line is edited the shell reads every key itself: no line
      * discipline, no echo, ^C as a byte (the editor's own), CR as CR. */
@@ -568,6 +569,7 @@ int main(int argc, char **argv) {
              * fresh listings for every prompt */
             bool p10k = prompt_p10k_source() != NULL;
             if (p10k) prompt_os_fresh();
+            shell_highlight_fresh();                   /* programs installed since are commands now */
             const char *user = getenv("USER");
             g_pstate = (struct prompt_state){
                 .user = user, .host = getenv("HOSTNAME"), .dir = where, .last_dir = last_where,

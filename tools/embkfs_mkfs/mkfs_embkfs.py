@@ -1300,7 +1300,7 @@ def discover_userland_objects(build_dir="build"):
                   "eval/eval.c", "eval/eval_extern.c", "eval/eval.h",
                   "eval/exec.c", "eval/exec.h",
                   "edit/edit.c", "edit/edit.h", "edit/wcwidth.c", "edit/wcwidth.h",
-                  "complete/complete.c", "complete/complete.h",
+                  "complete/complete.c", "complete/complete.h", "complete/highlight.c", "complete/highlight.h",
                   "prompt/prompt.c", "prompt/prompt.h",
                   "prompt/p10k.c", "prompt/p10k.h", "prompt/p10k_int.h",
                   "prompt/p10k_zsh.c", "prompt/p10k_render.c", "prompt/p10k_import.c",

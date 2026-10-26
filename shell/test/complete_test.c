@@ -10,6 +10,7 @@
  * ========================================================================== */
 #define _DEFAULT_SOURCE   /* mkdtemp */
 #include "complete/complete.h"
+#include "complete/highlight.h"
 #include "eval/eval.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,25 @@ static bool offers(const char *insert) {
     return false;
 }
 static void touch(const char *name) { FILE *f = fopen(name, "w"); if (f) fclose(f); }
+
+/* How each byte of `line` is drawn, as a letter: . the terminal's own, c a
+ * command (green), u unknown (red, bold), y yellow (reserved words, quoted
+ * text, redirections), e an escape (cyan), m magenta ($( and its )), p a path
+ * (underlined), # a comment. */
+static const char *paint(const char *line, bool done) {
+    static unsigned char style[256];
+    static char out[256];
+    size_t n = strlen(line);
+    memset(style, 0, sizeof style);
+    shell_highlight(&top, line, n, done, style);
+    for (size_t i = 0; i < n; i++)
+        out[i] = style[i] == EDIT_HL_DEFAULT ? '.' : style[i] == EDIT_HL_COMMAND ? 'c' : style[i] == EDIT_HL_UNKNOWN ? 'u'
+               : style[i] == EDIT_HL_QUOTED ? 'y' : style[i] == EDIT_HL_ESCAPE ? 'e' : style[i] == EDIT_HL_SUBSTITUTION ? 'm'
+               : style[i] == EDIT_HL_PATH ? 'p' : style[i] == EDIT_HL_COMMENT ? '#' : '?';
+    out[n] = '\0';
+    return out;
+}
+#define PAINTS(line, want, name) do { const char *got_ = paint(line, false); if (strcmp(got_, want)) printf("       %s\n  got  %s\n  want %s\n", line, got_, want); CHECK(!strcmp(got_, want), name); } while (0)
 
 int main(void) {
     char dir[] = "/tmp/emblink-complete-XXXXXX";
@@ -94,6 +114,29 @@ int main(void) {
     CHECK(m.n == 2 && offers("$alpha") && offers("$args"), "$ completes the session's names");
     ask("echo 'al");
     CHECK(m.n == 0, "nothing inside single quotes");
+
+    printf("highlighting:\n");
+    PAINTS("echo hi | count", "cccc......ccccc", "builtins are commands, after a pipe too");
+    PAINTS("frob x; deploy; exit", "uuuu....cccccc..cccc", "an unknown name, a def, the REPL's exit");
+    PAINTS("if $x > 1 { echo yes } else { frob }", "yy........y.cccc.....y.yyyy.y.uuuu.y",
+           "keywords and braces; a block's first word is a command");
+    PAINTS("let n = $(count)", "yyy.....mmcccccm", "let, and a command in $( )");
+    PAINTS("for f in $files { echo $f }", "yyy.............y.cccc....y", "for (its `in` is plain, as in zsh)");
+    PAINTS("def greet(name) { echo hi }", "yyy.............y.cccc....y", "def");
+    PAINTS("echo hi out> alpha.txt", "cccc....yyyy.ppppppppp", "a redirection, and the file it names");
+    PAINTS("echo alpha.txt nofile alpine/", "cccc.ppppppppp........ppppppp", "files and directories that are there");
+    PAINTS("echo alp", "cccc.ppp", "a word on its way to a file's name, at the end");
+    CHECK(!strcmp(paint("echo alp", true), "cccc...."), "but not once the line is done");
+    PAINTS("echo alp next", "cccc.........", "nor before the end");
+    PAINTS("echo -alpha", "cccc.......", "an option is not a file");
+    PAINTS("echo 'it' \"a\\nb\"", "cccc.yyyy.yyeeyy", "quoted text, a double quote's escapes");
+    PAINTS("echo \"open", "cccc.yyyyy", "a quote not closed yet, to the end");
+    PAINTS("echo hi # note", "cccc....######", "a comment");
+    PAINTS("echo }", "cccc.u", "a brace that closes nothing");
+    PAINTS("./alpha.txt", "ccccccccccc", "a path to a file, where a command goes");
+    PAINTS("./alp", "ppppp", "on its way to one");
+    PAINTS("./nothing", "uuuuuuuuu", "a path to nothing");
+    PAINTS("$x | where size > 1", ".....ccccc.........", "a value, then a command");
 
     scope_free(&top);
     remove("alpine/inside.c"); rmdir("alpine");

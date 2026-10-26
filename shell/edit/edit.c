@@ -140,6 +140,11 @@ struct editor {
     struct snapshot undo[UNDOS];
     int nundo;
 
+    /* the suggestion from history (zsh-autosuggestions' POSTDISPLAY): what the
+     * newest history line that starts with the whole line adds to it */
+    struct buf suggestion;
+    bool accepting;           /* the line is done: drawn the last time */
+
     /* completion */
     struct edit_matches m;
     bool menu;
@@ -531,9 +536,25 @@ static void clipped(struct buf *o, const char *s, int room) {
     }
     for (; used < room; used++) buf_add(o, " ", 1);
 }
+/* A highlighter's style (edit.h) as SGR, from the terminal's own pen. */
+static void style_sgr(struct buf *o, unsigned char s) {
+    int fg = (s & EDIT_FG_MASK) - 1;
+    buf_str(o, "\033[0");
+    if (s & EDIT_BOLD) buf_str(o, ";1");
+    if (s & EDIT_UNDERLINE) buf_str(o, ";4");
+    if (fg >= 0 && fg < 8) buf_fmt(o, ";%d", 30 + fg);
+    else if (fg >= 8) buf_fmt(o, ";38;5;%d", fg);
+    buf_str(o, "m");
+}
+static bool suggesting(const struct editor *e) { return e->suggestion.n && !e->searching && !e->menu; }
+
 static void render_vt(struct editor *e) {
     struct buf *o = &e->out;
     int cols = e->cols;
+    unsigned char *style = NULL;
+    if (e->host.highlight && e->line.n && (style = calloc(e->line.n, 1)))
+        e->host.highlight(e->host.ctx, e->line.p, e->line.n, e->accepting, style);
+    int pen = 0;
     if (e->fresh) buf_str(o, e->mark);
     else if (e->home) buf_str(o, e->home);
     else {
@@ -549,14 +570,16 @@ static void render_vt(struct editor *e) {
      * typing, and the cursor comes back to where the typing starts. */
     if (e->right && e->right[0] && !e->searching) {
         struct pos q = p;
-        bool fits = true;
+        bool fits = true, ended = false;
         for (size_t i = 0; i < e->line.n && fits;) {
-            if (e->line.p[i] == '\n') break;
+            if (e->line.p[i] == '\n') { ended = true; break; }
             int len;
             int w = wcwidth_cp(cp_at(e, i, &len));
             if (w > 0) { if (q.col + w > cols) fits = false; else q.col += w; }
             i += (size_t)len;
         }
+        if (!ended && suggesting(e)) layout(e->suggestion.p, strcspn(e->suggestion.p, "\n"), &q, 1 << 20);
+        if (q.col > cols) fits = false;
         int rw = text_width(e->right), at = cols - 1 - rw;
         if (fits && rw > 0 && q.col + 1 <= at && at > p.col) {
             buf_fmt(o, "\033[%dC", at - p.col);
@@ -570,6 +593,7 @@ static void render_vt(struct editor *e) {
         if (i == e->cur) cursor = settled(p, cols);
         if (i == e->line.n) break;
         if (e->line.p[i] == '\n') {
+            if (pen) { buf_str(o, "\033[0m"); pen = 0; }
             buf_str(o, "\r\n");
             p.row++;
             p.col = 0;
@@ -581,6 +605,7 @@ static void render_vt(struct editor *e) {
         int len;
         uint32_t cp = cp_at(e, i, &len);
         int w = wcwidth_cp(cp);
+        if (style && style[i] != pen) { style_sgr(o, style[i]); pen = style[i]; }
         if (w >= 0) {
             buf_add(o, e->line.p + i, (size_t)len);
             if (w > 0) {
@@ -590,6 +615,39 @@ static void render_vt(struct editor *e) {
         }
         i += (size_t)len;
     }
+    if (pen) buf_str(o, "\033[0m");
+    free(style);
+    /* the suggestion, after the line, in its own colour */
+    if (suggesting(e)) {
+        style_sgr(o, EDIT_SUGGESTION);
+        const char *t = e->suggestion.p;
+        for (size_t i = 0; i < e->suggestion.n;) {
+            if (t[i] == '\n') {
+                buf_str(o, "\033[0m\r\n");
+                p.row++;
+                p.col = 0;
+                buf_str(o, e->more);
+                if (e->more) layout(e->more, strlen(e->more), &p, cols);
+                style_sgr(o, EDIT_SUGGESTION);
+                i++;
+                continue;
+            }
+            uint32_t cp;
+            int len = utf8_decode(t + i, (int)(e->suggestion.n - i), &cp);
+            int w = wcwidth_cp(cp);
+            if (w >= 0) {
+                buf_add(o, t + i, (size_t)len);
+                if (w > 0) {
+                    if (p.col + w > cols) { p.row++; p.col = 0; }
+                    p.col += w;
+                }
+            }
+            i += (size_t)len;
+        }
+        buf_str(o, "\033[0m");
+    }
+    /* A line that's done leaves the cursor after everything drawn */
+    if (e->accepting) cursor = settled(p, cols);
     /* A line that ends exactly at the right margin leaves the terminal
      * waiting to wrap; settle it, so the cursor is where the next row starts. */
     if (p.col >= cols) { buf_str(o, " \r"); p.row++; p.col = 0; }
@@ -702,6 +760,7 @@ static void finish(struct editor *e, enum edit_result r, const char *note) {
     if (e->searching) search_end(e, true);
     if (e->menu) menu_close(e);
     e->cur = e->line.n;
+    e->accepting = true;
     /* Once a line is done its prompt is drawn the short way, if there is one:
      * the scrollback keeps the commands, not every full prompt. */
     if (e->mode == EDIT_VT && e->transient) {
@@ -995,6 +1054,104 @@ static void handle(struct editor *e, struct key k) {
     }
 }
 
+/* --- suggestions from history ----------------------------------------------------
+ * zsh-autosuggestions 0.7.1, its history strategy and default widgets: every
+ * key is a widget of one of its kinds. Most MODIFY the line, and the
+ * suggestion follows -- kept while the typing goes along it or the line does
+ * not change, else the newest history line that starts with the whole line.
+ * Some CLEAR it (the history keys, Enter), some ACCEPT it when the cursor is
+ * at the end (forward-char, end-of-line), forward-word takes it a word at a
+ * time (PARTIAL), and yank leaves it be. */
+
+enum widget { W_MODIFY, W_CLEAR, W_ACCEPT, W_PARTIAL, W_IGNORE };
+
+static enum widget widget_of(struct key k) {
+    unsigned alt = k.mods & M_ALT, ctrl = k.mods & M_CTRL;
+    switch (k.kind) {
+    case K_RIGHT: return ctrl || alt ? W_PARTIAL : W_ACCEPT;
+    case K_END: return W_ACCEPT;
+    case K_UP: case K_DOWN: case K_PGUP: case K_PGDN: return W_CLEAR;
+    case K_ENTER: return alt ? W_MODIFY : W_CLEAR;
+    case K_CTRL:
+        switch (k.ch) {
+        case 'f': case 'e': return W_ACCEPT;
+        case 'p': case 'n': return W_CLEAR;
+        case 'y': return W_IGNORE;
+        case 'c': return W_IGNORE;             /* send-break: the line is left as it was shown */
+        default: return W_MODIFY;
+        }
+    case K_TEXT:
+        if (alt && (k.ch == 'f' || k.ch == 'F')) return W_PARTIAL;
+        if (alt && (k.ch == 'y' || k.ch == 'Y')) return W_IGNORE;
+        return W_MODIFY;
+    default: return W_MODIFY;
+    }
+}
+
+static void suggest(struct editor *e) {
+    buf_set(&e->suggestion, "", 0);
+    if (!e->line.n || e->searching || e->menu) return;
+    for (size_t i = hist_count(); i-- > 0;) {
+        const char *h = hist_get(i);
+        if (h && !strncmp(h, e->line.p, e->line.n)) {
+            buf_set(&e->suggestion, h + e->line.n, strlen(h) - e->line.n);
+            return;
+        }
+    }
+}
+
+static void widget(struct editor *e, struct key k) {
+    if (e->mode != EDIT_VT) { handle(e, k); return; }
+    switch (widget_of(k)) {
+    case W_CLEAR:
+        buf_set(&e->suggestion, "", 0);
+        handle(e, k);
+        break;
+    case W_IGNORE:
+        handle(e, k);
+        break;
+    case W_ACCEPT:
+        if (e->cur != e->line.n || !suggesting(e)) { handle(e, k); break; }
+        snapshot(e);
+        insert(e, e->suggestion.p, e->suggestion.n);
+        buf_set(&e->suggestion, "", 0);
+        handle(e, k);
+        e->cur = e->line.n;
+        break;
+    case W_PARTIAL: {
+        size_t was = e->line.n;
+        char *orig = strdup(buf_text(&e->line));
+        if (!orig) { handle(e, k); break; }
+        buf_add(&e->line, e->suggestion.p, e->suggestion.n);
+        handle(e, k);
+        if (e->cur > was) {
+            buf_set(&e->suggestion, e->line.p + e->cur, e->line.n - e->cur);
+            e->line.n = e->cur;
+            e->line.p[e->line.n] = '\0';
+        } else {
+            buf_set(&e->line, orig, was);
+        }
+        free(orig);
+        break;
+    }
+    case W_MODIFY: {
+        size_t was = e->line.n;
+        bool aside = e->searching || e->menu;    /* zsh runs a whole search, a whole menu, as one widget */
+        char *orig = strdup(buf_text(&e->line)), *shown = strdup(buf_text(&e->suggestion));
+        buf_set(&e->suggestion, "", 0);
+        handle(e, k);
+        /* typing along the suggestion, or the line as it was: the rest of it */
+        if (!aside && orig && shown && e->line.n >= was && !memcmp(e->line.p, orig, was) &&
+            !strncmp(shown, e->line.p + was, e->line.n - was) && !e->searching && !e->menu)
+            buf_set(&e->suggestion, shown + (e->line.n - was), strlen(shown) - (e->line.n - was));
+        else suggest(e);
+        free(orig);
+        free(shown);
+        break;
+    }
+    }
+}
+
 /* --- bytes -> keys -------------------------------------------------------------- */
 
 static struct key key_of(enum key_kind kind, unsigned mods) { struct key k = { kind, 0, mods, 0, 0 }; return k; }
@@ -1155,7 +1312,7 @@ void edit_free(struct editor *e) {
     if (!e) return;
     prompt_free(e);
     free(e->line.p); free(e->out.p); free(e->accepted.p); free(e->shown.p);
-    free(e->prefix.p); free(e->query.p);
+    free(e->prefix.p); free(e->query.p); free(e->suggestion.p);
     free(e->saved); free(e->sorig); free(e->menu_word);
     for (int i = 0; i < KILLS; i++) free(e->kills[i]);
     for (int i = 0; i < e->nundo; i++) free(e->undo[i].text);
@@ -1193,6 +1350,8 @@ void edit_begin(struct editor *e, const struct edit_prompt *prompt, enum edit_mo
     e->hpos = hist_count();
     free(e->saved); e->saved = 0;
     e->searching = false;
+    buf_set(&e->suggestion, "", 0);
+    e->accepting = false;
     menu_close(e);
     for (int i = 0; i < e->nundo; i++) free(e->undo[i].text);
     e->nundo = 0;
@@ -1209,7 +1368,7 @@ enum edit_result edit_feed(struct editor *e, const char *bytes, size_t n, size_t
     size_t i = 0;
     while (i < n && e->result == EDIT_MORE) {
         struct key k;
-        if (decode(e, (unsigned char)bytes[i++], &k)) handle(e, k);
+        if (decode(e, (unsigned char)bytes[i++], &k)) widget(e, k);
     }
     if (e->result == EDIT_MORE && !edit_pending_escape(e)) render(e);
     flush(e);
@@ -1223,7 +1382,7 @@ enum edit_result edit_escape_timeout(struct editor *e) {
     if (e->result != EDIT_MORE) return e->result;
     bool lone = e->dstate == 1;
     e->dstate = 0;
-    if (lone) handle(e, key_of(K_ESCAPE, 0));
+    if (lone) widget(e, key_of(K_ESCAPE, 0));
     if (e->result == EDIT_MORE) render(e);
     flush(e);
     return e->result;

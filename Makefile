@@ -1497,7 +1497,7 @@ SHELL_INC = -Ishell
 SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
              shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h \
-             shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h \
+             shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h shell/complete/highlight.h \
              shell/prompt/prompt.h shell/prompt/p10k.h shell/prompt/p10k_int.h shell/prompt/icons.h \
              shell/prompt/colors.h shell/prompt/prompt_os.h shell/prompt/wizard.h shell/prompt/wizard_os.h
 
@@ -1524,6 +1524,8 @@ $(BUILD)/shobj_edit.o: shell/edit/edit.c $(SHELL_HDRS) | $(BUILD)
 $(BUILD)/shobj_wcwidth.o: shell/edit/wcwidth.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_complete.o: shell/complete/complete.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_highlight.o: shell/complete/highlight.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_prompt.o: shell/prompt/prompt.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1565,7 +1567,7 @@ SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o 
              $(BUILD)/shobj_lex.o $(BUILD)/shobj_parse.o $(BUILD)/shobj_eval.o \
              $(BUILD)/shobj_exec.o \
              $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
-             $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o \
+             $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o $(BUILD)/shobj_highlight.o \
              $(BUILD)/shobj_prompt.o $(BUILD)/shobj_p10k.o $(BUILD)/shobj_p10k_zsh.o \
              $(BUILD)/shobj_p10k_render.o $(BUILD)/shobj_p10k_import.o $(BUILD)/shobj_icons.o \
              $(BUILD)/shobj_colors.o $(BUILD)/shobj_prompt_os.o $(BUILD)/shobj_wizard.o \
@@ -2864,9 +2866,16 @@ shell-test:
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
 	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
-	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c shell/complete/highlight.c \
 	    shell/test/complete_test.c -o $(BUILD)/complete_test
 	$(BUILD)/complete_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell -Iuser/terminal \
+	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/highlight.c $(VT_SRC) \
+	    tests/edit/highlight_dump.c -o $(BUILD)/highlight_dump
+	python3 tools/golden_highlight.py
 
 scene-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene \
