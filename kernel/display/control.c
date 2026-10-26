@@ -358,6 +358,16 @@ int monitor_control(unsigned op,void *data,unsigned bytes) {
 out:mutex_unlock(&lock);return rc;
 }
 
+uint32_t display_refresh_mhz(void) {
+    static struct embk_monitor_info info;   /* large; one caller, under the lock */
+    mutex_lock(&lock);
+    describe(&info);
+    uint32_t mhz=0;
+    for(unsigned i=0;i<info.mode_count;i++)if(info.modes[i].flags&EMBK_MONITOR_CURRENT)mhz=info.modes[i].refresh_millihz;
+    mutex_unlock(&lock);
+    return mhz;
+}
+
 void monitor_tick(void) {
     if(!mutex_trylock(&lock))return;
     uint64_t now=time_get_ns()/1000000;

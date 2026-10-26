@@ -357,6 +357,7 @@
 #define SYS_comp_stats 160 /* (struct embk_comp_stats *out) -> 0 | -err: what composing costs */
 #define SYS_ui_wait 161    /* (uint32_t *seq, timeout_ms) -> 1 event | 0 timeout | -err */
 #define SYS_win_frame 162  /* (struct embk_frame_info *out, timeout_ms) -> 0 | -err: the next frame */
+#define SYS_win_frame_rate 163 /* (pref_mhz) -> 0: the rate this process's motion wants */
 
 
 

@@ -21,6 +21,11 @@
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: the window-motion clock */
 #include "gfx/comp_stats.h"     /* what each compose costs, and why it was asked */
 #include "gfx/ui_events.h"      /* telling waiting applications something changed */
+#include "gfx/frameclock.h"     /* which rate to compose at */
+#include "display/control.h"    /* the display's own refresh */
+#if defined(__x86_64__)
+#include "power/policy.h"       /* the Efficiency profile caps the rate */
+#endif
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -197,6 +202,12 @@ static volatile int g_kicked;               /* work arrived since it last looked
  * unlock (ui_events.h). Set only under the lock, like g_need_kick, so the reap
  * path's unlock under the scheduler lock never finds it set. */
 static int g_post_ui;
+/* SYSTEM MOTION -- the pointer, a drag, window motion, the wheel -- until this
+ * uptime (ns): what earns the display's top rate (frameclock.h), held a
+ * moment past the last of it so a rate does not flap between two movements. */
+#define MOTION_HOLD_NS 500000000ull
+static volatile uint64_t g_motion_until_ns;
+static void motion_now(void) { __atomic_store_n(&g_motion_until_ns, time_get_ns() + MOTION_HOLD_NS, __ATOMIC_RELAXED); }
 
 /* Tell the frame thread there is work. Any context but under g_comp_lock --
  * the mouse interrupt included. A kick is a hint, not a payload: the frame
@@ -2364,6 +2375,7 @@ static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int rais
      * counts the same motion twice and the window runs away from the hand.
      * Shift it with the window, now. */
     if (g_ptr_pid == pid && g_ptr_win == id) { g_ptr_lx -= x - w->x; g_ptr_ly -= y - w->y; }
+    if (x != w->x || y != w->y) motion_now();
     w->x = x; w->y = y;
     if(raise)w->z = w->widget ? g_widget_z++ : g_next_z++;   /* explicit moves raise */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
@@ -2978,7 +2990,10 @@ static void pointer_frame(void) {
     /* the pointer moved or a button changed: whichever app it is over (or was)
      * has something to read. Pending presses and the wheel are input too. */
     { static int32_t sx = -1, sy = -1; static uint32_t sb;
-      if (x != sx || y != sy || b != sb || mouse_presses_pending()) { sx = x; sy = y; sb = b; g_post_ui = 1; } }
+      if (x != sx || y != sy || b != sb || mouse_presses_pending()) {
+          if (x != sx || y != sy) motion_now();
+          sx = x; sy = y; sb = b; g_post_ui = 1;
+      } }
     struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
     if(g_cap_pid && (!captured || !captured->visible || !on_workspace(captured) || !session_ui_allowed(captured->pid)))
         reset_pointer_capture_locked();
@@ -3224,7 +3239,7 @@ static void pointer_frame(void) {
     }
     /* drain the scroll wheel every tick; route it to the hovered window's app */
     int32_t wheel = mouse_take_wheel();
-    if (wheel && g_ptr_pid && !suppressed) { g_ptr_wheel += wheel; g_post_ui = 1; }
+    if (wheel && g_ptr_pid && !suppressed) { g_ptr_wheel += wheel; g_post_ui = 1; motion_now(); }
 
     g_prev_buttons = b;
     #undef DIRTY
@@ -3352,13 +3367,115 @@ static uint64_t g_frame_period_ns = 16666667;  /* 60 Hz until an output says oth
 static struct wait_queue g_frame_wq;
 static volatile uint64_t g_frame_done, g_frame_done_ns;
 
+static int comp_continuous(void);
+/* ---- the rate (frameclock.h) ----------------------------------------------
+ * What the display can do is read once a second (outside the lock: describing
+ * the display takes it), unless `perf display` set a display that is not
+ * there -- the simulated 120 Hz or VRR output the tests run. Each frame then
+ * asks frameclock which rate the moment wants. */
+static struct fc_display g_fc_display;
+static int      g_fc_simulated;
+static uint64_t g_fc_read_ns;
+static uint32_t g_power_cap_mhz;
+static uint32_t g_frame_cost_us;            /* a recent bad frame, fading */
+static uint64_t g_frame_cost_ns;            /* when it last faded */
+static uint32_t g_rate_mhz = FC_DEFAULT_MHZ;
+
+/* ANIMATING APPLICATIONS: a process waiting for frames is drawing motion, and
+ * gets frames at the rate it asked (embk_win_frame_rate) -- the display's top
+ * if it did not say, as the system's own toolkit is the one asking. */
+#define FC_REQUESTS 16
+static struct { int pid; uint32_t pref_mhz; uint64_t until_ns; } g_req[FC_REQUESTS];
+
+/* Caller holds g_comp_lock. The slot for `pid`, made if need be (the oldest
+ * goes when the table is full). */
+static int request_slot(int pid) {
+    int free_i = -1, oldest = 0;
+    for (int i = 0; i < FC_REQUESTS; i++) {
+        if (g_req[i].pid == pid) return i;
+        if (!g_req[i].pid && free_i < 0) free_i = i;
+        if (g_req[i].until_ns < g_req[oldest].until_ns) oldest = i;
+    }
+    int i = free_i >= 0 ? free_i : oldest;
+    g_req[i].pid = pid; g_req[i].pref_mhz = 0; g_req[i].until_ns = 0;
+    return i;
+}
+
+static uint32_t requests_now(uint64_t now) {
+    uint32_t want = 0;
+    for (int i = 0; i < FC_REQUESTS; i++) {
+        if (!g_req[i].pid || g_req[i].until_ns <= now) continue;
+        uint32_t p = g_req[i].pref_mhz ? g_req[i].pref_mhz : FC_MAX;
+        if (p > want) want = p;
+    }
+    return want;
+}
+
+/* `pid` wants its motion drawn at `pref_mhz` (0: as fast as the display goes). */
+int compositor_frame_rate(int pid, uint32_t pref_mhz) {
+    spin_lock(&g_comp_lock);
+    g_req[request_slot(pid)].pref_mhz = pref_mhz;
+    comp_unlock();
+    return 0;
+}
+
+/* `perf display 120`, `perf display 48-120` (VRR), `perf display auto`. */
+void compositor_simulate_display(uint32_t refresh_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz) {
+    spin_lock(&g_comp_lock);
+    g_fc_simulated = refresh_mhz || vrr_max_mhz;
+    g_fc_display = (struct fc_display){ refresh_mhz ? refresh_mhz : vrr_max_mhz, vrr_min_mhz, vrr_max_mhz };
+    g_fc_read_ns = 0;
+    comp_unlock();
+    comp_wake();
+}
+
+/* Before each frame, outside the lock. */
+static void comp_rate_update(uint64_t now) {
+    if (!g_fc_simulated && now - g_fc_read_ns > 1000000000ull) {
+        g_fc_read_ns = now;
+        uint32_t mhz = display_refresh_mhz();
+#if defined(__x86_64__)
+        struct embk_policy pol; power_policy_get(&pol);
+        uint32_t cap = pol.profile == EMBK_PROFILE_EFFICIENCY ? 60000u : 0u;
+#else
+        uint32_t cap = 0;
+#endif
+        spin_lock(&g_comp_lock);
+        if (!g_fc_simulated) g_fc_display = (struct fc_display){ mhz, 0, 0 };
+        g_power_cap_mhz = cap;
+        comp_unlock();
+    }
+    spin_lock(&g_comp_lock);
+    struct fc_inputs in = {
+        .motion = now < __atomic_load_n(&g_motion_until_ns, __ATOMIC_RELAXED) || comp_continuous() || g_dragging,
+        .request_mhz = requests_now(now),
+        .frame_cost_us = g_frame_cost_us,
+        .power_cap_mhz = g_power_cap_mhz,
+    };
+    g_rate_mhz = fc_rate_mhz(&g_fc_display, &in);
+    g_frame_period_ns = fc_period_ns(g_rate_mhz);
+    struct fc_display disp = g_fc_display;
+    comp_unlock();
+    comp_stats_rate(disp.refresh_mhz, disp.vrr_min_mhz, disp.vrr_max_mhz, g_rate_mhz, g_frame_cost_us);
+}
+
 static void comp_frame(void) {
     pointer_frame();
     anim_frame();
     spin_lock(&g_comp_lock);
+    uint64_t c0 = time_get_ns();
     compose_pending_locked();
     uint64_t seq = ++g_frame_seq;
     uint64_t now = time_get_ns();
+    /* THE GOVERNOR'S MEASURE: this frame's cost, or the last bad one fading --
+     * by TIME, halving every 250 ms. Fading per frame left one heavy frame
+     * (a window opening) holding the rate down through the stillness after
+     * it, where few frames come to fade it. */
+    uint32_t cost = (uint32_t)((now - c0) / 1000u);
+    while (g_frame_cost_us && now - g_frame_cost_ns >= 250000000ull) {
+        g_frame_cost_us /= 2; g_frame_cost_ns += 250000000ull;
+    }
+    if (cost >= g_frame_cost_us) { g_frame_cost_us = cost; g_frame_cost_ns = now; }
     comp_unlock();
     comp_stats_frame(now, g_frame_period_ns);
     __atomic_store_n(&g_frame_done_ns, now, __ATOMIC_RELAXED);
@@ -3372,8 +3489,11 @@ static void comp_frame(void) {
  * one, so it comes whether or not anything changed. -EMBK_ENOSYS before the
  * frame thread runs (the caller paces itself), -EMBK_ETIMEDOUT if no frame
  * came within `timeout_ms` (0: 100 ms), -EMBK_ECANCELED if told to stop. */
-int compositor_frame_wait(struct embk_frame_info *out, uint32_t timeout_ms) {
+int compositor_frame_wait(int pid, struct embk_frame_info *out, uint32_t timeout_ms) {
     if (!g_comp_thread) return -EMBK_ENOSYS;
+    spin_lock(&g_comp_lock);
+    g_req[request_slot(pid)].until_ns = time_get_ns() + MOTION_HOLD_NS;
+    comp_unlock();
     uint64_t target = __atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE) + 1;
     comp_wake();
     uint64_t deadline = timer_uptime_ms() + (timeout_ms ? timeout_ms : 100);
@@ -3424,14 +3544,14 @@ static void comp_thread_main(void) {
          * cost of each frame. The scheduler sleeps in milliseconds, so a beat
          * lands within one of where it is due. */
         uint64_t now = time_get_ns();
-        if (now >= g_frame_due_ns + g_frame_period_ns) {
-            g_frame_due_ns = now;
-        } else {
-            g_frame_due_ns += g_frame_period_ns;
-            if (g_frame_due_ns > now) {
-                uint64_t ms = (g_frame_due_ns - now + 500000u) / 1000000u;
-                if (ms) sched_sleep_ms(ms);
-            }
+        comp_rate_update(now);
+        uint32_t want_ms = (uint32_t)(g_frame_period_ns / 1000000u);
+        if (want_ms < SCHED_MIN_PERIOD_MS) want_ms = SCHED_MIN_PERIOD_MS;
+        if (want_ms != period_ms && !sched_declare_period(want_ms, want_ms / 2)) period_ms = want_ms;
+        g_frame_due_ns = fc_next_due(g_frame_due_ns, g_frame_period_ns, now);
+        if (g_frame_due_ns > now) {
+            uint64_t ms = (g_frame_due_ns - now + 500000u) / 1000000u;
+            if (ms) sched_sleep_ms(ms);
         }
         comp_frame();
     }

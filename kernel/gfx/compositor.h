@@ -205,7 +205,13 @@ void compositor_input_kick(void);
 void compositor_print_windows(void);
 /* Wait for the next frame (asking for one); see compositor.c. */
 struct embk_frame_info;
-int compositor_frame_wait(struct embk_frame_info *out, uint32_t timeout_ms);
+int compositor_frame_wait(int pid, struct embk_frame_info *out, uint32_t timeout_ms);
+/* The rate `pid`'s motion wants, in millihertz (0: as fast as the display
+ * goes) -- taken while it waits for frames (frameclock.h). */
+int compositor_frame_rate(int pid, uint32_t pref_mhz);
+/* A display that is not there, for the frame clock: a fixed refresh, or a
+ * VRR range; all zero goes back to the real one (`perf display`). */
+void compositor_simulate_display(uint32_t refresh_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz);
 /* The statistics overlay (comp_stats.h): toggle it (returns 1 if it is now
  * wanted), whether it is on screen, and the kernel loop's refresh of it. */
 int  compositor_hud_toggle(void);

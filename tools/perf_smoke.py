@@ -11,6 +11,11 @@ long they took and why (the serial `perf` command, kernel/gfx/comp_stats.c):
   drag      the Settings window dragged by its title bar and back
   launcher  the Applications launcher opened and dismissed
   openclose a Terminal opened from the dock, then closed with GUI+W
+  drag120   the drag again, the frame clock told the display is 120 Hz
+  dragvrr   and again on a variable-rate display, 48-120 Hz
+
+The last two use `perf display`, a display that is not there: the frame clock
+keeps its beat for it, so the beat and the rate it chose are the measure.
 
 Numbers under TCG are the emulator's, not a machine's: they compare one build
 with another on the same host, never a build with a target. The counts --
@@ -93,6 +98,8 @@ def scene(d, results, name, body):
           f"p95 {stats['p95_us'] / 1000:6.2f} ms  ptr p95 {stats['ptr_p95_us'] / 1000:6.2f} ms  "
           + (f"{stats.get('frames', 0)} frames beat p50 {stats.get('interval_p50_us', 0) / 1000:5.2f} "
              f"p95 {stats.get('interval_p95_us', 0) / 1000:5.2f} ms  " if 'frames' in stats else '')
+          + (f"rate {stats['rate_mhz'] / 1000:.0f}/{(stats['vrr_max_mhz'] or stats['display_mhz'] or 60000) / 1000:.0f} Hz  "
+             if 'rate_mhz' in stats else '')
           + ' '.join(f"{k}={v['composes']}" for k, v in stats['src'].items() if v['composes']),
           flush=True)
 
@@ -217,10 +224,12 @@ def main():
         # THE WINDOW STAYS WITH THE HAND. Dragged out and back to the grab
         # point, it must end where it started: a drag that counts motion twice
         # (or loses some) leaves it somewhere else.
-        end = windows(d)['Settings']
-        results['drag']['window_moved_by'] = [end['x'] - start['x'], end['y'] - start['y']]
-        assert abs(end['x'] - start['x']) <= 2 and abs(end['y'] - start['y']) <= 2, \
-            f"the dragged window did not come back with the pointer: {start} -> {end}"
+        def came_back(name):
+            end = windows(d)['Settings']
+            results[name]['window_moved_by'] = [end['x'] - start['x'], end['y'] - start['y']]
+            assert abs(end['x'] - start['x']) <= 2 and abs(end['y'] - start['y']) <= 2, \
+                f"{name}: the dragged window did not come back with the pointer: {start} -> {end}"
+        came_back('drag')
 
         def launcher():
             d.key('meta_l-spc'); d.g.pump(4)
@@ -233,6 +242,16 @@ def main():
             d.g.wait(b'Terminal: first frame presented', start=start); d.g.pump(3)
             d.key('meta_l-w'); d.g.pump(4)
         scene(d, results, 'openclose', openclose)
+
+        # THE SAME DRAG ON DISPLAYS THAT ARE NOT THERE: the frame clock told
+        # the display is 120 Hz, then that it refreshes anywhere in 48-120.
+        d.g.command('perf display 120', b'perf: display', 60)
+        scene(d, results, 'drag120', drag)
+        came_back('drag120')
+        d.g.command('perf display 48-120', b'perf: display', 60)
+        scene(d, results, 'dragvrr', drag)
+        came_back('dragvrr')
+        d.g.command('perf display auto', b'perf: display', 60)
 
         d.g.command('perf hud', b'perf: hud on', 60)
         d.g.pump(3)

@@ -217,6 +217,7 @@
 #define EMBK_SYS_comp_stats 160
 #define EMBK_SYS_ui_wait 161
 #define EMBK_SYS_win_frame 162
+#define EMBK_SYS_win_frame_rate 163
 
 
 

@@ -1220,6 +1220,14 @@ static inline int embk_win_frame(struct embk_frame_info *info, uint32_t timeout_
     return (int)embk_syscall2(EMBK_SYS_win_frame, (int64_t)(intptr_t)info, timeout_ms);
 }
 
+/* The rate this program's motion wants while it waits for frames, in
+ * millihertz: 24000 for a 24 fps video, 0 for as fast as the display goes
+ * (the default). The compositor gives the slowest rate the display can keep
+ * that is no slower than this, or exactly this on a variable-rate display. */
+static inline int embk_win_frame_rate(uint32_t pref_mhz) {
+    return (int)embk_syscall1(EMBK_SYS_win_frame_rate, pref_mhz);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);

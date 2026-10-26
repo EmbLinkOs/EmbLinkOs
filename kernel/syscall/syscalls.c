@@ -1949,10 +1949,14 @@ static int64_t sys_ui_wait(const struct sysargs *a) {
 /* arg 0 = struct embk_frame_info * (out, may be 0), arg 1 = timeout ms. */
 static int64_t sys_win_frame(const struct sysargs *a) {
     struct embk_frame_info fi;
-    int rc = compositor_frame_wait(&fi, (uint32_t)a->arg[1]);
+    int rc = compositor_frame_wait(current_process ? (int)current_process->pid : 0, &fi, (uint32_t)a->arg[1]);
     if (rc) return rc;
     if (a->arg[0] && copy_to_user((void *)(uintptr_t)a->arg[0], &fi, sizeof fi)) return -EMBK_EFAULT;
     return 0;
+}
+/* arg 0 = the rate (mHz) this process's motion wants; 0: the display's top. */
+static int64_t sys_win_frame_rate(const struct sysargs *a) {
+    return compositor_frame_rate(current_process ? (int)current_process->pid : 0, (uint32_t)a->arg[0]);
 }
 static int64_t sys_win_place(const struct sysargs *a) {
     return compositor_win_place((int)current_process->pid,(uint32_t)a->arg[0],(int32_t)a->arg[1],(int32_t)a->arg[2]);
@@ -2942,6 +2946,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_comp_stats] = sys_comp_stats,
     [SYS_ui_wait] = sys_ui_wait,
     [SYS_win_frame] = sys_win_frame,
+    [SYS_win_frame_rate] = sys_win_frame_rate,
     [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_win_focused] = sys_win_focused,
     [SYS_win_set_material] = sys_win_set_material,

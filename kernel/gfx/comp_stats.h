@@ -18,6 +18,9 @@ void comp_stats_record(unsigned src, uint64_t t0_ns, uint64_t t1_ns, uint64_t px
  * who is asking, not only why, and where. Kept for the few windows presenting
  * most since the last reset, with the rect each presented last. */
 void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+/* What the display can do and the rate chosen for it (frameclock.h). */
+void comp_stats_rate(uint32_t display_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz,
+                     uint32_t rate_mhz, uint32_t frame_cost_us);
 /* The frame thread finished a frame at `t_ns`, keeping a beat of `period_ns`. */
 void comp_stats_frame(uint64_t t_ns, uint64_t period_ns);
 /* The pointer moved at some instant and a compose showed it `ns` later. */

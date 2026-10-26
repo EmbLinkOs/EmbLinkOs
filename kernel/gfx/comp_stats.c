@@ -42,6 +42,7 @@ static struct {
     uint64_t frame_t[FRAME_RING];          /* when each recent frame finished */
     uint32_t interval[FRAME_RING];         /* and the gap before it, when it had one */
     uint32_t frame_head, frame_count, interval_count, interval_head;
+    uint32_t display_mhz, vrr_min_mhz, vrr_max_mhz, rate_mhz, frame_cost_us;
 } g;
 
 static uint32_t us_of(uint64_t ns)
@@ -93,6 +94,15 @@ void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint
     spin_unlock(&g_lock);
 }
 
+void comp_stats_rate(uint32_t display_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz,
+                     uint32_t rate_mhz, uint32_t frame_cost_us)
+{
+    spin_lock(&g_lock);
+    g.display_mhz = display_mhz; g.vrr_min_mhz = vrr_min_mhz; g.vrr_max_mhz = vrr_max_mhz;
+    g.rate_mhz = rate_mhz; g.frame_cost_us = frame_cost_us;
+    spin_unlock(&g_lock);
+}
+
 void comp_stats_frame(uint64_t t, uint64_t period_ns)
 {
     spin_lock(&g_lock);
@@ -124,7 +134,9 @@ void comp_stats_pointer(uint64_t ns)
 void comp_stats_reset(void)
 {
     spin_lock(&g_lock);
+    uint32_t dm = g.display_mhz, vmin = g.vrr_min_mhz, vmax = g.vrr_max_mhz, rm = g.rate_mhz;
     memset(&g, 0, sizeof g);
+    g.display_mhz = dm; g.vrr_min_mhz = vmin; g.vrr_max_mhz = vmax; g.rate_mhz = rm;
     g.since = time_get_ns();
     spin_unlock(&g_lock);
 }
@@ -186,6 +198,8 @@ void comp_stats_snapshot(struct embk_comp_stats *out)
     out->ptr_max_us = g.ptr_count ? scratch[g.ptr_count - 1] : 0;
     out->frames = g.frames;
     out->period_us = us_of(g.period_ns);
+    out->display_mhz = g.display_mhz; out->vrr_min_mhz = g.vrr_min_mhz; out->vrr_max_mhz = g.vrr_max_mhz;
+    out->rate_mhz = g.rate_mhz; out->frame_cost_us = g.frame_cost_us;
     for (uint32_t i = 0; i < g.frame_count; i++)
         if (g.frame_t[i] + 1000000000ull > now) out->sec_frames++;
     for (uint32_t i = 0; i < g.interval_count; i++) scratch[i] = g.interval[i];
@@ -214,10 +228,10 @@ int comp_stats_hud_text(char rows[COMP_STATS_HUD_ROWS][COMP_STATS_HUD_COLS + 1])
     struct embk_comp_stats s;
     comp_stats_snapshot(&s);
     char a[16], b[16], c[16];
-    uint32_t hz = s.period_us ? (1000000u + s.period_us / 2) / s.period_us : 0;
-    uint32_t mpx10 = s.sec_kpixels / 100u;   /* tenths of a megapixel */
-    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s %ux%u %uHz %u.%uMpx/s",
-             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h, hz, mpx10 / 10u, mpx10 % 10u);
+    uint32_t rate = (s.rate_mhz + 500u) / 1000u;
+    uint32_t top = ((s.vrr_max_mhz ? s.vrr_max_mhz : s.display_mhz) + 500u) / 1000u;
+    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s %ux%u %u/%uHz%s",
+             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h, rate, top ? top : 60u, s.vrr_max_mhz ? " VRR" : "");
     ms_text(a, sizeof a, s.interval_p50_us); ms_text(b, sizeof b, s.interval_p95_us);
     snprintf(rows[1], COMP_STATS_HUD_COLS + 1, "%3u fps beat %s p95 %s", s.sec_frames, a, b);
     ms_text(a, sizeof a, s.p50_us); ms_text(b, sizeof b, s.p95_us); ms_text(c, sizeof c, s.max_us);
@@ -247,13 +261,15 @@ static void dump(void)
             " p50_us=%u p95_us=%u max_us=%u recent=%u"
             " ptr_n=%u ptr_p50_us=%u ptr_p95_us=%u ptr_max_us=%u"
             " screen=%ux%u gpu=%u frames=%lu period_us=%u intervals=%u"
-            " interval_p50_us=%u interval_p95_us=%u interval_max_us=%u\n",
+            " interval_p50_us=%u interval_p95_us=%u interval_max_us=%u"
+            " display_mhz=%u vrr_min_mhz=%u vrr_max_mhz=%u rate_mhz=%u frame_cost_us=%u\n",
             (unsigned long)(span / 1000000u), (unsigned long)s.composes,
             (unsigned long)(s.compose_ns / 1000u), (unsigned long)(s.pixels / 1000u),
             (unsigned long)s.full_screen, s.p50_us, s.p95_us, s.max_us, s.recent,
             s.ptr_samples, s.ptr_p50_us, s.ptr_p95_us, s.ptr_max_us,
             s.screen_w, s.screen_h, s.gpu, (unsigned long)s.frames, s.period_us, s.intervals,
-            s.interval_p50_us, s.interval_p95_us, s.interval_max_us);
+            s.interval_p50_us, s.interval_p95_us, s.interval_max_us,
+            s.display_mhz, s.vrr_min_mhz, s.vrr_max_mhz, s.rate_mhz, s.frame_cost_us);
     for (int i = 0; i < EMBK_COMP_SRCS; i++)
         kprintf("perf: src=%s composes=%lu compose_us=%lu kpx=%lu\n", g_src_name[i],
                 (unsigned long)s.src_composes[i], (unsigned long)(s.src_ns[i] / 1000u),
@@ -281,6 +297,20 @@ int comp_stats_command(const char *cmd)
     if (!strcmp(cmd, "perf")) { dump(); return 1; }
     if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
     if (!strcmp(cmd, "perf windows")) { compositor_print_windows(); return 1; }
+    if (!strncmp(cmd, "perf display ", 13)) {
+        /* 120: a fixed 120 Hz display; 48-120: VRR from 48 to 120; auto: the real one */
+        const char *p = cmd + 13;
+        uint32_t a = 0, b = 0;
+        if (strcmp(p, "auto")) {
+            while (*p >= '0' && *p <= '9') a = a * 10 + (uint32_t)(*p++ - '0');
+            if (*p == '-') { p++; while (*p >= '0' && *p <= '9') b = b * 10 + (uint32_t)(*p++ - '0'); }
+            if (*p || !a || a > 1000 || b > 1000 || (b && b < a)) { kprintf("perf: display <hz> | <min>-<max> | auto\n"); return 1; }
+        }
+        if (b) compositor_simulate_display(0, a * 1000u, b * 1000u);
+        else compositor_simulate_display(a * 1000u, 0, 0);
+        kprintf("perf: display %s\n", a ? "simulated" : "auto");
+        return 1;
+    }
     if (!strcmp(cmd, "perf hud")) {
         int on = compositor_hud_toggle();
         kprintf("perf: hud %s\n", on ? "on" : "off");

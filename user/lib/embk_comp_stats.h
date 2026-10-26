@@ -14,7 +14,7 @@
  * layout without a version dance beyond `version`. */
 #include <stdint.h>
 
-#define EMBK_COMP_STATS_VERSION 2
+#define EMBK_COMP_STATS_VERSION 3
 
 #define EMBK_COMP_SRC_PRESENT 0   /* an application presented new pixels        */
 #define EMBK_COMP_SRC_MOVE    1   /* a window was moved, placed or resized       */
@@ -59,6 +59,12 @@ struct embk_comp_stats {
     uint32_t sec_frames;          /* in the last second */
     uint32_t period_us;           /* the beat the frame thread keeps */
     uint32_t intervals, interval_p50_us, interval_p95_us, interval_max_us;
+
+    /* THE RATE (version 3): what the display can do -- its refresh, or a VRR
+     * range -- the rate the frame thread chose for this moment, and the frame
+     * cost the governor weighed (frameclock.h). */
+    uint32_t display_mhz, vrr_min_mhz, vrr_max_mhz, rate_mhz;
+    uint32_t frame_cost_us, reserved2;
 };
 
 /* A FRAME, as the compositor's frame thread kept it (embk_win_frame). An
