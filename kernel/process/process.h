@@ -940,6 +940,15 @@ void sched_block_current_locked(struct wait_queue *wq);
  * frequent. See "UNDO A BLOCK THAT DID NOT HAPPEN" in process.c. */
 void sched_sleep_ms(uint64_t ms);
 
+/* A TIMED WAIT ON AN EVENT QUEUE: block on `wq` until woken, or until uptime
+ * `deadline_ms` -- whichever is first. The queue must have been registered
+ * with sched_timed_queue() (the timer drain walks only registered queues).
+ * Caller holds the scheduler lock; returns with it released, exactly like
+ * sched_block_current_locked. The caller re-checks its own condition: a wake
+ * says something happened or time ran out, not which. */
+void sched_timed_queue(struct wait_queue *wq);
+void sched_block_timeout_locked(struct wait_queue *wq, uint64_t deadline_ms);
+
 /* --- tickless idle --------------------------------------------------------
  * A core about to halt asks how long it may sleep, arms its own timer for
  * that, and announces that it is idle so a waker knows to kick it. On the way

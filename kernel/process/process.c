@@ -1224,29 +1224,71 @@ uint32_t sched_idle_next_ms(void) {
  * cycle entirely. It is also simply better: one acquisition per tick instead
  * of two, and the wake is now atomic with the scheduling decision that acts on
  * it. */
+/* TIMED WAITS ON ANY QUEUE. A thread waiting for an EVENT that must also give
+ * up at a deadline -- an application waiting for input or its next redraw,
+ * a frame waiter that must not hang on a stalled compositor -- blocks on its
+ * own queue with wake_at_ms set (sched_block_timeout_locked). Such a queue is
+ * registered once, and the drain below walks it as it walks g_sleep_wq: an
+ * expired waiter leaves the queue it was on and runs. Waiters on the same
+ * queue without a deadline (wake_at_ms 0) are not the drain's business. */
+#define TIMED_QUEUES_MAX 4
+static struct wait_queue *g_timed_queues[TIMED_QUEUES_MAX];
+static int g_ntimed_queues;
+
+void sched_timed_queue(struct wait_queue *wq) {
+    spin_lock(&g_sched_lock);
+    int known = 0;
+    for (int i = 0; i < g_ntimed_queues; i++) known |= g_timed_queues[i] == wq;
+    if (!known && g_ntimed_queues < TIMED_QUEUES_MAX) g_timed_queues[g_ntimed_queues++] = wq;
+    else if (!known) kprintf("sched: no room for another timed wait queue\n");
+    spin_unlock(&g_sched_lock);
+}
+
+void sched_block_timeout_locked(struct wait_queue *wq, uint64_t deadline_ms) {
+    struct thread *t = current_thread;
+    t->wake_at_ms = deadline_ms;
+    if (!g_earliest_wake_ms || deadline_ms < g_earliest_wake_ms)
+        __atomic_store_n(&g_earliest_wake_ms, deadline_ms, __ATOMIC_RELAXED);
+    if (t->period_ms &&
+        (!g_earliest_periodic_wake_ms || deadline_ms < g_earliest_periodic_wake_ms))
+        __atomic_store_n(&g_earliest_periodic_wake_ms, deadline_ms, __ATOMIC_RELAXED);
+    sched_block_current_locked(wq);
+    t->wake_at_ms = 0;              /* woken by the event or the clock: done either way */
+}
+
+/* One queue's expired sleepers made runnable; the rest's deadlines folded in. */
+static void wake_expired_on(struct wait_queue *wq, uint64_t now, bool *woke,
+                            uint64_t *earliest, uint64_t *earliest_p) {
+    struct thread *t = wq->head;
+    while (t) {
+        struct thread *next = t->wait_next;
+        if (t->wake_at_ms && now >= t->wake_at_ms) {
+            wait_queue_remove(wq, t);
+            t->wake_at_ms = 0;
+            sched_set_ready(t);
+            *woke = true;
+        } else if (t->wake_at_ms) {
+            if (!*earliest || t->wake_at_ms < *earliest)
+                *earliest = t->wake_at_ms;
+            if (t->period_ms && (!*earliest_p || t->wake_at_ms < *earliest_p))
+                *earliest_p = t->wake_at_ms;
+        }
+        t = next;
+    }
+}
+
 static void wake_expired_locked(void) {
-    if (!g_sleep_wq.head)
+    bool any = g_sleep_wq.head != 0;
+    for (int i = 0; i < g_ntimed_queues && !any; i++) any = g_timed_queues[i]->head != 0;
+    if (!any)
         return;                        /* the common case, and now lock-free */
 
     uint64_t now = timer_uptime_ms();
     bool woke = false;
     uint64_t earliest = 0, earliest_p = 0;
-    struct thread *t = g_sleep_wq.head;
-    while (t) {
-        struct thread *next = t->wait_next;
-        if (t->wake_at_ms && now >= t->wake_at_ms) {
-            wait_queue_remove(&g_sleep_wq, t);
-            t->wake_at_ms = 0;
-            sched_set_ready(t);
-            woke = true;
-        } else if (t->wake_at_ms) {
-            if (!earliest || t->wake_at_ms < earliest)
-                earliest = t->wake_at_ms;
-            if (t->period_ms && (!earliest_p || t->wake_at_ms < earliest_p))
-                earliest_p = t->wake_at_ms;
-        }
-        t = next;
-    }
+    wake_expired_on(&g_sleep_wq, now, &woke, &earliest, &earliest_p);
+    for (int i = 0; i < g_ntimed_queues; i++)
+        wake_expired_on(g_timed_queues[i], now, &woke, &earliest, &earliest_p);
     /* Recomputed from the walk we were doing anyway -- the caches are exact
      * again here, whatever they drifted to between drains. */
     __atomic_store_n(&g_earliest_wake_ms, earliest, __ATOMIC_RELAXED);
