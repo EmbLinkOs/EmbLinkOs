@@ -4317,6 +4317,26 @@
       "featured": false,
       "milestone": "Fluid desktop P5: shell",
       "historical": false
+    },
+    {
+      "id": "220-banners-stack",
+      "phase": "Fluid desktop",
+      "title": "A second notice",
+      "caption": "A second notice arriving: its banner slides in from the screen's edge on top while the first glides down to make room, both on springs. Banners leave the way they came -- when their time is up, clicked, or flicked away -- and stay while the pointer is on them. Under TCG.",
+      "alt": "Two EmbLinkOS notification banners at the top right: 'Second' sliding in from the edge above 'First', which is moving down",
+      "file": "220-banners-stack.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "bb95a4cfae1fcd813d71174b8b2fa171df54aa738bcd9107ed3bda4d6eb9daf7",
+      "source_capture": "emblink-banner-8q4vi_ol/stack-mid.png",
+      "source_sha256": "41323ba1b8ecfba7a3a05c0518fb90a2e5a2fbd3065aaa2236696483d989ba94",
+      "source_commit": "70c522e",
+      "featured": false,
+      "milestone": "Fluid desktop P5: shell",
+      "historical": false
     }
   ]
 }
