@@ -18,8 +18,8 @@ from lock_test import keyname
 import shell_shot as S
 
 class Desktop:
-    def __init__(self,out,disk,graphics="virtio",cpu_compose=False):
-        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics,cpu_compose=cpu_compose)
+    def __init__(self,out,disk,graphics="virtio",cpu_compose=False,extra=()):
+        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics,cpu_compose=cpu_compose,extra=extra)
         self.sock=out/'gdb.sock';self.symbols={}
     def login(self,setup=False):
         g=self.g

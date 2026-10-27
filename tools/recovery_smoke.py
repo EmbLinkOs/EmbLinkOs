@@ -27,7 +27,7 @@ def free_vnc_display():
     raise RuntimeError('no free VNC port')
 
 class Guest:
-    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None,graphics="virtio",cpu_compose=False):
+    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False,resolution=(800,600),audio=False,acpi=None,nic=None,graphics="virtio",cpu_compose=False,extra=()):
         if graphics not in ("virtio","bochs","virtio-dual","virgl"):raise ValueError("unsupported graphics fixture")
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
@@ -73,6 +73,7 @@ class Guest:
                   '-audiodev',f'wav,id=snd0,path={out / "audio.wav"}']
         if acpi:
             cmd+=['-acpitable',f'file={acpi}']
+        cmd+=list(extra)              # devices a particular test needs (a USB mouse)
         self.err=(out/'qemu.log').open('wb');self.log=(out/'serial.log').open('wb')
         self.p=subprocess.Popen(cmd,cwd=ROOT,stdout=self.err,stderr=self.err)
         self.serial=socket.socket(socket.AF_UNIX)

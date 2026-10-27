@@ -162,9 +162,22 @@ static void usb_tablet_process_report(const uint8_t *report, int len) {
     mouse_set_absolute(x, y, 0x7FFF, buttons, wheel);
 }
 
+/* A BOOT MOUSE: [buttons][dx][dy]([wheel]) -- signed 8-bit deltas, +y down,
+ * +wheel away from the user, the conventions mouse_move_relative() takes and
+ * the xHCI driver's own boot-mouse path already feeds it. The controllers
+ * this path serves (UHCI, OHCI, EHCI) used to find a mouse and print that
+ * they had no driver for it. */
+static void usb_mouse_process_report(const uint8_t *report, int len) {
+    if (len < 3) return;
+    int32_t wheel = len >= 4 ? (int32_t)(int8_t)report[3] : 0;
+    mouse_move_relative((int32_t)(int8_t)report[1], (int32_t)(int8_t)report[2],
+                        (uint32_t)report[0] & 0x07u, wheel);
+}
+
 static void usb_hid_process_report(struct usb_device *dev,
                                    const uint8_t *report, int len) {
     if (dev->hid_kind == USB_HID_TABLET) { usb_tablet_process_report(report, len); return; }
+    if (dev->hid_kind == USB_HID_MOUSE) { usb_mouse_process_report(report, len); return; }
     if (len < 3) return;
     keyboard_hid_boot_report(dev->prev_report, report, (unsigned)len);
 }
@@ -176,8 +189,9 @@ static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
         return false;
     }
 
-    if (kind == USB_HID_KEYBOARD) {
-        // Boot protocol so the keyboard sends the fixed 8-byte boot report.
+    if (kind == USB_HID_KEYBOARD || kind == USB_HID_MOUSE) {
+        // Boot protocol, so the report is the fixed boot layout: 8 bytes for a
+        // keyboard, [buttons, dx, dy, wheel] for a mouse.
         usb_control(dev, 0x21, 0x0B /* SET_PROTOCOL */, 0 /* boot */, 0, NULL, 0);
     }
     // A tablet has no boot mode -- leave it in REPORT protocol (its absolute
@@ -195,7 +209,7 @@ static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
     }
     dev->hid_active = true;
     kprintf("USB HID: %s ready (addr %u, ep 0x%x)\n",
-            kind == USB_HID_TABLET ? "absolute tablet" : "boot keyboard",
+            kind == USB_HID_TABLET ? "absolute tablet" : kind == USB_HID_MOUSE ? "boot mouse" : "boot keyboard",
             (unsigned int)dev->addr, (unsigned int)dev->hid_ep);
     return true;
 }
@@ -504,7 +518,7 @@ void usb_device_gone(struct usb_device *dev) {
             (unsigned)dev->vid, (unsigned)dev->pid, (unsigned)dev->port);
     usb_msc_detach(dev);
     usb_uas_detach(dev);
-    if (dev->hid_active && dev->hid_kind != USB_HID_TABLET) {   /* no key left held */
+    if (dev->hid_active && dev->hid_kind == USB_HID_KEYBOARD) {   /* no key left held */
         static const uint8_t none[8];
         keyboard_hid_boot_report(dev->prev_report, none, 8);
     }
@@ -774,7 +788,7 @@ int usb_enumerate(struct usb_device *dev) {
         usb_hid_attach(dev, USB_HID_TABLET);
     } else if (dev->if_class == 0x03 && dev->if_subclass == 0x01 &&
                dev->if_protocol == 0x02) {
-        kprintf("USB: HID boot mouse detected (relative; no driver)\n");
+        usb_hid_attach(dev, USB_HID_MOUSE);
     } else if (dev->if_class == 0x08) {
         /* UAS FIRST, BOT AS THE FALLBACK. Protocol 0x62 is USB Attached SCSI;
          * a device that speaks it still answers Bulk-Only Transport, so a

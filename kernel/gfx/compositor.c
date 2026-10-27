@@ -3919,6 +3919,8 @@ void compositor_print_windows(void) {
                 w->cw, w->ch, (unsigned)w->drag_n, w->drag_n ? w->drag_r[0][0] : 0, w->drag_n ? w->drag_r[0][1] : 0,
                 w->drag_n ? w->drag_r[0][2] : 0, w->drag_n ? w->drag_r[0][3] : 0);
     }
+    { int32_t px, py; uint32_t pb; mouse_get_state(&px, &py, &pb);
+      kprintf("perf: pointer x=%d y=%d buttons=%u\n", (int)px, (int)py, (unsigned)pb); }
     for (int i = 0; i < g_dock_tn; i++)
         kprintf("perf: dock app=%s x=%d y=%d w=%d h=%d\n", g_dock_t[i].app,
                 g_dock_t[i].x, g_dock_t[i].y, g_dock_t[i].w, g_dock_t[i].h);

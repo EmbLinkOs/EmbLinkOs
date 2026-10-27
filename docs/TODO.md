@@ -86,7 +86,10 @@ the default target). Measured before and after every step
         (`make kit-test`; one notch is 19 frames under HVF, `tools/motion_smoke.py`).
   - [ ] Pixel-precise scrolling and momentum after a touchpad flick: needs pixel deltas and a
         lift event from the touchpad driver (velocity.h is ready for the fling).
-  - [ ] Pointer acceleration; a USB HID mouse driver; event timestamps for velocity.
+  - [x] USB boot mice on the generic path the older controllers share (UHCI, OHCI, EHCI), which
+        found one and printed "no driver"; xHCI's own path already fed them
+        (`tools/usb_mouse_smoke.py`: a mouse on UHCI and one on EHCI move the pointer 1:1 and click).
+  - [ ] Pointer acceleration; event timestamps for velocity.
 - [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
       governor and an Effects setting; the toolkit's span rasterizer, gradient LUT, one blend policy,
       layer caching.
