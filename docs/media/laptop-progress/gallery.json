@@ -4217,6 +4217,26 @@
       "featured": false,
       "milestone": "Fluid desktop P3: materials",
       "historical": false
+    },
+    {
+      "id": "215-launcher-glass",
+      "phase": "Fluid desktop",
+      "title": "Glass you can see through",
+      "caption": "The Applications launcher on the new default material: translucent (35%) over a 12 px blur, the backdrop saturated as it shows through (vibrancy), with the two-layer shadow beneath the sheet. The default had been 18% over 6 px -- a surface 82% opaque. Under TCG.",
+      "alt": "The EmbLinkOS Applications launcher, a translucent dark sheet over the blurred, darkened wallpaper",
+      "file": "215-launcher-glass.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; opened with GUI+Space over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "b1687b46a2acb72092e5f082fb4ce6e384275993dd9a44e59a4e4e53623e775f",
+      "source_capture": "emblink-caplaunch-g2y2mpao/l8.ppm",
+      "source_sha256": "d3ff22fe53da15a1c2c2b27e7cb788b0d8481eb8e43d286def0d84a9d765d34a",
+      "source_commit": "5f15fe1",
+      "featured": false,
+      "milestone": "Fluid desktop P3: materials",
+      "historical": false
     }
   ]
 }

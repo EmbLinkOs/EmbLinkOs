@@ -103,7 +103,12 @@ the default target). Measured before and after every step
         (gallery 214). Drawn per pixel band with the straight edges computed once, not from a
         cached 9-slice: the corner zones are the only 2-D work.
   - [ ] Corner masks precomputed per radius (the carve supersamples 4 x 4 per corner pixel).
-  - [ ] Kawase blur at a quarter resolution with vibrancy; a quality governor and an Effects setting.
+  - [x] Vibrancy: every glass surface saturates what shows through it, compositor and toolkit;
+        translucent (35%) with a 12 px blur by default (gallery 215).
+  - [ ] Vibrancy on the GPU path (virgl, Intel): its blur primitive has no saturation yet.
+  - [ ] A blur at a quarter resolution for large glass (the box blur costs the same at any radius,
+        but a big translucent window re-blurs its whole backdrop while it is dragged); a quality
+        governor and an Effects setting.
   - [ ] The toolkit's span rasterizer, gradient LUT and dither, one blend policy, layer caching.
 - [ ] P4 Inter, area-coverage text, subpixel positioning, kerning; the token pass.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
