@@ -83,9 +83,27 @@ def main():
             _, _, b2 = pointer(d)
             assert b & 1 and not b2 & 1, f'{name}: the left button did not go down and up: {b} {b2}'
             print(f'{name} mouse: pointer {(x0, y0)} -> {(x1, y1)}, left button down and up', flush=True)
+
+        # THE CURVE (the launcher boots the pointer 1:1; this turns it on):
+        # an aim stays 1:1, a burst goes further than it counted
+        d.g.command('pointer accel', b'pointer: accelerated', 60)
+        hmp(d, f'mouse_set {mice[0]}')
+        P0 = pointer(d)
+        for _ in range(8):
+            d.g.qmp.cmd('input-send-event', events=[{'type': 'rel', 'data': {'axis': 'x', 'value': -4}}])
+            d.g.pump(0.25)
+        P1 = pointer(d)
+        assert P0[0] - P1[0] == 32, f'a slow aim of 32 counts moved {P0[0] - P1[0]} px'
+        for _ in range(12):
+            d.g.qmp.cmd('input-send-event', events=[{'type': 'rel', 'data': {'axis': 'x', 'value': 25}}])
+        d.g.pump(1)
+        P2 = pointer(d)
+        assert P2[0] - P1[0] > 300 * 1.3, f'a burst of 300 counts moved only {P2[0] - P1[0]} px'
+        print(f'accelerated: a slow aim of 32 counts moved {P0[0] - P1[0]} px, a burst of 300 moved {P2[0] - P1[0]} px', flush=True)
     finally:
         d.g.close()
-    print('PASS: USB boot mice on UHCI and EHCI move the pointer and press its button', flush=True)
+    print('PASS: USB boot mice on UHCI and EHCI move the pointer and press its button; '
+          'accelerated, an aim stays 1:1 and a burst goes further', flush=True)
 
 
 if __name__ == '__main__':

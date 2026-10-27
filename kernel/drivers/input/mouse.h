@@ -61,6 +61,10 @@ uint64_t mouse_take_motion_ns(void);
  * lock. The compositor's frame thread waits on it rather than polling. */
 void mouse_set_notify(void (*fn)(void));
 
+/* The serial console's `pointer linear` / `pointer accel`: relative motion
+ * 1:1, or on the acceleration curve (the default). 1 if `cmd` was one. */
+int pointer_command(const char *cmd);
+
 /* Put the cursor at (x, y), clamped to the bounds. For the compositor, which
  * keeps it off the parts of a multi-monitor desktop no monitor shows. */
 void mouse_warp(int32_t x, int32_t y);

@@ -100,6 +100,7 @@ def main():
     qmp_port = 4900 + random.randint(0, 400)
     argv = ["qemu-system-x86_64", "-cpu", "max",
             "-fw_cfg", "name=opt/emblink/live,string=1",
+        "-fw_cfg", "name=opt/emblink/pointer,string=1",   # aimed by counting: no curve
             "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT,
             "-drive", "format=raw,file=%s,if=ide,index=1" % disk,
             "-vga", "none", "-device", "virtio-vga,xres=1024,yres=768",

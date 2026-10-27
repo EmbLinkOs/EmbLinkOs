@@ -1704,7 +1704,8 @@ void arch_early_main(uint64_t dtb_phys) {
                 char c = serial_read_char();
                 if (c == '\r' || c == '\n') {
                     line[n] = 0;
-                    if (n && !comp_stats_command(line)) kprintf("[cmd] unknown command: %s\n", line);
+                    if (n && !comp_stats_command(line) && !pointer_command(line))
+                        kprintf("[cmd] unknown command: %s\n", line);
                     n = 0;
                 } else if ((c == '\b' || c == 127) && n) n--;
                 else if (c >= 32 && c <= 126 && n + 1 < sizeof line) line[n++] = c;

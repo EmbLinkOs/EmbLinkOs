@@ -223,6 +223,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
+             kernel/drivers/input/pointer_accel.c \
              kernel/drivers/input/i8042.c \
              kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \
@@ -2806,6 +2807,13 @@ frameclock-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	    -Ikernel tests/gfx/frameclock_test.c kernel/gfx/frameclock.c -o $(BUILD)/frameclock_test
 	$(BUILD)/frameclock_test
+
+.PHONY: pointer-accel-test
+# The pointer's acceleration curve (kernel/drivers/input/pointer_accel.c).
+pointer-accel-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Ikernel tests/input/pointer_accel_test.c kernel/drivers/input/pointer_accel.c -o $(BUILD)/pointer_accel_test
+	$(BUILD)/pointer_accel_test
 
 .PHONY: spring-test
 # The springs and the velocity fit everything on the desktop moves by

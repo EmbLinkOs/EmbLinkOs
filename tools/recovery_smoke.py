@@ -73,6 +73,9 @@ class Guest:
                   '-audiodev',f'wav,id=snd0,path={out / "audio.wav"}']
         if acpi:
             cmd+=['-acpitable',f'file={acpi}']
+        # the pointer 1:1: the tools aim a relative mouse by counting what
+        # they sent, which an acceleration curve would turn into a guess
+        cmd+=['-fw_cfg','name=opt/emblink/pointer,string=1']
         cmd+=list(extra)              # devices a particular test needs (a USB mouse)
         self.err=(out/'qemu.log').open('wb');self.log=(out/'serial.log').open('wb')
         self.p=subprocess.Popen(cmd,cwd=ROOT,stdout=self.err,stderr=self.err)

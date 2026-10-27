@@ -53,3 +53,10 @@ int boot_qemu_cpu_compose(void) {
     static const char name[]="opt/emblink/compose";
     return qemu_byte(name,sizeof name)=='0';
 }
+/* The pointer 1:1, no acceleration curve, when a test asks with -fw_cfg
+ * name=opt/emblink/pointer,string=1: the tools that aim a relative mouse by
+ * counting what they sent. */
+int boot_qemu_linear_pointer(void) {
+    static const char name[]="opt/emblink/pointer";
+    return qemu_byte(name,sizeof name)=='1';
+}

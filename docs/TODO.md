@@ -89,7 +89,13 @@ the default target). Measured before and after every step
   - [x] USB boot mice on the generic path the older controllers share (UHCI, OHCI, EHCI), which
         found one and printed "no driver"; xHCI's own path already fed them
         (`tools/usb_mouse_smoke.py`: a mouse on UHCI and one on EHCI move the pointer 1:1 and click).
-  - [ ] Pointer acceleration; event timestamps for velocity.
+  - [x] Pointer acceleration: 1:1 while aiming (under 0.6 counts/ms), up to 3x across a sweep,
+        fractions carried (`make pointer-accel-test`; in the guest a slow 32-count aim moves 32 px
+        and a 300-count burst 571). PS/2, USB and I2C touchpads alike; absolute tablets are not.
+        Test launchers boot it 1:1 (`opt/emblink/pointer`); `pointer accel|linear` on serial.
+  - [ ] A tracking-speed preference in Settings: the curve takes one (tracking_permille), nothing
+        sets it yet.
+  - [ ] Event timestamps on the input path for the toolkit's velocity fit (a touchpad flick).
 - [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
       governor and an Effects setting; the toolkit's span rasterizer, gradient LUT, one blend policy,
       layer caching.

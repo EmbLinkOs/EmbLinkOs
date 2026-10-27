@@ -26,6 +26,10 @@ static spinlock_t pointer_state_lock=SPINLOCK_INIT;
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: a press knows its own time */
+#include "drivers/input/pointer_accel.h"
+#if defined(__x86_64__)
+#include "arch/x86_64/boot/fw_cfg.h"   /* opt/emblink/pointer: a test asks for 1:1 */
+#endif
 
 #define PS2_DATA   0x60
 #define PS2_STATUS 0x64
@@ -68,6 +72,28 @@ uint64_t mouse_take_motion_ns(void) {
 }
 static volatile uint32_t g_buttons;
 static volatile int32_t  g_wheel;        /* accumulated scroll notches (IntelliMouse Z) */
+
+/* RELATIVE MOTION IS ACCELERATED (pointer_accel.h): 1:1 while aiming, up to
+ * three times across a sweep. Absolute devices are not -- a tablet's position
+ * is a position. `pointer linear` on the serial console turns it off, for the
+ * test tools that aim a relative mouse by counting what they sent. Caller
+ * holds pointer_state_lock. */
+static struct ptr_accel g_accel;
+static volatile int g_accel_on = 1;
+static uint32_t g_tracking_permille = 1000;
+static void accelerate(int32_t *dx, int32_t *dy) {
+    if (g_accel_on) ptr_accel_apply(&g_accel, dx, dy, time_get_ns(), g_tracking_permille);
+}
+
+int pointer_command(const char *cmd) {
+    const char *p = "pointer ";
+    for (int i = 0; p[i]; i++) if (cmd[i] != p[i]) return 0;
+    cmd += 8;
+    if (cmd[0] == 'l') { g_accel_on = 0; kprintf("pointer: linear\n"); return 1; }
+    if (cmd[0] == 'a') { g_accel_on = 1; kprintf("pointer: accelerated\n"); return 1; }
+    kprintf("pointer: linear | accel\n");
+    return 1;
+}
 
 /* LEFT-BUTTON PRESSES THAT HAVE HAPPENED, counted as the packets arrive.
  *
@@ -175,8 +201,10 @@ static void apply_motion(void) {
     int32_t dy = g_pkt[2];
     if (g_pkt[0] & PKT_X_SIGN) dx |= ~0xFF;   /* sign-extend 8->32 */
     if (g_pkt[0] & PKT_Y_SIGN) dy |= ~0xFF;
+    dy = -dy;                                  /* PS/2 y is up-positive; screen is down */
+    accelerate(&dx, &dy);
     int32_t nx = g_x + dx;
-    int32_t ny = g_y - dy;                     /* PS/2 y is up-positive; screen is down */
+    int32_t ny = g_y + dy;
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     note_motion(nx, ny);
@@ -213,6 +241,7 @@ void mouse_set_absolute(int32_t x,int32_t y,int32_t range,uint32_t buttons,int32
 
 
 void mouse_move_relative_inner(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel) {
+    accelerate(&dx, &dy);
     int32_t nx = g_x + dx;
     int32_t ny = g_y + dy;                     /* screen convention: +y is DOWN */
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
@@ -277,6 +306,9 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     g_w = (int32_t)screen_w; g_h = (int32_t)screen_h;
     g_x = g_w / 2; g_y = g_h / 2;
     g_cycle = 0; g_buttons = 0; g_press_head = g_press_n = 0;
+#if defined(__x86_64__)
+    if (boot_qemu_linear_pointer()) { g_accel_on = 0; kprintf("mouse: pointer 1:1 (opt/emblink/pointer)\n"); }
+#endif
 
 #if !defined(__x86_64__)
     /* The clamp bounds and the centred cursor ARE the whole of mouse_init()

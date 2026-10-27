@@ -3,4 +3,5 @@
 int boot_qemu_live(void);
 int boot_qemu_outputs(void);
 int boot_qemu_cpu_compose(void);
+int boot_qemu_linear_pointer(void);
 #endif

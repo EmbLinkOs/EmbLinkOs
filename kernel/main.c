@@ -1786,6 +1786,7 @@ static void kernel_handle_line_command(const char *cmd)
     }
     if(wifi_command(cmd))return;
     if(comp_stats_command(cmd))return;
+    if(pointer_command(cmd))return;
 
     if (shell_handle_process_command(cmd))
         return;
