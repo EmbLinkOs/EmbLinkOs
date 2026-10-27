@@ -94,7 +94,8 @@ initiating controls; menu arrows/Home/End/Escape retain slider and text-field
 editing keys. See [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md) for contracts and limits.
 Assistive-technology semantics and arbitrary shortcut recording remain further
 work. System shortcuts offer Super or Ctrl+Alt as their modifier:
-Space opens the library, Tab cycles windows, W closes, Q quits, 1–6 selects a
+Space opens the library, Tab cycles windows, W closes, Q quits, M minimises
+into the dock, 1–6 selects a
 workspace, Shift+1–6 moves a window, and [ / ] walks spaces; Shift+P shows what
 composing costs ([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)). Editing
 shortcuts retain their existing meanings.

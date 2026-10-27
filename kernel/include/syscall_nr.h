@@ -359,6 +359,7 @@
 #define SYS_win_frame 162  /* (struct embk_frame_info *out, timeout_ms) -> 0 | -err: the next frame */
 #define SYS_win_frame_rate 163 /* (pref_mhz) -> 0: the rate this process's motion wants */
 #define SYS_win_drag_regions 164 /* (id, int32_t (*rects)[4], n) -> 0 | -err: where the compositor drags it */
+#define SYS_dock_targets 165 /* (const struct embk_dock_target *, n) -> 0 | -err: the desktop's dock tiles */
 
 
 

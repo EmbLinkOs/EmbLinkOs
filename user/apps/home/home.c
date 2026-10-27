@@ -792,6 +792,31 @@ static void desk_ink_poll(void) {
 #define DOCK_PITCH   (DOCK_SLOT_W + 10.0f)
 static float dock_slot_x0(int i) { return g_dockr[0] + 12.0f + (float)i * DOCK_PITCH; }
 
+/* WHERE EACH TILE IS, told to the compositor: a minimised window flies into
+ * its app's tile and back out of it, not toward a guess at the bottom of the
+ * screen. The same geometry the hover test below uses, so the window lands on
+ * the tile the pointer would light. Said again only when it changes. */
+static void dock_publish_targets(void) {
+    static struct embk_dock_target last[EMBK_DOCK_TARGETS_MAX];
+    static int last_n = -1;
+    struct embk_dock_target t[EMBK_DOCK_TARGETS_MAX];
+    int n = 0;
+    for (int i = 0; i < g_dock_n && n < (int)EMBK_DOCK_TARGETS_MAX; i++) {
+        if (!g_dock[i].app) continue;
+        memset(&t[n], 0, sizeof t[n]);
+        strncpy(t[n].app, embk_basename(g_dock[i].app), sizeof t[n].app - 1);
+        float along = g_cfg.dock_edge ? g_dockr[1] + 12 + i * DOCK_PITCH : dock_slot_x0(i);
+        float across = g_cfg.dock_edge ? (g_dockr[0] + g_dockr[2] - DOCK_SLOT_W) * .5f
+                                       : (g_dockr[1] + g_dockr[3] - DOCK_SLOT_W) * .5f;
+        t[n].x = (int32_t)(g_cfg.dock_edge ? across : along);
+        t[n].y = (int32_t)(g_cfg.dock_edge ? along : across);
+        t[n].w = t[n].h = (int32_t)DOCK_SLOT_W;
+        n++;
+    }
+    if (n == last_n && !memcmp(t, last, (size_t)n * sizeof t[0])) return;
+    if (embk_dock_targets(t, (unsigned)n) == 0) { memcpy(last, t, (size_t)n * sizeof t[0]); last_n = n; }
+}
+
 /* Which slot the pointer is over, or -1. The readout and the hover plate both
  * ask this, so they can never disagree about which app you mean. */
 static int dock_hover_index(void) {
@@ -864,7 +889,7 @@ static void dock_pill(void) {
         }
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
-          if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
+          if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; dock_publish_targets(); } }
         for (int i = 0; i < g_dock_n; i++) {
             int running = dock_running(g_dock[i].app);
             int over    = (i == hov) && !g_drag;

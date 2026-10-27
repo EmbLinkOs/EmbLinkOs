@@ -100,9 +100,9 @@ def scene(d, results, name, body):
           f"p95 {stats['p95_us'] / 1000:6.2f} ms  ptr p95 {stats['ptr_p95_us'] / 1000:6.2f} ms  "
           + (f"{stats.get('frames', 0)} frames beat p50 {stats.get('interval_p50_us', 0) / 1000:5.2f} "
              f"p95 {stats.get('interval_p95_us', 0) / 1000:5.2f} ms  " if 'frames' in stats else '')
-          + (f"rate {stats.get('rate_peak_mhz', stats['rate_mhz']) / 1000:.0f}/"
+          + (f"rate {(stats.get('rate_peak_mhz') or stats['rate_mhz']) / 1000:.0f}/"
              f"{(stats['vrr_max_mhz'] or stats['display_mhz'] or 60000) / 1000:.0f} Hz  "
-             if 'rate_mhz' in stats else '')
+             if stats.get('rate_peak_mhz') or stats.get('rate_mhz') else '')
           + (f"late p50 {stats['late_p50_us'] / 1000:.2f} p95 {stats['late_p95_us'] / 1000:.2f} ms "
              f"lead {stats['lead_us'] / 1000:.2f} ms  " if stats.get('lates') else '')
           + ' '.join(f"{k}={v['composes']}" for k, v in stats['src'].items() if v['composes']),
@@ -182,6 +182,18 @@ def glide(d, x, y, step=8, pause=0.03):
         d.g.pump(pause)
 
 
+def boot(args, out):
+    """A disposable desktop of `args.arch` (and `args.accel`), not yet logged in."""
+    if args.arch == 'aarch64':
+        d = Desktop.__new__(Desktop)
+        d.out = out / 'guest'; d.g = Arm64Guest(d.out, args.accel); d.sock = d.out / 'gdb.sock'; d.symbols = {}
+    else:
+        disk = out / 'perf.img'
+        shutil.copyfile(ROOT / 'uefi-usb.img', disk)
+        d = Desktop(out / 'guest', disk)
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--label', default='run')
@@ -193,13 +205,7 @@ def main():
     out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix='emblink-perf-'))
     out.mkdir(parents=True, exist_ok=True)
     print(f'Logs and results: {out}', flush=True)
-    if args.arch == 'aarch64':
-        d = Desktop.__new__(Desktop)
-        d.out = out / 'guest'; d.g = Arm64Guest(d.out, args.accel); d.sock = d.out / 'gdb.sock'; d.symbols = {}
-    else:
-        disk = out / 'perf.img'
-        shutil.copyfile(ROOT / 'uefi-usb.img', disk)
-        d = Desktop(out / 'guest', disk)
+    d = boot(args, out)
     results = {}
     try:
         d.login(setup=True)

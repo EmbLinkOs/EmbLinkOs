@@ -319,6 +319,14 @@ int comp_stats_command(const char *cmd)
     if (!strcmp(cmd, "perf")) { dump(); return 1; }
     if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
     if (!strcmp(cmd, "perf windows")) { compositor_print_windows(); return 1; }
+    if (!strncmp(cmd, "perf slowmo ", 12)) {
+        uint32_t n = 0;
+        for (const char *p = cmd + 12; *p >= '0' && *p <= '9'; p++) n = n * 10 + (uint32_t)(*p - '0');
+        if (!n || n > 20) { kprintf("perf: slowmo <1-20>\n"); return 1; }
+        compositor_slowmo(n);
+        kprintf("perf: slowmo %u\n", n);
+        return 1;
+    }
     if (!strncmp(cmd, "perf beat ", 10)) {
         uint32_t n = 0;
         for (const char *p = cmd + 10; *p >= '0' && *p <= '9'; p++) n = n * 10 + (uint32_t)(*p - '0');

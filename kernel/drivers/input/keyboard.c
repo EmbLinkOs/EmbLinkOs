@@ -469,6 +469,7 @@ static int interface_key(uint16_t key, uint32_t base, uint32_t cp) {
         if(system=='\t'){g_syskey=SYSKEY_NEXT_WINDOW;return 1;}
         if(system=='w'){g_syskey=SYSKEY_CLOSE_WINDOW;return 1;}
         if(system=='q'){g_syskey=SYSKEY_QUIT_APP;return 1;}
+        if(system=='m'){g_syskey=SYSKEY_MINIMIZE;return 1;}
         if(system==' '){g_syskey=SYSKEY_LAUNCHER;return 1;}
         if(system=='['){g_syskey=SYSKEY_SPACE_PREVIOUS;return 1;}
         if(system==']'){g_syskey=SYSKEY_SPACE_NEXT;return 1;}

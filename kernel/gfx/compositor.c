@@ -26,6 +26,7 @@
 #if defined(__x86_64__)
 #include "power/policy.h"       /* the Efficiency profile caps the rate */
 #endif
+#include "../../ui/motion/spring.h"   /* window motion: the toolkit's springs */
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -145,6 +146,7 @@ struct comp_window {
     uint8_t   drag_n;
     int16_t   drag_r[COMP_DRAG_REGIONS][4];
     char      title[COMP_TITLE_MAX + 1];
+    char      app[24];      /* the program's basename, for its dock tile */
     uint32_t *content;      /* cw*ch, 0xAARRGGBB premultiplied. For a copy      */
                             /* window this is a kmalloc'd kernel buffer the      */
                             /* client presents INTO; for a shared window it's a  */
@@ -377,7 +379,6 @@ static void *g_canvas_px;
 static uint32_t g_aurora_img;
 static uint32_t g_cursor_img;
 static int g_cursor_img_stale = 1;
-static uint32_t g_snap_img;
 static uint32_t g_gpu_doomed[64];
 static unsigned g_gpu_ndoomed;
 
@@ -798,50 +799,73 @@ static void corners_carve(const struct comp_window *w, int focused) {
  * ghost of the input row (docs/TODO.md).
  *
  * Doing it in the compositor sidesteps that entirely. The compositor already
- * holds the window's FINISHED pixels, so the animation is a scale+fade of a
+ * holds the window's FINISHED pixels, so the motion is a scale+fade of a
  * buffer: no scene graph, no layout, no scratch surface, and the app never
- * learns it happened. The window is hidden for the duration and a ghost is
- * drawn in its place; paint_region draws that ghost itself, so anything else
- * repainting mid-flight (the cursor, another window) composes correctly. */
-#define ANIM_MS_OPEN   170
-#define ANIM_MS_PARK   200
-#define ANIM_MS_CLOSE  150   /* shorter than open: leaving should feel decisive */
+ * learns it happened. The window is hidden while it moves and a GHOST is
+ * drawn in its place; paint_region draws the ghosts itself, so anything else
+ * repainting mid-flight (the cursor, another window) composes correctly.
+ *
+ * ON SPRINGS (ui/motion/spring.h). The ghost's rectangle is four springs, so a
+ * motion can be turned around from wherever it is: a window minimised and
+ * clicked back in the dock flies back from where it had got to, at the speed
+ * it had, instead of finishing its trip first. Any number of windows move at
+ * once, each its own ghost; a fixed-duration curve allowed one. */
+enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE };
+
 #define ANIM_CLOSE_TO   92   /* shrink to 92% while fading -- a collapse, not a fly-off */
 #define ANIM_OPEN_FROM  88   /* open starts at 88% and grows in -- a small move;
                               * a big one reads as a zoom effect, not a window */
+/* (response ms, damping permille) per motion. Closing is the quickest and
+ * never overshoots: leaving should feel decisive. Opening barely overshoots.
+ * Parking is a flight, critically damped all the way into the dock. */
+#define ANIM_SPRING_OPEN   240u, 900u
+#define ANIM_SPRING_CLOSE  200u, 1000u
+#define ANIM_SPRING_PARK   SPRING_SMOOTH
+/* Landed: every edge within half a pixel and nearly still. A spring's own
+ * rest is 1/64 px, and the last pixel of a critically damped approach is a
+ * long crawl nobody can see but every frame of which recomposes the window. */
+#define ANIM_LAND_X        (SPRING_ONE / 2)
+#define ANIM_LAND_V        (30 * SPRING_ONE)
+#define GHOSTS_MAX         8
 
-enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE };
-
-static struct {
-    int      kind;
+struct ghost {
+    int      kind;                /* what landing does */
     uint32_t win_id;
-    uint64_t t0, dur;
-    int      from[4], to[4];      /* x, y, w, h */
-    int      last[4];             /* where the ghost was drawn last frame */
-    int      have_last;
+    struct spring r[4];           /* x, y, w, h, Q16.16 px */
+    /* Opacity follows the size: it goes from `a0` to `a1` as the width (or
+     * height) goes from `s0` to its target, so it can never disagree with the
+     * motion, and turning the motion around turns the fade with it. A flight
+     * to or from the dock fades only in the tenth of its travel nearest the
+     * tile -- the window stays a window all the way down, as on the Mac;
+     * fading along the whole way left it invisible before it got there. */
+    int      a0, a1, s0, axis;
+    int      last[4], have_last;  /* where it was drawn last frame */
     /* A CLOSING window's pixels are freed out from under us -- the process is
      * killed and reaped while the ghost is still in the air. So closing (and
-     * only closing) animates a COPY. Every other motion reads the live buffer,
-     * which stays valid because the app is still there. */
+     * only closing) flies a COPY, with its own GPU image. Every other motion
+     * reads the live buffer, which stays valid because the app is still there. */
     uint32_t *snap;
     int      snap_w, snap_h;
-} g_anim;
+    uint32_t snap_img;
+};
+static struct ghost g_ghosts[GHOSTS_MAX];
+static volatile int g_nghosts;                /* in flight: the frame clock's cheap check */
 
-static int anim_lerp(int a, int b, int num, int den) {
-    return a + (int)(((int64_t)(b - a) * num) / (den ? den : 1));
-}
+/* WHERE A PARKED WINDOW FLIES TO: its app's tile in the dock. The dock is the
+ * desktop's own drawing, so the desktop says where its tiles are
+ * (compositor_dock_targets), by the binary's basename -- the name the dock
+ * knows its apps by. An app with no tile, or a desktop that never said, gets
+ * the bottom centre of the screen, which is where the dock sits by default. */
+#define DOCK_TARGETS_MAX 16
+static struct { char app[24]; int x, y, w, h; } g_dock_t[DOCK_TARGETS_MAX];
+static int g_dock_tn;
 
-/* ease-out cubic on 0..1000: fast start, soft landing. 1000-(1-t)^3 */
-static int ease_out(int t) {
-    int64_t u = 1000 - t;
-    return (int)(1000 - (u * u * u) / 1000000);
-}
-
-/* Where a parked window flies to. The dock is drawn by the home process and
- * the kernel has no idea where its icons are, so this aims at the bottom
- * centre of the screen -- which is where the dock actually sits. Plumbing the
- * real icon rect through would make it exact; see docs/TODO.md. */
-static void anim_dock_rect(int out[4]) {
+static void anim_dock_rect(const struct comp_window *w, int out[4]) {
+    for (int i = 0; i < g_dock_tn; i++)
+        if (w->app[0] && !strcmp(g_dock_t[i].app, w->app)) {
+            out[0] = g_dock_t[i].x; out[1] = g_dock_t[i].y; out[2] = g_dock_t[i].w; out[3] = g_dock_t[i].h;
+            return;
+        }
     const fb_info_t *fi = fb_get_info();
     int W = fi ? (int)fi->width : 1024, H = fi ? (int)fi->height : 768;
     out[2] = 64; out[3] = 44;
@@ -849,109 +873,154 @@ static void anim_dock_rect(int out[4]) {
     out[1] = H - 56;
 }
 
-static void anim_progress(int *num, int *den) {
-    uint64_t now = timer_uptime_ms();
-    uint64_t el = now - g_anim.t0;
-    if (el >= g_anim.dur) { *num = 1000; *den = 1000; return; }
-    *num = (int)((el * 1000) / g_anim.dur);
-    *den = 1000;
+static struct ghost *ghost_of(uint32_t win_id) {
+    for (int i = 0; i < GHOSTS_MAX; i++)
+        if (g_ghosts[i].kind != ANIM_NONE && g_ghosts[i].win_id == win_id) return &g_ghosts[i];
+    return 0;
 }
 
-/* the ghost's rect and opacity at the current instant */
-static void anim_frame_rect(int out[4], int *alpha) {
-    int num, den; anim_progress(&num, &den);
-    int t = ease_out(num);
-    for (int i = 0; i < 4; i++) out[i] = anim_lerp(g_anim.from[i], g_anim.to[i], t, den);
-    /* fade with the raw (un-eased) time so opacity and motion don't fight */
-    int a = (g_anim.kind == ANIM_PARK || g_anim.kind == ANIM_CLOSE)
-                ? (255 - num * 255 / 1000)
-                : (num * 255 / 1000);
-    if (a < 0) a = 0; if (a > 255) a = 255;
-    *alpha = a;
+/* the ghost's rect and opacity now */
+static void ghost_rect(const struct ghost *g, int out[4], int *alpha) {
+    for (int i = 0; i < 4; i++) out[i] = spring_px(&g->r[i]);
+    const struct spring *s = &g->r[2 + g->axis];
+    int span = (int)spring_div(s->target, SPRING_ONE) - g->s0;
+    int a = g->a1;
+    if (span) {
+        int64_t done = (int64_t)(out[2 + g->axis] - g->s0) * 1000 / span;
+        done = done < 0 ? 0 : done > 1000 ? 1000 : done;
+        if (g->kind == ANIM_PARK) done = done < 900 ? 0 : (done - 900) * 10;
+        else if (g->kind == ANIM_UNPARK) done = done > 100 ? 1000 : done * 10;
+        a = g->a0 + (int)((g->a1 - g->a0) * done / 1000);
+    }
+    *alpha = a < 0 ? 0 : a > 255 ? 255 : a;
 }
 
 /* Union of the previous and current ghost rects: what a frame must repaint. */
-static void anim_dirty(int *x0, int *y0, int *x1, int *y1) {
-    int r[4], a; anim_frame_rect(r, &a);
+static void ghost_dirty(const struct ghost *g, int *x0, int *y0, int *x1, int *y1) {
+    int r[4], a; ghost_rect(g, r, &a);
     *x0 = r[0]; *y0 = r[1]; *x1 = r[0] + r[2]; *y1 = r[1] + r[3];
-    if (g_anim.have_last) {
-        *x0 = imin(*x0, g_anim.last[0]); *y0 = imin(*y0, g_anim.last[1]);
-        *x1 = imax(*x1, g_anim.last[0] + g_anim.last[2]);
-        *y1 = imax(*y1, g_anim.last[1] + g_anim.last[3]);
+    if (g->have_last) {
+        *x0 = imin(*x0, g->last[0]); *y0 = imin(*y0, g->last[1]);
+        *x1 = imax(*x1, g->last[0] + g->last[2]);
+        *y1 = imax(*y1, g->last[1] + g->last[3]);
     }
     *x0 -= 2; *y0 -= 2; *x1 += 2; *y1 += 2;
 }
 
-/* Kick off a motion. The window is HIDDEN for the duration (the ghost stands
- * in for it) and put back -- or not -- when the motion lands. */
+static int ghost_landed(const struct ghost *g) {
+    for (int i = 0; i < 4; i++) {
+        const struct spring *s = &g->r[i];
+        int64_t dx = s->x - s->target;
+        if (s->moving && (dx > ANIM_LAND_X || dx < -ANIM_LAND_X || s->v > ANIM_LAND_V || s->v < -ANIM_LAND_V))
+            return 0;
+    }
+    return 1;
+}
+
+/* `perf slowmo N`: every window motion N times slower, the same shape -- the
+ * Mac's shift-click, for watching (and photographing) a motion. */
+static volatile uint32_t g_slowmo = 1;
+void compositor_slowmo(uint32_t n) { g_slowmo = n ? n : 1; }
+
+/* Send a ghost toward `to` with opacity going to `alpha`, from wherever it is. */
+static void ghost_aim(struct ghost *g, const int to[4], int alpha, uint32_t resp, uint32_t damp, uint64_t now) {
+    int cur[4], a; ghost_rect(g, cur, &a);
+    struct spring_params p = spring_params(resp * g_slowmo, damp);
+    for (int i = 0; i < 4; i++) spring_to(&g->r[i], SPRING_PX(to[i]), p, now);
+    g->a0 = a; g->a1 = alpha;
+    g->axis = cur[2] != to[2] ? 0 : 1;
+    g->s0 = cur[2 + g->axis];
+}
+
+static void ghost_free(struct ghost *g) {
+    if (g->snap) { gpu_image_doom(&g->snap_img); kfree(g->snap); g->snap = 0; g->snap_w = g->snap_h = 0; }
+    if (g->kind != ANIM_NONE) g_nghosts--;
+    g->kind = ANIM_NONE; g->have_last = 0; g->win_id = 0;
+}
+
+/* Kick off a motion, or turn one around. The window is HIDDEN for the
+ * duration (the ghost stands in for it) and put back -- or not -- when the
+ * motion lands. */
 static void paint_region(int rx0, int ry0, int rx1, int ry1);   /* fwd */
 static void enforce_focus(void);
 
 static void anim_start(struct comp_window *w, int kind) {
     if (!w || !w->content) return;
-    if(g_desktop.flags&EMBK_DESKTOP_REDUCED_MOTION) {
-        w->visible=(kind==ANIM_OPEN || kind==ANIM_UNPARK);return;
-    }
+    int show = kind == ANIM_OPEN || kind == ANIM_UNPARK;
+    if(g_desktop.flags&EMBK_DESKTOP_REDUCED_MOTION) { w->visible=show; return; }
     if (w->desktop || w->widget || w->translucent) return;  /* chrome doesn't fly */
 
-    int full[4], dock[4];
+    int full[4], dock[4], from[4], to[4], alpha_from, alpha_to;
     win_frame_rect(w, &full[0], &full[1], &full[2], &full[3]);
     full[2] -= full[0]; full[3] -= full[1];
-    anim_dock_rect(dock);
+    anim_dock_rect(w, dock);
+    uint64_t now = time_get_ns();
 
-    /* if a motion is already running for another window, let it land first */
-    if (g_anim.kind != ANIM_NONE && g_anim.win_id != w->id) return;
+    struct ghost *g = ghost_of(w->id);
+    if (!g) {
+        for (int i = 0; i < GHOSTS_MAX && !g; i++) if (g_ghosts[i].kind == ANIM_NONE) g = &g_ghosts[i];
+        if (!g) { w->visible = show; return; }   /* all in the air: no motion, just the result */
+        if (kind == ANIM_OPEN) {
+            int sw_ = full[2] * ANIM_OPEN_FROM / 100, sh_ = full[3] * ANIM_OPEN_FROM / 100;
+            from[0] = full[0] + (full[2] - sw_) / 2; from[1] = full[1] + (full[3] - sh_) / 2;
+            from[2] = sw_; from[3] = sh_; alpha_from = 0;
+        } else if (kind == ANIM_UNPARK) {
+            for (int i = 0; i < 4; i++) from[i] = dock[i];
+            alpha_from = 0;
+        } else {
+            for (int i = 0; i < 4; i++) from[i] = full[i];
+            alpha_from = 255;
+        }
+        g->win_id = w->id; g->have_last = 0;
+        for (int i = 0; i < 4; i++) spring_init(&g->r[i], SPRING_PX(from[i]), now);
+        g->a0 = g->a1 = alpha_from; g->s0 = from[2]; g->axis = 0;
+        g_nghosts++;
+    } else if (g->kind != kind) {
+        /* INTERRUPTED: said once, because it is the case a curve could not do */
+        static const char *const kinds[] = { "none", "open", "park", "unpark", "close" };
+        int r[4], a; ghost_rect(g, r, &a);
+        kprintf("compositor: %s turned around in flight at %d,%d %dx%d (%s -> %s)\n",
+                w->app[0] ? w->app : "a window", r[0], r[1], r[2], r[3], kinds[g->kind], kinds[kind]);
+    }
+    g->kind = kind;
 
-    g_anim.kind = kind;
-    g_anim.win_id = w->id;
-    g_anim.t0 = timer_uptime_ms();
-    g_anim.have_last = 0;
-
-    if (kind == ANIM_OPEN) {
-        g_anim.dur = ANIM_MS_OPEN;
-        int sw_ = full[2] * ANIM_OPEN_FROM / 100, sh_ = full[3] * ANIM_OPEN_FROM / 100;
-        g_anim.from[0] = full[0] + (full[2] - sw_) / 2;
-        g_anim.from[1] = full[1] + (full[3] - sh_) / 2;
-        g_anim.from[2] = sw_; g_anim.from[3] = sh_;
-        for (int i = 0; i < 4; i++) g_anim.to[i] = full[i];
-    } else if (kind == ANIM_PARK) {
-        g_anim.dur = ANIM_MS_PARK;
-        for (int i = 0; i < 4; i++) { g_anim.from[i] = full[i]; g_anim.to[i] = dock[i]; }
-    } else if (kind == ANIM_UNPARK) {
-        g_anim.dur = ANIM_MS_PARK;
-        for (int i = 0; i < 4; i++) { g_anim.from[i] = dock[i]; g_anim.to[i] = full[i]; }
-    } else {  /* ANIM_CLOSE */
-        g_anim.dur = ANIM_MS_CLOSE;
-        int sw_ = full[2] * ANIM_CLOSE_TO / 100, sh_ = full[3] * ANIM_CLOSE_TO / 100;
-        for (int i = 0; i < 4; i++) g_anim.from[i] = full[i];
-        g_anim.to[0] = full[0] + (full[2] - sw_) / 2;
-        g_anim.to[1] = full[1] + (full[3] - sh_) / 2;
-        g_anim.to[2] = sw_; g_anim.to[3] = sh_;
-        /* take the copy now, while the buffer is still ours (a close already
-         * in flight for this window lets go of its own copy first) */
-        if (g_anim.snap) { gpu_image_doom(&g_snap_img); kfree(g_anim.snap); g_anim.snap = 0; }
+    if (kind == ANIM_CLOSE && !g->snap) {
+        /* take the copy now, while the buffer is still ours */
         size_t n = (size_t)w->cw * w->ch;
         uint32_t *cp = (uint32_t *)kmalloc(n * 4);
-        if (cp) {
-            for (size_t i = 0; i < n; i++) cp[i] = w->content[i];
-            g_anim.snap = cp; g_anim.snap_w = (int)w->cw; g_anim.snap_h = (int)w->ch;
-        } else {
-            g_anim.kind = ANIM_NONE;     /* no copy, no animation -- just close */
-            return;
+        if (!cp) {                       /* no copy, no motion -- just close */
+            if (g->have_last) paint_region(g->last[0] - 2, g->last[1] - 2,
+                                           g->last[0] + g->last[2] + 2, g->last[1] + g->last[3] + 2);
+            ghost_free(g); w->visible = 0; return;
         }
+        for (size_t i = 0; i < n; i++) cp[i] = w->content[i];
+        g->snap = cp; g->snap_w = (int)w->cw; g->snap_h = (int)w->ch;
+    }
+
+    if (kind == ANIM_OPEN || kind == ANIM_UNPARK) {
+        for (int i = 0; i < 4; i++) to[i] = full[i];
+        alpha_to = 255;
+        if (kind == ANIM_OPEN) ghost_aim(g, to, alpha_to, ANIM_SPRING_OPEN, now);
+        else ghost_aim(g, to, alpha_to, ANIM_SPRING_PARK, now);
+    } else if (kind == ANIM_PARK) {
+        ghost_aim(g, dock, 0, ANIM_SPRING_PARK, now);
+    } else {
+        int sw_ = full[2] * ANIM_CLOSE_TO / 100, sh_ = full[3] * ANIM_CLOSE_TO / 100;
+        to[0] = full[0] + (full[2] - sw_) / 2; to[1] = full[1] + (full[3] - sh_) / 2;
+        to[2] = sw_; to[3] = sh_;
+        ghost_aim(g, to, 0, ANIM_SPRING_CLOSE, now);
     }
     w->visible = 0;                      /* the ghost is the window for now */
 }
 
-/* Land the motion: the window becomes real again (or stays parked). */
-static void anim_finish(void) {
-    if(g_anim.kind==ANIM_NONE)return;
-    struct comp_window *w = win_by_id(g_anim.win_id);
-    int kind = g_anim.kind;
-    int last[4]; int had = g_anim.have_last;
-    for (int i = 0; i < 4; i++) last[i] = g_anim.last[i];
-    g_anim.kind = ANIM_NONE; g_anim.have_last = 0;
-    if (g_anim.snap) { gpu_image_doom(&g_snap_img); kfree(g_anim.snap); g_anim.snap = 0; g_anim.snap_w = g_anim.snap_h = 0; }
+/* Land a motion: the window becomes real again (or stays parked). */
+static void anim_finish(struct ghost *g) {
+    if (g->kind == ANIM_NONE) return;
+    struct comp_window *w = win_by_id(g->win_id);
+    int kind = g->kind;
+    int last[4]; int had = g->have_last;
+    for (int i = 0; i < 4; i++) last[i] = g->last[i];
+    ghost_free(g);
     if (w) w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK);
     /* repaint the window's footprint AND wherever the ghost last was */
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -966,6 +1035,32 @@ static void anim_finish(void) {
     }
     if (x1 > x0 && y1 > y0) paint_region(x0 - 2, y0 - 2, x1 + 2, y1 + 2);
     if (w && w->visible) enforce_focus();
+}
+
+int compositor_dock_targets(int pid, const struct embk_dock_target *t, unsigned n) {
+    if (n > DOCK_TARGETS_MAX) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    const struct comp_window *d = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++)
+        if (g_wins[i].used && g_wins[i].desktop && g_wins[i].pid == pid) { d = &g_wins[i]; break; }
+    if (!d) { comp_unlock(); return -EMBK_EPERM; }
+    g_dock_tn = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (t[i].w <= 0 || t[i].h <= 0 || t[i].w > 512 || t[i].h > 512) continue;
+        memcpy(g_dock_t[g_dock_tn].app, t[i].app, sizeof g_dock_t[0].app);
+        g_dock_t[g_dock_tn].app[sizeof g_dock_t[0].app - 1] = 0;
+        g_dock_t[g_dock_tn].x = d->x + t[i].x;    /* the desktop is chromeless: */
+        g_dock_t[g_dock_tn].y = d->y + t[i].y;    /* its content is its frame */
+        g_dock_t[g_dock_tn].w = t[i].w; g_dock_t[g_dock_tn].h = t[i].h;
+        g_dock_tn++;
+    }
+    comp_unlock();
+    return 0;
+}
+
+/* Every motion lands at once: the desktop is being reconfigured under them. */
+static void ghosts_land_all(void) {
+    for (int i = 0; i < GHOSTS_MAX; i++) if (g_ghosts[i].kind != ANIM_NONE) anim_finish(&g_ghosts[i]);
 }
 
 /* ---- compositing -------------------------------------------------------- *
@@ -1447,8 +1542,12 @@ static void gpu_fall_back(const char *why) {
         if (g_wins[i].gimg) gc->image_destroy(g_wins[i].gimg);
         g_wins[i].gimg = 0; g_wins[i].gimg_px = 0;
     }
-    uint32_t *singles[] = { &g_canvas_img, &g_aurora_img, &g_cursor_img, &g_snap_img };
-    for (unsigned i = 0; i < 4; i++) { if (*singles[i]) gc->image_destroy(*singles[i]); *singles[i] = 0; }
+    uint32_t *singles[] = { &g_canvas_img, &g_aurora_img, &g_cursor_img };
+    for (unsigned i = 0; i < 3; i++) { if (*singles[i]) gc->image_destroy(*singles[i]); *singles[i] = 0; }
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        if (g_ghosts[i].snap_img) gc->image_destroy(g_ghosts[i].snap_img);
+        g_ghosts[i].snap_img = 0;
+    }
     g_canvas_px = 0;
     g_gc = 0;
     fb_set_composed_elsewhere(false);
@@ -1710,22 +1809,24 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         drawn++;
     }
 
-    if (g_anim.kind != ANIM_NONE) {
+    for (int gi = 0; gi < GHOSTS_MAX; gi++) {
+        struct ghost *g = &g_ghosts[gi];
+        if (g->kind == ANIM_NONE) continue;
         uint32_t ghost = 0; int sw_ = 0, sh_ = 0;
-        if (g_anim.snap) {
-            /* anim_finish dooms it with the copy, so one here is of this copy */
-            if (!g_snap_img && g_gc->image_create(g_anim.snap, (uint32_t)g_anim.snap_w, (uint32_t)g_anim.snap_h,
-                                                  (uint32_t)g_anim.snap_w * 4, &g_snap_img)) { g_snap_img = 0; return -1; }
-            ghost = g_snap_img; sw_ = g_anim.snap_w; sh_ = g_anim.snap_h;
+        if (g->snap) {
+            /* ghost_free dooms it with the copy, so one here is of this copy */
+            if (!g->snap_img && g_gc->image_create(g->snap, (uint32_t)g->snap_w, (uint32_t)g->snap_h,
+                                                   (uint32_t)g->snap_w * 4, &g->snap_img)) { g->snap_img = 0; return -1; }
+            ghost = g->snap_img; sw_ = g->snap_w; sh_ = g->snap_h;
         } else {
-            struct comp_window *aw_ = win_by_id(g_anim.win_id);
+            struct comp_window *aw_ = win_by_id(g->win_id);
             if (aw_ && aw_->content) {
                 if (gpu_window_image(aw_)) return -1;
                 ghost = aw_->gimg; sw_ = (int)aw_->cw; sh_ = (int)aw_->ch;
             }
         }
         if (ghost) {
-            int r[4], alpha; anim_frame_rect(r, &alpha);
+            int r[4], alpha; ghost_rect(g, r, &alpha);
             if (alpha > 0 && r[2] > 0 && r[3] > 0) {
                 struct gpu_draw d = { .image = ghost, .src = { 0, 0, sw_, sh_ }, .dst = { r[0], r[1], r[2], r[3] },
                                       .opaque = 1, .opacity = (uint8_t)alpha };
@@ -1898,19 +1999,21 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
         drawn++;
     }
 
-    /* 2b) the flying ghost of a window being opened or parked. Drawn HERE --
-     *     above the windows, below the cursor -- so every repaint composes it
-     *     correctly, whatever triggered the repaint. */
-    if (g_anim.kind != ANIM_NONE) {
+    /* 2b) the ghosts of windows in motion. Drawn HERE -- above the windows,
+     *     below the cursor -- so every repaint composes them correctly,
+     *     whatever triggered the repaint. */
+    for (int gi = 0; gi < GHOSTS_MAX; gi++) {
+        const struct ghost *g = &g_ghosts[gi];
+        if (g->kind == ANIM_NONE) continue;
         const uint32_t *src = 0; int sw_ = 0, sh_ = 0;
-        if (g_anim.snap) {
-            src = g_anim.snap; sw_ = g_anim.snap_w; sh_ = g_anim.snap_h;
+        if (g->snap) {
+            src = g->snap; sw_ = g->snap_w; sh_ = g->snap_h;
         } else {
-            struct comp_window *aw = win_by_id(g_anim.win_id);
+            struct comp_window *aw = win_by_id(g->win_id);
             if (aw && aw->content) { src = aw->content; sw_ = (int)aw->cw; sh_ = (int)aw->ch; }
         }
         if (src) {
-            int r[4], alpha; anim_frame_rect(r, &alpha);
+            int r[4], alpha; ghost_rect(g, r, &alpha);
             fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], src, sw_, sh_,
                                    (uint32_t)sw_, (uint32_t)alpha, rx0, ry0, rx1, ry1);
         }
@@ -1996,6 +2099,8 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     if (cw == 0 || ch == 0 || cw > fi->width || ch + COMP_TITLEBAR_H > fi->height)
         return -EMBK_EINVAL;
 
+    char app[24];
+    process_exec_name((uint32_t)pid, app, (int)sizeof app);   /* the scheduler's lock: not under ours */
     spin_lock(&g_comp_lock);
     int slot = -1;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++)
@@ -2012,6 +2117,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->drag_n = 0;
     w->id = g_next_id++;
     w->pid = pid;
+    memcpy(w->app, app, sizeof w->app);
     w->x = x; w->y = y;
     w->cw = cw; w->ch = ch;
     w->z = g_next_z++;
@@ -2099,6 +2205,8 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     }
     client->shared_next_va = cva + (uint64_t)npages * PAGE_SIZE;
 
+    char app[24];
+    process_exec_name(client->pid, app, (int)sizeof app);   /* the scheduler's lock: not under ours */
     spin_lock(&g_comp_lock);
     int slot = -1;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) if (!g_wins[i].used) { slot = i; break; }
@@ -2111,6 +2219,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     }
     struct comp_window *w = &g_wins[slot];
     w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid; w->drag_n = 0;
+    memcpy(w->app, app, sizeof w->app);
     w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
     w->workspace=g_desktop.workspace;
     w->menu_keyboard = 0;
@@ -2443,13 +2552,11 @@ int64_t compositor_win_destroy(int pid, uint32_t id) {
 void compositor_exit_pid(int pid) {
     spin_lock(&g_comp_lock);
     int found = 0;
-    int animated = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || w->pid != pid || !w->visible) continue;
-        /* Collapse the FIRST real window on the way out (one motion at a time,
-         * and an app's second window is chrome or a widget anyway). */
-        if (!animated) { anim_start(w, ANIM_CLOSE); animated = (g_anim.kind == ANIM_CLOSE); }
+        if (!w->used || w->pid != pid || !(w->visible || ghost_of(w->id))) continue;
+        /* each of its windows collapses on the way out, a ghost apiece */
+        anim_start(w, ANIM_CLOSE);
         w->visible = 0;
         if (w->id == g_top_id) g_top_id = 0;
         int x0, y0, x1, y1;
@@ -2465,21 +2572,39 @@ void compositor_exit_pid(int pid) {
  * title bar to click, so the toolkit's own MinimizeButton needs a way in --
  * otherwise minimize would exist only for the handful of apps still using
  * kernel chrome. */
+/* Park a window in the dock. Caller holds g_comp_lock. */
+static void win_park(struct comp_window *w) {
+    if (w->minimized) return;
+    w->minimized = 1;
+    if (w->id == g_top_id) g_top_id = 0;
+    anim_start(w, ANIM_PARK);          /* hides it; the ghost flies down */
+    int x0, y0, x1, y1;
+    win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    enforce_focus();
+}
+
 int compositor_win_minimize(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     if (!w || w->desktop) { comp_unlock(); return -1; }
-    if (!w->minimized) {
-        w->minimized = 1;
-        if (w->id == g_top_id) g_top_id = 0;
-        anim_start(w, ANIM_PARK);          /* hides it; the ghost flies down */
-        int x0, y0, x1, y1;
-        win_repaint_rect(w, &x0, &y0, &x1, &y1);
-        paint_region(x0, y0, x1, y1);
-        enforce_focus();
-    }
+    win_park(w);
     comp_unlock();
     return 0;
+}
+
+/* GUI+M: the window in front into the dock, as the minimise light does. */
+void compositor_minimize_front(void) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *c = &g_wins[i];
+        if (!c->used || c->desktop || c->widget || c->translucent || !c->title[0]) continue;
+        if (!c->visible || !on_workspace(c)) continue;
+        if (!w || c->z > w->z) w = c;
+    }
+    if (w) win_park(w);
+    comp_unlock();
 }
 
 /* Lift the desktop layer above every app window, or drop it back to the ground.
@@ -2928,20 +3053,31 @@ void compositor_reap_pid(int pid) {
  * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
  * which is almost always. */
 static void anim_frame(void) {
-    if (g_anim.kind == ANIM_NONE) return;        /* cheap unlocked pre-check */
+    if (!g_nghosts) return;                  /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
-    if (g_anim.kind == ANIM_NONE) { comp_unlock(); return; }
     g_src = EMBK_COMP_SRC_ANIM;
-
-    int num, den; anim_progress(&num, &den);
-    if (num >= den) { anim_finish(); comp_unlock(); return; }
-
-    int x0, y0, x1, y1;
-    anim_dirty(&x0, &y0, &x1, &y1);
-    int r[4], a; anim_frame_rect(r, &a);
-    for (int i = 0; i < 4; i++) g_anim.last[i] = r[i];
-    g_anim.have_last = 1;
-    paint_region(x0, y0, x1, y1);            /* draws the ghost itself */
+    uint64_t now = time_get_ns();
+    for (int gi = 0; gi < GHOSTS_MAX; gi++) {
+        struct ghost *g = &g_ghosts[gi];
+        if (g->kind == ANIM_NONE) continue;
+        /* a window that moves or resizes while it opens: the ghost follows */
+        struct comp_window *w = win_by_id(g->win_id);
+        if (w && (g->kind == ANIM_OPEN || g->kind == ANIM_UNPARK)) {
+            int f[4];
+            win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+            f[2] -= f[0]; f[3] -= f[1];
+            for (int i = 0; i < 4; i++)
+                if (g->r[i].target != SPRING_PX(f[i])) spring_to(&g->r[i], SPRING_PX(f[i]), g->r[i].p, now);
+        }
+        for (int i = 0; i < 4; i++) spring_step(&g->r[i], now);
+        if (ghost_landed(g)) { anim_finish(g); continue; }
+        int x0, y0, x1, y1;
+        ghost_dirty(g, &x0, &y0, &x1, &y1);
+        int r[4], a; ghost_rect(g, r, &a);
+        for (int i = 0; i < 4; i++) g->last[i] = r[i];
+        g->have_last = 1;
+        paint_region(x0, y0, x1, y1);        /* draws the ghosts itself */
+    }
     comp_unlock();
 }
 
@@ -3644,7 +3780,7 @@ void compositor_beat_test(uint32_t seconds) {
 /* Work that keeps frames coming without a kick: window motion in flight, or
  * a beat being measured. */
 static int comp_continuous(void) {
-    return g_anim.kind != ANIM_NONE || time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
+    return g_nghosts || time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
 }
 
 static void comp_thread_main(void) {
@@ -3763,6 +3899,21 @@ void compositor_print_windows(void) {
                 w->cw, w->ch, (unsigned)w->drag_n, w->drag_n ? w->drag_r[0][0] : 0, w->drag_n ? w->drag_r[0][1] : 0,
                 w->drag_n ? w->drag_r[0][2] : 0, w->drag_n ? w->drag_r[0][3] : 0);
     }
+    for (int i = 0; i < g_dock_tn; i++)
+        kprintf("perf: dock app=%s x=%d y=%d w=%d h=%d\n", g_dock_t[i].app,
+                g_dock_t[i].x, g_dock_t[i].y, g_dock_t[i].w, g_dock_t[i].h);
+    /* and every ghost in the air: where it is, how opaque, where it is going */
+    static const char *const kinds[] = { "none", "open", "park", "unpark", "close" };
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind == ANIM_NONE) continue;
+        const struct comp_window *w = win_by_id(g->win_id);
+        int r[4], a; ghost_rect(g, r, &a);
+        kprintf("perf: ghost kind=%s app=%s x=%d y=%d w=%d h=%d alpha=%d to=%d,%d,%d,%d\n", kinds[g->kind],
+                w && w->app[0] ? w->app : "-", r[0], r[1], r[2], r[3], a,
+                spring_px(&(struct spring){ .x = g->r[0].target }), spring_px(&(struct spring){ .x = g->r[1].target }),
+                spring_px(&(struct spring){ .x = g->r[2].target }), spring_px(&(struct spring){ .x = g->r[3].target }));
+    }
     comp_unlock();
     kprintf("perf: end\n");
 }
@@ -3795,7 +3946,7 @@ void compositor_session_changed(void) {
     spin_lock(&g_comp_lock);
     g_drag_id=0;reset_pointer_capture_locked();
     uint32_t owner=session_input_owner();
-    g_anim.kind=ANIM_NONE;
+    ghosts_land_all();
     if(owner)for(unsigned i=0;i<COMP_MAX_WINDOWS;i++)
         if(g_wins[i].used && g_wins[i].pid==owner)g_wins[i].presented=false;
     const fb_info_t *fi=fb_get_info();
@@ -3827,7 +3978,7 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
            state->flags&~7u || state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
             comp_unlock();return -EMBK_EINVAL;
         }
-        if(g_anim.kind!=ANIM_NONE)anim_finish();
+        ghosts_land_all();
         unsigned before=g_desktop.workspace;
         int new_owner=g_desktop_owner!=(int)owns;
         unsigned active=new_owner?0:before;g_desktop_owner=(int)owns;
@@ -3839,7 +3990,7 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
     } else if(operation) {
         if(g_desktop_front){comp_unlock();return -EMBK_EBUSY;}
         if(state->workspace>=g_desktop.workspace_count){comp_unlock();return -EMBK_EINVAL;}
-        if(g_anim.kind!=ANIM_NONE)anim_finish();
+        ghosts_land_all();
         if(operation==EMBK_DESKTOP_MOVE_FRONT) {
             struct comp_window *front=front_app_window();
             if(front && !front->desktop && !front->translucent && !front->widget) {
@@ -3941,7 +4092,7 @@ struct fb_surface *compositor_select_layout(struct fb_surface *next, const struc
         g_cursor_under_valid=0;g_cursor_valid=0;
         gpu_image_doom(&g_canvas_img);   /* over the old backbuffer, which is released after this */
         g_cap_pid=0;g_cap_win=0;g_dragging=0;g_drag_on=0;g_ptr_buttons=0;g_buttons_suppressed=1;
-        anim_finish();
+        ghosts_land_all();
         g_nouts=0;
         for(unsigned i=0;i<n && i<LAYOUT_MAX_OUTPUTS;i++)g_outs[g_nouts++]=rects[i];
         outputs_whole(fi);

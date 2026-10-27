@@ -1239,6 +1239,14 @@ static inline int embk_win_drag_regions(int id, const int32_t (*rects)[4], unsig
     return (int)embk_syscall3(EMBK_SYS_win_drag_regions, id, (int64_t)(intptr_t)rects, n);
 }
 
+/* THE DESKTOP SAYS WHERE ITS DOCK TILES ARE: a window of `app` that is
+ * minimised flies into that tile, and back out of it when restored. Only the
+ * process that owns the desktop layer may say; each call replaces the last
+ * (at most EMBK_DOCK_TARGETS_MAX; 0 clears). */
+static inline int embk_dock_targets(const struct embk_dock_target *t, unsigned n) {
+    return (int)embk_syscall2(EMBK_SYS_dock_targets, (int64_t)(intptr_t)t, n);
+}
+
 /* Destroy a window and erase it from the desktop. */
 static inline int embk_win_destroy(int id) {
     return (int)embk_syscall1(EMBK_SYS_win_destroy, id);

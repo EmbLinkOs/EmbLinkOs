@@ -17,4 +17,11 @@ struct embk_desktop {
     uint32_t workspace_count,workspace;
     uint32_t shortcut_modifier,blur,opacity;
 };
+/* A dock tile, for a minimised window to fly into: the program's basename (as
+ * the window list names it) and the tile's rect in the desktop window. */
+#define EMBK_DOCK_TARGETS_MAX 16u
+struct embk_dock_target {
+    char    app[24];
+    int32_t x, y, w, h;
+};
 #endif

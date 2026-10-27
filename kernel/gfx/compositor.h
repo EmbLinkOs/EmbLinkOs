@@ -27,6 +27,7 @@
 #include "include/types.h"
 
 struct embk_desktop;
+struct embk_dock_target;
 int compositor_request_launcher(void);
 int compositor_workspace_key(int target,int move);
 int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *state);
@@ -208,6 +209,14 @@ void compositor_cursor_plane(int on);
  * drags it by, itself, clipped to the content; n 0 clears. Returns how many it
  * took. A drag that moved the window ends with EMBK_WIN_ACTION_MOVED. */
 int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n);
+/* The desktop's dock tiles (rects in the desktop window), by program
+ * basename: where a minimised window flies. Only the desktop layer's owner;
+ * replaces the last set; n 0 clears. */
+int compositor_dock_targets(int pid, const struct embk_dock_target *t, unsigned n);
+/* `perf slowmo N`: window motion N times slower (1: as designed). */
+void compositor_slowmo(uint32_t n);
+/* GUI+M: the front window into the dock. */
+void compositor_minimize_front(void);
 /* `perf beat N`: N seconds of frames on the beat, composing nothing. */
 void compositor_beat_test(uint32_t seconds);
 /* `perf windows` on the serial console: every visible window's geometry. */
