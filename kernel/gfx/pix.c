@@ -54,6 +54,20 @@ void pix_scale_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1,
 
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+void pix_saturate_row(uint32_t *px, int n, uint32_t s, int swap)
+{
+    int ws = swap ? 0 : 16, wb = swap ? 16 : 0;       /* where red and blue sit */
+    for (int i = 0; i < n; i++) {
+        uint32_t v = px[i];
+        int r = (int)((v >> ws) & 0xffu), g = (int)((v >> 8) & 0xffu), b = (int)((v >> wb) & 0xffu);
+        int l = (77 * r + 150 * g + 29 * b) >> 8;
+        r = clampi(l + (((r - l) * (int)s) >> 8), 0, 255);
+        g = clampi(l + (((g - l) * (int)s) >> 8), 0, 255);
+        b = clampi(l + (((b - l) * (int)s) >> 8), 0, 255);
+        px[i] = (v & 0xff000000u) | ((uint32_t)r << ws) | ((uint32_t)g << 8) | ((uint32_t)b << wb);
+    }
+}
+
 void pix_box_blur(uint32_t *px, int w, int h, int r, uint32_t *b, uint32_t *col)
 {
     uint32_t win = (uint32_t)(2 * r + 1), m = pix_box_recip(win);

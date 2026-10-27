@@ -178,8 +178,8 @@ static const struct oscfg_timezone oscfg_timezones[OSCFG_TIMEZONES] = {
     X(density, 1, 0, 2) \
     X(font, 0, 0, 2) \
     X(text_scale, 100, 90, 130) \
-    X(transparency, 18, 0, 50) \
-    X(blur, 6, 0, 16) \
+    X(transparency, 35, 0, 50) \
+    X(blur, 12, 0, 16) \
     X(reduce_motion, 0, 0, 1) \
     X(icon_theme, 0, 0, 1) \
     X(desktop_icons, 1, 0, 1) \

@@ -95,6 +95,14 @@ static inline uint32_t pix_lerp(uint32_t a, uint32_t b, uint32_t f)
 void pix_scale_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1, int sw,
                    int32_t sx, int32_t step, uint32_t fy, uint32_t alpha, int swap);
 
+/* VIBRANCY: each colour moved away from its own grey by `s` (Q8: 256 keeps
+ * it, 435 is 1.7 times), clamped -- grey being the luma 0.30 R + 0.59 G +
+ * 0.11 B, in eighths of 256. A blurred backdrop on its own goes muddy; frosted
+ * glass that looks like glass saturates what shows through it, as the Mac's
+ * materials do. `swap` as for the rows above: the word is R,G,B,X. */
+#define PIX_VIBRANCY 435u
+void pix_saturate_row(uint32_t *px, int n, uint32_t s, int swap);
+
 /* floor(sum / win) for 0 <= sum <= 255 * win, win in [1, PIX_BOX_MAX_WIN]:
  * one multiply and a shift (pix_box_recip(win) is the multiplier). */
 #define PIX_BOX_MAX_WIN 255

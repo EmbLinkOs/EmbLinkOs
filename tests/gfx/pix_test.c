@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include "gfx/pix.h"
 
 static unsigned checks, failures;
@@ -253,6 +254,34 @@ static int scale_matches(void) {
     return bad;
 }
 
+static int saturate_matches(void) {
+    int bad = 0;
+    uint32_t row[256], want[256];
+    for (int trial = 0; trial < 200 && !bad; trial++) {
+        uint32_t s = trial % 4 == 0 ? 256 : 128 + rnd() % 512;
+        int swap = trial & 1;
+        for (int i = 0; i < 256; i++) row[i] = want[i] = rnd();
+        for (int i = 0; i < 256; i++) {
+            uint32_t v = want[i];
+            int R = swap ? (int)(v & 255) : (int)((v >> 16) & 255), G = (int)((v >> 8) & 255);
+            int B = swap ? (int)((v >> 16) & 255) : (int)(v & 255);
+            int L = (77 * R + 150 * G + 29 * B) / 256;
+            int c[3] = { R, G, B };
+            for (int k = 0; k < 3; k++) {
+                int x = L + (int)floor((double)(c[k] - L) * s / 256.0);
+                c[k] = x < 0 ? 0 : x > 255 ? 255 : x;
+            }
+            want[i] = (v & 0xff000000u) | (uint32_t)(swap ? c[2] << 16 | c[1] << 8 | c[0] : c[0] << 16 | c[1] << 8 | c[2]);
+        }
+        pix_saturate_row(row, 256, s, swap);
+        for (int i = 0; i < 256; i++) if (row[i] != want[i]) { bad = 1; printf("    %08x != %08x (s %u)\n", row[i], want[i], s); break; }
+    }
+    uint32_t grey[3] = { 0x00808080u, 0x00000000u, 0x00ffffffu };
+    pix_saturate_row(grey, 3, PIX_VIBRANCY, 0);
+    if (grey[0] != 0x00808080u || grey[1] || grey[2] != 0x00ffffffu) bad = 1;   /* grey has no colour to lose */
+    return bad;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--bench")) return bench();
     printf("=== pix: the compositor's pixel loops ===\n");
@@ -274,6 +303,7 @@ int main(int argc, char **argv) {
     CHECK(rows_match(0) == 0, "rows on a B,G,R,X scanout: over, uniform mix, straight blend, copy");
     CHECK(rows_match(1) == 0, "rows on an R,G,B,X scanout, the source put into its order");
     CHECK(blur_matches() == 0, "the box blur equals the old two passes, every size and radius tried");
+    CHECK(saturate_matches() == 0, "vibrancy is the textbook saturation, either byte order; grey, black and white stay");
     CHECK(scale_matches() == 0, "a filtered scaled row is the textbook bilinear, any scale, alpha or order; a flat colour stays flat");
     printf("=== pix: %u checks, %u failures ===\n", checks, failures);
     return failures ? 1 : 0;

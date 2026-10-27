@@ -713,6 +713,8 @@ void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius) 
                 for (int32_t i = 0; i < cw; i++) o[i] = p[i] & 0x00FFFFFFu;
             }
             pix_box_blur(fb_blur_px, cw, ch, radius, fb_blur_tmp, fb_blur_col);
+            /* frosted glass, not fog: what shows through is saturated */
+            for (int32_t j = 0; j < ch; j++) pix_saturate_row(fb_blur_px + (uint64_t)j * cw, cw, PIX_VIBRANCY, fb_swap());
             for (int32_t j = 0; j < ch; j++)
                 memcpy(fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j)),
                        fb_blur_px + (uint64_t)j * cw, (uint64_t)cw * 4);

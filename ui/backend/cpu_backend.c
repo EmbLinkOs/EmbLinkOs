@@ -782,6 +782,18 @@ static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, f
             tile[j * rw + i] = rt_row(rt, (uint32_t)(y0 + j))[x0 + i];   /* everything BEHIND is already here */
 
     box_blur_region(tile, rw, rh, (int)(blur_radius + 0.5f));
+    /* VIBRANCY: frosted glass, not fog. A blur on its own goes muddy; what
+     * shows through glass that looks like glass is saturated -- 1.7 times
+     * away from its own grey, as the compositor's materials are (pix.h).
+     * Premultiplied, so each channel is held to the pixel's alpha. */
+    for (int k = 0; k < rw * rh; k++) {
+        int b_, g_, r_, a_; px_unpack(tile[k], &b_, &g_, &r_, &a_);
+        int l = (77 * r_ + 150 * g_ + 29 * b_) >> 8;
+        r_ = clampi(l + (((r_ - l) * 435) >> 8), 0, a_);
+        g_ = clampi(l + (((g_ - l) * 435) >> 8), 0, a_);
+        b_ = clampi(l + (((b_ - l) * 435) >> 8), 0, a_);
+        tile[k] = px_pack(b_, g_, r_, a_);
+    }
 
     float half_w = w * 0.5f, half_h = h * 0.5f, cx = x + half_w, cy = y + half_h;
     if (radius > half_w) radius = half_w;

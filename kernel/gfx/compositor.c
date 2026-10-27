@@ -22,6 +22,7 @@
 #include "gfx/comp_stats.h"     /* what each compose costs, and why it was asked */
 #include "gfx/ui_events.h"      /* telling waiting applications something changed */
 #include "gfx/frameclock.h"     /* which rate to compose at */
+#include "gfx/pix.h"            /* vibrancy: the kept blur, saturated */
 #include "display/control.h"    /* the display's own refresh */
 #if defined(__x86_64__)
 #include "power/policy.h"       /* the Efficiency profile caps the rate */
@@ -263,7 +264,7 @@ static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window
 
 static struct embk_desktop g_desktop={.version=1,.flags=EMBK_DESKTOP_SNAP|EMBK_DESKTOP_WRAP,
     .top=34,.bottom=84,.background=0x202524,.text=0xecf0ec,.accent=0x71b5aa,
-    .radius=8,.shadows=1,.workspace_count=4,.blur=6,.opacity=209,.danger=0xee887b,.secondary=0x94a29a};
+    .radius=8,.shadows=1,.workspace_count=4,.blur=12,.opacity=166,.danger=0xee887b,.secondary=0x94a29a};
 static int g_desktop_owner;
 static int on_workspace(const struct comp_window *w) {
     return w->desktop || w->widget || w->translucent || w->workspace==g_desktop.workspace;
@@ -1225,6 +1226,11 @@ static void region_grow_material(int *rx0, int *ry0, int *rx1, int *ry1, int gpu
  * window draws anything (its own shadow included), compared with what was
  * there, and blurred again where it changed. */
 static uint32_t g_bd_row[8192];
+/* The kept blur, saturated where it was just made (pix_saturate_row): kept
+ * that way, so a frame that shows it pays nothing for it. */
+static void mat_vibrancy(struct comp_window *w, int x0, int y0, int x1, int y1) {
+    for (int y = y0; y < y1; y++) pix_saturate_row(w->bd_blur + (size_t)y * w->cw + x0, x1 - x0, PIX_VIBRANCY, 0);
+}
 static void mat_capture(struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
     int vx0, vy0, vx1, vy1;
     if (!mat_visible(w, &vx0, &vy0, &vx1, &vy1)) return;
@@ -1263,8 +1269,10 @@ static void mat_capture(struct comp_window *w, int rx0, int ry0, int rx1, int ry
     if (!w->bd_valid) {
         /* region_grow_material made this repaint cover all of it */
         if (ix0 != vx0 || iy0 != vy0 || ix1 != vx1 || iy1 != vy1) return;
-        if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, vx0, vy0, vx1, vy1, w->mat_blur) == 0)
+        if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, vx0, vy0, vx1, vy1, w->mat_blur) == 0) {
+            mat_vibrancy(w, vx0, vy0, vx1, vy1);
             w->bd_valid = 1;
+        }
         return;
     }
     if (chx1 <= chx0) return;                                    /* nothing behind it changed */
@@ -1273,6 +1281,7 @@ static void mat_capture(struct comp_window *w, int rx0, int ry0, int rx1, int ry
     if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, ex0, ey0, ex1, ey1, w->mat_blur)) {
         w->bd_valid = 0; return;
     }
+    mat_vibrancy(w, ex0, ey0, ex1, ey1);
     if (ex0 < ix0 || ey0 < iy0 || ex1 > ix1 || ey1 > iy1) mat_more(cx0 + ex0, cy0 + ey0, cx0 + ex1, cy0 + ey1);
 }
 
