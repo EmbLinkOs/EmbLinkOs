@@ -4257,6 +4257,26 @@
       "featured": false,
       "milestone": "Fluid desktop P4: type and tokens",
       "historical": false
+    },
+    {
+      "id": "217-spaces-slide",
+      "phase": "Fluid desktop",
+      "title": "Between two spaces",
+      "caption": "GUI+2 pressed with Settings open on the first space, photographed mid-slide: the window on its way off the left of the screen as the second space comes in, drawn as itself -- rounded corners, title bar and shadow -- on four springs. Pressed back mid-slide, it turns round where it is. Slowed ten times (`perf slowmo 10`) to be photographed. Under TCG.",
+      "alt": "The EmbLinkOS desktop with the Settings window half off the left edge of the screen, sliding away as the top bar reads Space 2",
+      "file": "217-spaces-slide.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "2e4be5a16377647b2094980aba2afd619ef7e007a1f0869e1232ece095a6193e",
+      "source_capture": "emblink-motion-cv80ifkt/slide-1.ppm",
+      "source_sha256": "2f7aefedd5908ff3e37a55815cc727b773e154f2a74864aedb9e1de10ab873c4",
+      "source_commit": "7c22b70",
+      "featured": false,
+      "milestone": "Fluid desktop P5: shell",
+      "historical": false
     }
   ]
 }

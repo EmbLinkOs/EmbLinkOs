@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-216 actual EmbLinkOS captures document the original laptop work, its
+217 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, and a new face. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, and spaces that slide. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -71,6 +71,12 @@ The Applications launcher on the new default material: translucent (35%) over a 
 Settings in the interface's new face, Inter: Regular for text, SemiBold for headings and emphasis, DejaVu Sans kept as the fallback for anything Inter does not cover. Compare 214, the same window in DejaVu Sans. Under TCG.
 
 ![The EmbLinkOS Settings window, Appearance page, set in the Inter typeface](216-inter.png)
+
+### Between two spaces
+
+GUI+2 pressed with Settings open on the first space, photographed mid-slide: the window on its way off the left of the screen as the second space comes in, drawn as itself -- rounded corners, title bar and shadow -- on four springs. Pressed back mid-slide, it turns round where it is. Slowed ten times (`perf slowmo 10`) to be photographed. Under TCG.
+
+![The EmbLinkOS desktop with the Settings window half off the left edge of the screen, sliding away as the top bar reads Space 2](217-spaces-slide.png)
 
 ## The prompt, Powerlevel10k-style
 
