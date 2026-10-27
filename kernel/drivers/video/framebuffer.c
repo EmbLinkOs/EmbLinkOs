@@ -575,12 +575,17 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
 // is the window-motion primitive: the compositor already owns a window's
 // finished pixels, so a scale+fade of that buffer is all an open/minimize
 // animation needs -- no app involvement, no scene graph, no per-frame layout.
-// Nearest-neighbour with a 16.16 source step: the frames are in motion and the
-// whole thing is over in a few hundred ms, so filtering would cost more than
-// anyone can see.
+// BILINEAR on a 32-bit scanout when `smooth` (pix_scale_row): nearest-
+// neighbour was the first choice, on the theory that a motion over in a few
+// hundred ms hides it, and it does not -- the text of a shrinking window
+// crawls as rows and columns drop in and out. Pixel centres map to pixel
+// centres. It costs about six times as much (1.15 ms against 0.19 for a
+// 980 x 660 window at 88% on an M5 core, `make pix-bench`), so the caller
+// asks for it only while the frame can afford it. At the image's own size
+// -- where every motion lands -- it is a copy.
 void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             const uint32_t *argb, int32_t sw, int32_t sh,
-                            uint32_t stride, uint32_t alpha,
+                            uint32_t stride, uint32_t alpha, int smooth,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
     if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || !argb || alpha == 0) return;
     int32_t x0 = dx, y0 = dy, x1 = dx + dw, y1 = dy + dh;
@@ -595,7 +600,34 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
     uint32_t stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
     uint32_t inv = 255 - alpha;
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
-    if (fb_fast()) {
+    if (fb_fast() && dw == sw && dh == sh) {
+        /* AT ITS OWN SIZE -- where every motion lands, and opacity-only
+         * frames -- a copy: nothing to filter, at a sixth of the cost */
+        int swap = fb_swap();
+        for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+            const uint32_t *s = argb + (uint64_t)(y - dy) * stride + (x0 - dx);
+            if (alpha >= 255) pix_copy_row((uint32_t *)row, s, x1 - x0, swap);
+            else pix_mix_row((uint32_t *)row, s, x1 - x0, alpha, swap);
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
+    if (fb_fast() && smooth) {
+        int swap = fb_swap();
+        int32_t sx0 = (int32_t)(((int64_t)(2 * (x0 - dx) + 1) * stepx) / 2) - 32768;
+        for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+            int32_t sy = (int32_t)(((int64_t)(2 * (y - dy) + 1) * stepy) / 2) - 32768;
+            if (sy < 0) sy = 0;
+            int32_t r0 = sy >> 16, r1 = r0 + 1;
+            uint32_t fy = ((uint32_t)sy >> 8) & 0xffu;
+            if (r0 >= sh - 1) { r0 = r1 = sh - 1; fy = 0; }
+            pix_scale_row((uint32_t *)row, x1 - x0, argb + (uint64_t)r0 * stride, argb + (uint64_t)r1 * stride,
+                          sw, sx0, (int32_t)stepx, fy, alpha, swap);
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
+    if (fb_fast()) {                         /* nearest: the frame cannot afford more */
         int swap = fb_swap();
         for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
             uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;

@@ -76,6 +76,25 @@ void pix_blend_row(uint32_t *dst, const uint32_t *src, int n, int swap);
 /* The source's colour, alpha dropped. */
 void pix_copy_row(uint32_t *dst, const uint32_t *src, int n, int swap);
 
+/* (a * (256 - f) + b * f) >> 8 per channel, f in 0..256: the step of a
+ * bilinear filter. The products fit their lanes (255 * 256 = 65280). */
+static inline uint32_t pix_lerp(uint32_t a, uint32_t b, uint32_t f)
+{
+    uint32_t k = 256u - f;
+    uint32_t rb = (((a & 0x00ff00ffu) * k + (b & 0x00ff00ffu) * f) >> 8) & 0x00ff00ffu;
+    uint32_t g = ((((a >> 8) & 0xffu) * k + ((b >> 8) & 0xffu) * f) >> 8) & 0xffu;
+    return rb | (g << 8);
+}
+
+/* A SCALED ROW, FILTERED: n destination pixels from the source rows `r0` and
+ * `r1` (sw wide), `fy` (0..256) of the way from one to the other. The first
+ * pixel samples source x `sx` (16.16, may be negative: clamped to the edge)
+ * and each next one `step` further. The colour is mixed over the destination
+ * at `alpha` (255: replaces it); source alpha is ignored. Window motion's
+ * ghost: nearest-neighbour made the text in a shrinking window crawl. */
+void pix_scale_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1, int sw,
+                   int32_t sx, int32_t step, uint32_t fy, uint32_t alpha, int swap);
+
 /* floor(sum / win) for 0 <= sum <= 255 * win, win in [1, PIX_BOX_MAX_WIN]:
  * one multiply and a shift (pix_box_recip(win) is the multiplier). */
 #define PIX_BOX_MAX_WIN 255

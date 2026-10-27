@@ -850,6 +850,11 @@ struct ghost {
 };
 static struct ghost g_ghosts[GHOSTS_MAX];
 static volatile int g_nghosts;                /* in flight: the frame clock's cheap check */
+/* Ghosts are filtered while the frames can afford it: the last frame cost
+ * under half its period (comp_frame decides). Six times nearest-neighbour's
+ * cost is a frame a slow core at 120 Hz cannot spare; a crawl of text in a
+ * motion is the lesser loss than a dropped frame. */
+static int g_ghost_smooth = 1;
 
 /* WHERE A PARKED WINDOW FLIES TO: its app's tile in the dock. The dock is the
  * desktop's own drawing, so the desktop says where its tiles are
@@ -2015,7 +2020,7 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
         if (src) {
             int r[4], alpha; ghost_rect(g, r, &alpha);
             fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], src, sw_, sh_,
-                                   (uint32_t)sw_, (uint32_t)alpha, rx0, ry0, rx1, ry1);
+                                   (uint32_t)sw_, (uint32_t)alpha, g_ghost_smooth, rx0, ry0, rx1, ry1);
         }
     }
 
@@ -3730,6 +3735,11 @@ static void comp_frame(void) {
         g_frame_cost_us /= 2; g_frame_cost_ns += 250000000ull;
     }
     if (cost >= g_frame_cost_us) { g_frame_cost_us = cost; g_frame_cost_ns = now; }
+    /* filtered ghosts while frames cost under half the period; back to them
+     * only under a quarter, so one motion does not flicker between the two */
+    uint64_t cost_ns = (uint64_t)g_frame_cost_us * 1000u;
+    if (cost_ns * 2 > g_frame_period_ns) g_ghost_smooth = 0;
+    else if (cost_ns * 4 < g_frame_period_ns) g_ghost_smooth = 1;
     comp_unlock();
     comp_stats_frame(now, g_frame_period_ns);
     __atomic_store_n(&g_frame_done_ns, now, __ATOMIC_RELAXED);

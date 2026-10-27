@@ -37,6 +37,21 @@ void pix_copy_row(uint32_t *dst, const uint32_t *src, int n, int swap)
     else      for (int i = 0; i < n; i++) dst[i] = src[i] & 0x00ffffffu;
 }
 
+void pix_scale_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1, int sw,
+                   int32_t sx, int32_t step, uint32_t fy, uint32_t alpha, int swap)
+{
+    for (int i = 0; i < n; i++, sx += step) {
+        int32_t s = sx < 0 ? 0 : sx;
+        int x0 = s >> 16;
+        uint32_t fx = ((uint32_t)s >> 8) & 0xffu;
+        int x1 = x0 + 1;
+        if (x0 >= sw - 1) { x0 = x1 = sw - 1; fx = 0; }
+        uint32_t c = pix_lerp(pix_lerp(r0[x0], r0[x1], fx), pix_lerp(r1[x0], r1[x1], fx), fy);
+        if (swap) c = pix_swap_rb(c);
+        dst[i] = alpha >= 255u ? c : pix_mix(c, dst[i], alpha);
+    }
+}
+
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 void pix_box_blur(uint32_t *px, int w, int h, int r, uint32_t *b, uint32_t *col)

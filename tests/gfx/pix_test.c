@@ -185,8 +185,72 @@ static int bench(void) {
     double t4 = now_ms();
     printf("1280 x 800 screen, host, scalar: over %.2f ms -> %.2f ms; box blur r=6 %.2f ms -> %.2f ms\n",
            (t1 - t0) / 10, (t2 - t1) / 10, (t3 - t2) / 3, (t4 - t3) / 3);
+    /* A ghost: a 980 x 660 window drawn at 88% (an opening one), opaque.
+     * Nearest-neighbour as framebuffer.c had it, against the filtered row. */
+    enum { SW = 980, SH = 660, DW = 862, DH = 580 };
+    uint32_t stepx = (SW << 16) / DW, stepy = (SH << 16) / DH;
+    double t5 = now_ms();
+    for (int k = 0; k < 10; k++)
+        for (int y = 0; y < DH; y++) {
+            uint32_t sy = ((uint32_t)y * stepy) >> 16;
+            const uint32_t *srow = src + sy * W;
+            uint32_t sx = 0, *p = dst + y * W;
+            for (int x = 0; x < DW; x++, sx += stepx) p[x] = srow[sx >> 16] & 0xffffffu;
+        }
+    double t6 = now_ms();
+    for (int k = 0; k < 10; k++)
+        for (int y = 0; y < DH; y++) {
+            int32_t sy = (int32_t)(((int64_t)(2 * y + 1) * stepy) / 2) - 32768;
+            if (sy < 0) sy = 0;
+            int r0 = sy >> 16, r1 = r0 + 1 < SH ? r0 + 1 : r0;
+            pix_scale_row(dst + y * W, DW, src + r0 * W, src + r1 * W, SW,
+                          (int32_t)stepx / 2 - 32768, (int32_t)stepx, ((uint32_t)sy >> 8) & 255, 255, 0);
+        }
+    double t7 = now_ms();
+    printf("a 980 x 660 window at 88%%: nearest %.2f ms, bilinear %.2f ms\n", (t6 - t5) / 10, (t7 - t6) / 10);
     free(src); free(dst); free(tmp); free(col);
     return 0;
+}
+
+/* The filter one channel at a time, as a textbook writes it. */
+static uint32_t ref_lerp1(uint32_t a, uint32_t b, uint32_t f) { return (a * (256 - f) + b * f) >> 8; }
+static uint32_t ref_bilinear(const uint32_t *r0, const uint32_t *r1, int sw, int32_t sx, uint32_t fy) {
+    int32_t s = sx < 0 ? 0 : sx;
+    int x0 = s >> 16; uint32_t fx = ((uint32_t)s >> 8) & 255; int x1 = x0 + 1;
+    if (x0 >= sw - 1) { x0 = x1 = sw - 1; fx = 0; }
+    uint32_t out = 0;
+    for (int sh = 0; sh <= 16; sh += 8) {
+        uint32_t top = ref_lerp1((r0[x0] >> sh) & 255, (r0[x1] >> sh) & 255, fx);
+        uint32_t bot = ref_lerp1((r1[x0] >> sh) & 255, (r1[x1] >> sh) & 255, fx);
+        out |= ref_lerp1(top, bot, fy) << sh;
+    }
+    return out;
+}
+
+static int scale_matches(void) {
+    int bad = 0;
+    uint32_t r0[97], r1[97], dst[300], want[300];
+    for (int trial = 0; trial < 400 && !bad; trial++) {
+        int sw = 1 + (int)(rnd() % 97), n = 1 + (int)(rnd() % 300), swap = (int)(rnd() & 1);
+        for (int i = 0; i < sw; i++) { r0[i] = rnd(); r1[i] = rnd(); }
+        int32_t step = (int32_t)((((uint64_t)sw) << 16) / (uint64_t)n);
+        int32_t sx = step / 2 - 32768;                       /* pixel centres */
+        uint32_t fy = rnd() % 257, alpha = trial % 3 ? 255 : rnd() % 256;
+        for (int i = 0; i < n; i++) dst[i] = want[i] = rnd() & 0xffffffu;
+        for (int i = 0; i < n; i++) {
+            uint32_t c = ref_bilinear(r0, r1, sw, sx + i * step, fy);
+            if (swap) c = RGB(c & 255, (c >> 8) & 255, c >> 16);
+            want[i] = alpha >= 255 ? c : pix_mix(c, want[i], alpha);
+        }
+        pix_scale_row(dst, n, r0, r1, sw, sx, step, fy, alpha, swap);
+        for (int i = 0; i < n; i++) if (dst[i] != want[i]) { bad = 1; printf("    sw %d n %d at %d: %08x != %08x\n", sw, n, i, dst[i], want[i]); break; }
+    }
+    /* a flat colour stays that colour however it is scaled: no darkening at
+     * the edges, no rounding drift */
+    for (int i = 0; i < 97; i++) r0[i] = r1[i] = 0xff3c7ab9u;
+    pix_scale_row(dst, 300, r0, r1, 97, -20000, 21000, 128, 255, 0);
+    for (int i = 0; i < 300; i++) if (dst[i] != 0x003c7ab9u) { bad = 1; break; }
+    return bad;
 }
 
 int main(int argc, char **argv) {
@@ -210,6 +274,7 @@ int main(int argc, char **argv) {
     CHECK(rows_match(0) == 0, "rows on a B,G,R,X scanout: over, uniform mix, straight blend, copy");
     CHECK(rows_match(1) == 0, "rows on an R,G,B,X scanout, the source put into its order");
     CHECK(blur_matches() == 0, "the box blur equals the old two passes, every size and radius tried");
+    CHECK(scale_matches() == 0, "a filtered scaled row is the textbook bilinear, any scale, alpha or order; a flat colour stays flat");
     printf("=== pix: %u checks, %u failures ===\n", checks, failures);
     return failures ? 1 : 0;
 }

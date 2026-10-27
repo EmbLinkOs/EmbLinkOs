@@ -83,9 +83,10 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
                      const uint32_t *argb, uint32_t stride, uint32_t alpha);
 // Scale an image into a destination rect and composite it at a uniform alpha,
 // clipped to [clx0,cly0)-(clx1,cly1). The window open/minimize motion.
+// `smooth`: filtered (bilinear), not nearest-neighbour -- six times the cost.
 void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             const uint32_t *argb, int32_t sw, int32_t sh,
-                            uint32_t stride, uint32_t alpha,
+                            uint32_t stride, uint32_t alpha, int smooth,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 // The composed pixels of a rect, as 0x00RRGGBB, into `dst` (stride in pixels):
 // the backdrop a window that shows through keeps. The part off the screen is
