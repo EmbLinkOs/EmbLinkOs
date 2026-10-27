@@ -4417,6 +4417,26 @@
       "featured": false,
       "milestone": "Fluid desktop P6: advanced",
       "historical": false
+    },
+    {
+      "id": "225-inter-tracked",
+      "phase": "Fluid desktop",
+      "title": "Spaced for its size",
+      "caption": "Settings again, with Inter set as its designer publishes it for each size: the titles and headings close up (0.22 px a pair at 17 px, 0.44 at 23), the 13 px text is left nearly as drawn, and the smallest type opens a little. Measuring, wrapping and the caret take the same spacing as the pixels. Compare 216, the same window before. Under TCG.",
+      "alt": "The EmbLinkOS Settings window, Appearance page, set in Inter with size-dependent letter-spacing",
+      "file": "225-inter-tracked.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "8f1d5a50abec58e7dff0440e0219af019c966c748f8df2370f8e696862edb636",
+      "source_capture": "emblink-capmat-lo4y490c/settings.ppm",
+      "source_sha256": "1504249463385af0e4df809eeb1dff415476a74b2eb637d3339ae16f4756ff44",
+      "source_commit": "cf34265",
+      "featured": false,
+      "milestone": "Fluid desktop P4: type and tokens",
+      "historical": false
     }
   ]
 }
