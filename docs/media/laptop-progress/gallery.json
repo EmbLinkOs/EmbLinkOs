@@ -4277,6 +4277,46 @@
       "featured": false,
       "milestone": "Fluid desktop P5: shell",
       "historical": false
+    },
+    {
+      "id": "218-dock-plate",
+      "phase": "Fluid desktop",
+      "title": "The pointer's plate, on its way",
+      "caption": "The pointer moved from the Files tile to Settings, photographed as the dock's plate glides after it on a spring: here it is passing under the Files icon. One plate, gliding -- the icons never move under the aim. Under TCG.",
+      "alt": "The EmbLinkOS dock with a dark rounded plate half under the Files icon, between Files and Terminal",
+      "file": "218-dock-plate.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "e77c7e2509a7924e64315f8598123fa10cdd39ec8b5d0b3ea05db735eb045e54",
+      "source_capture": "emblink-dock-vbsh0yp3/plate-between.png",
+      "source_sha256": "ced2a94dad7d31faa4d5fdc2131d2b7844c379088ac349b84778b78882d09bcc",
+      "source_commit": "421e923",
+      "featured": false,
+      "milestone": "Fluid desktop P5: shell",
+      "historical": false
+    },
+    {
+      "id": "219-dock-hop",
+      "phase": "Fluid desktop",
+      "title": "Files, starting",
+      "caption": "Files clicked in the dock: while it starts, its icon hops above its tile, which has just lit as running. The one time a dock icon moves, after the click; it settles once the app's window is up. Under TCG.",
+      "alt": "The EmbLinkOS dock with the Files icon raised above its lit tile while the app starts",
+      "file": "219-dock-hop.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "2a713728be41286294bceb6650432d318eb6220199d0ec34cbcda180ae34df64",
+      "source_capture": "emblink-dock-vbsh0yp3/hop-top.png",
+      "source_sha256": "213e45993924cd059b70ff71a3e5787784859af1b7032cb0a91a09cda25fcdc8",
+      "source_commit": "421e923",
+      "featured": false,
+      "milestone": "Fluid desktop P5: shell",
+      "historical": false
     }
   ]
 }
