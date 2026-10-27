@@ -98,9 +98,13 @@ the default target). Measured before and after every step
   - [ ] A tracking-speed preference in Settings: the curve takes one (tracking_permille), nothing
         sets it yet.
   - [ ] Event timestamps on the input path for the toolkit's velocity fit (a touchpad flick).
-- [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
-      governor and an Effects setting; the toolkit's span rasterizer, gradient LUT, one blend policy,
-      layer caching.
+- [ ] P3 Materials.
+  - [x] Windows cast two shadow layers (key and ambient), rounded with their corners, on both paths
+        (gallery 214). Drawn per pixel band with the straight edges computed once, not from a
+        cached 9-slice: the corner zones are the only 2-D work.
+  - [ ] Corner masks precomputed per radius (the carve supersamples 4 x 4 per corner pixel).
+  - [ ] Kawase blur at a quarter resolution with vibrancy; a quality governor and an Effects setting.
+  - [ ] The toolkit's span rasterizer, gradient LUT and dither, one blend policy, layer caching.
 - [ ] P4 Inter, area-coverage text, subpixel positioning, kerning; the token pass.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
       A double click on a title bar should zoom the window as on macOS, now that the
