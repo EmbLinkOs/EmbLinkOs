@@ -80,7 +80,9 @@ the default target). Measured before and after every step
         nearest's cost; nearest when frames cost over half the period (under TCG, always).
   - [ ] A ghost shrinking far (into the dock) still aliases: bilinear reads 2 x 2 pixels, and at
         a twentieth of the size a mip level is what is wanted.
-  - [ ] Toolkit transitions, menus and toasts on springs.
+  - [x] Toolkit motion on springs: em_animate, page navigation, the menu drop-in, the toast's rise
+        and the close pull's spring back -- which sprang back by a fraction a FRAME, twice as fast at
+        120 Hz as at 60.
   - [x] The wheel glides: a notch moves where the view is going and the view follows on a spring;
         fast notches go further; past an edge it gives (Apple's rubber-band curve) and springs back
         (`make kit-test`; one notch is 19 frames under HVF, `tools/motion_smoke.py`).

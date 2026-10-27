@@ -12,6 +12,7 @@
 #include "em.h"
 #include "kit.h"
 #include "font.h"
+#include "../motion/spring.h"   /* every motion here: see em_spring_to */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -492,9 +493,49 @@ void em_tooltip_host(void) {
     ui_text("%s",g_tip_label);ui_end_stack();ui_end_stack();
 }
 
-#define ANIM_MAX 96
-static struct { const char *id; float cur, target; int used; } g_anim[ANIM_MAX];
+/* A FLOAT ON A SPRING, on this toolkit's clock (ui/motion/spring.h). Every
+ * motion here goes through it: an approach with a velocity, so a motion
+ * turned round mid-way turns round smoothly, and one that lands where it
+ * lands at any frame rate -- the per-frame `*= 0.72` and the dt-scaled
+ * exponential it replaces did neither. Values are any unit (an opacity, a
+ * pixel offset), held at 1/1024 in the spring's Q16.16. With no clock (a host
+ * render) or reduced motion it is simply the target. Settled when within
+ * 0.001 and nearly still: a spring's own rest, 1/64 of a unit at this scale,
+ * would keep redrawing a crawl nobody can see. */
+#define EM_SPRING_SCALE 1024.0f
+struct em_spring { struct spring s; int live; };
+static int64_t em_q(float v) { return (int64_t)(v * EM_SPRING_SCALE * (float)SPRING_ONE); }
+static float em_spring_value(const struct em_spring *m) {
+    return (float)m->s.x / ((float)SPRING_ONE * EM_SPRING_SCALE);
+}
+/* Put it at `v`, at rest (a gesture's direct manipulation, a fresh start). */
+static void em_spring_set(struct em_spring *m, float v) {
+    uint64_t now_ns = em_now_ms() * 1000000ull;
+    if (!m->live) { spring_init(&m->s, em_q(v), now_ns); m->live = 1; }
+    else spring_set(&m->s, em_q(v), now_ns);
+}
+/* Toward `target` (response ms, damping permille); the value now. */
+static float em_spring_to(struct em_spring *m, float target, uint32_t resp_ms, uint32_t damp) {
+    uint64_t now_ms = em_now_ms();
+    if (!now_ms || TH->reduced_motion) { em_spring_set(m, target); return target; }
+    uint64_t now_ns = now_ms * 1000000ull;
+    if (!m->live) { spring_init(&m->s, em_q(target), now_ns); m->live = 1; }
+    int64_t tq = em_q(target);
+    if (tq != m->s.target) spring_to(&m->s, tq, spring_params(resp_ms, damp), now_ns);
+    if (spring_step(&m->s, now_ns)) {
+        int64_t dx = m->s.x - m->s.target, rest = em_q(0.001f), still = em_q(0.02f);
+        if (dx < rest && dx > -rest && m->s.v < still && m->s.v > -still) spring_set(&m->s, tq, now_ns);
+        else em_request_frame();
+    }
+    return em_spring_value(m);
+}
 
+#define ANIM_MAX 96
+static struct { const char *id; struct em_spring m; int used; } g_anim[ANIM_MAX];
+
+/* `rate` (per second) was an exponential approach's: 63% of the way in 1/rate
+ * s. A critically damped spring is there at 2.15/w, so its response
+ * (2 pi / w) is 2.92/rate s -- the same pace, now with a velocity. */
 float em_animate(const char *id, float target, float rate) {
     if(TH->reduced_motion)return target;
     int slot = -1, freei = -1;
@@ -503,17 +544,13 @@ float em_animate(const char *id, float target, float rate) {
             if (g_anim[i].id == id || (g_anim[i].id && id && strcmp(g_anim[i].id, id) == 0)) { slot = i; break; }
         } else if (freei < 0) freei = i;
     }
-    if (slot < 0) { slot = freei >= 0 ? freei : 0; g_anim[slot].used = 1; g_anim[slot].id = id; g_anim[slot].cur = target; }
-    g_anim[slot].target = target;
-    float dt = g_dt_ms / 1000.0f;                 /* exponential approach, frame-rate independent-ish */
-    float step = rate * dt;
-    if (step > 1.0f) step = 1.0f;
-    if (step < 0.0f) step = 0.0f;
-    g_anim[slot].cur += (g_anim[slot].target - g_anim[slot].cur) * step;
-    float d = g_anim[slot].target - g_anim[slot].cur;
-    if (d < 0.0008f && d > -0.0008f) g_anim[slot].cur = g_anim[slot].target;   /* settle */
-    else em_request_frame();               /* still easing -> keep frames coming */
-    return g_anim[slot].cur;
+    if (slot < 0) {
+        slot = freei >= 0 ? freei : 0;
+        g_anim[slot].used = 1; g_anim[slot].id = id; g_anim[slot].m.live = 0;
+        em_spring_set(&g_anim[slot].m, target);
+    }
+    uint32_t resp = rate > 0.1f ? (uint32_t)(2920.0f / rate) : 29200u;
+    return em_spring_to(&g_anim[slot].m, target, resp, 1000u);
 }
 
 /* THE DRAG ZONES this frame built (WindowBar, AppBar, DragHandle), for the
@@ -543,8 +580,9 @@ static EmPage g_pages[16];
 static int    g_nav_top = -1;
 static float  g_nav_t = 1.0f;   /* transition progress: 1 = settled, <1 = fading in */
 static int    g_nav_dir = 1;    /* +1 push (slide from right), -1 pop (from left) */
-void em_push(EmPage p) { if (p && g_nav_top < 15) { g_pages[++g_nav_top] = p; g_nav_t = 0.0f; g_nav_dir = 1; } }
-void em_pop(void)      { if (g_nav_top > 0) { g_nav_top--; g_nav_t = 0.0f; g_nav_dir = -1; } }
+static struct em_spring g_nav_m; /* the progress, on a spring: it eases itself */
+void em_push(EmPage p) { if (p && g_nav_top < 15) { g_pages[++g_nav_top] = p; g_nav_t = 0.0f; g_nav_dir = 1; em_spring_set(&g_nav_m, 0.0f); } }
+void em_pop(void)      { if (g_nav_top > 0) { g_nav_top--; g_nav_t = 0.0f; g_nav_dir = -1; em_spring_set(&g_nav_m, 0.0f); } }
 int  em_nav_depth(void){ return g_nav_top + 1; }
 
 /* ---- modal overlay (Sheet / Alert) ------------------------------------- *
@@ -592,9 +630,10 @@ void em_nav(EmPage root) {
     if (em_now_ms() == 0 || TH->reduced_motion) {
         g_nav_t = 1.0f;
     } else if (g_nav_t < 1.0f) {
-        g_nav_t += (float)em_dt_ms() / (TH->motion_ms>0?TH->motion_ms*1.5f:NAV_DUR_MS);
-        if (g_nav_t > 1.0f) g_nav_t = 1.0f;
-        em_request_frame();                /* transition in flight */
+        /* critically damped: 98% of the way at its response, the ease-out
+         * the old curve applied by hand; em_spring_to keeps frames coming */
+        g_nav_t = em_spring_to(&g_nav_m, 1.0f, (uint32_t)(TH->motion_ms > 0 ? TH->motion_ms * 1.8f : NAV_DUR_MS), 1000u);
+        if (g_nav_t > 0.999f) g_nav_t = 1.0f;
     }
 
     /* Resolve the transition transform. It is applied to the page's OWN root
@@ -603,7 +642,7 @@ void em_nav(EmPage root) {
      * swaps g_pages[g_nav_top]; the page is called directly as the root here. */
     g_nav_cur_op = 1.0f; g_nav_cur_slide = 0.0f;
     if (g_nav_t < 1.0f) {
-        float e = 1.0f - (1.0f - g_nav_t) * (1.0f - g_nav_t);   /* easeOutQuad */
+        float e = g_nav_t;                  /* the spring is its own ease-out */
         g_nav_cur_op = 0.12f + 0.88f * e;   /* floor avoids a fully-blank first frame */
         g_nav_cur_slide = (1.0f - e) * 44.0f * (float)g_nav_dir; /* right on push, left on pop */
     }
@@ -1262,6 +1301,9 @@ int em_window_take_resize(int *dw, int *dh) {
 #define CLOSE_PULL 95.0f           /* px of drag that commits the close */
 static int   g_cl_active, g_cl_pend;
 static float g_cl_grab_x, g_cl_grab_y, g_cl_dx, g_cl_dy, g_cl_progress;
+/* the spring back after a pull let go short: 1 at release, 0 home */
+static struct em_spring g_cl_back;
+static float g_cl_rel_dx, g_cl_rel_dy, g_cl_rel_progress;
 
 int em_window_take_close(void) { if (!g_cl_pend) return 0; g_cl_pend = 0; return 1; }
 
@@ -1296,12 +1338,16 @@ bool em_close_grip(void) {
         em_request_frame();
     } else if (g_cl_active) {
         g_cl_active = 0;                               /* released before the threshold */
+        g_cl_rel_dx = g_cl_dx; g_cl_rel_dy = g_cl_dy; g_cl_rel_progress = g_cl_progress;
+        em_spring_set(&g_cl_back, 1.0f);
     }
-    /* spring back when released below the threshold */
+    /* spring back when released below the threshold -- on the clock, not by
+     * a fraction a frame, which sprang back twice as fast at 120 Hz */
     if (!g_cl_active && !g_cl_pend && g_cl_progress > 0.001f) {
-        g_cl_progress *= 0.72f; g_cl_dx *= 0.72f; g_cl_dy *= 0.72f;
-        if (g_cl_progress < 0.02f) { g_cl_progress = 0; g_cl_dx = g_cl_dy = 0; }
-        em_request_frame();
+        float k = em_spring_to(&g_cl_back, 0.0f, SPRING_SNAPPY);
+        if (k < 0.0f) k = 0.0f;
+        g_cl_progress = g_cl_rel_progress * k; g_cl_dx = g_cl_rel_dx * k; g_cl_dy = g_cl_rel_dy * k;
+        if (g_cl_progress < 0.002f) { g_cl_progress = 0; g_cl_dx = g_cl_dy = 0; }
     }
     return g_cl_pend != 0;
 }
@@ -2478,10 +2524,11 @@ void em_divider_label(const char *label) {
 }
 
 /* ---- Toast: transient message; ToastHost() renders the active one ------ */
-static struct { const char *msg; EmTone tone; uint64_t raised; int active; } g_toast;
+static struct { const char *msg; EmTone tone; uint64_t raised; int active; struct em_spring m; } g_toast;
 #define TOAST_MS 2500
 
 void em_toast(const char *msg, EmTone tone) {
+    if (!g_toast.active) em_spring_set(&g_toast.m, 0.0f);   /* a fresh one rises from below */
     g_toast.msg = msg; g_toast.tone = tone; g_toast.raised = em_now_ms(); g_toast.active = 1;
     g_em_epoch++;
 }
@@ -2492,16 +2539,14 @@ void em_toast_host(void) {
     uint64_t now = em_now_ms();
     /* with a real clock, auto-expire; on host (clock 0) stay visible for render */
     float age = (now && g_toast.raised) ? (float)(now - g_toast.raised) : 0.0f;
-    if (now && age > TOAST_MS) { g_toast.active = 0; g_em_epoch++; return; }
-    /* fade+rise in over the first 180ms and out over the last 300ms */
-    float op = 1.0f;
-    if (now && !t->reduced_motion && t->motion_ms>0) {
-        float enter=t->motion_ms*1.5f,leave=t->motion_ms*2.5f;
-        if(age<enter)op=age/enter;
-        else if(age>TOAST_MS-leave)op=(TOAST_MS-age)/leave;
-    }
+    /* RISES IN ON A SPRING and sinks out on one: in while it has time left,
+     * out over the last stretch, gone once it is down. A touch under critical
+     * damping, so the rise settles with a lift rather than a stop. */
+    float leave = t->motion_ms > 0 ? t->motion_ms * 2.5f : 300.0f;
+    int staying = !now || age < TOAST_MS - leave;
+    float op = em_spring_to(&g_toast.m, staying ? 1.0f : 0.0f, SPRING_SNAPPY);
+    if (!staying && op < 0.01f) { g_toast.active = 0; g_em_epoch++; return; }
     if (op < 0) op = 0;
-    if (op > 1) op = 1;
     Color accent = t->accent;
     int cp = IconInfo;
     switch (g_toast.tone) {
@@ -2518,7 +2563,7 @@ void em_toast_host(void) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
-    ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar */
+    ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar (a lift past it, then back) */
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {
         ui_begin_hstack(1);
@@ -3227,17 +3272,11 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal) {
     /* drop-in motion: the panel fades in while settling down its last 8px.
      * Keyed on WHICH menu is open, so switching between menus re-plays it;
      * with no clock (host renders) it snaps to settled, like em_nav. */
-    static uint64_t s_anim_key, s_anim_t0;
-    uint64_t mnow = em_now_ms();
-    if (s_anim_key != key) { s_anim_key = key; s_anim_t0 = mnow; }
-    float mt = 1.0f;
-    if (mnow && s_anim_t0 && !t->reduced_motion) {
-        float e = (float)(mnow-s_anim_t0)/(t->motion_ms>0?t->motion_ms:120.0f);
-        mt = e < 0 ? 0 : e > 1.0f ? 1.0f : e;
-        float inv = 1.0f - mt;
-        mt = 1.0f - inv * inv * inv;
-        if (mt < 1.0f) em_request_frame();
-    }
+    static uint64_t s_anim_key;
+    static struct em_spring s_menu_m;
+    if (s_anim_key != key) { s_anim_key = key; em_spring_set(&s_menu_m, 0.0f); }
+    float mt = em_spring_to(&s_menu_m, 1.0f, (uint32_t)(t->motion_ms > 0 ? t->motion_ms * 2.0f : 240.0f), 1000u);
+    if (mt > 1.0f) mt = 1.0f;
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
     ui_set_opacity(mt);
     if(ay<0) {
