@@ -247,8 +247,13 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
             if (n->shadow_enabled)
                 be->draw_shadow(target, dx, dy, w, h, n->corner_radius,
                                 n->shadow_dx, n->shadow_dy, n->shadow_blur_radius, n->shadow_color);
-            if (n->backdrop_blur_enabled)
-                be->draw_backdrop_blur(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius);
+            if (n->backdrop_blur_enabled) {
+                if (r->backdrop && r->backdrop != target && be->draw_backdrop_blur_from)
+                    be->draw_backdrop_blur_from(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius,
+                                                r->backdrop, ab.x - r->bd_ox, ab.y - r->bd_oy);
+                else
+                    be->draw_backdrop_blur(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius);
+            }
             be->draw_rect(target, dx, dy, w, h, n->corner_radius, &n->data.rect.fill, 1.0f);
             if (n->border_width > 0 && be->draw_border)
                 be->draw_border(target, dx, dy, w, h, n->corner_radius, n->border_width,
@@ -371,9 +376,14 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
         struct render_target *scratch = cpu_scratch_acquire((uint32_t)bw, (uint32_t)bh);
         if (scratch) {
             struct clip_saved sv;
+            /* glass in the group blurs what the group lands on: the outermost
+             * group's target (a nested group's is a half-rendered scratch) */
+            int outer = !r->backdrop;
+            if (outer) { r->backdrop = target; r->bd_ox = ox; r->bd_oy = oy; }
             cpu_clip_save_and_clear(&sv);   /* isolate scratch coords + lift dirty */
             render_subtree_opaque(r, a, h, wparent, scratch, (float)bx, (float)by);
             cpu_clip_restore(&sv);
+            if (outer) r->backdrop = 0;
             /* blit flattened result; coverage_at clips this to the dirty union */
             /* flattened subtree: already-rendered pixels, never a stencil */
             r->be->draw_image(target, (float)bx - ox, (float)by - oy, (float)bw, (float)bh,
@@ -409,6 +419,7 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be) {
     r->be = be; r->cache = 0; r->cache_cap = 0; r->n_dirty = 0; r->full = 0; r->has_scroll_present = 0;
+    r->backdrop = 0; r->bd_ox = r->bd_oy = 0;
 }
 void scene_render_destroy(struct scene_renderer *r) {
     free(r->cache); r->cache = 0; r->cache_cap = 0;

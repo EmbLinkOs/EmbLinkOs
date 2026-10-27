@@ -765,8 +765,9 @@ static void box_blur_region(uint32_t *buf, int w, int h, int radius) {
 /* draw_backdrop_blur (Section 4): sample rt, blur, SDF-clipped write-back    */
 /* ------------------------------------------------------------------------- */
 
-static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, float w, float h,
-                                   float radius, float blur_radius) {
+static void cpu_draw_backdrop_blur_from(struct render_target *rt, float x, float y, float w, float h,
+                                        float radius, float blur_radius,
+                                        const struct render_target *src, float sx, float sy) {
     if (w <= 0 || h <= 0) return;
     int x0 = clampi((int)floorf(x), 0, (int)rt->width);
     int y0 = clampi((int)floorf(y), 0, (int)rt->height);
@@ -777,9 +778,17 @@ static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, f
 
     uint32_t *tile = (uint32_t *)malloc((size_t)rw * rh * 4);
     if (!tile) return;
-    for (int j = 0; j < rh; j++)
-        for (int i = 0; i < rw; i++)
-            tile[j * rw + i] = rt_row(rt, (uint32_t)(y0 + j))[x0 + i];   /* everything BEHIND is already here */
+    /* everything BEHIND is already in `src`, where this rect lies at (sx, sy)
+     * -- the same target when not in a group */
+    int ddx = (int)floorf(sx) - (int)floorf(x), ddy = (int)floorf(sy) - (int)floorf(y);
+    for (int j = 0; j < rh; j++) {
+        int syy = y0 + j + ddy;
+        for (int i = 0; i < rw; i++) {
+            int sxx = x0 + i + ddx;
+            tile[j * rw + i] = sxx >= 0 && syy >= 0 && sxx < (int)src->width && syy < (int)src->height
+                ? rt_row((struct render_target *)src, (uint32_t)syy)[sxx] : 0;
+        }
+    }
 
     box_blur_region(tile, rw, rh, (int)(blur_radius + 0.5f));
     /* VIBRANCY: frosted glass, not fog. A blur on its own goes muddy; what
@@ -817,6 +826,10 @@ static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, f
         }
     }
     free(tile);
+}
+static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, float w, float h,
+                                   float radius, float blur_radius) {
+    cpu_draw_backdrop_blur_from(rt, x, y, w, h, radius, blur_radius, rt, x, y);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1021,6 +1034,7 @@ static struct render_backend g_cpu_backend = {
     .draw_image         = cpu_draw_image,
     .draw_shadow        = cpu_draw_shadow,
     .draw_backdrop_blur = cpu_draw_backdrop_blur,
+    .draw_backdrop_blur_from = cpu_draw_backdrop_blur_from,
     .draw_border        = cpu_draw_border,
     .draw_text          = 0,   /* Piece 4b */
 };

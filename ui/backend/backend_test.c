@@ -441,6 +441,41 @@ static void t10_clear_outside(void) {
     free(rt.pixels);
 }
 
+/* ---- T11: glass inside an opacity group blurs what is behind the group --
+ * A group renders into a scratch target that starts empty; a backdrop blur
+ * that read its own target there blurred nothing, and every glass panel
+ * fading in (a menu, the launcher) lost its frost until the fade ended. */
+static void t11_glass_in_group(void) {
+    printf("T11 glass in an opacity group frosts the real backdrop:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    /* the backdrop: red on the left, blue on the right, a sharp edge at x 32
+     * -- frosted, the pixel beside it is a mix; seen through clear, it is not */
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 32, 64);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, bg, &redp);
+    struct node_handle bg2 = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg2, 32, 64); scene_set_transform(&a, bg2, 32,0,0, 0,0,0,1, 1,1,1);
+    struct paint bluep; bluep.kind = PAINT_SOLID; bluep.solid = (struct color){0,0,1,1}; bluep.n_stops = 0;
+    scene_set_paint(&a, bg2, &bluep);
+    struct node_handle grp = scene_create_node(&a, SCENE_NODE_GROUP, root);
+    scene_set_opacity(&a, grp, 0.99f);              /* a group, near full strength */
+    struct node_handle glass = scene_create_node(&a, SCENE_NODE_RECT, grp);
+    scene_set_size(&a, glass, 32, 32); scene_set_transform(&a, glass, 16,16,0, 0,0,0,1, 1,1,1);
+    struct paint clearp; clearp.kind = PAINT_SOLID; clearp.solid = (struct color){0,0,0,0}; clearp.n_stops = 0;
+    scene_set_paint(&a, glass, &clearp);
+    scene_set_backdrop_blur(&a, glass, 1, 4.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 33, 32) > 30 && blue_at(&rt, 33, 32) > 30,
+          "the glass frosts the edge behind its group -- not an empty blur that shows it sharp");
+    CHECK(r.backdrop == 0, "and the renderer forgets the backdrop once the group is done");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -453,6 +488,7 @@ int main(void) {
     t8_image_damage();
     t9_fractional_edge();
     t10_clear_outside();
+    t11_glass_in_group();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

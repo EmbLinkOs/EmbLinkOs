@@ -29,6 +29,10 @@ struct scene_renderer {
      * rect must cover THIS rect too. Valid when has_scroll_present. */
     float                  sp_x, sp_y, sp_w, sp_h;
     int                    has_scroll_present;
+    /* Inside an opacity group: the target the outermost group is composited
+     * onto, and its offset -- where glass in the group finds its backdrop. */
+    struct render_target  *backdrop;
+    float                  bd_ox, bd_oy;
 };
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be);
