@@ -4377,6 +4377,26 @@
       "featured": false,
       "milestone": "Fluid desktop P3: materials",
       "historical": false
+    },
+    {
+      "id": "223-overview",
+      "phase": "Fluid desktop",
+      "title": "The overview",
+      "caption": "GUI+Up: the overview. Settings and the Terminal, each flown on springs to a place of its own over the dimmed desktop -- the windows themselves, scaled and live, with their corners and shadows. A click on one brings it in front as both fly home; Esc leaves them as they were. Under TCG.",
+      "alt": "The EmbLinkOS overview: the Settings and Terminal windows side by side, scaled down, over a dimmed desktop",
+      "file": "223-overview.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "27a6d83bb7ba55587e09c011186607e33f59e8925895953b7589e82f717aa528",
+      "source_capture": "emblink-overview-w2bcilir/overview.ppm",
+      "source_sha256": "a63b6724e17777c8234ab1019888c8113b87edcae96f8d378fbfe67a1b2d7f98",
+      "source_commit": "6a53a6b",
+      "featured": false,
+      "milestone": "Fluid desktop P6: advanced",
+      "historical": false
     }
   ]
 }
