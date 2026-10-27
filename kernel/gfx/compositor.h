@@ -209,6 +209,8 @@ void compositor_cursor_plane(int on);
  * drags it by, itself, clipped to the content; n 0 clears. Returns how many it
  * took. A drag that moved the window ends with EMBK_WIN_ACTION_MOVED. */
 int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n);
+/* The app tiles this window when it is dragged against an edge (EMBK_WINF_RESIZABLE). */
+void compositor_win_set_resizable(int pid, uint32_t id);
 /* The desktop's dock tiles (rects in the desktop window), by program
  * basename: where a minimised window flies. Only the desktop layer's owner;
  * replaces the last set; n 0 clears. */

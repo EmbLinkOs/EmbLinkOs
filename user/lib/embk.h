@@ -1133,6 +1133,9 @@ static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, in
                                              * transparent, NO blur -- composited
                                              * over the sharp backdrop. A thin bar
                                              * with a tall invisible dropdown canvas. */
+#define EMBK_WINF_RESIZABLE  (1ULL << 36)   /* the app resizes and tiles it: dragged
+                                             * against an edge it will take half the
+                                             * screen, and the compositor shows where */
 
 /* Resize a shared window's content to w x h. The window's pixel pages are
  * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is

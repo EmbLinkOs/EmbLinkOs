@@ -205,7 +205,11 @@ be turned around mid-way from where it is, at the speed it has.
   back) flies: what the window looked like stays where it was until the app
   has drawn at its new size, then it flies to the new frame on a spring,
   drawn from the new pixels. The corner grip, a step at a time, is drawn as
-  it comes.
+  it comes. Dragged against an edge, a window that will tile shows where
+  before it is let go: a wash of the accent grows out of it on a spring
+  toward the half (or, at the top, all) of the work area it will take, under
+  the window, and the target's outline is drawn over it, since a big window
+  covers most of its own wash.
 - **The overview.** GUI+Up flies every window of the space, on springs, to a
   place of its own in a grid over the dimmed desktop -- each the window
   itself, scaled, live (an app drawing while it is up is seen drawing), with

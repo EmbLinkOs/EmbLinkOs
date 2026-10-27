@@ -194,7 +194,13 @@ the default target). Measured before and after every step
         pointer (its dock labels show).
   - [ ] Asked for again while it is closing, it is ignored until the windows are home.
   - [ ] Touchpad gestures (three fingers up for the overview, sideways for spaces).
-  - [ ] Tiling previews; a minimise warp on the GPU path.
+  - [x] Tiling previews: held against an edge, a window shows the half (or, at the top, all) of
+        the work area it will take -- a wash under it, the outline over it -- by the runtime's own
+        rule (`EMBK_WINF_RESIZABLE` tells the compositor which windows tile;
+        `tools/tile_smoke.py`: x86, arm64 and virgl; gallery 224).
+  - [ ] The preview does not know an app's minimum size: where half the screen is smaller than
+        that, the runtime fills instead and the preview showed a half.
+  - [ ] A minimise warp on the GPU path.
 
 ## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
 

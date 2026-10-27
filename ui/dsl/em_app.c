@@ -524,9 +524,10 @@ int em_app_run(const EmApp *app) {
     em_set_viewport(g_viewport_w, g_viewport_h);
 
     uint32_t *px = 0;
-    uint64_t wflags = translucent ? EMBK_WINF_TRANSLUCENT
+    uint64_t wflags = (translucent ? EMBK_WINF_TRANSLUCENT
                     : glass       ? EMBK_WINF_GLASS
-                    : chromeless  ? EMBK_WINF_CHROMELESS : 0;
+                    : chromeless  ? EMBK_WINF_CHROMELESS : 0)
+                    | (app->resize == Resizable ? EMBK_WINF_RESIZABLE : 0);   /* it tiles (the snap below) */
     int win = embk_win_create_shared_ex((uint32_t)winw, (uint32_t)winh, wx, wy, title,
                                         wflags, (void **)&px);
     if (win < 0 || !px) {

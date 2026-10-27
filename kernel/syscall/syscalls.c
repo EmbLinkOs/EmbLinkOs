@@ -1846,6 +1846,7 @@ static int64_t sys_win_create(const struct sysargs *a) {
     int widget      = (a->arg[0] >> 33) & 1;   /* EMBK_WINF_WIDGET */
     int glass       = (a->arg[0] >> 34) & 1;   /* EMBK_WINF_GLASS */
     int translucent = (a->arg[0] >> 35) & 1;   /* EMBK_WINF_TRANSLUCENT */
+    int resizable   = (a->arg[0] >> 36) & 1;   /* EMBK_WINF_RESIZABLE */
     int32_t x = (int32_t)a->arg[2], y = (int32_t)a->arg[3];
     char title[COMP_TITLE_MAX + 1];
     int i = 0;
@@ -1872,6 +1873,7 @@ static int64_t sys_win_create(const struct sysargs *a) {
             ? compositor_win_create_chromeless(current_process, cw, ch, x, y, title, &cva)
             : compositor_win_create_shared(current_process, cw, ch, x, y, title, &cva);
         if (id < 0) return id;
+        if (resizable) compositor_win_set_resizable(pid, (uint32_t)id);
         if (copy_to_user((void *)a->arg[5], &cva, sizeof(cva)) != EMBK_OK) {
             compositor_win_destroy(pid, (uint32_t)id);
             return -EMBK_EFAULT;

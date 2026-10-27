@@ -54,6 +54,7 @@ struct comp_window {
     uint64_t  zoom_since_ms;
     int       menu_keyboard; /* temporary keyboard owner while a bar menu is open */
     int       desktop;      /* 1 = chromeless full-screen back layer (the home) */
+    int       resizable;    /* the app tiles it, dragged against an edge (tile preview) */
     int       chromeless;   /* 1 = floating window with NO kernel chrome: the app
                              * draws its own bar/close (EmUI V4 Window/WindowBar)
                              * and moves itself via win_move. Unlike `desktop` it
@@ -1437,6 +1438,113 @@ static void ov_dim_cpu(int rx0, int ry0, int rx1, int ry1) {
     fb_blit_uniform(rx0, ry0, w, ry1 - ry0, g_ov_black, 0, (uint32_t)(a > 255 ? 255 : a));
 }
 
+/* THE TILE PREVIEW. A window dragged against an edge of the work area tiles
+ * when it is let go -- the app's runtime does it (em_app.c): against the left
+ * or right edge, that half; against the top, all of it -- and until the hand
+ * let go nothing said so. While a window that will tile is held against an
+ * edge, a wash of the accent shows where it will go, under the window,
+ * growing out of it on a spring; off the edge, or let go (as the window
+ * flies there), it fades. The rule is the runtime's, read from where the
+ * window is: snapping on, the window chromeless, resizable, and dragged by a
+ * zone it declared. Caller holds g_comp_lock. */
+#define TP_EDGE   4                /* em_app.c's margin */
+#define TP_ALPHA  72               /* the wash at its full, 0-255 */
+static struct { int on; uint32_t win_id; struct spring r[4], a; int last[4], have_last; } g_tp;
+
+static int tile_target(const struct comp_window *w, int out[4]) {
+    if (!(g_desktop.flags & EMBK_DESKTOP_SNAP) || !w->chromeless || !w->resizable ||
+        w->desktop || w->widget || w->translucent) return 0;
+    int x0, y0, x1, y1, fw = (int)w->cw, fh = win_titlebar_h(w) + (int)w->ch;
+    work_area_for(w->x, w->y, fw, fh, &x0, &y0, &x1, &y1);
+    int aw = x1 - x0, ah = y1 - y0;
+    out[1] = y0; out[3] = ah;
+    if (w->x <= x0 + TP_EDGE)            { out[0] = x0;          out[2] = aw / 2;      return 1; }
+    if (w->x + fw >= x1 - TP_EDGE)       { out[0] = x0 + aw / 2; out[2] = aw - aw / 2; return 1; }
+    if (w->y <= y0 + TP_EDGE)            { out[0] = x0;          out[2] = aw;          return 1; }
+    return 0;
+}
+
+static void tp_rect(int r[4]) { for (int i = 0; i < 4; i++) r[i] = spring_px(&g_tp.r[i]); }
+static void tp_dirty(void) {
+    int r[4]; tp_rect(r);
+    paint_region(r[0] - 2, r[1] - 2, r[0] + r[2] + 2, r[1] + r[3] + 2);
+    if (g_tp.have_last)
+        paint_region(g_tp.last[0] - 2, g_tp.last[1] - 2, g_tp.last[0] + g_tp.last[2] + 2, g_tp.last[1] + g_tp.last[3] + 2);
+    for (int i = 0; i < 4; i++) g_tp.last[i] = r[i];
+    g_tp.have_last = 1;
+}
+
+/* After the dragged window moved (or the drag ended: w 0). */
+static void tp_update(const struct comp_window *w) {
+    int t[4], on = w && tile_target(w, t);
+    uint64_t now = time_get_ns();
+    struct spring_params p = spring_params(SPRING_SNAPPY);
+    if (on) {
+        if (!g_tp.on && spring_px(&g_tp.a) <= 0) {          /* out of the window itself */
+            int f[4];
+            win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+            f[2] -= f[0]; f[3] -= f[1];
+            for (int i = 0; i < 4; i++) spring_init(&g_tp.r[i], SPRING_PX(f[i]), now);
+            g_tp.have_last = 0;
+        }
+        for (int i = 0; i < 4; i++)
+            if (g_tp.r[i].target != SPRING_PX(t[i])) spring_to(&g_tp.r[i], SPRING_PX(t[i]), p, now);
+        if (g_tp.a.target != SPRING_PX(TP_ALPHA)) spring_to(&g_tp.a, SPRING_PX(TP_ALPHA), p, now);
+        g_tp.win_id = w->id;
+    } else if (g_tp.on && g_tp.a.target != 0) {
+        spring_to(&g_tp.a, 0, p, now);
+    }
+    g_tp.on = on;
+}
+static int tp_moving(void) {
+    if (g_tp.a.moving) return 1;
+    for (int i = 0; i < 4; i++) if (g_tp.r[i].moving) return 1;
+    return 0;
+}
+/* A frame of it (anim_frame). */
+static void tp_frame(uint64_t now) {
+    if (!tp_moving()) return;
+    spring_step(&g_tp.a, now);
+    for (int i = 0; i < 4; i++) spring_step(&g_tp.r[i], now);
+    tp_dirty();
+}
+
+/* Drawn under the window being dragged: the wash, its corners rounded. */
+static uint32_t g_tp_row[8192], g_tp_rgb = 0xFFFFFFFFu;
+static void tp_draw_cpu(int rx0, int ry0, int rx1, int ry1) {
+    int a = spring_px(&g_tp.a), r[4];
+    if (a <= 0) return;
+    tp_rect(r);
+    if (r[2] <= 0 || r[3] <= 0) return;
+    if (g_tp_rgb != g_desktop.accent) {
+        g_tp_rgb = g_desktop.accent;
+        for (unsigned i = 0; i < sizeof g_tp_row / sizeof *g_tp_row; i++) g_tp_row[i] = 0xFF000000u | g_tp_rgb;
+    }
+    int x0 = imax(r[0], rx0), y0 = imax(r[1], ry0), x1 = imin(r[0] + r[2], rx1), y1 = imin(r[1] + r[3], ry1);
+    if (x1 <= x0 || y1 <= y0 || x1 - x0 > (int)(sizeof g_tp_row / sizeof *g_tp_row)) return;
+    corners_save_at(r[0], r[1], r[0] + r[2], r[1] + r[3], rx0, ry0, rx1, ry1);
+    fb_blit_uniform(x0, y0, x1 - x0, y1 - y0, g_tp_row, 0, (uint32_t)(a > 255 ? 255 : a));
+    corners_carve_ring(0, 0);
+}
+
+/* ...and over it, the target's outline: a big window covers most of its own
+ * wash, and the outline says where it goes whatever is in the way. */
+#define TP_RING 2
+static void tp_ring_cpu(int rx0, int ry0, int rx1, int ry1) {
+    int a = spring_px(&g_tp.a), r[4];
+    if (a <= 0 || g_tp_rgb != g_desktop.accent) return;      /* (the row is the wash's) */
+    tp_rect(r);
+    uint32_t alpha = (uint32_t)(a * 255 / TP_ALPHA > 255 ? 255 : a * 255 / TP_ALPHA);
+    int e[4][4] = { { r[0], r[1], r[2], TP_RING }, { r[0], r[1] + r[3] - TP_RING, r[2], TP_RING },
+                    { r[0], r[1], TP_RING, r[3] }, { r[0] + r[2] - TP_RING, r[1], TP_RING, r[3] } };
+    for (int k = 0; k < 4; k++) {
+        int x0 = imax(e[k][0], rx0), y0 = imax(e[k][1], ry0);
+        int x1 = imin(e[k][0] + e[k][2], rx1), y1 = imin(e[k][1] + e[k][3], ry1);
+        if (x1 > x0 && y1 > y0 && x1 - x0 <= (int)(sizeof g_tp_row / sizeof *g_tp_row))
+            fb_blit_uniform(x0, y0, x1 - x0, y1 - y0, g_tp_row, 0, alpha);
+    }
+}
+
 /* A DOUBLE CLICK where a window is dragged by -- its title bar, or a zone the
  * app declared -- zooms it, as on the Mac: it fills the work area, or goes
  * back (the app's runtime does the layout, EMBK_WIN_ACTION_MAXIMIZE, and the
@@ -2261,10 +2369,31 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         if (best < 0) break;
         {
             struct comp_window *bw = &g_wins[best];
+            if (bw->id == g_tp.win_id && spring_px(&g_tp.a) > 0) {   /* the tile preview, under it */
+                static uint32_t tp_px, tp_img, tp_img_rgb = 0xFFFFFFFFu;
+                if (tp_img && tp_img_rgb != g_desktop.accent) gpu_image_doom(&tp_img);
+                if (!tp_img) {
+                    tp_px = 0xFF000000u | g_desktop.accent; tp_img_rgb = g_desktop.accent;
+                    if (gc->image_create(&tp_px, 1, 1, 4, &tp_img)) tp_img = 0;
+                }
+                if (tp_img) {
+                    int r[4], a = spring_px(&g_tp.a); tp_rect(r);
+                    struct gpu_rect fr = { r[0], r[1], r[2], r[3] };
+                    struct gpu_draw d = { .image = tp_img, .src = { 0, 0, 1, 1 }, .dst = fr, .opaque = 1,
+                                          .opacity = (uint8_t)(a > 255 ? 255 : a), .radius = (uint8_t)WIN_RADIUS, .frame = fr };
+                    gc->draw(&d);
+                }
+            }
             int dx, dy; slide_offset(bw, &dx, &dy);
             bw->x += dx; bw->y += dy;
             int failed = paint_window_gpu(bw, bw->z == tz, rx0, ry0, rx1, ry1);
             bw->x -= dx; bw->y -= dy;
+            if (!failed && bw->id == g_tp.win_id && spring_px(&g_tp.a) * 2 > TP_ALPHA) {   /* its outline, over it */
+                int r[4]; tp_rect(r);
+                struct gpu_rect e[4] = { { r[0], r[1], r[2], TP_RING }, { r[0], r[1] + r[3] - TP_RING, r[2], TP_RING },
+                                         { r[0], r[1], TP_RING, r[3] }, { r[0] + r[2] - TP_RING, r[1], TP_RING, r[3] } };
+                for (int k = 0; k < 4; k++) gc->fill(&e[k], g_desktop.accent);
+            }
             if (failed) return -1;
         }
         last_z = g_wins[best].z;
@@ -2486,10 +2615,12 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
         if (best < 0) break;
         {
             struct comp_window *bw = &g_wins[best];
+            if (bw->id == g_tp.win_id) tp_draw_cpu(rx0, ry0, rx1, ry1);   /* under the window it is for */
             int dx, dy; slide_offset(bw, &dx, &dy);
             bw->x += dx; bw->y += dy;
             paint_window(bw, bw->z == tz, rx0, ry0, rx1, ry1);
             bw->x -= dx; bw->y -= dy;
+            if (bw->id == g_tp.win_id) tp_ring_cpu(rx0, ry0, rx1, ry1);
         }
         last_z = g_wins[best].z;
         drawn++;
@@ -3587,10 +3718,11 @@ void compositor_reap_pid(int pid) {
  * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
  * which is almost always. */
 static void anim_frame(void) {
-    if (!g_nghosts && !g_ov) return;         /* cheap unlocked pre-check */
+    if (!g_nghosts && !g_ov && !tp_moving()) return;   /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
     g_src = EMBK_COMP_SRC_ANIM;
     uint64_t now = time_get_ns();
+    tp_frame(now);
     int held = 0;                            /* overview windows still in their places */
     if (g_ov) {
         /* the dimming, on its spring: all the screen, while it moves */
@@ -3952,6 +4084,7 @@ static void pointer_frame(void) {
         struct comp_window *dw = win_by_id(g_drag_id);
         if (g_drag_region && g_drag_moved && dw) { dw->pending_action = 9; g_post_ui = 1; }   /* EMBK_WIN_ACTION_MOVED */
         g_dragging = 0; g_drag_region = 0;
+        tp_update(0);                         /* the window flies there; the wash goes */
     }
 
     /* drag: move the grabbed window to follow the pointer */
@@ -3970,6 +4103,7 @@ static void pointer_frame(void) {
                 DIRTY(ox0, oy0, ox1, oy1);
                 DIRTY(nx0, ny0, nx1, ny1);
             }
+            tp_update(g_drag_region ? w : 0);   /* held against an edge: where it will go */
         }
     }
 
@@ -4441,7 +4575,7 @@ void compositor_beat_test(uint32_t seconds) {
 static int comp_continuous(void) {
     /* (windows held still in the overview are not motion: an app drawing
      * in one kicks a frame like any present) */
-    return g_nghosts > g_ov_held || (g_ov && (g_ov_leaving || g_ov_dim.moving)) ||
+    return g_nghosts > g_ov_held || (g_ov && (g_ov_leaving || g_ov_dim.moving)) || tp_moving() ||
            time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
 }
 
@@ -4525,6 +4659,13 @@ void compositor_start(void) {
 }
 
 /* The rects of (pid,id)'s content the compositor drags it by; n 0 clears. */
+void compositor_win_set_resizable(int pid, uint32_t id) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (w) w->resizable = 1;
+    comp_unlock();
+}
+
 int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n) {
     if (n > COMP_DRAG_REGIONS) return -EMBK_EINVAL;
     spin_lock(&g_comp_lock);
@@ -4562,6 +4703,13 @@ void compositor_print_windows(void) {
                 w->drag_n ? w->drag_r[0][2] : 0, w->drag_n ? w->drag_r[0][3] : 0);
     }
     kprintf("perf: workspace now=%u count=%u\n", g_desktop.workspace, g_desktop.workspace_count);
+    if (spring_px(&g_tp.a) > 0 || g_tp.on) {
+        int r[4]; tp_rect(r);
+        kprintf("perf: tile on=%d x=%d y=%d w=%d h=%d alpha=%d to=%d,%d,%d,%d\n", g_tp.on, r[0], r[1], r[2], r[3],
+                spring_px(&g_tp.a), spring_px(&(struct spring){ .x = g_tp.r[0].target }),
+                spring_px(&(struct spring){ .x = g_tp.r[1].target }), spring_px(&(struct spring){ .x = g_tp.r[2].target }),
+                spring_px(&(struct spring){ .x = g_tp.r[3].target }));
+    }
     { int32_t px, py; uint32_t pb; mouse_get_state(&px, &py, &pb);
       kprintf("perf: pointer x=%d y=%d buttons=%u\n", (int)px, (int)py, (unsigned)pb); }
     for (int i = 0; i < g_dock_tn; i++)
