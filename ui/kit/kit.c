@@ -3,6 +3,7 @@
 
 #include "kit.h"
 #include "font.h"      /* glyph advances: a caret has to know where it is */
+#include "../motion/spring.h"   /* the wheel glides: see the scroll view */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -1319,6 +1320,64 @@ bool ui_password_field(char *buf, unsigned long cap, const char *placeholder) {
 static float *g_scroll_ptrs[16];
 static unsigned g_scroll_depth;
 
+/* THE WHEEL GLIDES. A notch used to move the content 40 px between one frame
+ * and the next, and a wheel spun hard moved it in 40 px steps. Now a notch
+ * moves where the view is GOING, and the view follows on a critically damped
+ * spring (ui/motion/spring.h): it glides there, and notches that arrive while
+ * it is still moving add to where it is going without restarting it. Notches
+ * that come fast count for more -- a flick of the wheel goes further than the
+ * same notches turned slowly, as on the Mac.
+ *
+ * THE RUBBER BAND. Pushed past an edge, the content gives -- a resisting
+ * fraction of the push, Apple's curve (1 - 1/(x c / d + 1)) d with c = 0.55 --
+ * and once the wheel has been still for UI_SCROLL_IDLE_MS it springs back to
+ * the edge. An edge you can feel says "that is all" better than a dead stop.
+ *
+ * Each view's motion is keyed by the caller's offset pointer, which is the
+ * view's identity across frames. Whatever moves that offset from outside --
+ * the thumb, a focus reveal, the app itself -- is taken as where the view is. */
+#define UI_SCROLL_STEP     40.0f   /* px a notch, turned slowly */
+#define UI_SCROLL_VIEWS    16
+#define UI_SCROLL_IDLE_MS  120     /* the wheel still this long: an overscroll springs back */
+#define UI_SCROLL_SPRING   180u, 1000u
+#define UI_RUBBER          0.55f
+
+static struct ui_scroll_motion {
+    float   *ptr;          /* the caller's offset, the view's identity */
+    struct spring s;       /* the offset shown, Q16.16 px */
+    float    want;         /* where the notches so far send it (may lie past an edge) */
+    float    shown;        /* what was last written to *ptr */
+    float    maxs;         /* the range, as last measured; < 0: not yet */
+    uint64_t wheel_ms;     /* the last notch */
+    unsigned used;
+} g_sv[UI_SCROLL_VIEWS];
+static unsigned g_sv_tick;
+static void (*g_kit_frame_request)(void);
+static uint64_t (*g_kit_motion_ms)(void);
+void ui_kit_motion(void (*request_frame)(void), uint64_t (*now_ms)(void)) {
+    g_kit_frame_request = request_frame; g_kit_motion_ms = now_ms;
+}
+
+static float ui_rubber(float x, float d) {
+    if (d < 1.0f) d = 1.0f;
+    return (1.0f - 1.0f / (x * UI_RUBBER / d + 1.0f)) * d;
+}
+
+static struct ui_scroll_motion *scroll_motion(float *ptr, uint64_t now_ns) {
+    struct ui_scroll_motion *m = 0, *old = &g_sv[0];
+    for (int i = 0; i < UI_SCROLL_VIEWS; i++) {
+        if (g_sv[i].ptr == ptr) { m = &g_sv[i]; break; }
+        if (g_sv[i].used < old->used) old = &g_sv[i];
+    }
+    if (!m) {                      /* a view not seen before takes the stalest slot */
+        m = old;
+        m->ptr = ptr; m->want = m->shown = *ptr; m->maxs = -1.0f; m->wheel_ms = 0;
+        spring_init(&m->s, (int64_t)(*ptr * SPRING_ONE), now_ns);
+    }
+    m->used = ++g_sv_tick;
+    return m;
+}
+
 /* THE SCROLLBAR'S GUTTER, always reserved.
  *
  * Reserved rather than overlaid on purpose: a bar that appears only when the
@@ -1337,10 +1396,45 @@ void ui_scroll_begin(uint64_t key, float viewport_h, float *scroll_y) {
      * is why the scroll offset and the clip live on the inner column instead. */
     ui_begin_hstack(key);
     /* wheel anywhere over the view -- bar included -- scrolls it
-     * (40px per notch; wheel up -> content up) */
+     * (wheel up -> content up), gliding: see THE WHEEL GLIDES above */
+    /* no motion hookup (a loop that never asked): jumps, as it always did */
+    uint64_t now_ms = g_kit_motion_ms ? g_kit_motion_ms() : 0, now_ns = now_ms * 1000000ull;
+    struct ui_scroll_motion *m = scroll_motion(scroll_y, now_ns);
+    if (*scroll_y != m->shown) {
+        /* MOVED FROM OUTSIDE: it is there now -- within the range, because
+         * only the wheel puts a view past an edge (an app jumping to the
+         * bottom with a huge offset gets the bottom, not a long glide) */
+        float at = *scroll_y < 0.0f ? 0.0f : *scroll_y;
+        if (m->maxs >= 0.0f && at > m->maxs) at = m->maxs;
+        spring_set(&m->s, (int64_t)(at * SPRING_ONE), now_ns);
+        m->want = m->shown = *scroll_y = at;
+    }
     float w = ui_take_wheel();
-    if (w != 0.0f) *scroll_y -= w * 40.0f;
-    if (*scroll_y < 0) *scroll_y = 0;
+    if (w != 0.0f) {
+        uint64_t gap = now_ms - m->wheel_ms;
+        float accel = gap < 40 ? 3.0f : gap < 100 ? 2.0f : 1.0f;
+        if (m->want < 0.0f && w > 0.0f) m->want = 0.0f;   /* back from past an edge: from the edge */
+        if (m->maxs >= 0.0f && m->want > m->maxs && w < 0.0f) m->want = m->maxs;
+        m->want -= w * UI_SCROLL_STEP * accel;
+        m->wheel_ms = now_ms;
+    }
+    int idle = now_ms - m->wheel_ms >= UI_SCROLL_IDLE_MS;
+    float goal = m->want;
+    if (m->want < 0.0f) {
+        if (idle) m->want = 0.0f;
+        goal = idle ? 0.0f : -ui_rubber(-m->want, viewport_h);
+    } else if (m->maxs >= 0.0f && m->want > m->maxs) {
+        if (idle) m->want = m->maxs;
+        goal = idle ? m->maxs : m->maxs + ui_rubber(m->want - m->maxs, viewport_h);
+    }
+    if (!g_kit_motion_ms) { goal = m->want = goal < 0.0f ? 0.0f : goal; }
+    int64_t goal_q = (int64_t)(goal * SPRING_ONE);
+    if (!g_kit_motion_ms) spring_set(&m->s, goal_q, 0);
+    else if (goal_q != m->s.target) spring_to(&m->s, goal_q, spring_params(UI_SCROLL_SPRING), now_ns);
+    int moving = spring_step(&m->s, now_ns);
+    *scroll_y = m->shown = (float)m->s.x / SPRING_ONE;
+    if ((moving || (!idle && goal != m->want) || m->s.target != goal_q) && g_kit_frame_request)
+        g_kit_frame_request();     /* frames on the compositor's beat, at the display's top rate */
     ui_set_size(sz_grow(), sz_fixed(viewport_h));
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
@@ -1364,10 +1458,24 @@ void ui_scroll_end(void) {
     float content = 0, viewport = 0;
     int measured = ui_open_content_extent(&content, &viewport);
     float maxs = 0;
+    struct ui_scroll_motion *m = 0;
+    for (int i = 0; i < UI_SCROLL_VIEWS && !m; i++) if (g_sv[i].ptr == g_scroll_ptr) m = &g_sv[i];
     if (measured) {
         maxs = content - viewport;
         if (maxs < 0) maxs = 0;
-        if (g_scroll_ptr && *g_scroll_ptr > maxs) { *g_scroll_ptr = maxs; ui_set_scroll_offset(maxs); }
+        if (m) m->maxs = maxs;
+        /* past the end: a rubber band the wheel is pushing, or one springing
+         * back, is left alone; anything else past the end (the content
+         * shrank, the app jumped to the bottom) is put at the end at once */
+        uint64_t now_ms = g_kit_motion_ms ? g_kit_motion_ms() : 0;
+        int banding = m && g_kit_motion_ms && (now_ms - m->wheel_ms < UI_SCROLL_IDLE_MS || m->s.moving);
+        if (*g_scroll_ptr > maxs && !banding) {
+            *g_scroll_ptr = maxs; ui_set_scroll_offset(maxs);
+            if (m) {
+                m->want = m->shown = maxs;
+                spring_set(&m->s, (int64_t)(maxs * SPRING_ONE), g_kit_motion_ms ? g_kit_motion_ms() * 1000000ull : 0);
+            }
+        }
     }
     ui_end_stack();                     /* content column */
 

@@ -34,7 +34,9 @@ the default target). Measured before and after every step
       `menu_smoke.py` clicks (916,195) for Settings' Light appearance, which is now at about
       (1005,426), so the light menu never comes; `desktop_smoke.py`'s mute click at (1000,306)
       misses the same way (volume stays 100). Their coordinates predate the current Settings
-      layout.
+      layout. **And a third**: `files_document_smoke.py` clicks Files' New Document at the
+      window's (930, 90), and the Contour redesign (26988d7, after the smoke's 7d15db6) put the
+      button's row at y 64 -- the click lands in the empty row below the toolbar.
 - [ ] A drag step still recomposes the window's old and new footprints (about 0.7 Mpx for
       Settings): 2 ms a step on an M5 core (arm64 drag p50 2.08 ms), an order more on slow
       ones. The compositor drags the window now (P1), so the app no longer presents, but the
@@ -79,7 +81,11 @@ the default target). Measured before and after every step
   - [ ] A ghost shrinking far (into the dock) still aliases: bilinear reads 2 x 2 pixels, and at
         a twentieth of the size a mip level is what is wanted.
   - [ ] Toolkit transitions, menus and toasts on springs.
-  - [ ] Momentum scrolling with a rubber band; pixel-precise scrolling.
+  - [x] The wheel glides: a notch moves where the view is going and the view follows on a spring;
+        fast notches go further; past an edge it gives (Apple's rubber-band curve) and springs back
+        (`make kit-test`; one notch is 19 frames under HVF, `tools/motion_smoke.py`).
+  - [ ] Pixel-precise scrolling and momentum after a touchpad flick: needs pixel deltas and a
+        lift event from the touchpad driver (velocity.h is ready for the fling).
   - [ ] Pointer acceleration; a USB HID mouse driver; event timestamps for velocity.
 - [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
       governor and an Effects setting; the toolkit's span rasterizer, gradient LUT, one blend policy,
@@ -5980,10 +5986,10 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       tile (dd046be). An app with no tile still goes to the bottom centre.
 - [x] Only one motion runs at a time -- DONE: up to eight ghosts on springs,
       and a motion in flight can be turned around (dd046be).
-- [ ] The window is un-hittable while it is in flight (it is hidden and the
-      ghost takes no input): about 0.3 s opening and 0.5 s into the dock now,
-      on springs that land within half a pixel. A click on the ghost of an
-      opening window is lost.
+- [x] The window is un-hittable while it is in flight -- DONE for an
+      arriving window: one opening or coming back from the dock takes clicks
+      and the keyboard at its real place while its ghost is in the air (the
+      hand aims at where it is going). One leaving takes nothing, as it should.
 - [ ] Frame pacing rides the main loop's ~100Hz timer wake. Under heavy TCG load
       the loop can be slower, and the motion degrades to fewer frames rather
       than slowing down (it is time-based, so it still lands on schedule).

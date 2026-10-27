@@ -553,6 +553,8 @@ int em_app_run(const EmApp *app) {
      * was. Counting frames would not do -- this loop skips them when nothing
      * moves. */
     ui_clock_provider(embk_uptime_ms);
+    /* ...and, for the scroll views' glide, the next frame and the time */
+    ui_kit_motion(em_request_frame, embk_uptime_ms);
     /* ...and the modifier keys, for shift-click. A click carries no byte, so
      * unlike Shift+Left -- which the driver decides before sending -- the kit
      * has to ask what was held. */

@@ -15,6 +15,8 @@ in the air: its kind, rect, opacity and target). It asserts:
              lands where it started
   together   two windows minimised at once (GUI+M twice) are two ghosts in
              the air at once
+  scroll     one notch of the wheel over Settings glides: several frames of
+             motion, not one jump
 
 and captures frames mid-flight. --arch aarch64 runs it on arm64 under HVF.
 """
@@ -118,6 +120,16 @@ def main():
         assert tile, f'the desktop published no tile for settings.elf: {dock}'
         print(f'Settings at {start}; its dock tile at {tile}', flush=True)
         light = (start[0] + MIN_LIGHT[0], start[1] + MIN_LIGHT[1])
+
+        # SCROLL: a notch glides -- the app presents a run of frames, not one
+        P.move(d, start[0] + start[2] - 45, start[1] + start[3] // 2); d.g.pump(1)
+        d.g.command('perf reset', b'perf: reset', 60)
+        d.g.qmp.cmd('input-send-event', events=[{'type': 'btn', 'data': {'down': True, 'button': 'wheel-down'}},
+                                                {'type': 'btn', 'data': {'down': False, 'button': 'wheel-down'}}])
+        d.g.pump(1.5)
+        presents = P.perf(d).get('windows', {}).get('Settings', {}).get('presents', 0)
+        assert presents >= 3, f'one notch was {presents} frame(s) of Settings: it jumped, it did not glide'
+        print(f'scroll: one notch glided over {presents} frames', flush=True)
 
         # PARK: into its own tile, smaller and fainter on the way
         P.click(d, *light)

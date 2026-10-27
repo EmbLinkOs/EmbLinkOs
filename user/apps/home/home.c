@@ -1882,6 +1882,7 @@ int main(int argc, char **argv, char **envp) {
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
 
     em_set_clock(embk_uptime_ms);
+    ui_kit_motion(em_request_frame, embk_uptime_ms);   /* the launcher's scroll glides */
     /* Our menu bar IS topbar.elf -- the Apple-modern glass bar with the drag
      * handle, draggable dock chips, and pin/snap. The desktop no longer draws
      * its own top status bar; this floating bar takes the top strip. */

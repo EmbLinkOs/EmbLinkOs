@@ -179,6 +179,31 @@ static void scroll_wrapped(float *sc) {
     ui_end_stack();ui_scroll_end();ui_frame_end();ui_run_layout(140,80);
 }
 
+/* ONE FRAME of a 100 px view over 400 px of rows, the pointer over it and
+ * `notches` of wheel fed first -- at time g_ms. */
+static int g_frames_asked;
+static void ask_frame(void) { g_frames_asked++; }
+static uint64_t motion_clock(void) { return g_ms; }
+static void glide_frame(float *sc, float notches) {
+    ui_pointer(200, 50, false);
+    if (notches != 0.0f) ui_wheel(notches);
+    ui_frame_begin();
+    ui_scroll_begin(0x5C403, 100, sc);
+    for (int i = 0; i < 20; i++) {
+        ui_box_begin((uint64_t)(i + 1));
+        ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                    (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 20 });
+        ui_box_end();
+    }
+    ui_scroll_end();
+    ui_frame_end();
+    ui_run_layout(400, 300);
+}
+/* frames every 8 ms for `ms`: what a 120 Hz loop asked by the view does */
+static void glide_for(float *sc, unsigned ms) {
+    for (unsigned t = 0; t < ms; t += 8) { g_ms += 8; glide_frame(sc, 0); }
+}
+
 static float nav_scroll;
 static void scroll_controls(void) {
     ui_frame_begin();ui_scroll_begin(0xACC355,80,&nav_scroll);
@@ -671,6 +696,62 @@ int main(void) {
         sc=100000;scroll_wrapped(&sc);scroll_wrapped(&sc);
         CHECK(ui_rect_of(wrapped_last,&x,&y,&w,&h) && y>=-1 && y+h<=61,
               "scrolling reaches the final control after nested text wraps");
+    }
+
+    /* ---- THE WHEEL GLIDES -----------------------------------------------
+     *
+     * A notch moves where the view is going, and the view follows on a
+     * spring; fast notches go further; past an edge the content gives and
+     * springs back. Driven on a fake clock with the motion hookup the app
+     * runtime installs. */
+    {
+        static float sc;
+        ui_kit_motion(ask_frame, motion_clock);
+        sc = 0; g_ms += 5000;
+        glide_frame(&sc, 0); glide_frame(&sc, 0);          /* measured: the range is known */
+        g_frames_asked = 0;
+        glide_frame(&sc, -1.0f);                            /* one notch down */
+        CHECK(sc >= 0.0f && sc < 10.0f, "a notch does not jump: the first frame has barely moved");
+        CHECK(g_frames_asked > 0, "and the gliding view asks for the next frame");
+        glide_for(&sc, 64);
+        float mid = sc;
+        CHECK(mid > 10.0f && mid < 40.0f, "partway there 64 ms later");
+        glide_for(&sc, 600);
+        CHECK(sc == 40.0f, "and at rest on exactly 40 px, one notch");
+        g_frames_asked = 0;
+        g_ms += 8; glide_frame(&sc, 0);
+        CHECK(g_frames_asked == 0, "at rest it asks for nothing");
+
+        /* fast notches go further than the same notches turned slowly */
+        float slow0 = sc;
+        for (int i = 0; i < 3; i++) { g_ms += 300; glide_frame(&sc, -1.0f); glide_for(&sc, 600); }
+        float slow = sc - slow0;
+        g_ms += 1000; glide_frame(&sc, 0);
+        sc = 0; g_ms += 8; glide_frame(&sc, 0); glide_for(&sc, 600);   /* back to the top, set from outside */
+        CHECK(sc == 0.0f, "an offset set from outside is taken as where the view is");
+        for (int i = 0; i < 3; i++) { g_ms += 20; glide_frame(&sc, -1.0f); }
+        glide_for(&sc, 800);
+        printf("        (three slow notches: %.1f px, three fast: %.1f px)\n", slow, sc);
+        CHECK(slow == 120.0f && sc > slow, "three notches 20 ms apart go further than three turned slowly");
+
+        /* the rubber band at the top: it gives, then springs back */
+        sc = 0; g_ms += 8; glide_frame(&sc, 0); glide_for(&sc, 600);
+        g_ms += 8; glide_frame(&sc, 3.0f);                  /* three notches up, at the top */
+        glide_for(&sc, 64);
+        CHECK(sc < 0.0f && sc > -120.0f, "pushed past the top it gives, less than the push");
+        glide_for(&sc, 1000);
+        CHECK(sc == 0.0f, "and springs back to the edge when the wheel is still");
+
+        /* and at the bottom */
+        sc = 1e6f; g_ms += 8; glide_frame(&sc, 0); glide_frame(&sc, 0);
+        float bottom = sc;
+        CHECK(bottom > 300.0f && bottom < 1000.0f, "an offset past the end, set from outside, is put at the end at once");
+        g_ms += 8; glide_frame(&sc, -3.0f);
+        glide_for(&sc, 64);
+        CHECK(sc > bottom && sc < bottom + 120.0f, "pushed past the bottom it gives too");
+        glide_for(&sc, 1000);
+        CHECK(sc == bottom, "and comes back to the end");
+        ui_kit_motion(NULL, NULL);
     }
 
     /* ---- SHIFT-CLICK ----------------------------------------------------

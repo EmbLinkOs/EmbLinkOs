@@ -39,6 +39,11 @@ struct comp_window {
     uint32_t  cw, ch;       /* content dimensions in px                       */
     int       z;            /* z-order: larger is nearer the front            */
     int       visible;
+    /* OPENING, or coming back out of the dock: hidden behind its ghost while
+     * it moves (visible 0), but already where a hand aims -- clicks and the
+     * keyboard go to it. A window that took a third of a second to accept the
+     * click that opened it would lose the next one. */
+    int       arriving;
     int       menu_keyboard; /* temporary keyboard owner while a bar menu is open */
     int       desktop;      /* 1 = chromeless full-screen back layer (the home) */
     int       chromeless;   /* 1 = floating window with NO kernel chrome: the app
@@ -533,10 +538,13 @@ static int top_z(void) {
     return z;
 }
 
+/* There for input: shown, or arriving (see comp_window). */
+static int win_present(const struct comp_window *w) { return w->visible || w->arriving; }
+
 static struct comp_window *front_window(void) {
     struct comp_window *top = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+        if (!g_wins[i].used || !win_present(&g_wins[i]) || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
         if (!top || g_wins[i].z > top->z) top = &g_wins[i];
     }
     return top;
@@ -546,7 +554,7 @@ static struct comp_window *front_app_window(void) {
     struct comp_window *front=0;
     for(int i=0;i<COMP_MAX_WINDOWS;i++) {
         struct comp_window *w=&g_wins[i];
-        if(!w->used || !w->visible || w->desktop || w->widget || w->translucent ||
+        if(!w->used || !win_present(w) || w->desktop || w->widget || w->translucent ||
            !on_workspace(w) || !session_ui_allowed(w->pid))continue;
         if(!front || w->z>front->z)front=w;
     }
@@ -557,7 +565,7 @@ static struct comp_window *front_app_window(void) {
 static struct comp_window *topmost_at(int x, int y) {
     struct comp_window *best = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+        if (!g_wins[i].used || !win_present(&g_wins[i]) || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
         int fx0, fy0, fx1, fy1; win_frame_rect(&g_wins[i], &fx0, &fy0, &fx1, &fy1);
         if(x>=fx0 && x<fx1 && y>=fy0 && y<fy1) {
             struct comp_window *w=&g_wins[i];
@@ -582,7 +590,7 @@ uint32_t compositor_focused_pid(void) {
     struct comp_window *best = 0, *desk = 0, *menu = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || !w->visible || (!session_ui_allowed(w->pid) || !on_workspace(w))) continue;
+        if (!w->used || !win_present(w) || (!session_ui_allowed(w->pid) || !on_workspace(w))) continue;
         if (w->desktop) { desk = w; continue; }     /* the fallback owner */
         if (w->translucent && w->menu_keyboard) {
             if (!menu || w->z > menu->z) menu = w;
@@ -952,6 +960,7 @@ static void enforce_focus(void);
 static void anim_start(struct comp_window *w, int kind) {
     if (!w || !w->content) return;
     int show = kind == ANIM_OPEN || kind == ANIM_UNPARK;
+    w->arriving = 0;
     if(g_desktop.flags&EMBK_DESKTOP_REDUCED_MOTION) { w->visible=show; return; }
     if (w->desktop || w->widget || w->translucent) return;  /* chrome doesn't fly */
 
@@ -1016,6 +1025,7 @@ static void anim_start(struct comp_window *w, int kind) {
         ghost_aim(g, to, 0, ANIM_SPRING_CLOSE, now);
     }
     w->visible = 0;                      /* the ghost is the window for now */
+    w->arriving = show;                  /* ...but an arriving one takes input */
 }
 
 /* Land a motion: the window becomes real again (or stays parked). */
@@ -1026,7 +1036,7 @@ static void anim_finish(struct ghost *g) {
     int last[4]; int had = g->have_last;
     for (int i = 0; i < 4; i++) last[i] = g->last[i];
     ghost_free(g);
-    if (w) w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK);
+    if (w) { w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK); w->arriving = 0; }
     /* repaint the window's footprint AND wherever the ghost last was */
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     if (w && w->used) win_repaint_rect(w, &x0, &y0, &x1, &y1);
@@ -2126,7 +2136,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->x = x; w->y = y;
     w->cw = cw; w->ch = ch;
     w->z = g_next_z++;
-    w->visible = 1;
+    w->visible = 1; w->arriving = 0;
     w->workspace=g_desktop.workspace;
     w->menu_keyboard = 0;
     w->desktop = 0;
@@ -2225,7 +2235,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     struct comp_window *w = &g_wins[slot];
     w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid; w->drag_n = 0;
     memcpy(w->app, app, sizeof w->app);
-    w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
+    w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1; w->arriving = 0;
     w->workspace=g_desktop.workspace;
     w->menu_keyboard = 0;
     w->desktop = desktop;
@@ -2816,7 +2826,7 @@ int compositor_close_overdue(int *out, int max) {
          * there, a frozen picture of an application that no longer exists.
          * That is exactly what the old close path did at click time and what
          * was lost when closing became a request. */
-        w->visible = 0;
+        w->visible = 0; w->arriving = 0;
         if (w->id == g_top_id) g_top_id = 0;
         int x0, y0, x1, y1;
         win_repaint_rect(w, &x0, &y0, &x1, &y1);
