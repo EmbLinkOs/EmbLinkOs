@@ -791,13 +791,16 @@ float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nb
     if (!f) return 0.0f;
     unsigned limit = nbytes < 0 ? (unsigned)-1 : (unsigned)nbytes;
     float w = 0;
+    uint32_t prev = 0;                       /* kerned as the renderer kerns: within words */
     for (unsigned i = 0; s[i] && i < limit; ) {
         uint32_t cp;
         int adv = font_utf8_decode(s + i, &cp);
         if (adv <= 0) break;
         struct glyph_cache_entry *e =
             glyph_cache_lookup_or_rasterize(font_global_atlas(), font_for_codepoint(f, cp), cp, size_px);
-        if (e) w += e->advance_px;
+        if (cp == ' ' || cp == '\t') prev = 0;
+        if (e) w += font_kern_px(f, prev, cp, size_px) + e->advance_px;
+        prev = cp == ' ' || cp == '\t' ? 0 : cp;
         i += (unsigned)adv;
     }
     return w;

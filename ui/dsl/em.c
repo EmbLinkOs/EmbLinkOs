@@ -2851,18 +2851,8 @@ uint32_t em_font(const char *path) {
     return h;
 }
 float em_text_width(const char *s, float size_px) {
-    if (!s || !*s) return 0.0f;
-    struct font *f = font_for_handle(TH->font_regular);
-    if (!f) return 0.0f;
-    float w = 0;
-    for (const char *p = s; *p; ) {
-        uint32_t cp;
-        p += font_utf8_decode(p, &cp);
-        struct glyph_cache_entry *e =
-            glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
-        if (e) w += e->advance_px;
-    }
-    return w;
+    /* the kit's measure: the fallback face and the kerning, as drawn */
+    return s && *s ? ui_text_width_n(TH->font_regular, size_px, s, -1) : 0.0f;
 }
 
 

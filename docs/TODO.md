@@ -119,8 +119,14 @@ the default target). Measured before and after every step
   - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
         stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its
         fallback (`make font-test`) -- and as the Condensed, Serif and Mono faces (gallery 216).
-  - [ ] Area-coverage rasterising (256 levels, not 4 x 4 supersampling), subpixel positioning,
-        GPOS kerning (Inter keeps its kerning in GPOS only), an advance cache, a type scale.
+  - [x] Exact area coverage (256 levels, where 4 x 4 supersampling had 17), quarter-pixel
+        subpixel positioning, and GPOS pair kerning (formats 1 and 2, extension lookups; ASCII pairs
+        cached per face) in every walk over text -- the renderer's, the layout's, the caret's.
+        `make font-test` holds all three against exact areas and Inter's own pairs.
+  - [ ] A type scale with per-size tracking; hinting or stem darkening at small sizes.
+  - [ ] `contour_modal_smoke` failed once with "scaled serif paragraph lost its wrapped height" while
+        seven emulators ran at once, and passed twice alone: a read before the Serif/115% change had
+        settled, most likely. Watch it.
   - [ ] The token pass and a light/dark audit.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
       A double click on a title bar should zoom the window as on macOS, now that the

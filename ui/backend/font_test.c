@@ -195,6 +195,33 @@ static uint32_t t1_load_and_square(void) {
     /* a corner-ish sample inside, and outside-of-bitmap is by definition uncovered */
     CHECK(cov && cov[2*w + 2] >= 250, "square interior covered");
     free(cov);
+    /* EXACT AREA: at 103 px the square spans x 10.3..41.2, so its left column
+     * is 70% covered and its right one 20% -- 179 and 51. Sampling 4 x 4 gave
+     * 191 and 64: only the multiples of a quarter it could see. */
+    cov = 0;
+    CHECK(font_rasterize_glyph(f, 1, 103.0f, &cov, &w, &h, &bx, &by, &adv), "rasterize square @103px");
+    if (cov) {
+        int l = cov[(h/2)*w], r = cov[(h/2)*w + w - 1];
+        printf("        (edge columns: %d and %d)\n", l, r);
+        CHECK(l >= 178 && l <= 180, "a 70%-covered edge pixel is 179, the area it covers");
+        CHECK(r >= 50 && r <= 52, "a 20%-covered one is 51");
+    }
+    free(cov);
+    /* SUBPIXEL: at 100 px the square's left edge is on a whole pixel; moved
+     * half a pixel right it half-covers that column instead */
+    cov = 0;
+    CHECK(font_rasterize_glyph_at(f, 1, 100.0f, 0.5f, &cov, &w, &h, &bx, &by, &adv), "rasterize square half a pixel right");
+    if (cov) {
+        int l = cov[(h/2)*w];
+        CHECK(bx == 10 && l >= 126 && l <= 129, "half a pixel right: the edge column is half covered (128)");
+        CHECK(adv == 50.0f, "and the advance is the advance at every phase");
+    }
+    free(cov);
+    struct glyph_cache_entry *p0 = glyph_cache_lookup_phase(font_global_atlas(), f, 'A', 40.0f, 0);
+    uint16_t p0x = p0 ? p0->atlas_x : 0, p0y = p0 ? p0->atlas_y : 0;
+    struct glyph_cache_entry *p2 = glyph_cache_lookup_phase(font_global_atlas(), f, 'A', 40.0f, 2);
+    CHECK(p0 && p2 && p2->phase == 2 && (p2->atlas_x != p0x || p2->atlas_y != p0y),
+          "each phase is its own cache entry, with its own pixels");
     return fh;
 }
 
@@ -386,7 +413,7 @@ static void t8_cache_pressure(struct font *f) {
         struct glyph_cache_entry *e = &atlas->entries[i];
         if (!e->used) { if (!evicted_seen++) { gone_cp = e->codepoint; gone_size = e->size_px_x4 / 4.0f; } continue; }
         uint32_t before = font_debug_rasterize_count();
-        struct glyph_cache_entry *again = glyph_cache_lookup_or_rasterize(atlas, f, e->codepoint, e->size_px_x4 / 4.0f);
+        struct glyph_cache_entry *again = glyph_cache_lookup_phase(atlas, f, e->codepoint, e->size_px_x4 / 4.0f, e->phase);
         if (again != e || font_debug_rasterize_count() != before) consistent = 0;
     }
     CHECK(consistent, "every cached glyph is found by its key");
@@ -428,6 +455,39 @@ static void t9_meslo(void) {
     CHECK(sep->atlas_w > 4 && sep->atlas_h > 12 && !sep->missing, "the separator rasterizes");
 }
 
+/* ---- T10: the interface's face, and its kerning ------------------------- */
+static float g_kx[8];
+static int g_kn;
+static void kern_visit(void *ctx, uint32_t cp, float x, float y) { (void)ctx; (void)cp; (void)y; if (g_kn < 8) g_kx[g_kn++] = x; }
+static void t10_inter(void) {
+    printf("T10 Inter and its kerning (third_party/fonts/inter):\n");
+    FILE *file = fopen("third_party/fonts/inter/Inter-Regular.ttf", "rb");
+    CHECK(file != 0, "the vendored face is in the tree");
+    if (!file) return;
+    fseek(file, 0, SEEK_END); long n = ftell(file); fseek(file, 0, SEEK_SET);
+    uint8_t *data = malloc((size_t)n);
+    CHECK(data && fread(data, 1, (size_t)n, file) == (size_t)n, "read it");
+    fclose(file);
+    struct font *f = font_for_handle(font_load(data, (size_t)n));
+    CHECK(f && f->gpos_len > 0 && f->n_kern_lookups > 0, "it loads, with GPOS and a 'kern' feature");
+    if (!f) return;
+    float av = font_kern_px(f, 'A', 'V', 100), to = font_kern_px(f, 'T', 'o', 100);
+    float vertical = font_kern_px(f, 'H', 'H', 100);
+    printf("        (at 100 px: AV %.2f, To %.2f, HH %.2f)\n", av, to, vertical);
+    CHECK(av < -2.0f && to < -2.0f, "AV and To sit closer than their advances say");
+    CHECK(vertical == 0.0f, "two upright stems keep their spacing (HH is not kerned)");
+    CHECK(font_kern_px(f, 0x00C5, 'V', 100) < -2.0f, "an accented capital (\u00c5, outside the ASCII table) kerns as A does");
+    CHECK(font_kern_px(f, 'A', 'V', 20) * 5 > av - 0.3f && font_kern_px(f, 'A', 'V', 20) * 5 < av + 0.3f,
+          "kerning scales with the size");
+    CHECK(font_kern_px(f, 0, 'V', 100) == 0.0f, "nothing before the first glyph");
+    /* the text walk places the V at A's advance plus the pair's kerning */
+    g_kn = 0;
+    font_layout_text(f, "AV", 100, 0, kern_visit, 0);
+    float adv_a = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'A', 100)->advance_px;
+    CHECK(g_kn == 2 && g_kx[1] > adv_a + av - 0.01f && g_kx[1] < adv_a + av + 0.01f,
+          "the text walk puts V at A's advance plus the kerning");
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4b: font-rasterizer selftests ===\n");
     uint32_t fh = t1_load_and_square();
@@ -442,6 +502,7 @@ int main(void) {
     } else { printf("  FAIL: no font handle; skipping T2-T5\n"); g_fail++; }
     t7_cmap12();
     t9_meslo();
+    t10_inter();
     printf("=== font-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

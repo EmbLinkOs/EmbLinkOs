@@ -49,6 +49,13 @@ struct font {
      * much it covers, and text should not turn to boxes at the first symbol
      * the UI face lacks. */
     uint32_t fallback;
+    /* KERNING, from GPOS (font_kern_px): the pair-adjustment lookups the
+     * 'kern' feature names, and the ASCII pairs worked out once, the first
+     * time any is asked for -- text is mostly ASCII and measured every frame. */
+    uint32_t gpos_offset, gpos_len;
+    uint16_t kern_lookups[16];
+    uint8_t  n_kern_lookups;
+    int16_t *kern_ascii;          /* 95 x 95 font units, ' '..'~', or NULL */
 };
 
 /* Parse the sfnt table directory once; -> a handle (index into a table of
@@ -57,6 +64,12 @@ struct font {
 #define FONT_MAX 16
 uint32_t font_load(const uint8_t *ttf_data, size_t len);
 struct font *font_for_handle(uint32_t handle);
+/* How much closer (negative) or further apart the pair `left` `right` sits
+ * than their advances say, in pixels at `size_px` -- the face's own kerning
+ * (GPOS pair adjustment). 0 for a pair the face does not kern, or whose
+ * glyphs come from different faces. Every walk over text adds it, so a caret
+ * stands where the glyphs are. */
+float font_kern_px(struct font *f, uint32_t left, uint32_t right, float size_px);
 /* Codepoints `font` lacks come from `fallback` (0 clears). */
 void font_set_fallback(uint32_t font, uint32_t fallback);
 /* The face that draws `codepoint`: `f` when it has it, else its fallback when
@@ -103,6 +116,17 @@ void font_free_outline(struct glyph_outline *o);
 bool font_rasterize_glyph(struct font *f, uint32_t glyph_index, float size_px,
                           uint8_t **out_coverage, int *out_w, int *out_h,
                           int *out_bearing_x, int *out_bearing_y, float *out_advance_px);
+/* ...with the outline moved right by `dx` (0 <= dx < 1) of a pixel first:
+ * a glyph for a pen that is not on a whole pixel. */
+bool font_rasterize_glyph_at(struct font *f, uint32_t glyph_index, float size_px, float dx,
+                             uint8_t **out_coverage, int *out_w, int *out_h,
+                             int *out_bearing_x, int *out_bearing_y, float *out_advance_px);
+/* SUBPIXEL POSITIONING: a glyph is rasterised at one of FONT_PHASES offsets
+ * of a pixel, and drawn at the one nearest its pen. A pen rounded to whole
+ * pixels makes the space between letters uneven -- "rn" one pixel tighter
+ * than "nn" -- by up to half a pixel each, which at text sizes is a fifth of
+ * a stem. Quarters are the phases desktops settle on. */
+#define FONT_PHASES 4
 
 /* Debug counter: how many times font_rasterize_glyph actually ran (T4 asserts
  * the cache stops this incrementing on a repeat lookup). */
@@ -133,6 +157,7 @@ int font_debug_flatten_contour0(struct font *f, uint32_t gi, float scale,
 struct glyph_cache_entry {
     uint32_t font_handle, codepoint;
     uint16_t size_px_x4;          /* size_px * 4 rounded -> collapses float noise */
+    uint8_t  phase;               /* which FONT_PHASES offset it was rasterised at */
     uint16_t atlas_x, atlas_y, atlas_w, atlas_h;
     int16_t  bearing_x, bearing_y;
     float    advance_px;
@@ -162,6 +187,10 @@ struct glyph_atlas {
  * The entry is valid until the next lookup (that one may evict it). */
 struct glyph_cache_entry *glyph_cache_lookup_or_rasterize(
     struct glyph_atlas *atlas, struct font *f, uint32_t codepoint, float size_px);
+/* ...at a phase (0 .. FONT_PHASES - 1): the glyph moved right phase/FONT_PHASES
+ * of a pixel. Advances are the same at every phase. */
+struct glyph_cache_entry *glyph_cache_lookup_phase(
+    struct glyph_atlas *atlas, struct font *f, uint32_t codepoint, float size_px, uint32_t phase);
 /* The entry's coverage: atlas_h rows of atlas_w bytes, GLYPH_ATLAS_SIZE apart.
  * NULL for a glyph with no pixels. */
 const uint8_t *glyph_coverage(const struct glyph_atlas *atlas, const struct glyph_cache_entry *e);
