@@ -354,3 +354,35 @@ zooms, slides -- never leaves the full tier. Under TCG, where dragging
 Settings costs 11-20 ms a frame, `tools/effects_smoke.py` sees it step down
 during the drag and back up once the hand is still (fourteen steps over the
 run, most of them app launches), and holds either tier when told to.
+
+## The toolkit's own frame: the library's entrance
+
+The compositor's numbers above say nothing about what an app pays to draw its
+frame. The library (GUI+Space) comes in on a spring over a dimming scrim, so
+every frame of its entrance repaints the whole desktop in the desktop's own
+process. Measured there, on one M5 core under HVF (`embk_thread_cpu_ns` around
+`scene_render_frame`):
+
+| | Render per frame | Frames shown in its entrance |
+|---|---|---|
+| Before | 43-66 ms | 5 |
+| After | 17 ms | 52 (captures 10 ms apart) |
+
+Where it went, and what changed:
+
+- **The wallpaper is a full-screen linear gradient**, and a gradient pixel cost
+  two trig calls, a search of its stops and a float blend. Now an opaque
+  gradient's colour comes from a 512-entry table along it, `t` steps along
+  each row, and a 4 x 4 ordered dither spends the table's extra bits so wide
+  dark sweeps do not band. It was also projected from the rect's corner rather
+  than its centre, so every gradient showed only the second half of its stops;
+  the wallpaper now shows all of its own.
+- **The sheet's glass re-blurred 720 x 536 pixels a frame** (it fades over a
+  scrim that changes under it). The box blur divided four times a sample and
+  walked columns a row's stride apart; it now multiplies by a reciprocal and
+  runs the vertical pass row by row with a sum per column. From a radius of 6
+  it blurs at half resolution (averaged down 2 x 2, half the radius, filtered
+  back up), which does not show at that radius; the interior is written back
+  without a coverage test, and the backdrop is read a row at a time.
+- What remains: rect fills (the scrim and wallpaper among them) about 5 ms,
+  the blur about 6, drawing the scaled sheet about 4, shadows about 1.

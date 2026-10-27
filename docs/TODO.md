@@ -121,7 +121,13 @@ the default target). Measured before and after every step
   - [x] Apps' own glass follows the tier: the runtime and the desktop read it (`embk_comp_stats`,
         twice a second) and the toolkit draws a glass node's tint whole, with no blur
         (`scene_render_set_reduced`; `make backend-test` T12).
-  - [ ] The toolkit's span rasterizer, gradient LUT and dither, one blend policy, layer caching.
+  - [x] The toolkit's gradient table and dither, and a blur at half resolution from radius 6, with
+        a reciprocal box blur and a row-major vertical pass: the library's entrance frame went from
+        43-66 ms to 17 ms (DESKTOP_PERFORMANCE.md; T15, T16). Gradients were projected from the
+        rect's corner and showed only the second half of their stops; now from the centre.
+  - [ ] The toolkit's span rasterizer, one blend policy, layer caching (a group that only fades or
+        scales could reuse its last flattened pixels; the library's tiles animate inside it, so it
+        would not help there).
 - [ ] P4 Type and tokens.
   - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
         stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its
@@ -169,9 +175,11 @@ the default target). Measured before and after every step
   - [ ] arm64 has no system notices (sessions and their notice ring are x86-only), so
         `perf notice` and the banner smoke are x86-only; banners from programs (the notify
         service) work there.
-  - [ ] Menu bar popovers that scale in on a spring. The dropdowns fade in with a small drop on
-        a spring already; a scale needs scaled layers in the toolkit's renderer, which composes
-        translation only (the layer caching of A6).
+  - [x] Menus and popovers grow out of the corner they open from as they fade in, and the library
+        zooms in from a little smaller: a group's scale (`ui_set_scale`; the flattened group drawn
+        smaller toward an anchor, shrinking only; `make backend-test` T13).
+  - [x] A fade with nothing moving repainted nothing: opacity marked a node dirty but not its
+        content (T14). Every toolkit fade so far also moved, which hid it.
   - [x] A double click on a window's bar zooms it (fill, or back), timed by when the presses
         happened, so a slow tick carrying both -- or a whole click between two ticks -- still
         counts. Any big resize at once flies: the old picture is held where it was until the app

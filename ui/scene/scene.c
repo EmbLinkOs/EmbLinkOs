@@ -181,6 +181,7 @@ struct node_handle scene_create_node(struct scene_arena *a, enum scene_node_kind
     n->qw = 1.0f;
     n->sx = n->sy = n->sz = 1.0f;
     n->opacity = 1.0f;
+    n->group_scale = 1.0f; n->anchor_x = n->anchor_y = 0.5f;
 
     struct node_handle h = n->self;
 
@@ -484,7 +485,19 @@ void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacit
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
     if (n->opacity == opacity) return;
-    n->opacity = opacity; n->dirty = true;
+    /* the pixels change, not just where they are: content, so a pure fade
+     * (no move to carry it) repaints */
+    DMARK(n); n->opacity = opacity; n->dirty = true; n->dirty_content = true;
+}
+
+void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float scale, float anchor_x, float anchor_y) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n) return;
+    if (!(scale > 0.01f)) scale = 0.01f;   /* (NaN too) */
+    if (scale > 1.0f) scale = 1.0f;
+    if (n->group_scale == scale && n->anchor_x == anchor_x && n->anchor_y == anchor_y) return;
+    DMARK(n); n->group_scale = scale; n->anchor_x = anchor_x; n->anchor_y = anchor_y;
+    n->dirty = true; n->dirty_content = true;
 }
 
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip) {

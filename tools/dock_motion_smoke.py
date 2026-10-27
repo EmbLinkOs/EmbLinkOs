@@ -94,7 +94,9 @@ def main():
         rest = shot(d, out, 'rest')
         x0 = tiles[0][1][0] - 12
         x1 = tiles[-1][1][0] + tiles[-1][1][2] + 12
-        row = tiles[0][1][1] + tiles[0][1][3] - 2          # just under the icons, inside the tiles
+        # just under the icons, on the plate's straight sides -- above the arcs
+        # of its bottom corners, where where its edge reads depends on the glass
+        row = tiles[0][1][1] + tiles[0][1][3] - 12
         (a_app, a), (c_app, c) = tiles[0], tiles[2]
 
         # PLATE: under the tile the pointer is over...

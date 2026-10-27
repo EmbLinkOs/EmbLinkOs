@@ -3322,6 +3322,9 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal) {
     if (mt > 1.0f) mt = 1.0f;
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
     ui_set_opacity(mt);
+    /* ...and it grows out of the corner it opens from, as a popover does:
+     * the top (or, opening upward, the bottom) at its anchor */
+    ui_set_scale(0.94f + 0.06f * mt, 0.0f, ay < 0 ? 1.0f : 0.0f);
     if(ay<0) {
         float x,y,w,h;
         if(!ui_open_rect(&x,&y,&w,&h) || h<1)h=320;

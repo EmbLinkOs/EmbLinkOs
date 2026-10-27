@@ -1185,7 +1185,8 @@ static void apps_grid(void) {
         VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {
             Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
                 ui_set_opacity(kk);                       /* the glass fades as glass (scene_render: backdrop) */
-                ui_set_offset(0,(1.f-k)*28.f);
+                ui_set_scale(0.94f+0.06f*kk,0.5f,0.5f);   /* and zooms in from a little smaller */
+                ui_set_offset(0,(1.f-k)*12.f);
                 HStack(.spacing=12,.align=Center) {
                     Icon(IconGrid).color(T.accent);
                     Text("Applications").title();Spacer();

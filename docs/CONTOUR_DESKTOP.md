@@ -250,4 +250,7 @@ be turned around mid-way from where it is, at the speed it has.
 - **The pointer.** Relative motion follows an acceleration curve: 1:1 while
   aiming, up to three times across a sweep (`make pointer-accel-test`).
 - **The toolkit.** Page navigation, the menu drop-in, the toast and
-  `em_animate` run on the same springs, on the toolkit's clock.
+  `em_animate` run on the same springs, on the toolkit's clock. A menu grows
+  out of the corner it opens from as it fades in, and the library zooms in
+  from a little smaller (`ui_set_scale`: a group drawn smaller toward an
+  anchor).

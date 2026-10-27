@@ -560,6 +560,10 @@ void ui_set_opacity(float opacity) {
      * full opacity (the steady state after a transition) costs nothing. */
     scene_set_opacity(g_sa, b->scene_node, opacity);
 }
+void ui_set_scale(float scale, float anchor_x, float anchor_y) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_group_scale(g_sa, b->scene_node, scale, anchor_x, anchor_y);   /* guarded */
+}
 void ui_set_offset(float x, float y) {
     struct instance *b = cur_box(); if (!b) return;
     /* post-layout translate: layout adds this to the resolved position when it

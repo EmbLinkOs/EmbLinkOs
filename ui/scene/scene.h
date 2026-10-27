@@ -140,6 +140,11 @@ struct scene_node {
     float backdrop_blur_radius;
 
     float opacity;              /* 0..1; multiplies the WHOLE subtree in traversal */
+    /* A GROUP'S SCALE: below 1 the subtree, flattened as an opacity group is,
+     * is drawn that much smaller toward its anchor (fractions of its bounds:
+     * 0,0 top-left, .5,.5 the middle) -- a popover growing out of where it
+     * opens. Shrinking only, so its unscaled bounds stay where it can draw. */
+    float group_scale, anchor_x, anchor_y;
 
     /* --- kind-specific payload --- */
     union {
@@ -253,6 +258,7 @@ void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
                                float width, const struct paint *paint);
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius);
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity);
+void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float scale, float anchor_x, float anchor_y);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);
 void scene_set_z(struct scene_arena *a, struct node_handle h, float z);
 

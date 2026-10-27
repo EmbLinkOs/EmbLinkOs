@@ -32,6 +32,10 @@ void ui_set_size(struct layout_size w, struct layout_size h);
 void ui_set_size_bounds(float min_w, float max_w, float min_h, float max_h);  /* 0 = unset */
 void ui_set_shadow(bool enabled, float dx, float dy, float blur, struct color color);
 void ui_set_opacity(float opacity);   /* 0..1; wraps the subtree in a group */
+/* Below 1, the subtree (a group) is drawn that much smaller toward the anchor
+ * (fractions of its bounds): a popover growing out of where it opens. Hit
+ * testing keeps the unscaled bounds; a motion, not a layout. */
+void ui_set_scale(float scale, float anchor_x, float anchor_y);
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);

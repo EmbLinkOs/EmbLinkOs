@@ -196,7 +196,7 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     }
     int child_group = has_group;
     struct frect child_gb = gbounds;
-    if (node->opacity < 1.0f) {      /* this node starts (or nests) a group */
+    if (node->opacity < 1.0f || node->group_scale < 1.0f) {   /* this node starts (or nests) a group */
         child_group = 1;
         child_gb = subtree_bounds(a, h, wparent);
     }
@@ -371,7 +371,7 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);
 
-    if (n->opacity < 1.0f) {
+    if (n->opacity < 1.0f || n->group_scale < 1.0f) {
         /* Section 5: grouped offscreen compositing -- render the whole subtree
          * at full opacity into a scratch target, then blit once with the
          * group's opacity, so overlapping children blend against each other at
@@ -395,7 +395,12 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
             if (outer) r->backdrop = 0;
             /* blit flattened result; coverage_at clips this to the dirty union */
             /* flattened subtree: already-rendered pixels, never a stencil */
-            r->be->draw_image(target, (float)bx - ox, (float)by - oy, (float)bw, (float)bh,
+            /* ...smaller toward its anchor when the group is scaled (inside its
+             * own bounds, so what the dirty rects cover still covers it) */
+            float s = n->group_scale < 1.0f ? n->group_scale : 1.0f;
+            float dw = (float)bw * s, dh = (float)bh * s;
+            float dx = (float)bx + ((float)bw - dw) * n->anchor_x, dy = (float)by + ((float)bh - dh) * n->anchor_y;
+            r->be->draw_image(target, dx - ox, dy - oy, dw, dh,
                               scratch->pixels, (uint32_t)bw, (uint32_t)bh, scratch->stride,
                               scratch->format, n->opacity, NULL);
             cpu_scratch_release(scratch);

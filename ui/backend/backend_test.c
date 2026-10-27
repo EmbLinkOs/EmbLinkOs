@@ -504,6 +504,122 @@ static void t12_reduced_glass(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- T13: a scaled group draws its flattened subtree smaller, toward its
+ * anchor -- a popover growing out of where it opens ---------------------- */
+static void t13_scaled_group(void) {
+    printf("T13 a scaled group is drawn smaller toward its anchor:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    /* a sized box, as every toolkit box that takes ui_set_scale is: its own
+     * change dirties all it covers */
+    struct node_handle grp = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, grp, 64, 64);
+    struct paint clear; clear.kind = PAINT_SOLID; clear.solid = (struct color){0,0,0,0}; clear.n_stops = 0;
+    scene_set_paint(&a, grp, &clear);
+    struct node_handle box = scene_create_node(&a, SCENE_NODE_RECT, grp);
+    scene_set_size(&a, box, 40, 40); scene_set_transform(&a, box, 12,12,0, 0,0,0,1, 1,1,1);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, box, &redp);
+    scene_set_group_scale(&a, grp, 0.5f, 0.0f, 0.0f);     /* half, toward the top-left */
+    scene_render_frame(&r, &a, root, &rt);
+    /* the group is 64 x 64, so half of it toward the top-left puts the box
+     * (12..52) at 6..26 */
+    CHECK(red_at(&rt, 8, 8) > 200 && red_at(&rt, 24, 24) > 200, "the box is drawn at half, toward the top-left");
+    CHECK(red_at(&rt, 30, 30) < 10 && red_at(&rt, 50, 20) < 10, "and not where it would stand at full size");
+    scene_set_group_scale(&a, grp, 1.0f, 0.0f, 0.0f);     /* grown: all of it */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 50, 50) > 200 && red_at(&rt, 12, 51) > 200, "at full size the whole box is back");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T14: a fade alone repaints -- an opacity that changes with nothing
+ * moving is still new pixels (it was dirty but not content, and nothing was
+ * redrawn until something moved) ---------------------------------------- */
+static void t14_fade_alone(void) {
+    printf("T14 a fade with nothing moving repaints:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(32, 32);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle box = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, box, 32, 32);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, box, &redp);
+    scene_set_opacity(&a, box, 0.2f);
+    scene_render_frame(&r, &a, root, &rt);
+    int faint = red_at(&rt, 16, 16);
+    scene_set_opacity(&a, box, 1.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(faint < 80 && red_at(&rt, 16, 16) > 250, "faded in, the box is drawn whole");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T15: an opaque linear gradient runs its whole range corner to corner
+ * (it was projected from the corner and showed only its second half), and
+ * drawn from its table matches the exact gradient within the dither ------ */
+static void t15_gradient_table(void) {
+    printf("T15 a gradient drawn from its table is the gradient:\n");
+    for (int vertical = 0; vertical < 2; vertical++) {
+        struct scene_arena a; scene_arena_init(&a);
+        struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+        int W = vertical ? 40 : 256, H = vertical ? 256 : 40;
+        struct render_target rt = make_target((uint32_t)W, (uint32_t)H);
+        fill_target(&rt, bgra(0,0,0,255));
+        struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+        struct node_handle box = scene_create_node(&a, SCENE_NODE_RECT, root);
+        scene_set_size(&a, box, (float)W, (float)H);
+        struct paint g; memset(&g, 0, sizeof g);
+        g.kind = PAINT_LINEAR_GRADIENT; g.angle_deg = vertical ? 90.0f : 0.0f; g.n_stops = 2;
+        g.stops[0].offset = 0; g.stops[0].color = (struct color){0,0,0,1};
+        g.stops[1].offset = 1; g.stops[1].color = (struct color){1,0,0,1};
+        scene_set_paint(&a, box, &g);
+        scene_render_frame(&r, &a, root, &rt);
+        int worst = 0, n = vertical ? H : W;
+        for (int k = 2; k < n - 2; k++) {
+            float t = ((k + 0.5f) / (float)n);
+            int want = (int)(t * 255.0f + 0.5f), got = vertical ? red_at(&rt, W / 2, k) : red_at(&rt, k, H / 2);
+            int d = got > want ? got - want : want - got;
+            if (d > worst) worst = d;
+        }
+        CHECK(worst <= 2, vertical ? "down: within two levels of the gradient everywhere" : "across: within two levels of the gradient everywhere");
+        free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+    }
+}
+
+/* ---- T16: a large blur (half resolution from radius 6) still frosts an edge
+ * evenly: a mix at the edge, graded beside it, pure far from it ---------- */
+static void t16_large_blur(void) {
+    printf("T16 a large glass blur, at half resolution, frosts an edge evenly:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(160, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle l = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, l, 80, 64);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, l, &redp);
+    struct node_handle rr = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, rr, 80, 64); scene_set_transform(&a, rr, 80,0,0, 0,0,0,1, 1,1,1);
+    struct paint bluep; bluep.kind = PAINT_SOLID; bluep.solid = (struct color){0,0,1,1}; bluep.n_stops = 0;
+    scene_set_paint(&a, rr, &bluep);
+    struct node_handle glass = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, glass, 160, 64);
+    struct paint clearp; clearp.kind = PAINT_SOLID; clearp.solid = (struct color){0,0,0,0}; clearp.n_stops = 0;
+    scene_set_paint(&a, glass, &clearp);
+    scene_set_backdrop_blur(&a, glass, 1, 12.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    int edge_r = red_at(&rt, 80, 32), edge_b = blue_at(&rt, 79, 32);
+    CHECK(edge_r > 70 && edge_r < 190 && edge_b > 70 && edge_b < 190, "at the edge, a mix of both");
+    CHECK(red_at(&rt, 70, 32) > red_at(&rt, 80, 32) && red_at(&rt, 80, 32) > red_at(&rt, 90, 32), "graded across it, falling away steadily");
+    CHECK(red_at(&rt, 20, 32) > 230 && blue_at(&rt, 140, 32) > 230, "far from it, each side as it was");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -518,6 +634,10 @@ int main(void) {
     t10_clear_outside();
     t11_glass_in_group();
     t12_reduced_glass();
+    t13_scaled_group();
+    t14_fade_alone();
+    t15_gradient_table();
+    t16_large_blur();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }
