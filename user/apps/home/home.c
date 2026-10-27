@@ -194,6 +194,7 @@ struct grid_app { char name[32]; char icon[96]; char label[24]; char exec[80]; }
 static struct grid_app g_all[48];
 static int g_all_n = 0;
 static int   g_apps_open = 0;     /* is the launcher grid showing? */
+static int   g_apps_closing;      /* ...and on its way out (apps_set_open) */
 static int   g_apps_frames = 0;   /* debounce the click that opened it */
 static float g_apps_scroll = 0;   /* launcher grid scroll offset */
 static char  g_apps_q[40];        /* the launcher's search text */
@@ -380,6 +381,7 @@ static void lock_set(int on) {
     if (on) {
         ui_request_focus(INSTANCE_HANDLE_NULL); /* password owns the new modal */
         g_apps_open = 0;                      /* one modal surface at a time */
+        g_apps_closing = 0;
         g_lock_gen++;
         g_lock_msg[0] = 0;
         for (unsigned i = 0; i < sizeof g_lock_pw; i++) g_lock_pw[i] = 0;
@@ -438,7 +440,34 @@ static void poll_lock_request(void) {
 
 
 
+static void apps_apply_open(int open);
+/* IN AND OUT ON A SPRING (apps_grid): the sheet rises and fades in, its tiles
+ * a beat apart, and leaves the same way. Leaving gives everything back AT
+ * ONCE -- the layer goes back down, keys go to whatever is in front, clicks
+ * pass through the fading sheet -- because the hand has already moved on: an
+ * app launched from it, or the dock clicked as it closes, must have its first
+ * keystroke and its click. The sheet fades out behind the windows. Asking it
+ * open again while it leaves turns it round where it is. Reduced motion
+ * closes at once, as it did. */
 static void apps_set_open(int open) {
+    if (!open && g_apps_open && !ui_theme()->reduced_motion) {
+        if (!g_apps_closing) {
+            g_apps_closing = 1; em_request_frame();
+            embk_win_desktop_front(0);        /* the layer back down now (above) */
+            g_full_present = 3; g_invalidate = 2;
+        }
+        return;
+    }
+    if (open && g_apps_closing) {             /* turned round: in front again */
+        g_apps_closing = 0; em_request_frame();
+        embk_win_desktop_front(1);
+        g_full_present = 3; g_invalidate = 2;
+        return;
+    }
+    g_apps_closing = 0;
+    apps_apply_open(open);
+}
+static void apps_apply_open(int open) {
     if (open == g_apps_open) return;
     if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
     g_apps_open = open;
@@ -1074,10 +1103,19 @@ static void apps_grid(void) {
     float height=g_ph-132;if(height>536)height=536;
     int cols=width<560?4:6;
     char sheet[24];snprintf(sheet,sizeof sheet,"apps%u",g_apps_gen);
+    /* how far in it is: 0 gone, 1 settled (a touch under critical going in) */
+    char sid[24];snprintf(sid,sizeof sid,"apps-in%u",g_apps_gen);
+    float k=g_apps_closing?em_spring(sid,0.f,0.f,200,1000):em_spring(sid,0.f,1.f,320,900);
+    if(g_apps_closing && k<=0.02f){g_apps_closing=0;apps_apply_open(0);return;}
+    float kk=k<0?0:k>1?1:k;
     Overlay() {
+        ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=(Color){0,0,0,0.55f*kk}});   /* the dimming comes and goes with it */
+        ui_set_hit_passthrough(g_apps_closing);   /* leaving: clicks reach what is behind */
         at_begin(0xA995EE7ull, g_px, g_py);
         VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {
             Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
+                ui_set_opacity(kk);                       /* the glass fades as glass (scene_render: backdrop) */
+                ui_set_offset(0,(1.f-k)*28.f);
                 HStack(.spacing=12,.align=Center) {
                     Icon(IconGrid).color(T.accent);
                     Text("Applications").title();Spacer();
@@ -1097,6 +1135,9 @@ static void apps_grid(void) {
                             if(!app_matches(g_all[i].label,g_apps_q))continue;
                             count++;
                             VStack(.spacing=6,.align=Center,.py=5) {
+                                /* a beat apart: each tile a little behind the one before */
+                                float d=(float)(count<12?count:12)*0.035f,pi=(k-d)/(1.f-d);
+                                ui_set_offset(0,(1.f-(pi<0?0:pi>1?1:pi))*16.f);
                                 drag_icon(grid_to_item(i),54,3,i);
                                 Text(g_all[i].label).caption();
                             }
@@ -2004,7 +2045,7 @@ int main(int argc, char **argv, char **envp) {
         if (g_locked) {
             for (int input; (input=embk_key_poll_input())>0; )
                 if(!g_lock_checking)ui_input_key(input&255,(unsigned)(input>>8)&255);
-        } else if (g_apps_open) {
+        } else if (g_apps_open && !g_apps_closing) {
             for (int input; (input=embk_key_poll_input())>0; ) {
                 int c=input&255;
                 if (c == 27) { apps_set_open(0); break; }   /* Esc dismisses */
