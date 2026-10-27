@@ -597,6 +597,15 @@ ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
 $(ARM_USER):
 	mkdir -p $(ARM_USER)
 
+# HEADER DEPENDENCIES. Every compile in this directory writes its own
+# (NEWLIB_CFLAGS: -MMD -MP -MF $@.d), and until this line only the shell's
+# were read back. So a header change rebuilt nothing that merely included it:
+# when struct scene_renderer grew, libembk's renderer was rebuilt and the apps
+# that keep one on their stack were not, and its new fields landed past the
+# end of their old, smaller copy -- every window on arm64 drew its background
+# and nothing else, while x86 (whose rules read theirs) was fine.
+-include $(wildcard $(ARM_USER)/*.o.d)
+
 # The retargeting layer, once.
 $(ARM_USER)/crt0.o: user/lib/crt0.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
