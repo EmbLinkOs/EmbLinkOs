@@ -295,3 +295,22 @@ What it says:
   steps, so its interval is the input rate's wherever that is slower than the
   display.
 
+## Motion (P2): what it costs
+
+P2 put window motion, scrolling and the toolkit on springs
+([CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md#motion-on-springs)). What that adds to a frame:
+
+- **Springs themselves: nothing measurable.** Integer arithmetic, 960 substeps
+  a second of motion per spring, a few multiplies each.
+- **A window in flight composes its ghost and what is under it, every frame it
+  moves.** Open and close: 11-12 motion frames under HVF against P1's 8, at
+  about the cost of a compose of the same area; they land within half a pixel
+  rather than crawling the last one.
+- **The ghost is filtered (bilinear) while the frame can afford it**: 1.15 ms
+  against 0.19 ms nearest for a 980 x 660 window at 88% on an M5 core, scalar
+  (`make pix-bench`) -- six times. The compositor filters only while the last
+  frame cost under half its period, so under TCG (23 ms frames) ghosts stay
+  nearest and under HVF they are filtered.
+- **A notch of the wheel is a glide**: 19 frames of the scrolled view under HVF
+  where it was one, each a present of what moved.
+

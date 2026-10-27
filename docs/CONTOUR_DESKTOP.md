@@ -168,3 +168,37 @@ applications and the toolkit are rebuilt together.
 The shared motion timing token drives menus, page transitions and toast fades.
 Reduced motion presents toasts without a fade/slide and keeps indeterminate dots
 static. No animation is required for a control to communicate its state.
+
+### Motion on springs
+
+Everything that moves -- in the compositor and in the toolkit -- moves on one
+damped spring (`ui/motion/spring.h`): integers only, so the kernel and the
+toolkit run the same code, integrated in fixed 1/960 s substeps from the
+spring's own origin, so 60 Hz, 120 Hz and a ragged emulator see one trajectory
+(`make spring-test`). A spring has a position and a velocity, so any motion can
+be turned around mid-way from where it is, at the speed it has.
+
+| Token | Response, damping | Used by |
+|---|---|---|
+| snappy | 250 ms, 0.9 | the close pull's spring back, the toast |
+| smooth | 350 ms, 1.0 | a window's flight to and from the dock |
+| bouncy | 450 ms, 0.7 | reserved for the dock's launch bounce (P5) |
+| (open) | 240 ms, 0.9 | a window opening |
+| (close) | 200 ms, 1.0 | a window closing: decisive, never overshooting |
+| (scroll) | 180 ms, 1.0 | the wheel's glide |
+
+- **Windows.** A window in motion is drawn as a ghost whose rectangle is four
+  springs; any number fly at once. Minimised, a window flies into its own app's
+  dock tile (the desktop publishes the tiles), staying opaque until the last
+  tenth of the trip; clicked back mid-flight it turns around. A window opening
+  or coming back takes clicks and keys at its real place while its ghost is in
+  the air. GUI+M minimises the front window. `perf slowmo N` slows every window
+  motion N times; `tools/motion_smoke.py` watches them in flight.
+- **Scrolling.** A notch of the wheel moves where a view is going and the view
+  glides there; notches 40 ms apart count three times. Pushed past an edge, the
+  content gives (Apple's rubber-band curve) and springs back once the wheel is
+  still.
+- **The pointer.** Relative motion follows an acceleration curve: 1:1 while
+  aiming, up to three times across a sweep (`make pointer-accel-test`).
+- **The toolkit.** Page navigation, the menu drop-in, the toast and
+  `em_animate` run on the same springs, on the toolkit's clock.
