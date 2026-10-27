@@ -719,6 +719,25 @@ int main(void) {
 
     navigation_regressions();
 
+    /* em_spring: an entrance from `from`, a turn mid-way, the id copied */
+    {
+        struct ui_appearance moving={.density=1,.text_scale=100,.radius=8};
+        ui_theme_configure(&moving);em_set_clock(fake_clock);g_ms+=10000;
+        char id[16];snprintf(id,sizeof id,"enter%d",7);
+        float v0=em_spring(id,0.0f,1.0f,EmSmooth);
+        snprintf(id,sizeof id,"scribbled");                 /* the caller's buffer reused */
+        g_ms+=60;float v1=em_spring("enter7",0.0f,1.0f,EmSmooth);
+        CHECK(v0==0.0f && v1>0.05f && v1<0.9f,"a new spring starts at `from` and is on its way 60 ms later");
+        CHECK(em_spring_moving("enter7"),"and says it is moving");
+        g_ms+=40;float v2=em_spring("enter7",0.0f,0.0f,EmSmooth);
+        CHECK(v2>v1,"turned round, it keeps the way it was going for a moment");
+        for(int i=0;i<200 && em_spring_moving("enter7");i++){g_ms+=8;v2=em_spring("enter7",0.0f,0.0f,EmSmooth);}
+        CHECK(v2==0.0f && !em_spring_moving("enter7"),"and comes to rest exactly on the new target");
+        struct ui_appearance still={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
+        ui_theme_configure(&still);
+        CHECK(em_spring("enter8",0.0f,1.0f,EmSmooth)==1.0f,"with reduced motion a spring is its target");
+    }
+
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

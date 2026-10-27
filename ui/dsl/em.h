@@ -921,6 +921,18 @@ uint64_t em_now_ms(void);   /* current time (0 if no clock set) */
 int   em_dt_ms(void);                 /* ms since the previous frame */
 float em_animate(const char *id, float target, float rate);
 #define Animate(id, target, rate) em_animate((id), (target), (rate))
+/* A VALUE ON A SPRING, by id (copied: a formatted buffer is fine): toward `to`
+ * from wherever it is, turning round mid-way when `to` changes, at a response
+ * (ms) and damping (permille) -- the motion tokens in ui/motion/spring.h are
+ * (250, 900) snappy, (350, 1000) smooth, (450, 700) bouncy. An id seen for the
+ * first time starts at `from`: that is an entrance. Asks for frames while it
+ * moves; with reduced motion, or no clock, it is `to`. */
+float em_spring(const char *id, float from, float to, int response_ms, int damping_permille);
+#define EmSnappy 250, 900      /* the motion tokens, as em_spring's last two arguments */
+#define EmSmooth 350, 1000
+#define EmBouncy 450, 700
+/* Whether the id's spring is still moving (or not yet seen). */
+int em_spring_moving(const char *id);
 
 /* Reusable views are just C functions. This is optional sugar for the no-arg
  * case so `Component(ProfileCard) { ... }` reads nicely; call it as ProfileCard(). */

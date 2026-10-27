@@ -530,6 +530,35 @@ static float em_spring_to(struct em_spring *m, float target, uint32_t resp_ms, u
     return em_spring_value(m);
 }
 
+/* em_spring's table: ids copied, the least recently used slot reused. */
+#define EM_SPRINGS 64
+static struct { char id[40]; struct em_spring m; uint64_t used; } g_springs[EM_SPRINGS];
+static uint64_t g_spring_tick;
+static int em_spring_slot(const char *id, int create) {
+    int lru = 0;
+    for (int i = 0; i < EM_SPRINGS; i++) {
+        if (g_springs[i].used && !strncmp(g_springs[i].id, id, sizeof g_springs[i].id - 1)) return i;
+        if (g_springs[i].used < g_springs[lru].used) lru = i;
+    }
+    if (!create) return -1;
+    snprintf(g_springs[lru].id, sizeof g_springs[lru].id, "%s", id);
+    g_springs[lru].m.live = 0;
+    g_springs[lru].used = 0;
+    return lru;
+}
+float em_spring(const char *id, float from, float to, int response_ms, int damping_permille) {
+    if (!id) return to;
+    int s = em_spring_slot(id, 0);
+    if (s < 0) { s = em_spring_slot(id, 1); em_spring_set(&g_springs[s].m, from); }
+    g_springs[s].used = ++g_spring_tick;
+    return em_spring_to(&g_springs[s].m, to, (uint32_t)(response_ms > 4 ? response_ms : 4),
+                        (uint32_t)(damping_permille > 0 ? damping_permille : 1000));
+}
+int em_spring_moving(const char *id) {
+    int s = id ? em_spring_slot(id, 0) : -1;
+    return s < 0 || g_springs[s].m.s.moving;
+}
+
 #define ANIM_MAX 96
 static struct { const char *id; struct em_spring m; int used; } g_anim[ANIM_MAX];
 
