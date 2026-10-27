@@ -185,6 +185,7 @@ be turned around mid-way from where it is, at the speed it has.
 | bouncy | 450 ms, 0.7 | the dock's launch hop |
 | (open) | 240 ms, 0.9 | a window opening |
 | (close) | 200 ms, 1.0 | a window closing: decisive, never overshooting |
+| (zoom) | 300 ms, 1.0 | a window flying to a new frame: filled, halved, back |
 | (scroll) | 180 ms, 1.0 | the wheel's glide |
 
 - **Windows.** A window in motion is drawn as a ghost whose rectangle is four
@@ -192,8 +193,16 @@ be turned around mid-way from where it is, at the speed it has.
   dock tile (the desktop publishes the tiles), staying opaque until the last
   tenth of the trip; clicked back mid-flight it turns around. A window opening
   or coming back takes clicks and keys at its real place while its ghost is in
-  the air. GUI+M minimises the front window. `perf slowmo N` slows every window
+  the air, and a window in the air keeps its rounded corners and its shadow
+  (fading with it). GUI+M minimises the front window. `perf slowmo N` slows every window
   motion N times; `tools/motion_smoke.py` watches them in flight.
+- **Zoom.** A double click where a window is dragged by -- its bar -- zooms
+  it, as on the Mac: it fills the work area, or goes back. Any big change of
+  a window's size at once (filling, a half of the screen, a layout, going
+  back) flies: what the window looked like stays where it was until the app
+  has drawn at its new size, then it flies to the new frame on a spring,
+  drawn from the new pixels. The corner grip, a step at a time, is drawn as
+  it comes.
 - **Workspaces.** Changing space slides: the space being left goes off one
   side while the next comes in from the other -- leftwards going up the
   spaces, as on the Mac -- whether the change came from the keys, the top

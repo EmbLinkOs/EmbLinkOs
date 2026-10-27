@@ -17,6 +17,9 @@ in the air: its kind, rect, opacity and target). It asserts:
              the air at once
   scroll     one notch of the wheel over Settings glides: several frames of
              motion, not one jump
+  zoom       a double click on Settings' bar fills the work area and another
+             brings it back: each time the window flies between the two frames
+             (a `zoom` ghost through sizes between them), landing exactly
   slide      changing workspace (GUI+2, GUI+1) slides the windows: Settings
              goes off to the left going up the spaces and comes back in from
              the left going down, landing exactly where it was; switching
@@ -47,8 +50,11 @@ def state(d):
         pairs = dict(kv.split('=', 1) for kv in rest.split() if '=' in kv)
         if kind == 'workspace':
             d.space = int(pairs['now'])
+        elif kind == 'pointer':
+            d.ptr = (int(pairs['x']), int(pairs['y']))
         elif kind == 'window':
             wins[pairs['title'].replace('_', ' ')] = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'space')}
+            wins[pairs['title'].replace('_', ' ')]['drag0'] = [int(v) for v in pairs['drag0'].split(',')]
         elif kind == 'ghost':
             g = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'alpha')}
             g['kind'], g['app'] = pairs['kind'], pairs['app']
@@ -149,7 +155,10 @@ def main():
                                                 {'type': 'btn', 'data': {'down': False, 'button': 'wheel-down'}}])
         d.g.pump(1.5)
         presents = P.perf(d).get('windows', {}).get('Settings', {}).get('presents', 0)
-        assert presents >= 3, f'one notch was {presents} frame(s) of Settings: it jumped, it did not glide'
+        # a jump is one frame; under the Lima VM's nested emulation a 180 ms
+        # glide is drawn in two or three
+        assert presents >= (2 if args.graphics == 'virgl' else 3), \
+            f'one notch was {presents} frame(s) of Settings: it jumped, it did not glide'
         print(f'scroll: one notch glided over {presents} frames', flush=True)
 
         # PARK: into its own tile, smaller and fainter on the way
@@ -182,12 +191,16 @@ def main():
         # the compositor says where (it is the one case a curve cannot do).
         # The pointer waits on the tile and GUI+M sends the window: no pointer
         # travel between the two, which a relative mouse would make too slow.
+        # Four times slower, so an emulator's late click still finds it in the
+        # air (at full speed under TCG the click met it a few pixels from the tile).
         P.move(d, tile[0] + tile[2] // 2, tile[1] + tile[3] // 2)
         assert 'Settings' in state(d)[0], 'Settings is not back on screen to be minimised again'
+        d.g.command('perf slowmo 4', b'perf: slowmo', 60)
         n0 = len(d.g.seen)
         d.key('meta_l-m')                   # (sends, then waits 0.2 s)
         tap(d, None)
         d.g.wait(b'settings.elf turned around in flight', 20, start=n0)
+        d.g.command('perf slowmo 1', b'perf: slowmo', 60)
         line = d.g.seen[n0:].decode(errors='replace').split('settings.elf turned around in flight at ')[1].split('\n')[0]
         at = line.split(' (')[0]
         xy, wh = at.split(' ')
@@ -216,6 +229,66 @@ def main():
         assert both == {'term.elf', 'settings.elf'}, f'two windows minimised at once were not two ghosts: {both}'
         watch(d, 'settings.elf'); watch(d, 'term.elf')
         print('together: two ghosts in the air at once', flush=True)
+
+        # ZOOM: a double click on its bar, and back
+        def double_click(x, y):
+            P.move(d, x, y)
+            end = time.monotonic() + 10                # the compositor has the pointer there
+            while time.monotonic() < end and (abs(d.ptr[0] - x) > 3 or abs(d.ptr[1] - y) > 3):
+                state(d)
+            for _ in range(2):
+                P.press(d, True); time.sleep(0.03); P.press(d, False); time.sleep(0.08)
+
+        def zoom(title, app, want=None):
+            n0 = len(d.g.seen)
+            win = state(d)[0][title]
+            dz = win['drag0']
+            double_click(win['x'] + dz[0] + dz[2] // 2, win['y'] + dz[1] + dz[3] // 2)
+            d.g.wait(b'zoomed by a double click', 20, start=n0)
+            seen, end = [], time.monotonic() + 15
+            while time.monotonic() < end:
+                wins, ghosts, _ = state(d)
+                mine = [g for g in ghosts if g['app'] == app]
+                seen.extend(mine)
+                now = wins.get(title)
+                if now and not mine and frame_rect(now) != frame_rect(win) and \
+                        (want is None or frame_rect(now) == want):
+                    return frame_rect(win), frame_rect(now), seen
+            raise AssertionError(f'{title} did not land after a double click: {seen[-3:]}')
+
+        tap(d, tile[0] + tile[2] // 2, tile[1] + tile[3] // 2)
+        until_back(d, 'Settings', 'settings.elf'); d.g.pump(1)
+        d.g.command('perf slowmo 4', b'perf: slowmo', 60)   # a 300 ms flight, sampled
+        was, filled, flight = zoom('Settings', 'settings.elf')
+        assert filled[2] > was[2] + 100 and filled[3] >= was[3], f'a double click did not fill: {was} -> {filled}'
+        assert flight and all(g['kind'] == 'zoom' for g in flight), f'expected a zoom in flight: {flight}'
+        between = [g for g in flight if was[2] < g['w'] < filled[2]]
+        assert between, f'it did not fly between the frames: {[(g["w"], g["h"]) for g in flight]}'
+        print(f'zoom: double-clicked, it flew from {was} to {filled}, caught at {between[0]["w"]}x{between[0]["h"]}', flush=True)
+        _, back, flight = zoom('Settings', 'settings.elf', want=was)
+        assert back == was and any(filled[2] > g['w'] > was[2] for g in flight), \
+            f'a second double click did not fly it back to {was}: {back}, {[(g["w"], g["h"]) for g in flight]}'
+        d.g.command('perf slowmo 1', b'perf: slowmo', 60)
+        print(f'zoom: double-clicked again, back at {back}', flush=True)
+        # photographed on the way, ten times slower
+        d.g.command('perf slowmo 10', b'perf: slowmo', 60)
+        n0 = len(d.g.seen)
+        win = state(d)[0]['Settings']; dz = win['drag0']
+        double_click(win['x'] + dz[0] + dz[2] // 2, win['y'] + dz[1] + dz[3] // 2)
+        d.g.wait(b'zoomed by a double click', 20, start=n0)
+        zooms, end = [], time.monotonic() + 30
+        while len(zooms) < 5 and time.monotonic() < end:
+            mine = [g for g in state(d)[1] if g['app'] == 'settings.elf' and g['kind'] == 'zoom']
+            if mine and was[2] < mine[-1]['w'] < filled[2]:
+                path = d.g.capture(out / f'zoom-{len(zooms)}.ppm')
+                zooms.append(f"{path} (Settings at {mine[-1]['w']}x{mine[-1]['h']})")
+                time.sleep(0.3)
+            elif zooms and not mine:
+                break
+        d.g.command('perf slowmo 1', b'perf: slowmo', 60)
+        until_back(d, 'Settings', 'settings.elf', 30)
+        zoom('Settings', 'settings.elf', want=was)          # and back, for what follows
+        print('zoom captures:\n  ' + '\n  '.join(zooms), flush=True)
 
         # SLIDE: Settings back out on space 1, then the spaces changed under it
         tap(d, tile[0] + tile[2] // 2, tile[1] + tile[3] // 2)
@@ -289,8 +362,9 @@ def main():
     finally:
         d.g.close()
     print('PASS: a window parks into its own dock tile and comes back out of it, turns around '
-          'mid-flight when interrupted, two windows move at once, and changing workspace slides '
-          'the windows, turning round when switched back mid-slide', flush=True)
+          'mid-flight when interrupted, two windows move at once, a double click zooms a window '
+          'and back on a spring, and changing workspace slides the windows, turning round when '
+          'switched back mid-slide', flush=True)
 
 
 if __name__ == '__main__':

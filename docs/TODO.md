@@ -162,10 +162,19 @@ the default target). Measured before and after every step
   - [ ] arm64 has no system notices (sessions and their notice ring are x86-only), so
         `perf notice` and the banner smoke are x86-only; banners from programs (the notify
         service) work there.
-  - [ ] Menu bar popovers that scale in on a spring.
-  - [ ] A double click on a title bar should zoom the window as on macOS, now that the
-        compositor owns the drag that the first click starts. Live resize (the compositor
-        scaling the old buffer until the app catches up).
+  - [ ] Menu bar popovers that scale in on a spring. The dropdowns fade in with a small drop on
+        a spring already; a scale needs scaled layers in the toolkit's renderer, which composes
+        translation only (the layer caching of A6).
+  - [x] A double click on a window's bar zooms it (fill, or back), timed by when the presses
+        happened, so a slow tick carrying both -- or a whole click between two ticks -- still
+        counts. Any big resize at once flies: the old picture is held where it was until the app
+        has drawn at its new size, then flies to the new frame (a `zoom` ghost;
+        `tools/motion_smoke.py` on x86, arm64 and virgl; gallery 221). Every window in the air
+        now keeps its rounded corners and shadow, on both paths.
+  - [ ] Live resize by the corner grip: each step is still drawn as the app delivers it; the
+        compositor could scale the last frame until the app catches up.
+  - [ ] Ghost shadows cost a band per frame on the CPU path; under TCG that slowed the park
+        flight enough that the interrupt test needed `perf slowmo`. Not measured on hardware.
 - [ ] P6 Overview, touchpad gestures, tiling previews.
 
 ## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
