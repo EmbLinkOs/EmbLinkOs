@@ -799,7 +799,7 @@ float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nb
         struct glyph_cache_entry *e =
             glyph_cache_lookup_or_rasterize(font_global_atlas(), font_for_codepoint(f, cp), cp, size_px);
         if (cp == ' ' || cp == '\t') prev = 0;
-        if (e) w += font_kern_px(f, prev, cp, size_px) + e->advance_px;
+        if (e) w += font_pair_px(f, prev, cp, size_px) + e->advance_px;
         prev = cp == ' ' || cp == '\t' ? 0 : cp;
         i += (unsigned)adv;
     }

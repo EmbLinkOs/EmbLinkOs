@@ -212,7 +212,8 @@ fractional place still stains the pixel its edge partly covers, through
 anti-aliasing or through text's truncated pen. Without the rounding, that pixel
 outlived the node: a shrinking window title left a one-pixel sliver of its old
 first letter (`backend_test.c` T9). `font.c` is a from-scratch TrueType rasterizer
-(glyf outlines only — no CFF, no hinting, no kerning) with a glyph atlas
+(glyf outlines only — no CFF, no hinting; GPOS pair kerning, and Inter's
+size-dependent tracking, both added between every pair by `font_pair_px`) with a glyph atlas
 cache; `font_install_backend()` is what actually plugs `draw_text` into the
 CPU backend (it's `NULL` until called, which is why every app calls it right
 after loading its font).

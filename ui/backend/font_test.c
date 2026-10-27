@@ -484,7 +484,8 @@ static void t10_inter(void) {
     g_kn = 0;
     font_layout_text(f, "AV", 100, 0, kern_visit, 0);
     float adv_a = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'A', 100)->advance_px;
-    CHECK(g_kn == 2 && g_kx[1] > adv_a + av - 0.01f && g_kx[1] < adv_a + av + 0.01f,
+    float pair = font_pair_px(f, 'A', 'V', 100);   /* the kerning, and Inter's tracking (T11) */
+    CHECK(g_kn == 2 && g_kx[1] > adv_a + pair - 0.01f && g_kx[1] < adv_a + pair + 0.01f,
           "the text walk puts V at A's advance plus the kerning");
     /* a box exactly as wide as the kerned word holds all of it: the fit test
      * once left the pair's kerning out and wrapped the last letter away
@@ -494,7 +495,7 @@ static void t10_inter(void) {
     for (int i = 0; i < 5; i++) {
         float w = 0; uint32_t prev = 0;
         for (const char *p = words[i]; *p; p++) {
-            w += font_kern_px(f, prev, (uint32_t)*p, 14) + glyph_cache_lookup_or_rasterize(font_global_atlas(), f, (uint32_t)*p, 14)->advance_px;
+            w += font_pair_px(f, prev, (uint32_t)*p, 14) + glyph_cache_lookup_or_rasterize(font_global_atlas(), f, (uint32_t)*p, 14)->advance_px;
             prev = (uint32_t)*p;
         }
         if (font_layout_text(f, words[i], 14, w, NULL, NULL) != 1) { whole = 0; printf("        (\"%s\" wrapped at its own width %.3f)\n", words[i], w); }
@@ -502,6 +503,23 @@ static void t10_inter(void) {
         if (font_layout_text(f, words[i], 14, w, kern_visit, 0) != 1) whole = 0;
     }
     CHECK(whole, "a word in a box its own kerned width stays on one line, measured and drawn");
+
+    /* T11: Inter's dynamic tracking -- large type closes up, small type keeps
+     * its air -- on every pair the walks add (font_pair_px), and nowhere else */
+    printf("T11 Inter's dynamic tracking:\n");
+    CHECK(f->dyn_tracking, "the face is recognised as Inter by its family name");
+    float t32 = font_pair_px(f, 'H', 'H', 32), t11 = font_pair_px(f, 'H', 'H', 11), t13 = font_pair_px(f, 'H', 'H', 13);
+    printf("        (HH at 32 px %.3f, 13 px %.3f, 11 px %.3f)\n", t32, t13, t11);
+    CHECK(t32 < -0.6f && t32 > -0.8f, "at 32 px a title closes up by about 0.7 px a pair");
+    CHECK(t11 > 0.0f && t11 < 0.1f, "at 11 px a caption opens a touch");
+    CHECK(t13 > -0.1f && t13 < 0.0f, "at 13 px body text is all but untouched");
+    CHECK(font_pair_px(f, 'A', 'V', 32) < font_kern_px(f, 'A', 'V', 32), "kerning and tracking add up");
+    CHECK(font_pair_px(f, 0, 'V', 32) == 0.0f, "nothing before the first glyph");
+    g_kn = 0;
+    font_layout_text(f, "HH", 32, 0, kern_visit, 0);
+    float adv_h = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'H', 32)->advance_px;
+    CHECK(g_kn == 2 && g_kx[1] > adv_h + t32 - 0.01f && g_kx[1] < adv_h + t32 + 0.01f,
+          "the text walk spaces the letters by it");
 }
 
 int main(void) {

@@ -8,6 +8,7 @@
 #include "font.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>    /* expf: the tracking curve, once per size */
 
 /* ------------------------------------------------------------------------- */
 /* big-endian sfnt readers (all bounds-checked against data_len by callers)   */
@@ -255,6 +256,42 @@ float font_kern_px(struct font *f, uint32_t left, uint32_t right, float size_px)
     return (float)units * canonical / (float)f->units_per_em;
 }
 
+/* Inter's dynamic metrics (rsms.me/inter/dynmetrics): tracking in ems as a
+ * function of the size in pixels -- about +0.005 em at 11 px, -0.003 at 13,
+ * -0.02 at 24 and up. */
+static float inter_tracking_em(float size_px) { return -0.0223f + 0.185f * expf(-0.1745f * size_px); }
+
+float font_pair_px(struct font *f, uint32_t left, uint32_t right, float size_px) {
+    if (!f || !left || !right) return 0.0f;
+    float px = font_kern_px(f, left, right, size_px);
+    if (f->dyn_tracking) {
+        float canonical = (float)(uint16_t)(size_px * 4.0f + .5f) / 4.0f;   /* the cache's size */
+        if (canonical != f->trk_size) { f->trk_size = canonical; f->trk_px = inter_tracking_em(canonical) * canonical; }
+        px += f->trk_px;
+    }
+    return px;
+}
+
+/* Is the face's family (name ID 1, Windows UTF-16 or Mac Roman) `family`? */
+static int family_is(const uint8_t *d, size_t len, const char *family) {
+    uint32_t off, tl;
+    if (!find_table(d, len, "name", &off, &tl) || tl < 6) return 0;
+    uint16_t count = rd_u16(d, off + 2), strings = rd_u16(d, off + 4);
+    size_t fl = strlen(family);
+    for (uint16_t i = 0; i < count && 6u + 12u * (i + 1u) <= tl; i++) {
+        uint32_t r = off + 6 + 12u * i;
+        uint16_t platform = rd_u16(d, r), name_id = rd_u16(d, r + 6), slen = rd_u16(d, r + 8), soff = rd_u16(d, r + 10);
+        if (name_id != 1 || (size_t)off + strings + soff + slen > len) continue;
+        const uint8_t *str = d + off + strings + soff;
+        if (platform == 3 && slen >= 2 * fl) {
+            size_t k = 0;
+            while (k < fl && str[2 * k] == 0 && str[2 * k + 1] == (uint8_t)family[k]) k++;
+            if (k == fl) return 1;
+        } else if (platform == 1 && slen >= fl && !memcmp(str, family, fl)) return 1;
+    }
+    return 0;
+}
+
 uint32_t font_load(const uint8_t *ttf_data, size_t len) {
     if (!ttf_data || len < 12) return 0;
     uint32_t ver = rd_u32(ttf_data, 0);
@@ -293,6 +330,7 @@ uint32_t font_load(const uint8_t *ttf_data, size_t len) {
     if (!pick_cmap(ttf_data, len, cmap_off, &f->cmap_subtable_offset, &f->cmap_format)) return 0;
 
     if (find_table(ttf_data, len, "GPOS", &f->gpos_offset, &f->gpos_len)) gpos_kern_lookups(f);
+    f->dyn_tracking = family_is(ttf_data, len, "Inter");
 
     f->used = true;
     return (uint32_t)(slot + 1);
@@ -1099,7 +1137,7 @@ int font_layout_text(struct font *f,const char *text,float size,float width,
         const char *end=p;float word=0;int bytes=0;uint32_t wp=prev;
         while(*end && *end!=' ' && *end!='\t' && *end!='\n' && *end!='\r' && scanned+bytes<8192) {
             uint32_t cp;int n=font_utf8_decode(end,&cp);end+=n;bytes+=n;
-            word+=font_kern_px(f,wp,cp,size)+layout_advance(f,cp,size);wp=cp;
+            word+=font_pair_px(f,wp,cp,size)+layout_advance(f,cp,size);wp=cp;
         }
         if(width>0 && x>0 && x+word>width+.01f){line++;x=0;}
         if(!visit && (width<=0 || word<=width)) {
@@ -1109,7 +1147,7 @@ int font_layout_text(struct font *f,const char *text,float size,float width,
             uint32_t cp;int n=font_utf8_decode(p,&cp);p+=n;scanned+=n;
             /* the pair's kerning before the fit test: a box measured to the
              * kerned width must hold its last glyph, not wrap it away */
-            float advance=layout_advance(f,cp,size),kern=font_kern_px(f,prev,cp,size);
+            float advance=layout_advance(f,cp,size),kern=font_pair_px(f,prev,cp,size);
             if(width>0 && x>0 && x+kern+advance>width+.01f){line++;x=0;prev=0;kern=0;}
             x+=kern;
             if(visit)visit(context,cp,x,line*line_height);

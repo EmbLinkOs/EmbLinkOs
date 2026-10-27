@@ -173,7 +173,7 @@ static float text_line_width(struct font *f, const char *s, float size_px) {
         uint32_t cp;
         p += font_utf8_decode(p, &cp);
         if (cp == ' ' || cp == '\t') prev = 0;          /* the renderer kerns words, as here */
-        w += font_kern_px(f, prev, cp, size_px) + text_char_advance(f, cp, size_px);
+        w += font_pair_px(f, prev, cp, size_px) + text_char_advance(f, cp, size_px);
         prev = cp == ' ' || cp == '\t' ? 0 : cp;
     }
     return w;

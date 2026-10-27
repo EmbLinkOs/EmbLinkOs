@@ -56,6 +56,11 @@ struct font {
     uint16_t kern_lookups[16];
     uint8_t  n_kern_lookups;
     int16_t *kern_ascii;          /* 95 x 95 font units, ' '..'~', or NULL */
+    /* DYNAMIC TRACKING (font_pair_px): letter-spacing that depends on the size,
+     * as the face's designer publishes it -- Inter's dynamic metrics, read from
+     * the family name. Large type closes up, small type keeps its air. */
+    bool     dyn_tracking;
+    float    trk_size, trk_px;      /* the last size asked for, and its tracking */
 };
 
 /* Parse the sfnt table directory once; -> a handle (index into a table of
@@ -70,6 +75,9 @@ struct font *font_for_handle(uint32_t handle);
  * glyphs come from different faces. Every walk over text adds it, so a caret
  * stands where the glyphs are. */
 float font_kern_px(struct font *f, uint32_t left, uint32_t right, float size_px);
+/* What every walk over text adds between `left` and `right`: their kerning and
+ * the face's tracking at that size (dyn_tracking). 0 before the first glyph. */
+float font_pair_px(struct font *f, uint32_t left, uint32_t right, float size_px);
 /* Codepoints `font` lacks come from `fallback` (0 clears). */
 void font_set_fallback(uint32_t font, uint32_t fallback);
 /* The face that draws `codepoint`: `f` when it has it, else its fallback when

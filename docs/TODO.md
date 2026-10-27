@@ -136,7 +136,12 @@ the default target). Measured before and after every step
         subpixel positioning, and GPOS pair kerning (formats 1 and 2, extension lookups; ASCII pairs
         cached per face) in every walk over text -- the renderer's, the layout's, the caret's.
         `make font-test` holds all three against exact areas and Inter's own pairs.
-  - [ ] A type scale with per-size tracking; hinting or stem darkening at small sizes.
+  - [x] Per-size tracking: Inter (found by its family name) is spaced by its own dynamic metrics,
+        -0.0223 + 0.185 e^(-0.1745 px) em -- a 32 px title closes up by 0.7 px a pair, 13 px body
+        is left nearly as drawn, 11 px captions open by 0.05 px -- added in every walk over text
+        with the kerning (`font_pair_px`), so measure, wrap, caret and pixels agree. The theme's
+        type scale (caption, body, title, heading) gets it at each of its sizes (`make font-test` T11).
+  - [ ] Hinting or stem darkening at small sizes; tracking for the other faces (DejaVu publishes none).
   - [ ] `contour_modal_smoke` failed once with "scaled serif paragraph lost its wrapped height" while
         seven emulators ran at once, and passed twice alone: a read before the Serif/115% change had
         settled, most likely. Watch it.
