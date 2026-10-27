@@ -73,7 +73,10 @@ shortcut modifier and power policy intact. Custom surface hues are adapted to th
 interactive accent tones are adjusted for readable text and selection contrast.
 
 The versioned `desktop_control` ABI (147) shares insets, palette, corner/shadow,
-cursor, material, shortcut and workspace preferences with the compositor. GPU
+cursor, material, effects, shortcut and workspace preferences with the compositor.
+Effects (Settings > Appearance) is Automatic, Full or Reduced: the compositor
+steps blur and the wide shadow layer down when frames run long, unless held
+([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md#the-effects-governor-p3)). GPU
 capability is required; only the process owning the desktop layer may publish
 its configuration. Queries and workspace requests cannot bypass session locks.
 Flags in existing window snapshots encode the workspace in bits 8–15 without

@@ -48,6 +48,7 @@ static struct {
     uint32_t frame_head, frame_count, interval_count, interval_head;
     uint32_t display_mhz, vrr_min_mhz, vrr_max_mhz, rate_mhz, frame_cost_us, rate_peak_mhz;
     uint32_t late[FRAME_RING], late_head, late_count;
+    uint32_t effects, effects_mode, effects_steps;
 } g;
 
 static uint32_t us_of(uint64_t ns)
@@ -109,6 +110,14 @@ void comp_stats_rate(uint32_t display_mhz, uint32_t vrr_min_mhz, uint32_t vrr_ma
     spin_unlock(&g_lock);
 }
 
+void comp_stats_effects(uint32_t tier, uint32_t mode)
+{
+    spin_lock(&g_lock);
+    if (tier != g.effects) g.effects_steps++;
+    g.effects = tier; g.effects_mode = mode;
+    spin_unlock(&g_lock);
+}
+
 void comp_stats_late(uint64_t late_ns)
 {
     spin_lock(&g_lock);
@@ -150,8 +159,10 @@ void comp_stats_reset(void)
 {
     spin_lock(&g_lock);
     uint32_t dm = g.display_mhz, vmin = g.vrr_min_mhz, vmax = g.vrr_max_mhz, rm = g.rate_mhz;
+    uint32_t fx = g.effects, fxm = g.effects_mode;
     memset(&g, 0, sizeof g);
     g.display_mhz = dm; g.vrr_min_mhz = vmin; g.vrr_max_mhz = vmax; g.rate_mhz = rm;
+    g.effects = fx; g.effects_mode = fxm;
     g.since = time_get_ns();
     spin_unlock(&g_lock);
 }
@@ -231,6 +242,7 @@ void comp_stats_snapshot(struct embk_comp_stats *out)
     out->late_max_us = g.late_count ? scratch[g.late_count - 1] : 0;
     out->lead_us = us_of(sched_precise_lead_ns());
     out->rate_peak_mhz = g.rate_peak_mhz;
+    out->effects = g.effects; out->effects_mode = g.effects_mode; out->effects_steps = g.effects_steps;
     spin_unlock(&g_lock);
 
     const fb_info_t *fi = fb_get_info();
@@ -253,8 +265,9 @@ int comp_stats_hud_text(char rows[COMP_STATS_HUD_ROWS][COMP_STATS_HUD_COLS + 1])
     char a[16], b[16], c[16];
     uint32_t rate = (s.rate_mhz + 500u) / 1000u;
     uint32_t top = ((s.vrr_max_mhz ? s.vrr_max_mhz : s.display_mhz) + 500u) / 1000u;
-    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s %ux%u %u/%uHz%s",
-             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h, rate, top ? top : 60u, s.vrr_max_mhz ? " VRR" : "");
+    snprintf(rows[0], COMP_STATS_HUD_COLS + 1, "%s %ux%u %u/%uHz%s%s",
+             s.gpu ? "GPU" : "CPU", s.screen_w, s.screen_h, rate, top ? top : 60u, s.vrr_max_mhz ? " VRR" : "",
+             s.effects ? " -fx" : "");
     ms_text(a, sizeof a, s.interval_p50_us); ms_text(b, sizeof b, s.interval_p95_us);
     snprintf(rows[1], COMP_STATS_HUD_COLS + 1, "%3u fps beat %s p95 %s", s.sec_frames, a, b);
     ms_text(a, sizeof a, s.p50_us); ms_text(b, sizeof b, s.p95_us); ms_text(c, sizeof c, s.max_us);
@@ -286,7 +299,8 @@ static void dump(void)
             " screen=%ux%u gpu=%u frames=%lu period_us=%u intervals=%u"
             " interval_p50_us=%u interval_p95_us=%u interval_max_us=%u"
             " display_mhz=%u vrr_min_mhz=%u vrr_max_mhz=%u rate_mhz=%u frame_cost_us=%u"
-            " lates=%u late_p50_us=%u late_p95_us=%u late_max_us=%u lead_us=%u rate_peak_mhz=%u\n",
+            " lates=%u late_p50_us=%u late_p95_us=%u late_max_us=%u lead_us=%u rate_peak_mhz=%u"
+            " effects=%u effects_mode=%u effects_steps=%u\n",
             (unsigned long)(span / 1000000u), (unsigned long)s.composes,
             (unsigned long)(s.compose_ns / 1000u), (unsigned long)(s.pixels / 1000u),
             (unsigned long)s.full_screen, s.p50_us, s.p95_us, s.max_us, s.recent,
@@ -294,7 +308,8 @@ static void dump(void)
             s.screen_w, s.screen_h, s.gpu, (unsigned long)s.frames, s.period_us, s.intervals,
             s.interval_p50_us, s.interval_p95_us, s.interval_max_us,
             s.display_mhz, s.vrr_min_mhz, s.vrr_max_mhz, s.rate_mhz, s.frame_cost_us,
-            s.lates, s.late_p50_us, s.late_p95_us, s.late_max_us, s.lead_us, s.rate_peak_mhz);
+            s.lates, s.late_p50_us, s.late_p95_us, s.late_max_us, s.lead_us, s.rate_peak_mhz,
+            s.effects, s.effects_mode, s.effects_steps);
     for (int i = 0; i < EMBK_COMP_SRCS; i++)
         kprintf("perf: src=%s composes=%lu compose_us=%lu kpx=%lu\n", g_src_name[i],
                 (unsigned long)s.src_composes[i], (unsigned long)(s.src_ns[i] / 1000u),
@@ -328,6 +343,13 @@ int comp_stats_command(const char *cmd)
         if (!n || n > 20) { kprintf("perf: slowmo <1-20>\n"); return 1; }
         compositor_slowmo(n);
         kprintf("perf: slowmo %u\n", n);
+        return 1;
+    }
+    if (!strcmp(cmd, "perf effects auto") || !strcmp(cmd, "perf effects full") ||
+        !strcmp(cmd, "perf effects reduced")) {
+        /* the Effects setting, from the console: tests hold the tier with it */
+        compositor_effects_override(cmd[13] == 'a' ? 0 : cmd[13] == 'f' ? 1 : 2);
+        kprintf("perf: effects %s\n", cmd + 13);
         return 1;
     }
     if (!strncmp(cmd, "perf notice ", 12)) {

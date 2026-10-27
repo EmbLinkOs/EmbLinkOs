@@ -28,7 +28,8 @@ static inline unsigned oscfg_rgb(Color c) {
 static inline int oscfg_publish_desktop(const struct oscfg *c) {
     const struct ui_theme *t=ui_theme();int l,top,r,b;oscfg_insets(c,&l,&top,&r,&b);
     struct embk_desktop d={.version=1,.flags=(c->reduce_motion?EMBK_DESKTOP_REDUCED_MOTION:0)|
-        (c->snap?EMBK_DESKTOP_SNAP:0)|(c->workspace_wrap?EMBK_DESKTOP_WRAP:0),
+        (c->snap?EMBK_DESKTOP_SNAP:0)|(c->workspace_wrap?EMBK_DESKTOP_WRAP:0)|
+        (c->effects==1?EMBK_DESKTOP_EFFECTS_FULL:c->effects==2?EMBK_DESKTOP_EFFECTS_REDUCED:0),
         .left=l,.top=top,.right=r,.bottom=b,.background=oscfg_rgb(t->chrome),.text=oscfg_rgb(t->text),.accent=oscfg_rgb(t->accent),.danger=oscfg_rgb(t->danger),.secondary=oscfg_rgb(t->text_tertiary),
         .radius=c->window_radius,.shadows=c->shadows,.decoration=c->decoration,.cursor_style=c->cursor_style,
         .cursor_size=c->cursor_size,.workspace_count=c->workspace_count,.shortcut_modifier=c->shortcut_modifier,.blur=c->transparency?c->blur:0,.opacity=(unsigned)(255*(100-c->transparency)/100)};

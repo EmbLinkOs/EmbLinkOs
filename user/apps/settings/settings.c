@@ -246,6 +246,8 @@ static void pane_appearance(void) {
         static const char *blur[]={"Off","6 px","12 px"};int step=g_cfg.blur==0?0:g_cfg.blur<=6?1:2,old=step;
         choice("Backdrop blur","Bounded to temporary panels; no full-screen blur.",blur,3,&step);
         if(step!=old){g_cfg.blur=step==0?0:step==1?6:12;commit();}
+        static const char *effects[]={"Automatic","Full","Reduced"};
+        choice("Effects","Automatic trades blur and deep shadows for a steady frame rate when frames run long.",effects,3,&g_cfg.effects);
     }
     Divider();
     if(Button("Reset appearance…").secondary().clicked())g_reset_confirm=true;

@@ -203,7 +203,8 @@ static const struct oscfg_timezone oscfg_timezones[OSCFG_TIMEZONES] = {
     X(shadows, 1, 0, 2) \
     X(snap, 1, 0, 1) \
     X(workspace_count, 4, 1, 6) \
-    X(workspace_wrap, 1, 0, 1)
+    X(workspace_wrap, 1, 0, 1) \
+    X(effects, 0, 0, 2)         /* 0 automatic, 1 full, 2 reduced: the compositor's effects tier */
 
 struct oscfg {
     #define OSCFG_MEMBER(name, value, lo, hi) int name;

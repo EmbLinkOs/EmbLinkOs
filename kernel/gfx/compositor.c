@@ -302,14 +302,29 @@ static int win_shown(const struct comp_window *w) { return on_workspace(w) || w-
 static const struct fb_shadow_layer SHADOW_FOCUS[2] = { { 14, 40, 64 }, { 1, 6, 50 } };
 static const struct fb_shadow_layer SHADOW_IDLE[2]  = { {  8, 26, 40 }, { 1, 4, 34 } };
 #define SHADOW_PAD (40 + 14 + 2)   /* repaint growth: the widest key's reach */
+
+/* THE EFFECTS TIER: what the compositor can afford to draw. Full is the
+ * material as designed -- a window that shows through blurs what is behind
+ * it, every window casts both of its shadow layers. Reduced is what keeps
+ * the frame rate when frames run long: what shows through is a flat tint of
+ * the desktop's own colour (no blur to compute again), and a shadow is its
+ * tight ambient layer alone (the wide key is most of a shadow's pixels).
+ * Chosen per frame by comp_frame from what frames cost, unless the person
+ * holds it (Settings > Appearance > Effects; EMBK_DESKTOP_EFFECTS_*). */
+enum { FX_FULL = 0, FX_REDUCED };
+static int g_fx;                                  /* the tier being drawn */
+static int fx_reduced(void) { return g_fx == FX_REDUCED; }
+
 /* this window's layers, at the desktop's shadow strength (0 none, 2 strong) */
 static int shadow_layers(int focused, struct fb_shadow_layer out[2]) {
     const struct fb_shadow_layer *s = focused ? SHADOW_FOCUS : SHADOW_IDLE;
-    for (int i = 0; i < 2; i++) {
-        out[i] = s[i];
-        out[i].peak = s[i].peak * (g_desktop.shadows == 2 ? 3u : 2u) / 2u;
+    int n = 0;
+    for (int i = fx_reduced() ? 1 : 0; i < 2; i++) {
+        out[n] = s[i];
+        out[n].peak = s[i].peak * (g_desktop.shadows == 2 ? 3u : 2u) / 2u;
+        n++;
     }
-    return g_desktop.shadows ? 2 : 0;
+    return g_desktop.shadows ? n : 0;
 }
 #define WORK_TOP ((int)g_desktop.top)         /* universal system/status bar */
 #define WORK_BOTTOM ((int)g_desktop.bottom)      /* desktop taskbar */
@@ -1385,7 +1400,7 @@ static int mat_hidden(const struct comp_window *w) {
  * a frame's whole budget per window, for a backdrop nobody can follow. */
 static int mat_blurs(const struct comp_window *w) {
     return w->used && w->visible && w->presented && w->mat_alpha && w->mat_blur && w->content &&
-           session_ui_allowed(w->pid) && on_workspace(w) && !w->sliding;
+           session_ui_allowed(w->pid) && on_workspace(w) && !w->sliding && !fx_reduced();
 }
 /* The kept blur covers the whole window (it was all on the screen) */
 static int mat_kept_whole(const struct comp_window *w) {
@@ -1550,7 +1565,10 @@ static void paint_window(struct comp_window *w, int focused,
              * this window. A glass WIDGET renders a translucent tint -> composite
              * per-pixel so the frosted aurora shows through it; an acrylic app
              * window renders opaque -> lay it over at a uniform translucency. */
-            if(GLASS_BLUR>0)fb_blur_region(sx0,sy0,sx1-sx0,sy1-sy0,GLASS_BLUR);
+            if(GLASS_BLUR>0) {
+                if (fx_reduced()) fill_clip(sx0, sy0, sx1 - sx0, sy1 - sy0, g_desktop.background, rx0, ry0, rx1, ry1);
+                else fb_blur_region(sx0,sy0,sx1-sx0,sy1-sy0,GLASS_BLUR);
+            }
             if(w->widget && GLASS_ALPHA==255)fill_clip(sx0,sy0,sx1-sx0,sy1-sy0,g_desktop.background,rx0,ry0,rx1,ry1);
             if (w->widget)
                 fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
@@ -1560,7 +1578,9 @@ static void paint_window(struct comp_window *w, int focused,
             /* a window that shows through: its own alpha, over the kept blur
              * of what is behind it (or the sharp backdrop, with no blur). A
              * sliding window carries its kept blur along, if it has all of it. */
-            if (w->mat_blur && w->bd_valid && w->bd_blur && (!w->sliding || mat_kept_whole(w)))
+            if (w->mat_blur && fx_reduced())          /* the tier's tint, not a blur */
+                fill_clip(sx0, sy0, sx1 - sx0, sy1 - sy0, g_desktop.background, rx0, ry0, rx1, ry1);
+            else if (w->mat_blur && w->bd_valid && w->bd_blur && (!w->sliding || mat_kept_whole(w)))
                 fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, w->bd_blur + (size_t)src_y * w->cw + src_x, w->cw);
             fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else if (w->desktop || w->translucent) {
@@ -1576,8 +1596,10 @@ static void paint_window(struct comp_window *w, int focused,
                 int by0 = imax(sy0, cy0 + w->blur_y);
                 int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w);
                 int by1 = imin(sy1, cy0 + w->blur_y + w->blur_h);
-                if (bx1 > bx0 && by1 > by0)
-                    fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                if (bx1 > bx0 && by1 > by0) {
+                    if (fx_reduced()) fill_clip(bx0, by0, bx1 - bx0, by1 - by0, g_desktop.background, rx0, ry0, rx1, ry1);
+                    else fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                }
             }
             fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else {
@@ -1908,7 +1930,10 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
             /* frost what is already drawn behind; a glass widget lays its
              * translucent tint over it, an acrylic window its opaque pixels at
              * a uniform translucency (paint_window's two cases) */
-            if (GLASS_BLUR > 0) gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius);
+            if (GLASS_BLUR > 0) {
+                if (fx_reduced()) gc->fill(&shown, g_desktop.background);
+                else gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius);
+            }
             if (w->widget && GLASS_ALPHA == 255) gc->fill(&shown, g_desktop.background);
             if (w->widget) d.opaque = 0;
             else d.opacity = (uint8_t)GLASS_ALPHA;
@@ -1916,7 +1941,9 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
             /* the repaint covers all of the window (region_grow_material), so
              * the blur reads all of what is behind it: two box passes of half
              * the radius, the tent the CPU's backdrop_blur draws */
-            if (w->mat_blur) {
+            if (w->mat_blur && fx_reduced()) {
+                gc->fill(&shown, g_desktop.background);
+            } else if (w->mat_blur) {
                 uint32_t half = (uint32_t)(w->mat_blur + 1) / 2;
                 gc->blur(&shown, half, 0, 0);
                 gc->blur(&shown, half, round ? &frame : 0, radius);
@@ -1928,7 +1955,8 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
                 int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w), by1 = imin(sy1, cy0 + w->blur_y + w->blur_h);
                 if (bx1 > bx0 && by1 > by0) {
                     struct gpu_rect b = { bx0, by0, bx1 - bx0, by1 - by0 };
-                    gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0);
+                    if (fx_reduced()) gc->fill(&b, g_desktop.background);
+                    else gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0);
                 }
             }
             d.opaque = 0;
@@ -4028,6 +4056,74 @@ static void comp_rate_update(uint64_t now) {
     comp_stats_rate(disp.refresh_mhz, disp.vrr_min_mhz, disp.vrr_max_mhz, g_rate_mhz, g_frame_cost_us);
 }
 
+/* THE EFFECTS GOVERNOR: the tier (g_fx) for the frames to come, from what
+ * frames cost -- the same measure as the rate's, the last bad frame fading --
+ * against a 60 Hz frame, not the period of the moment: the rate governor
+ * stretches that when frames are dear, and effects judged by it would come
+ * back exactly when the rate had given way. Effects give way first; the rate
+ * only once even reduced effects cannot keep 60. Down when what frames that
+ * compose cost, averaged (a quarter each), stays over half of one for
+ * FX_OVER_NS -- a drag of something heavy, not one dear frame (an app's first,
+ * a big ghost), which would change every shadow on the screen for nothing;
+ * stillness ends a heavy run. Back up only once frames take under a quarter
+ * AND it has held for a while. The while doubles (to 16 s)
+ * each time full effects come back only to be too much again at once, so a
+ * heavy scene that full effects cannot afford does not flicker between the
+ * two; it is two seconds again once full has lasted. A change repaints the
+ * screen -- itself a heavy frame, which the half second after a change does
+ * not count. Held by the Effects setting or `perf effects`. Under the lock. */
+#define FX_HOLD_MIN_NS  2000000000ull
+#define FX_HOLD_MAX_NS 16000000000ull
+#define FX_GRACE_NS      500000000ull
+#define FX_FRAME_NS       16666667ull     /* 60 Hz */
+#define FX_OVER_NS        150000000ull
+#define FX_IDLE_NS        200000ull       /* a frame cheaper than this composed nothing */
+#define FX_STILL_NS       250000000ull    /* this long without composing: the run is over */
+static volatile int g_fx_override;
+static uint64_t     g_fx_since_ns, g_fx_hold_ns = FX_HOLD_MIN_NS;
+static uint64_t     g_fx_avg_ns, g_fx_over_ns, g_fx_composed_ns;   /* the average; since when over; last compose */
+static void fx_choose(uint64_t now, uint64_t frame_ns, uint64_t cost_ns);
+/* At once: an idle desktop draws no frame for the change to wait for. */
+void compositor_effects_override(int mode) {
+    spin_lock(&g_comp_lock);
+    g_fx_override = mode >= 0 && mode <= 2 ? mode : 0;
+    fx_choose(time_get_ns(), 0, (uint64_t)g_frame_cost_us * 1000u);
+    comp_unlock();
+}
+
+/* `frame_ns`: this frame's cost; `cost_ns`: the fading measure. */
+static void fx_choose(uint64_t now, uint64_t frame_ns, uint64_t cost_ns) {
+    int mode = g_fx_override ? g_fx_override
+             : (g_desktop.flags & EMBK_DESKTOP_EFFECTS_FULL) ? 1
+             : (g_desktop.flags & EMBK_DESKTOP_EFFECTS_REDUCED) ? 2 : 0;
+    int want = mode == 1 ? FX_FULL : mode == 2 ? FX_REDUCED : g_fx;
+    /* a frame that composed nothing (the hand between two reports) says
+     * nothing; stillness ends the run */
+    if (frame_ns > FX_IDLE_NS) { g_fx_avg_ns = (g_fx_avg_ns * 3 + frame_ns) / 4; g_fx_composed_ns = now; }
+    else if (now - g_fx_composed_ns > FX_STILL_NS) g_fx_avg_ns = 0;
+    if (g_fx_avg_ns * 2 <= FX_FRAME_NS) g_fx_over_ns = 0;
+    else if (!g_fx_over_ns) g_fx_over_ns = now;
+    if (!mode && now - g_fx_since_ns >= FX_GRACE_NS) {
+        if (g_fx == FX_FULL && g_fx_over_ns && now - g_fx_over_ns >= FX_OVER_NS) {
+            want = FX_REDUCED;
+            uint64_t lasted = now - g_fx_since_ns;
+            g_fx_hold_ns = lasted < 2 * g_fx_hold_ns && g_fx_since_ns
+                         ? (g_fx_hold_ns * 2 > FX_HOLD_MAX_NS ? FX_HOLD_MAX_NS : g_fx_hold_ns * 2)
+                         : FX_HOLD_MIN_NS;
+        } else if (g_fx == FX_REDUCED && cost_ns * 4 < FX_FRAME_NS && now - g_fx_since_ns >= g_fx_hold_ns) {
+            want = FX_FULL;
+        }
+    }
+    if (want != g_fx) {
+        g_fx = want; g_fx_since_ns = now;
+        kprintf("compositor: effects %s (%s, frame %u us)\n", want ? "reduced" : "full",
+                mode ? "held" : "by cost", (unsigned)((want ? g_fx_avg_ns : cost_ns) / 1000u));
+        const fb_info_t *fi = fb_get_info();
+        if (fi) paint_region(0, 0, (int)fi->width, (int)fi->height);
+    }
+    comp_stats_effects((uint32_t)g_fx, (uint32_t)mode);
+}
+
 static void comp_frame(void) {
     pointer_frame();
     anim_frame();
@@ -4050,6 +4146,7 @@ static void comp_frame(void) {
     uint64_t cost_ns = (uint64_t)g_frame_cost_us * 1000u;
     if (cost_ns * 2 > g_frame_period_ns) g_ghost_smooth = 0;
     else if (cost_ns * 4 < g_frame_period_ns) g_ghost_smooth = 1;
+    fx_choose(now, (uint64_t)cost * 1000u, cost_ns);
     comp_unlock();
     comp_stats_frame(now, g_frame_period_ns);
     __atomic_store_n(&g_frame_done_ns, now, __ATOMIC_RELAXED);
@@ -4297,7 +4394,8 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
            state->left>256 || state->right>256 || state->top>256 || state->bottom>256 ||
            state->radius>12 || state->shadows>2 || state->decoration>2 || state->cursor_style>2 ||
            state->cursor_size>1 || state->shortcut_modifier>1 || state->blur>16 || state->opacity<127 || state->opacity>255 || state->workspace_count<1 || state->workspace_count>6 ||
-           state->flags&~7u || state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
+           state->flags&~31u || (state->flags&(EMBK_DESKTOP_EFFECTS_FULL|EMBK_DESKTOP_EFFECTS_REDUCED))==(EMBK_DESKTOP_EFFECTS_FULL|EMBK_DESKTOP_EFFECTS_REDUCED) ||
+           state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
             comp_unlock();return -EMBK_EINVAL;
         }
         ghosts_land_all();

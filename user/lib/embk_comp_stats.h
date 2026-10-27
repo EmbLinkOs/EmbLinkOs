@@ -14,7 +14,7 @@
  * layout without a version dance beyond `version`. */
 #include <stdint.h>
 
-#define EMBK_COMP_STATS_VERSION 4
+#define EMBK_COMP_STATS_VERSION 5
 
 #define EMBK_COMP_SRC_PRESENT 0   /* an application presented new pixels        */
 #define EMBK_COMP_SRC_MOVE    1   /* a window was moved, placed or resized       */
@@ -75,6 +75,11 @@ struct embk_comp_stats {
      * rate now, which on a still desktop is the slow one. */
     uint32_t lates, late_p50_us, late_p95_us, late_max_us;
     uint32_t lead_us, rate_peak_mhz;
+
+    /* THE EFFECTS TIER (version 5): 0 full, 1 reduced -- what the compositor
+     * draws now; how it is chosen, 0 by what frames cost, 1 held full, 2 held
+     * reduced; and how many times it has stepped since the reset. */
+    uint32_t effects, effects_mode, effects_steps, reserved3;
 };
 
 /* A FRAME, as the compositor's frame thread kept it (embk_win_frame). An

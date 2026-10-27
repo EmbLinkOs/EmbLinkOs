@@ -9,6 +9,10 @@
 #define EMBK_DESKTOP_REDUCED_MOTION 1u
 #define EMBK_DESKTOP_SNAP 2u
 #define EMBK_DESKTOP_WRAP 4u
+/* The effects tier, held: full blur and shadows whatever frames cost, or the
+ * reduced tier always. Neither: the compositor chooses by what frames cost. */
+#define EMBK_DESKTOP_EFFECTS_FULL 8u
+#define EMBK_DESKTOP_EFFECTS_REDUCED 16u
 struct embk_desktop {
     uint32_t version, flags;
     uint32_t left,top,right,bottom;

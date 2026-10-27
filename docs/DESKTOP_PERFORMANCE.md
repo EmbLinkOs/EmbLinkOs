@@ -50,7 +50,8 @@ Three ways to read it:
   frame clock the display is a fixed 120 Hz one (a VRR one, the real one);
   `perf beat N` keeps the beat for N seconds composing nothing; `perf cursor
   hw|sw` puts the pointer on the cursor plane or draws it; `perf windows` lists
-  the window stack, the dock's tiles and every ghost in flight; `perf slowmo N`
+  the window stack, the dock's tiles and every ghost in flight; `perf effects
+  auto|full|reduced` holds the effects tier (below); `perf slowmo N`
   slows the compositor's motions N times; `perf notice TITLE` posts a system
   notice, which comes up as a banner (x86: arm64 has no system notices).
 - `embk_comp_stats()` (`user/lib/embk_comp_stats.h`) hands any program the
@@ -316,3 +317,40 @@ P2 put window motion, scrolling and the toolkit on springs
 - **A notch of the wheel is a glide**: 19 frames of the scrolled view under HVF
   where it was one, each a present of what moved.
 
+
+## The effects governor (P3)
+
+What a frame can afford decides what it draws. The compositor has two
+effects tiers:
+
+| Tier | Materials | Shadows |
+|---|---|---|
+| Full | a window or bar that shows through blurs what is behind it | key and ambient layers |
+| Reduced | a flat tint of the desktop's own colour behind it, no blur to compute; an app's own glass (the library, menus) its tint made whole | the tight ambient layer alone |
+
+The rate governor (P1) and this one share their measure, what frames cost,
+but effects are judged against a **60 Hz frame**, not the period of the
+moment: the rate governor stretches that when frames are dear, and effects
+judged by it would come back exactly when the rate had given way. Effects
+give way first; the rate only once even reduced effects cannot keep 60.
+
+- **Down** when the cost of frames that compose, averaged (a quarter each),
+  stays over half a 60 Hz frame for 150 ms: a drag of something heavy, not one
+  dear frame (an app's first, a big ghost), which would change every shadow
+  on the screen for nothing. A frame that composes nothing (the hand between
+  two reports) does not count; a quarter of a second of stillness ends a run.
+- **Up** once frames cost under a quarter of a 60 Hz frame and the reduced
+  tier has held for a while: two seconds, doubled (to sixteen) each time full
+  effects come back only to be too much again at once.
+- A change repaints the screen, itself a heavy frame, which the half second
+  after a change does not count.
+- **Settings > Appearance > Effects** holds it: Automatic, Full or Reduced
+  (`EMBK_DESKTOP_EFFECTS_*`); `perf effects auto|full|reduced` from the
+  console. `perf` reports `effects` (0 full, 1 reduced), `effects_mode` and
+  `effects_steps`; the overlay says `-fx` while reduced.
+
+Observed: under HVF the whole of `tools/motion_smoke.py` -- opens, flights,
+zooms, slides -- never leaves the full tier. Under TCG, where dragging
+Settings costs 11-20 ms a frame, `tools/effects_smoke.py` sees it step down
+during the drag and back up once the hand is still (fourteen steps over the
+run, most of them app launches), and holds either tier when told to.

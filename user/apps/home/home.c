@@ -2028,6 +2028,11 @@ int main(int argc, char **argv, char **envp) {
         cfg_poll(); /* Load saved preferences before deciding whether to restore a mode. */
         if(embk_uptime_ms()>=screen_next) {
             screen_next=embk_uptime_ms()+200;uint32_t nw=0,nh=0;embk_screen_size(&nw,&nh);
+            /* the compositor's effects tier: the library and the dock's glass
+             * draw their tint while frames run long (scene_render_set_reduced) */
+            { static int fx_tick; struct embk_comp_stats cs;
+              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5 &&
+                  scene_render_set_reduced((int)cs.effects)) { g_invalidate = 2; g_full_present = 2; } }
             uint32_t gen_before=g_out_gen;outputs_poll();
             if(g_out_gen!=gen_before && nw==sw && nh==sh) {
                 /* The monitors moved under the same desktop size: re-place, repaint. */

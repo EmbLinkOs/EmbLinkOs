@@ -111,9 +111,16 @@ the default target). Measured before and after every step
   - [x] Vibrancy: every glass surface saturates what shows through it, compositor and toolkit;
         translucent (35%) with a 12 px blur by default (gallery 215).
   - [ ] Vibrancy on the GPU path (virgl, Intel): its blur primitive has no saturation yet.
-  - [ ] A blur at a quarter resolution for large glass (the box blur costs the same at any radius,
-        but a big translucent window re-blurs its whole backdrop while it is dragged); a quality
-        governor and an Effects setting.
+  - [x] An effects governor with an Effects setting (Automatic / Full / Reduced): reduced draws
+        a tint instead of a blur behind what shows through and only the ambient shadow layer;
+        judged against a 60 Hz frame, down on a sustained run of dear frames, up after a hold that
+        backs off (DESKTOP_PERFORMANCE.md; `tools/effects_smoke.py`, x86).
+  - [ ] The tier between them: a blur at a quarter resolution for large glass (the box blur costs
+        the same at any radius, but a big translucent window re-blurs its whole backdrop while it
+        is dragged).
+  - [x] Apps' own glass follows the tier: the runtime and the desktop read it (`embk_comp_stats`,
+        twice a second) and the toolkit draws a glass node's tint whole, with no blur
+        (`scene_render_set_reduced`; `make backend-test` T12).
   - [ ] The toolkit's span rasterizer, gradient LUT and dither, one blend policy, layer caching.
 - [ ] P4 Type and tokens.
   - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans

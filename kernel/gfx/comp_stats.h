@@ -21,6 +21,9 @@ void comp_stats_present(int pid, const char *title, uint32_t x, uint32_t y, uint
 /* What the display can do and the rate chosen for it (frameclock.h). */
 void comp_stats_rate(uint32_t display_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz,
                      uint32_t rate_mhz, uint32_t frame_cost_us);
+/* The effects tier now (0 full, 1 reduced) and how it is chosen (0 by cost,
+ * 1 held full, 2 held reduced); a change of tier is counted. */
+void comp_stats_effects(uint32_t tier, uint32_t mode);
 /* The frame thread began a beat's frame `late_ns` after it was due. */
 void comp_stats_late(uint64_t late_ns);
 /* The frame thread finished a frame at `t_ns`, keeping a beat of `period_ns`. */

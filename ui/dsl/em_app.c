@@ -633,6 +633,11 @@ int em_app_run(const EmApp *app) {
 
         if(em_now_ms()>=screen_next) {
             screen_next=em_now_ms()+200;uint32_t nsw=0,nsh=0;embk_screen_size(&nsw,&nsh);
+            /* THE COMPOSITOR'S EFFECTS TIER, followed here: glass draws its tint
+             * while frames run long (scene_render_set_reduced) */
+            { static int fx_tick; struct embk_comp_stats cs;
+              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5 &&
+                  scene_render_set_reduced((int)cs.effects)) { scene_render_invalidate(&r); em_request_frame(); } }
             struct embk_display_layout was=g_dl;int was_ok=g_dl_ok;
             outputs_refresh();
             int layout_moved=g_dl_ok && g_dl.generation!=g_dl_seen;

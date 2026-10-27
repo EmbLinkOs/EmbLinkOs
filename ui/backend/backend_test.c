@@ -476,6 +476,34 @@ static void t11_glass_in_group(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- T12: the reduced effects tier draws glass as its tint, unblurred ---- */
+static void t12_reduced_glass(void) {
+    printf("T12 reduced effects: glass is its own tint, whole, with no blur:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 32, 64);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, bg, &redp);
+    struct node_handle glass = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, glass, 32, 32); scene_set_transform(&a, glass, 16,16,0, 0,0,0,1, 1,1,1);
+    struct paint tint; tint.kind = PAINT_SOLID; tint.solid = (struct color){0,0,1,0.5f}; tint.n_stops = 0;
+    scene_set_paint(&a, glass, &tint);
+    scene_set_backdrop_blur(&a, glass, 1, 4.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 30, 32) > 30, "full: the half-clear tint shows the red behind it");
+    CHECK(scene_render_set_reduced(1) == 1 && scene_render_set_reduced(1) == 0, "the tier changes once");
+    scene_render_invalidate(&r);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 30, 32) < 4 && blue_at(&rt, 30, 32) > 250 && red_at(&rt, 33, 32) < 4,
+          "reduced: the tint is whole -- nothing behind shows, blurred or sharp");
+    scene_render_set_reduced(0);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -489,6 +517,7 @@ int main(void) {
     t9_fractional_edge();
     t10_clear_outside();
     t11_glass_in_group();
+    t12_reduced_glass();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -53,5 +53,9 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
  * equal and not one pixel is painted. The declarative pass runs, the app
  * believes it drew, and the screen keeps the frame from before. */
 void scene_render_invalidate(struct scene_renderer *r);
+/* THE REDUCED EFFECTS TIER (the compositor's, embk_comp_stats().effects): glass
+ * draws no blur, only its own tint made whole. Per process; 1 if it changed --
+ * the caller then invalidates its renderer so every glass node is drawn anew. */
+int  scene_render_set_reduced(int on);
 
 #endif /* __EMBLINK_UI_SCENE_RENDER_H__ */

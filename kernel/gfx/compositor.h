@@ -215,6 +215,8 @@ int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4],
 int compositor_dock_targets(int pid, const struct embk_dock_target *t, unsigned n);
 /* `perf slowmo N`: window motion N times slower (1: as designed). */
 void compositor_slowmo(uint32_t n);
+/* `perf effects`: 0 the desktop's Effects setting, 1 hold full, 2 hold reduced. */
+void compositor_effects_override(int mode);
 /* GUI+M: the front window into the dock. */
 void compositor_minimize_front(void);
 /* `perf beat N`: N seconds of frames on the beat, composing nothing. */

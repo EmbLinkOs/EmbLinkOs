@@ -11,6 +11,9 @@
 #include <math.h>
 #include <string.h>
 
+/* the reduced effects tier (scene_render_set_reduced): glass without its blur */
+static int g_effects_reduced;
+
 
 /* ------------------------------------------------------------------------- */
 /* geometry helpers                                                          */
@@ -247,14 +250,20 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
             if (n->shadow_enabled)
                 be->draw_shadow(target, dx, dy, w, h, n->corner_radius,
                                 n->shadow_dx, n->shadow_dy, n->shadow_blur_radius, n->shadow_color);
-            if (n->backdrop_blur_enabled) {
-                if (r->backdrop && r->backdrop != target && be->draw_backdrop_blur_from)
-                    be->draw_backdrop_blur_from(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius,
-                                                r->backdrop, ab.x - r->bd_ox, ab.y - r->bd_oy);
-                else
-                    be->draw_backdrop_blur(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius);
+            {
+                struct paint fill = n->data.rect.fill;
+                if (n->backdrop_blur_enabled && g_effects_reduced) {
+                    /* the reduced tier: no blur to compute -- the glass's own tint, whole */
+                    if (fill.kind == PAINT_SOLID) fill.solid.a = 1.0f;
+                } else if (n->backdrop_blur_enabled) {
+                    if (r->backdrop && r->backdrop != target && be->draw_backdrop_blur_from)
+                        be->draw_backdrop_blur_from(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius,
+                                                    r->backdrop, ab.x - r->bd_ox, ab.y - r->bd_oy);
+                    else
+                        be->draw_backdrop_blur(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius);
+                }
+                be->draw_rect(target, dx, dy, w, h, n->corner_radius, &fill, 1.0f);
             }
-            be->draw_rect(target, dx, dy, w, h, n->corner_radius, &n->data.rect.fill, 1.0f);
             if (n->border_width > 0 && be->draw_border)
                 be->draw_border(target, dx, dy, w, h, n->corner_radius, n->border_width,
                                 n->border_color, &n->border_paint);
@@ -423,6 +432,13 @@ void scene_render_init(struct scene_renderer *r, struct render_backend *be) {
 }
 void scene_render_destroy(struct scene_renderer *r) {
     free(r->cache); r->cache = 0; r->cache_cap = 0;
+}
+
+int scene_render_set_reduced(int on) {
+    on = !!on;
+    if (on == g_effects_reduced) return 0;
+    g_effects_reduced = on;
+    return 1;
 }
 
 void scene_render_invalidate(struct scene_renderer *r) {
