@@ -31,6 +31,9 @@ def main():
         assert bright>20,'monochrome desktop glyph lost contrast against the dark wallpaper'
         d.key('meta_l-spc');d.g.pump(2)
         desktop=next(a for a in d.state()['windows'] if a['pid']==home)
+        # the library comes in on a spring: under TCG its first frames are
+        # slow, and one built early in the fade shows nothing yet
+        eventually(lambda:any(r['text']=='Calculator' for r in ui.labels(desktop)),'the library never showed Calculator')
         assert abs(ui.text(desktop,'Calculator')['rect'][1]-ui.text(desktop,'Settings')['rect'][1])<2, 'a missing icon collapsed its library cell'
         d.snap('monochrome-library');d.key('meta_l-spc');d.g.pump(1)
         ui.click_text(w,'Appearance');ui.select(w,'Surfaces','Custom')
