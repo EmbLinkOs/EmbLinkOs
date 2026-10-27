@@ -4437,6 +4437,26 @@
       "featured": false,
       "milestone": "Fluid desktop P4: type and tokens",
       "historical": false
+    },
+    {
+      "id": "226-spaces-under-the-hand",
+      "phase": "Fluid desktop",
+      "title": "Spaces under the hand",
+      "caption": "Three fingers on a touchscreen, held 560 px to the left: the first space (Settings) going off one side and the second (the Terminal) coming in from the other, both following the hand one to one while the bar, the dock and the wallpaper stay. Let go past a third of the screen, or flicked, the second space is taken and the windows carry on at the hand's speed; short of it they spring back. Three fingers up open the overview. Fingers driven over QMP on a virtio-multitouch device; arm64 under HVF.",
+      "alt": "The EmbLinkOS desktop mid-swipe: Settings sliding off to the left and the Terminal coming in from the right edge",
+      "file": "226-spaces-under-the-hand.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800, virtio-multitouch; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "673f063c3a72aaf983bd820e9b3c4e88fcc3f992a9f2263f6fa055b568bef601",
+      "source_capture": "emblink-gesture-x0vasanm/swipe.ppm",
+      "source_sha256": "73563df7570a6241624ec673218dbe77a6d9172d5185ef5388814751f29336e6",
+      "source_commit": "62577fd",
+      "featured": false,
+      "milestone": "Fluid desktop P6: advanced",
+      "historical": false
     }
   ]
 }
