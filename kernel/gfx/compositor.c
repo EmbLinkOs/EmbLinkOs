@@ -9,6 +9,7 @@
 #include "display/layout.h"
 #include "drivers/video/console.h"
 #include "drivers/input/mouse.h"
+#include "drivers/input/gesture.h"
 #include "drivers/input/keyboard.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* struct process (shared_next_va, pml4_phys) for zero-copy */
@@ -1161,13 +1162,17 @@ static int      g_ov;            /* 1 from GUI+Up until the last window is home 
 static int      g_ov_leaving;    /* on the way home */
 static uint32_t g_ov_hover;      /* the window under the pointer, if any */
 static struct spring g_ov_dim;   /* the desktop's dimming, 0..OV_DIM, Q16.16 */
-static volatile int g_ov_held;   /* its windows still in their places (anim_frame) */
+static volatile int g_ghosts_still;   /* ghosts held still: the overview's in their places, a swipe's under resting fingers (anim_frame) */
+/* A SWIPE between spaces holds its windows where the fingers put them:
+ * anim_frame neither steps nor lands them until the fingers lift. */
+static int g_swipe_hold;
 /* Its windows landed by someone else (a space change, the display): over. */
 static void ov_reset(void) {
-    g_ov = g_ov_leaving = 0; g_ov_hover = 0; g_ov_held = 0;
+    g_ov = g_ov_leaving = 0; g_ov_hover = 0; g_ghosts_still = 0;
     spring_set(&g_ov_dim, 0, time_get_ns());
 }
 static void ghosts_land_all(void) {
+    g_swipe_hold = 0; g_ghosts_still = 0;
     for (int i = 0; i < GHOSTS_MAX; i++) if (g_ghosts[i].kind != ANIM_NONE) anim_finish(&g_ghosts[i]);
     if (g_ov) ov_reset();
 }
@@ -1221,6 +1226,138 @@ static void workspace_slide(unsigned from, unsigned to) {
         w->sliding = 1;
     }
     if (turned) kprintf("compositor: workspace slide turned around in flight (%d windows)\n", turned);
+}
+
+/* THE SPACES UNDER THE HAND (a three-finger swipe sideways; gesture.h). The
+ * space shown and the next one along -- in the direction the fingers go --
+ * are laid side by side and follow the fingers one to one, each window drawn
+ * as itself where the hand puts it (slide ghosts, held: g_swipe_hold).
+ * Toward a space that is not there -- past the first or the last; wrapping
+ * round is the keys' preference, not the hand's -- the hand meets a rubber
+ * band. Lifted far enough, or flicked, the next space is taken and the
+ * windows carry on at the speed the hand had; otherwise they spring back.
+ * Caller holds g_comp_lock. */
+static struct { int on, from, to; int shift, dx; } g_sw;   /* shift: +W toward a later space; dx: the hand's last */
+
+static int sw_rubber(int d) {                            /* Apple's, as the scroll's */
+    int64_t a = d < 0 ? -d : d;
+    int64_t r = a * 120 / (a + 120);                     /* never past 120 px */
+    return (int)(d < 0 ? -r : r);
+}
+/* Each held window where `dx` puts it. */
+static void swipe_place(int dx) {
+    g_sw.dx = dx;
+    int off = g_sw.to < 0 ? sw_rubber(dx) : (g_sw.shift > 0 ? (dx > 0 ? sw_rubber(dx) : dx)
+                                                             : (dx < 0 ? sw_rubber(dx) : dx));
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        struct ghost *g = &g_ghosts[i];
+        if (!ghost_slides(g)) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (!w) continue;
+        int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+        int x = fx0 + off + (w->workspace == (unsigned)g_sw.from ? 0 : g_sw.shift);
+        int pad = ghost_pad(g);
+        if (g->have_last) paint_region(g->last[0] - pad, g->last[1] - pad, g->last[0] + g->last[2] + pad, g->last[1] + g->last[3] + pad);
+        spring_set(&g->r[0], SPRING_PX(x), now);
+        int r[4], a; ghost_rect(g, r, &a);
+        for (int k = 0; k < 4; k++) g->last[k] = r[k];
+        g->have_last = 1;
+        paint_region(r[0] - pad, r[1] - pad, r[0] + r[2] + pad, r[1] + r[3] + pad);
+    }
+}
+static void swipe_begin(int dx) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || g_ov || session_input_owner() || (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION)) return;
+    ghosts_land_all();
+    int count = (int)g_desktop.workspace_count, from = (int)g_desktop.workspace;
+    int step = dx < 0 ? 1 : -1;                          /* fingers left: the space after */
+    int to = from + step;                                /* never wraps: wrapping is the keys' preference */
+    if (to < 0 || to >= count) to = -1;
+    g_sw.on = 1; g_sw.from = from; g_sw.to = to; g_sw.shift = step > 0 ? (int)fi->width : -(int)fi->width;
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->visible || !w->presented || !w->content) continue;
+        if (w->desktop || w->widget || w->translucent || !session_ui_allowed(w->pid)) continue;
+        int kind = (int)w->workspace == from ? ANIM_SLIDE_IN : (int)w->workspace == to ? ANIM_SLIDE_OUT : ANIM_NONE;
+        if (kind == ANIM_NONE) continue;
+        struct ghost *g = 0;
+        for (int k = 0; k < GHOSTS_MAX && !g; k++) if (g_ghosts[k].kind == ANIM_NONE) g = &g_ghosts[k];
+        if (!g) break;
+        int f[4]; win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]); f[2] -= f[0]; f[3] -= f[1];
+        g->kind = kind; g->win_id = w->id; g->have_last = 0; g->chrome = (uint8_t)win_shadows(w); g->focus = 0;
+        for (int k = 0; k < 4; k++) spring_init(&g->r[k], SPRING_PX(f[k]), now);
+        g->a0 = g->a1 = 255; g->s0 = f[2]; g->axis = 0; g->off_x = 0;
+        g_nghosts++;
+        w->sliding = 1;
+    }
+    g_swipe_hold = 1;
+    kprintf("compositor: swipe from space %d toward %d\n", from + 1, to + 1);
+    swipe_place(dx);
+}
+static void swipe_end(int dx, int vx) {
+    g_swipe_hold = 0; g_ghosts_still = 0;                /* they move now: frames keep coming */
+    if (!g_sw.on) return;
+    g_sw.on = 0;
+    int dir = g_sw.shift > 0 ? -1 : 1;                   /* the way the fingers go to take it */
+    const fb_info_t *fi = fb_get_info();
+    int W = fi ? (int)fi->width : 1280;
+    int take = g_sw.to >= 0 && (dx * dir > W / 3 || (vx * dir > 400 && dx * dir > 40));
+    if (take) {
+        g_desktop.workspace = (unsigned)g_sw.to;
+        reset_pointer_capture_locked();
+    }
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        struct ghost *g = &g_ghosts[i];
+        if (!ghost_slides(g)) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (!w) continue;
+        int f[4]; win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]); f[2] -= f[0]; f[3] -= f[1];
+        int home = on_workspace(w);                     /* on the space shown after this */
+        g->kind = home ? ANIM_SLIDE_IN : ANIM_SLIDE_OUT;
+        g->off_x = home ? 0 : ((int)w->workspace == g_sw.from ? -g_sw.shift : g_sw.shift);
+        int dst[4] = { f[0] + g->off_x, f[1], f[2], f[3] };
+        ghost_aim(g, dst, 255, ANIM_SPRING_SLIDE, now);
+        spring_kick(&g->r[0], SPRING_PX(vx), now);       /* the hand's speed, carried on */
+    }
+    kprintf("compositor: swipe %s space %d (%d px, %d px/s)\n", take ? "took" : "let go of",
+            (take ? g_sw.to : g_sw.from) + 1, dx, vx);
+    enforce_focus();
+    const fb_info_t *f2 = fb_get_info();
+    if (f2) paint_region(0, 0, (int)f2->width, (int)f2->height);
+}
+
+/* THE GESTURES, read on the compositor's frame (pointer_frame). A swipe
+ * decides its axis once it has gone GS_DECIDE px one way more than the
+ * other: sideways it is the spaces under the hand; up opens the overview and
+ * down closes it. A flick can be over before a frame reads it: it is decided
+ * from where it ended, and a sideways one begins and ends in that frame. */
+#define GS_DECIDE 24
+static struct { uint32_t seq; int axis; } g_gs;          /* axis: 0 undecided, 1 sideways, 2 up/down */
+static void ov_enter(void);
+static void ov_leave(uint32_t pick);
+static void gesture_frame_locked(void) {
+    struct gesture g;
+    if (!gesture_take(&g)) return;
+    if (g.seq != g_gs.seq) {
+        if (g_sw.on) swipe_end(g_sw.dx, 0);              /* lifted and down again between two frames */
+        g_gs.seq = g.seq; g_gs.axis = 0;
+    }
+    if (!g_gs.axis) {
+        int ax = g.dx < 0 ? -g.dx : g.dx, ay = g.dy < 0 ? -g.dy : g.dy;
+        if (ax >= GS_DECIDE && ax > ay) { g_gs.axis = 1; swipe_begin(g.dx); }
+        else if (ay >= GS_DECIDE && ay > ax) {
+            g_gs.axis = 2;
+            if (g.dy < 0 && !g_ov && !session_input_owner()) ov_enter();
+            else if (g.dy > 0 && g_ov && !g_ov_leaving) ov_leave(0);
+        }
+    }
+    if (g_gs.axis == 1 && g_sw.on) {
+        if (!g.active) swipe_end(g.dx, g.vx);
+        else if (g.dx != g_sw.dx) swipe_place(g.dx);     /* a hand at rest repaints nothing */
+    }
 }
 
 /* A WINDOW CHANGING SIZE A LOT AT ONCE -- filling the work area and back (a
@@ -1365,7 +1502,7 @@ static void ov_enter(void) {
 /* Home, all of them; `pick` in front. */
 static void ov_leave(uint32_t pick) {
     uint64_t now = time_get_ns();
-    g_ov_leaving = 1; g_ov_hover = 0; g_ov_held = 0;
+    g_ov_leaving = 1; g_ov_hover = 0; g_ghosts_still = 0;
     spring_to(&g_ov_dim, 0, spring_params(ANIM_SPRING_OVERVIEW), now);
     struct comp_window *pw = pick ? win_by_id(pick) : 0;
     if (pw) pw->z = g_next_z++;
@@ -3723,7 +3860,7 @@ static void anim_frame(void) {
     g_src = EMBK_COMP_SRC_ANIM;
     uint64_t now = time_get_ns();
     tp_frame(now);
-    int held = 0;                            /* overview windows still in their places */
+    int held = 0;                            /* windows held still: in the overview, under the fingers */
     if (g_ov) {
         /* the dimming, on its spring: all the screen, while it moves */
         int was = spring_px(&g_ov_dim);
@@ -3740,6 +3877,7 @@ static void anim_frame(void) {
         struct ghost *g = &g_ghosts[gi];
         if (g->kind == ANIM_NONE) continue;
         struct comp_window *w = win_by_id(g->win_id);
+        if (g_swipe_hold && ghost_slides(g)) { held++; continue; }   /* under the fingers (swipe_place) */
         if (g->kind == ANIM_OVERVIEW && !g_ov_leaving && ghost_landed(g)) {
             if (g->have_last) { held++; continue; } /* in its place: it stays, still */
         }
@@ -3769,7 +3907,7 @@ static void anim_frame(void) {
         g->have_last = 1;
         paint_region(x0, y0, x1, y1);        /* draws the ghosts itself */
     }
-    g_ov_held = held;
+    g_ghosts_still = held;
     comp_unlock();
 }
 
@@ -3901,6 +4039,7 @@ static void pointer_frame(void) {
 
     spin_lock(&g_comp_lock);
     g_src = EMBK_COMP_SRC_POINTER;
+    gesture_frame_locked();                  /* several fingers first: they may own this frame */
     cursor_plane_sync(x, y);
     /* the pointer moved or a button changed: whichever app it is over (or was)
      * has something to read. Pending presses and the wheel are input too. */
@@ -4573,9 +4712,10 @@ void compositor_beat_test(uint32_t seconds) {
 /* Work that keeps frames coming without a kick: window motion in flight, the
  * overview's dimming coming or going (and its end), or a beat being measured. */
 static int comp_continuous(void) {
-    /* (windows held still in the overview are not motion: an app drawing
-     * in one kicks a frame like any present) */
-    return g_nghosts > g_ov_held || (g_ov && (g_ov_leaving || g_ov_dim.moving)) || tp_moving() ||
+    /* (windows held still in the overview or under resting fingers are not
+     * motion: an app drawing in one kicks a frame like any present, and so
+     * does a finger moving) */
+    return g_nghosts > g_ghosts_still || (g_ov && (g_ov_leaving || g_ov_dim.moving)) || tp_moving() ||
            time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
 }
 

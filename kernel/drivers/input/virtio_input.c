@@ -2,6 +2,9 @@
 #include "drivers/bus/virtio_pci.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/input/mouse.h"
+#include "drivers/input/gesture.h"
+#include "drivers/video/framebuffer.h"
+#include "drivers/timer/timer.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -122,6 +125,7 @@ struct vi_dev {
     uint16_t notify_off;
     uint16_t last_used;
     bool     is_keyboard;
+    bool     is_touch;          /* its sync publishes contacts, not a tablet's point */
     bool     up;
 };
 
@@ -139,6 +143,11 @@ static uint32_t g_buttons;
  * stays active until its tracking id goes to -1, whatever else arrives. */
 static struct { bool active; int32_t x, y; } g_mt[MT_MAX_SLOTS];
 static uint32_t g_mt_slot;        /* which contact the device is talking about */
+/* The touch surface's own range. A machine can have a tablet AND a touchscreen,
+ * and each reports in its own units. */
+static int32_t g_mt_max_x = 32767, g_mt_max_y = 32767;
+static uint32_t g_mt_buttons;     /* clicks it was handed (mouse_hold_buttons) */
+static bool g_mt_pressing;        /* its first finger is the pointer's left button */
 static uint32_t g_mt_events;
 static bool g_mt_present;
 
@@ -267,13 +276,21 @@ static void vi_arm_all(struct vi_dev *d) {
     virtio_pci_notify(&d->vd, d->notify_off, 0);
 }
 
-static void vi_handle(const struct virtio_input_event *e) {
+static void vi_handle(const struct vi_dev *d, const struct virtio_input_event *e) {
     switch (e->type) {
     case EV_KEY: {
         if (e->code == BTN_LEFT || e->code == BTN_RIGHT || e->code == BTN_MIDDLE) {
             uint32_t bit = (e->code == BTN_LEFT)  ? MOUSE_BTN_LEFT :
                            (e->code == BTN_RIGHT) ? MOUSE_BTN_RIGHT
                                                   : MOUSE_BTN_MIDDLE;
+            /* A click handed to the touchscreen (QEMU gives buttons to the
+             * newest device that takes them) is not at any finger: it is
+             * the pointer's, wherever the mouse or tablet has put it. */
+            if (d->is_touch) {
+                if (e->value) g_mt_buttons |= bit; else g_mt_buttons &= ~bit;
+                mouse_hold_buttons(g_mt_buttons);
+                return;
+            }
             if (e->value) g_buttons |= bit; else g_buttons &= ~bit;
             mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons, 0);
             return;
@@ -291,8 +308,9 @@ static void vi_handle(const struct virtio_input_event *e) {
     case EV_ABS:
         g_ptr_events++;
         switch (e->code) {
-        case ABS_X: g_last_x = (int32_t)e->value; return;
-        case ABS_Y: g_last_y = (int32_t)e->value; return;
+        /* a touchscreen's ABS_X/Y repeat its first contact: its slots say it */
+        case ABS_X: if (!d->is_touch) g_last_x = (int32_t)e->value; return;
+        case ABS_Y: if (!d->is_touch) g_last_y = (int32_t)e->value; return;
 
         /* THE SLOT IS A MODE, NOT A VALUE. Everything after it belongs to
          * that contact until another SLOT event changes the subject, so it
@@ -346,20 +364,40 @@ static void vi_handle(const struct virtio_input_event *e) {
          * contact existing IS the button being down -- there is no separate
          * press. Later contacts are counted and kept but do nothing on their
          * own: a gesture recogniser is a different piece of software, and
-         * inventing one here would put guesses in the input path. */
-        if (g_mt_present) {
-            uint32_t buttons = g_buttons;
-            int32_t x = g_last_x, y = g_last_y;
-            if (g_mt[0].active) {
-                x = g_mt[0].x;
-                y = g_mt[0].y;
-                buttons |= MOUSE_BTN_LEFT;
-            } else {
-                buttons &= ~MOUSE_BTN_LEFT;
+         * inventing one here would put guesses in the input path.
+         *
+         * THE DEVICE THAT SENT THE SYNC, not whether a touchscreen exists:
+         * with a tablet beside it, the tablet's own frames must keep the
+         * tablet's buttons (asking "is there a touchscreen?" here once
+         * cleared every tablet click while no finger was down). */
+        if (d->is_touch) {
+            /* THE FINGERS, ALL OF THEM, to the gesture recogniser (screen
+             * pixels): three or more moving together are the system's (a
+             * swipe), and two or more are no pointer -- the first finger
+             * neither presses nor drags until they have all lifted. */
+            {
+                int32_t gx[MT_MAX_SLOTS], gy[MT_MAX_SLOTS]; int n = 0;
+                const fb_info_t *fi = fb_get_info();
+                for (int i = 0; i < MT_MAX_SLOTS; i++) {
+                    if (!g_mt[i].active) continue;
+                    gx[n] = fi ? (int32_t)((int64_t)g_mt[i].x * (int64_t)fi->width / ((int64_t)g_mt_max_x + 1)) : g_mt[i].x;
+                    gy[n] = fi ? (int32_t)((int64_t)g_mt[i].y * (int64_t)fi->height / ((int64_t)g_mt_max_y + 1)) : g_mt[i].y;
+                    n++;
+                }
+                gesture_contacts(gx, gy, n, time_get_ns());
+                if (gesture_holds_pointer()) {
+                    if (g_mt_pressing) mouse_move_relative(0, 0, 0, 0);   /* where it is, let go */
+                    g_mt_pressing = false;
+                    return;
+                }
             }
-            g_last_x = x;
-            g_last_y = y;
-            mouse_set_absolute(x, y, g_abs_max_x, buttons, 0);
+            /* Only its own press is its to release: a frame of nothing (the
+             * sync after a click it was handed) leaves the buttons alone. */
+            if (g_mt[0].active)
+                mouse_set_absolute(g_mt[0].x, g_mt[0].y, g_mt_max_x, MOUSE_BTN_LEFT, 0);
+            else if (g_mt_pressing)
+                mouse_move_relative(0, 0, 0, 0);         /* lifted: released where it is */
+            g_mt_pressing = g_mt[0].active;
             return;
         }
         mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons, 0);
@@ -379,7 +417,7 @@ void virtio_input_poll(void) {
             uint16_t slot = (uint16_t)(d->last_used % d->qsize);
             uint32_t id   = d->used.ring[slot].id;
             if (id < d->qsize)
-                vi_handle(&d->ev[id]);
+                vi_handle(d, &d->ev[id]);
 
             /* Recycle the buffer immediately: the queue is the only place
              * events can land, and a buffer left un-armed is an event the
@@ -436,17 +474,18 @@ void virtio_input_init(void) {
         if (is_touch) {
             is_tablet = true;                /* it reports ABS_X/Y as well */
             g_mt_present = true;
+            d->is_touch = true;
             /* The touch surface's own range, which is the one the contacts
              * are reported in. */
             uint8_t ai[24];
             if (vi_cfg(d, 0x12, ABS_MT_POSITION_X, ai, sizeof ai) >= 8)
-                g_abs_max_x = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
-                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+                g_mt_max_x = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                       ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
             if (vi_cfg(d, 0x12, ABS_MT_POSITION_Y, ai, sizeof ai) >= 8)
-                g_abs_max_y = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
-                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
-            if (g_abs_max_x <= 0) g_abs_max_x = 32767;
-            if (g_abs_max_y <= 0) g_abs_max_y = 32767;
+                g_mt_max_y = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                       ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (g_mt_max_x <= 0) g_mt_max_x = 32767;
+            if (g_mt_max_y <= 0) g_mt_max_y = 32767;
         }
 
         /* The tablet's real coordinate range, read rather than assumed. */

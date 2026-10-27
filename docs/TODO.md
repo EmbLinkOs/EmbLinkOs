@@ -206,7 +206,27 @@ the default target). Measured before and after every step
         and the ring is square around rounded corners. The desktop under it still sees the
         pointer (its dock labels show).
   - [ ] Asked for again while it is closing, it is ignored until the windows are home.
-  - [ ] Touchpad gestures (three fingers up for the overview, sideways for spaces).
+  - [x] Three-finger gestures on a touchscreen (`kernel/drivers/input/gesture.c`, fed every contact
+        by virtio-input): sideways, the space shown and the next lie side by side and follow the
+        hand one to one; lifted past a third of the screen, or flicked (over 400 px/s, from the
+        same velocity fit as scrolling), the next is taken and the windows carry on at the hand's
+        speed, else they spring back; past the first or last space a rubber band (swipes do not
+        wrap: that preference is the keys'). Up opens the overview, down closes it. Two fingers
+        down hold the pointer until all lift, so a gesture never clicks (`tools/gesture_smoke.py`:
+        x86 and arm64; gallery 226).
+  - [x] Beside a touchscreen, clicks reached the pointer at the wrong place or not at all: the
+        touch path ran on every device's sync and cleared the tablet's button, and QEMU hands
+        buttons to the newest device that takes them (the touchscreen), whose clicks were
+        published at the tablet's last point. Now the touch path is the touchscreen's alone, with
+        its own range, and a click it is handed is held at the pointer (`mouse_hold_buttons`).
+  - [ ] Real touchpads: the I2C-HID driver reads the primary contact only and never sets a
+        Precision Touchpad's input mode, so its fingers never reach the recogniser. Needs the
+        Input Mode feature report, per-finger collections (parallel and hybrid reporting) and a
+        pad-to-screen scale, tested on hardware.
+  - [ ] On a real touchscreen the first finger presses as it lands, before the others: a
+        three-finger swipe can click under the first finger. A short hold-off before a touch
+        presses would fix it, at the cost of that much latency on every tap.
+  - [ ] No pinch, no two-finger scrolling from a touchscreen, no four-finger variants.
   - [x] Tiling previews: held against an edge, a window shows the half (or, at the top, all) of
         the work area it will take -- a wash under it, the outline over it -- by the runtime's own
         rule (`EMBK_WINF_RESIZABLE` tells the compositor which windows tile;

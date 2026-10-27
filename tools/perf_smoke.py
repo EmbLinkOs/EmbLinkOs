@@ -113,10 +113,11 @@ class Arm64Guest(Guest):
     """The arm64 machine, behind the same interface as recovery_smoke.Guest:
     QEMU virt with the kernel image and a disposable copy of its root
     filesystem, virtio GPU/keyboard/tablet, serial and QMP on Unix sockets.
-    The tablet is ABSOLUTE, so the pointer goes where it is put (absolute)."""
+    The tablet is ABSOLUTE, so the pointer goes where it is put (absolute).
+    `extra`: devices a particular test needs (a touchscreen)."""
     absolute = True
 
-    def __init__(self, out, accel='hvf'):
+    def __init__(self, out, accel='hvf', extra=()):
         self.out = out; out.mkdir(); self.seen = bytearray(); self.menu = 1; self.selected = True
         self.graphics = 'virtio'
         disks = []
@@ -135,7 +136,7 @@ class Arm64Guest(Guest):
                '-nic', 'none', '-display', 'none',
                '-serial', f'unix:{out / "serial.sock"},server=on,wait=off',
                '-qmp', f'unix:{out / "qmp.sock"},server=on,wait=off',
-               '-kernel', str(ROOT / 'build/aarch64/kernel.img'), '-no-reboot']
+               '-kernel', str(ROOT / 'build/aarch64/kernel.img'), '-no-reboot', *extra]
         self.err = (out / 'qemu.log').open('wb'); self.log = (out / 'serial.log').open('wb')
         self.p = subprocess.Popen(cmd, cwd=ROOT, stdout=self.err, stderr=self.err)
         self.serial = socket.socket(socket.AF_UNIX)
@@ -182,15 +183,16 @@ def glide(d, x, y, step=8, pause=0.03):
         d.g.pump(pause)
 
 
-def boot(args, out):
-    """A disposable desktop of `args.arch` (and `args.accel`), not yet logged in."""
+def boot(args, out, extra=()):
+    """A disposable desktop of `args.arch` (and `args.accel`), not yet logged
+    in, with `extra` QEMU devices."""
     if args.arch == 'aarch64':
         d = Desktop.__new__(Desktop)
-        d.out = out / 'guest'; d.g = Arm64Guest(d.out, args.accel); d.sock = d.out / 'gdb.sock'; d.symbols = {}
+        d.out = out / 'guest'; d.g = Arm64Guest(d.out, args.accel, extra); d.sock = d.out / 'gdb.sock'; d.symbols = {}
     else:
         disk = out / 'perf.img'
         shutil.copyfile(ROOT / 'uefi-usb.img', disk)
-        d = Desktop(out / 'guest', disk, graphics=getattr(args, 'graphics', 'virtio'))
+        d = Desktop(out / 'guest', disk, graphics=getattr(args, 'graphics', 'virtio'), extra=extra)
     return d
 
 

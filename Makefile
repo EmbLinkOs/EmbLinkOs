@@ -224,6 +224,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
              kernel/drivers/input/pointer_accel.c \
+             kernel/drivers/input/gesture.c \
              kernel/drivers/input/i8042.c \
              kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \

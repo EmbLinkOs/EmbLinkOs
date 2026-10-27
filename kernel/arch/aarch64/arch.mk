@@ -189,6 +189,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/input/keyboard.c \
                   kernel/drivers/input/mouse.c \
                   kernel/drivers/input/pointer_accel.c \
+                  kernel/drivers/input/gesture.c \
                   kernel/drivers/video/framebuffer.c \
                   kernel/drivers/video/console.c \
                   kernel/drivers/video/font_8x16.c \

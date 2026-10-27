@@ -123,9 +123,19 @@ int pointer_command(const char *cmd) {
 static volatile uint32_t g_press_t[MOUSE_PRESS_Q];
 static volatile uint8_t  g_press_head, g_press_n;
 
+/* BUTTONS FROM A DEVICE WITH NO POSITION OF ITS OWN (mouse_hold_buttons):
+ * QEMU hands a click to the newest device that takes buttons, which beside a
+ * touchscreen is the touchscreen, while motion still comes from the mouse.
+ * Those buttons are held here and added to whatever the pointing devices
+ * report, so a press lands where the pointer is and a drag survives the
+ * mouse's own reports (which never saw the press). */
+static uint32_t g_reported, g_held;
+
 /* Apply a new button mask, recording the DOWN transition of the left button.
  * Both device paths go through here so neither can forget to. */
-static void buttons_set(uint32_t nb) {
+static void buttons_set(uint32_t reported) {
+    g_reported = reported;
+    uint32_t nb = reported | g_held;
     uint32_t ob = g_buttons;
     if ((nb & MOUSE_BTN_LEFT) && !(ob & MOUSE_BTN_LEFT)) {
         if (g_press_n < MOUSE_PRESS_Q) {
@@ -258,6 +268,14 @@ void mouse_move_relative(int32_t dx,int32_t dy,uint32_t buttons,int32_t wheel) {
     spin_unlock(&pointer_state_lock);
     notify();
 }
+void mouse_hold_buttons(uint32_t mask) {
+    spin_lock(&pointer_state_lock);
+    g_held = mask & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE);
+    if ((g_reported | g_held) != g_buttons) POINTER_ACTIVITY();
+    buttons_set(g_reported);
+    spin_unlock(&pointer_state_lock);
+    notify();
+}
 
 
 #if defined(__x86_64__)
@@ -305,7 +323,7 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     serial_write_string("\n=== Mouse init ===\n");
     g_w = (int32_t)screen_w; g_h = (int32_t)screen_h;
     g_x = g_w / 2; g_y = g_h / 2;
-    g_cycle = 0; g_buttons = 0; g_press_head = g_press_n = 0;
+    g_cycle = 0; g_buttons = g_reported = g_held = 0; g_press_head = g_press_n = 0;
 #if defined(__x86_64__)
     if (boot_qemu_linear_pointer()) { g_accel_on = 0; kprintf("mouse: pointer 1:1 (opt/emblink/pointer)\n"); }
 #endif

@@ -50,6 +50,11 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
  * MOUSE_BTN_*; wheel is a delta to accumulate (+up). */
 void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel);
 
+/* Buttons held down by a device that has no position of its own (a click a
+ * touchscreen was handed): pressed where the pointer is, and kept down
+ * whatever the pointing devices report until released here. */
+void mouse_hold_buttons(uint32_t mask);
+
 /* The uptime (ns) at which the pointer first moved since this was last taken,
  * or 0 if it has not -- and clear it. The compositor takes it when it has drawn
  * the cursor at its new place, which makes the difference the time the motion

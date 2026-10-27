@@ -228,6 +228,14 @@ be turned around mid-way from where it is, at the speed it has.
   clicks and keys at their real places from the start. Reduced motion
   changes space at once. With several monitors the desktop slides as one
   strip.
+- **Three fingers.** On a touchscreen, three fingers moving sideways put the
+  space shown and the next one side by side under the hand, following it one
+  to one. Lifted past a third of the screen, or flicked, the next space is
+  taken and the windows carry on at the speed the hand had; otherwise both
+  spring back. Past the first or the last space the hand meets a rubber band
+  (wrapping round is the keys' preference). Three fingers up open the overview
+  and down close it. Once two fingers are down the pointer neither moves nor
+  presses until every finger has lifted (`tools/gesture_smoke.py`).
 - **The dock.** Its icons still never move under the aim and never swell.
   The pointer's plate is one plate that glides from tile to tile on a spring
   as the pointer runs along the dock, fading at its ends; the icon button
