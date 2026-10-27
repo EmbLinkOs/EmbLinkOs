@@ -69,8 +69,15 @@ the default target). Measured before and after every step
 - [ ] **Window motion composes slowly under TCG**: three frames of a Terminal opening and
       closing took about 90 ms each, the slowest 208 ms, against under 3 ms on arm64 under HVF.
       P2 replaces this motion; measure it again then.
-- [ ] P2 Springs (fixed point, shared by kernel and toolkit), interruptible window motion to the real
-      dock icon, momentum scrolling, pointer acceleration, a USB mouse driver, precise scrolling.
+- [ ] P2 Motion and input feel.
+  - [x] Springs and a velocity fit in fixed point, shared by the kernel and the toolkit, the same at
+        any frame rate (c38f573; `make spring-test`).
+  - [x] Window motion on springs: any number of windows at once, interruptible, into the window's
+        own dock tile; GUI+M minimises; `perf slowmo` (dd046be; `tools/motion_smoke.py`).
+  - [ ] The ghost is scaled nearest-neighbour; bilinear filtering on the CPU path.
+  - [ ] Toolkit transitions, menus and toasts on springs.
+  - [ ] Momentum scrolling with a rubber band; pixel-precise scrolling.
+  - [ ] Pointer acceleration; a USB HID mouse driver; event timestamps for velocity.
 - [ ] P3 Materials: corner masks, two-layer 9-slice shadows, Kawase blur with vibrancy, a quality
       governor and an Effects setting; the toolkit's span rasterizer, gradient LUT, one blend policy,
       layer caching.
@@ -5835,14 +5842,13 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped
 
 ### Minimize / restore (shipped 2026-08-06)
-- [ ] No minimize ANIMATION -- the window vanishes and reappears instantly.
-      The Mac genie is the obvious want; a scale+fade toward the dock icon is
-      the cheap version. Blocked on the same window-motion work as the reverted
-      open/close animation below.
+- [x] No minimize ANIMATION -- DONE: the window flies into its own dock tile
+      on springs and back out of it (dd046be). The genie warp is P6's, on the
+      GPU path.
 - [ ] Restore is per-PROCESS, not per-window: an app with two windows gets both
       back. Fine while apps are single-window; revisit with a real window list.
-- [ ] No keyboard path (Super+M) and no "minimize all" -- the dock icon is the
-      only way back.
+- [ ] No "minimize all", and no keyboard path BACK -- the dock icon is the only
+      way to restore. GUI+M minimises the front window (dd046be).
 - [ ] A minimized app still runs its render loop if it is timer-driven (a clock
       widget keeps painting into a buffer nobody composites). Retained-update
       apps idle correctly; a `minimized` bit in win_input would let the rest
@@ -5963,17 +5969,18 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 ### Window motion (shipped 2026-08-06, compositor-side)
 - [ ] Closing animates via a full-window pixel COPY (~1.4MB kmalloc per close;
       the live buffer is freed under the ghost when the process is reaped).
-      Cheap enough at one motion at a time, but if closes ever overlap or
-      windows get much bigger, a deferred free of the shared buffer would beat
-      copying it.
-- [ ] The park target is the bottom CENTRE of the screen, not the app's actual
-      dock icon: the dock is drawn by home and the kernel has no idea where its
-      icons are. Plumbing the icon rect through (win_set_park_target?) would
-      make it land on the right icon.
-- [ ] Only one motion runs at a time; a second window animating while one is in
-      flight is simply not animated (anim_start returns).
-- [ ] The window is un-hittable for the 170-200ms it is in flight (it is hidden
-      and the ghost takes no input). Fine at these durations, wrong if they grow.
+      Closes can overlap now (one ghost each, dd046be), so a quit of an app
+      with several big windows copies all of them; a deferred free of the
+      shared buffer would beat copying it.
+- [x] The park target is the bottom CENTRE of the screen -- DONE: the desktop
+      publishes its dock tiles (syscall 165) and a window lands on its own app's
+      tile (dd046be). An app with no tile still goes to the bottom centre.
+- [x] Only one motion runs at a time -- DONE: up to eight ghosts on springs,
+      and a motion in flight can be turned around (dd046be).
+- [ ] The window is un-hittable while it is in flight (it is hidden and the
+      ghost takes no input): about 0.3 s opening and 0.5 s into the dock now,
+      on springs that land within half a pixel. A click on the ghost of an
+      opening window is lost.
 - [ ] Frame pacing rides the main loop's ~100Hz timer wake. Under heavy TCG load
       the loop can be slower, and the motion degrades to fewer frames rather
       than slowing down (it is time-based, so it still lands on schedule).

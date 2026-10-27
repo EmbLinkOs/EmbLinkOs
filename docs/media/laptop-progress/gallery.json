@@ -4157,6 +4157,46 @@
       "featured": false,
       "milestone": "Fluid desktop P1: frame clock and presentation",
       "historical": false
+    },
+    {
+      "id": "212-park-in-flight",
+      "phase": "Fluid desktop",
+      "title": "A window on its way to the dock",
+      "caption": "Settings minimised with GUI+M, photographed in flight: the ghost of its window, 581 px wide and fully opaque, on four springs toward its own tile in the dock -- the tile the desktop told the compositor about. Slowed ten times (perf slowmo 10) to be photographed; the motion is the same. Under TCG.",
+      "alt": "The EmbLinkOS desktop with a shrunken copy of the Settings window in mid-air between where it was and the dock",
+      "file": "212-park-in-flight.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP and the serial console by tools/motion_smoke.py",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "1078c04d0a976cef4a0b080834a6c74ec62c81f7854249148aed6cac714628f0",
+      "source_capture": "emblink-motion-uiv6304p/flight-1.ppm",
+      "source_sha256": "ee7594f9f0a62bb039ea914d35ca81dfb484f90192263e4987af8bed0f4851b9",
+      "source_commit": "dd046be",
+      "featured": false,
+      "milestone": "Fluid desktop P2: motion and input feel",
+      "historical": false
+    },
+    {
+      "id": "213-park-at-the-tile",
+      "phase": "Fluid desktop",
+      "title": "Into its own tile",
+      "caption": "The same flight a moment later: the window, 89 px wide, over the Settings tile and fading into it -- opaque the whole way down and fading only in the last tenth of the trip. Clicked back before it lands, it turns around from where it is. Under TCG, slowed ten times.",
+      "alt": "The EmbLinkOS dock with a small fading copy of the Settings window landing on the Settings tile",
+      "file": "213-park-at-the-tile.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP and the serial console by tools/motion_smoke.py",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "3ad4d5d2fb4d25e7e6a19fc9bbed5e4526a1924b71371e46d7bac554e1a98562",
+      "source_capture": "emblink-motion-uiv6304p/flight-4.ppm",
+      "source_sha256": "9095573f5b6a21fd2adf6a6e2cc95c7d952eaad3b722b0e0dc7cce9682ab613e",
+      "source_commit": "dd046be",
+      "featured": false,
+      "milestone": "Fluid desktop P2: motion and input feel",
+      "historical": false
     }
   ]
 }

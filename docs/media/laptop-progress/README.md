@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-211 actual EmbLinkOS captures document the original laptop work, its
+213 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, and keeping time at 120 Hz. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, and windows moving on springs. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -41,6 +41,18 @@ arm64 under HVF, on the host's own core: window motion at about 100 frames a sec
 The frame clock told the display is a fixed 120 Hz one (`perf display 120`) and keeping the beat (`perf beat`): the overlay reads 120 of 120 Hz, 120 frames in the last second, a beat of 8.33 ms with a 95th percentile of 9.53. Under TCG; arm64 under HVF keeps the same beat to a p95 of 8.8 ms ([the beat](../../DESKTOP_PERFORMANCE.md#the-beat)).
 
 ![The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 120/120Hz, 120 fps, beat 8.33 ms](211-frame-clock-120.png)
+
+### A window on its way to the dock
+
+Settings minimised with GUI+M, photographed in flight: the ghost of its window, fully opaque, on four springs toward its own tile in the dock -- the tile the desktop told the compositor about. Slowed ten times (`perf slowmo 10`) to be photographed; the motion is the same. Under TCG.
+
+![The EmbLinkOS desktop with a shrunken copy of the Settings window in mid-air between where it was and the dock](212-park-in-flight.png)
+
+### Into its own tile
+
+A moment later: the window over the Settings tile and fading into it -- opaque the whole way down, fading only in the last tenth of the trip. Clicked back before it lands, it turns around from where it is.
+
+![The EmbLinkOS dock with a small fading copy of the Settings window landing on the Settings tile](213-park-at-the-tile.png)
 
 ## The prompt, Powerlevel10k-style
 
