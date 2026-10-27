@@ -4237,6 +4237,26 @@
       "featured": false,
       "milestone": "Fluid desktop P3: materials",
       "historical": false
+    },
+    {
+      "id": "216-inter",
+      "phase": "Fluid desktop",
+      "title": "Set in Inter",
+      "caption": "Settings in the interface's new face, Inter: Regular for text, SemiBold for headings and emphasis, DejaVu Sans kept as the fallback for anything Inter does not cover. Compare 214, the same window in DejaVu Sans. Under TCG.",
+      "alt": "The EmbLinkOS Settings window, Appearance page, set in the Inter typeface",
+      "file": "216-inter.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "0e3a4015ee7a2a9440d3c9605ad8992ceeb6a0e606797939c15df903d39eb1bf",
+      "source_capture": "emblink-capmat-5zoda0x5/settings.ppm",
+      "source_sha256": "028f4247cfc9ddbf8e286e40566452cbd7e900dc028affe28defa7c3f8fe6818",
+      "source_commit": "ca291c4",
+      "featured": false,
+      "milestone": "Fluid desktop P4: type and tokens",
+      "historical": false
     }
   ]
 }
