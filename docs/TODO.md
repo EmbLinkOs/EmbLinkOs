@@ -21,7 +21,12 @@ the default target). Measured before and after every step
         which types first-boot setup as the x86 scenes do).
   - [x] System shortcuts and GUI editing commands were decided only for PS/2 keyboards; on arm64's
         virtio keyboard GUI+Space typed a space. Decided for every keyboard now.
-- [ ] **The arm64 desktop's text sits wrong**: in Settings the sidebar icons fall below their
+- [ ] **The arm64 desktop's text sits wrong -- with the DejaVu faces.** With Inter as the UI face
+      (P4) arm64 lays text out exactly as x86 does (the perf capture after the switch matches x86's
+      pixel for pixel in layout), so the fault is in how something about DejaVu's faces is read or
+      used; nothing in font.c reads a signed byte through `char`. Condensed and Serif, still DejaVu,
+      very likely still show it on arm64. What it looked like:
+      in Settings the sidebar icons fall below their
       labels, segmented buttons are tall with their text at the top, the top bar's text is cut
       off at the top edge and the dock's label is an empty box. The same with the P0 UI changes
       reverted, so it predates them; x86 draws the same build correctly. Not investigated --
@@ -110,7 +115,13 @@ the default target). Measured before and after every step
         but a big translucent window re-blurs its whole backdrop while it is dragged); a quality
         governor and an Effects setting.
   - [ ] The toolkit's span rasterizer, gradient LUT and dither, one blend policy, layer caching.
-- [ ] P4 Inter, area-coverage text, subpixel positioning, kerning; the token pass.
+- [ ] P4 Type and tokens.
+  - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
+        stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its
+        fallback (`make font-test`) -- and as the Condensed, Serif and Mono faces (gallery 216).
+  - [ ] Area-coverage rasterising (256 levels, not 4 x 4 supersampling), subpixel positioning,
+        GPOS kerning (Inter keeps its kerning in GPOS only), an advance cache, a type scale.
+  - [ ] The token pass and a light/dark audit.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
       A double click on a title bar should zoom the window as on macOS, now that the
       compositor owns the drag that the first click starts.

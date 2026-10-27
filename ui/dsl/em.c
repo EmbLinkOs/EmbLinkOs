@@ -2843,6 +2843,11 @@ uint32_t em_font(const char *path) {
             snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
             cache[i].used = 1; cache[i].handle = h; break;
         }
+    /* Every face but the fallback itself -- and the monospaced ones, whose
+     * columns a proportional stand-in would break -- borrows what it lacks
+     * from the system's widest face (font.h: THE FALLBACK). */
+    static const char fallback[] = "/system/fonts/fallback.ttf";
+    if (h && strcmp(path, fallback) && !strstr(path, "mono")) font_set_fallback(h, em_font(fallback));
     return h;
 }
 float em_text_width(const char *s, float size_px) {

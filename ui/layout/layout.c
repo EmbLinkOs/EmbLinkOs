@@ -154,7 +154,7 @@ void layout_destroy_node(struct layout_arena *a, struct layout_handle h) {
 /* ------------------------------------------------------------------------- */
 
 static float text_char_advance(struct font *f, uint32_t cp, float size_px) {
-    struct glyph_cache_entry *e = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
+    struct glyph_cache_entry *e = glyph_cache_lookup_or_rasterize(font_global_atlas(), font_for_codepoint(f, cp), cp, size_px);
     return e ? e->advance_px : 0.0f;
 }
 /* One-line, unwrapped pixel width (Phase-1 text intrinsic).

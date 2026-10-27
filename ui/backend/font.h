@@ -44,6 +44,11 @@ struct font {
      * Piece 5's layout line-height formula. */
     int16_t  ascent, descent, line_gap;
     bool     used;
+    /* THE FALLBACK: a face (handle, 0: none) for the codepoints this one does
+     * not have -- the UI face is chosen for how it reads, the fallback for how
+     * much it covers, and text should not turn to boxes at the first symbol
+     * the UI face lacks. */
+    uint32_t fallback;
 };
 
 /* Parse the sfnt table directory once; -> a handle (index into a table of
@@ -52,6 +57,11 @@ struct font {
 #define FONT_MAX 16
 uint32_t font_load(const uint8_t *ttf_data, size_t len);
 struct font *font_for_handle(uint32_t handle);
+/* Codepoints `font` lacks come from `fallback` (0 clears). */
+void font_set_fallback(uint32_t font, uint32_t fallback);
+/* The face that draws `codepoint`: `f` when it has it, else its fallback when
+ * that does, else `f` (its .notdef box). */
+struct font *font_for_codepoint(struct font *f, uint32_t codepoint);
 
 /* ------------------------------------------------------------------------- */
 /* Section 2: cmap (formats 12 and 4)                                        */

@@ -333,6 +333,20 @@ static void t7_cmap12(void) {
     CHECK(font_codepoint_to_glyph(f, 0xF0002) == 2 && font_codepoint_to_glyph(f, 0xF0003) == 0,
           "a range in plane 15 maps by offset and ends where it ends");
     CHECK(font_codepoint_to_glyph(f, 0x10FFF0) == 0, "a glyph past numGlyphs is no glyph");
+
+    /* THE FALLBACK: a face without U+1F600 borrows it from one with it */
+    static uint8_t g_ttf4[4096];
+    uint32_t len4 = build_ttf_with(0);
+    memcpy(g_ttf4, g_ttf, len4);
+    uint32_t ph = font_load(g_ttf4, len4);
+    struct font *p = font_for_handle(ph);
+    CHECK(p && font_for_codepoint(p, 0x1F600) == p, "with no fallback, a missing codepoint stays with its face");
+    font_set_fallback(ph, fh);
+    CHECK(p && font_for_codepoint(p, 0x1F600) == f, "with one, the fallback draws what the face lacks");
+    CHECK(p && font_for_codepoint(p, 'A') == p, "and the face still draws what it has");
+    CHECK(p && font_for_codepoint(p, 0xF0003) == p, "a codepoint neither has stays with the face (its .notdef)");
+    font_set_fallback(ph, ph);
+    CHECK(p && p->fallback == fh, "a face is never its own fallback");
     CHECK(font_has_glyph(f, 0x1F600) && !font_has_glyph(f, 0x40), "font_has_glyph");
 }
 

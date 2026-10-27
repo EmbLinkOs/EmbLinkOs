@@ -152,6 +152,17 @@ static uint32_t cmap12_glyph(struct font *f, uint32_t codepoint) {
     return 0;
 }
 
+void font_set_fallback(uint32_t font, uint32_t fallback) {
+    struct font *f = font_for_handle(font);
+    if (f && fallback != font) f->fallback = fallback;
+}
+
+struct font *font_for_codepoint(struct font *f, uint32_t codepoint) {
+    if (!f || codepoint < 0x80 || font_codepoint_to_glyph(f, codepoint)) return f;
+    struct font *fb = font_for_handle(f->fallback);
+    return fb && font_codepoint_to_glyph(fb, codepoint) ? fb : f;
+}
+
 bool font_has_glyph(struct font *f, uint32_t codepoint) {
     return font_codepoint_to_glyph(f, codepoint) != 0;
 }
@@ -850,6 +861,7 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
  * preserves preformatted rows. Explicit line breaks are always honored. */
 static float layout_advance(struct font *f,uint32_t cp,float size) {
     float canonical=(float)(uint16_t)(size*4.0f+.5f)/4.0f;
+    f=font_for_codepoint(f,cp);
     return glyph_advance(f,font_codepoint_to_glyph(f,cp))*canonical/f->units_per_em;
 }
 int font_layout_text(struct font *f,const char *text,float size,float width,
@@ -901,7 +913,7 @@ struct text_draw_context {
 static void draw_positioned_glyph(void *opaque,uint32_t cp,float x,float y) {
     struct text_draw_context *c=opaque;
     if(c->height>0 && y>=c->height)return;
-    struct glyph_cache_entry *g=glyph_cache_lookup_or_rasterize(&g_atlas,c->font,cp,c->size);
+    struct glyph_cache_entry *g=glyph_cache_lookup_or_rasterize(&g_atlas,font_for_codepoint(c->font,cp),cp,c->size);
     const uint8_t *coverage=glyph_coverage(&g_atlas,g);
     if(coverage && g->atlas_h>0)
         blit_coverage_tinted(c->rt,(int)(c->x+x+g->bearing_x),(int)(c->y+y+c->ascent-g->bearing_y),

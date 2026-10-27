@@ -796,7 +796,7 @@ float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nb
         int adv = font_utf8_decode(s + i, &cp);
         if (adv <= 0) break;
         struct glyph_cache_entry *e =
-            glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
+            glyph_cache_lookup_or_rasterize(font_global_atlas(), font_for_codepoint(f, cp), cp, size_px);
         if (e) w += e->advance_px;
         i += (unsigned)adv;
     }

@@ -1,11 +1,13 @@
 """The fonts on the image, one list for both image builders.
 
 mkfs_embkfs.py (x86) and mkfs_arm64.py both install exactly these, so the two
-images cannot carry different faces. DejaVu comes from the HOST's install
-(mkfs_embkfs._read_font knows where to look); Terminal's MesloLGS Nerd Font
-Mono is vendored in the tree (third_party/fonts/meslo-nf), so every build gets
-the same four faces whatever the host has. Licences for both are in
-system/licenses, which both builders install too.
+images cannot carry different faces. The interface's face, Inter, and
+Terminal's MesloLGS Nerd Font Mono are vendored in the tree
+(third_party/fonts/inter, third_party/fonts/meslo-nf), so every build gets the
+same faces whatever the host has; DejaVu -- the fallback for what Inter does
+not cover, and the condensed, serif and mono faces -- comes from the HOST's
+install (mkfs_embkfs._read_font knows where to look). Licences for all three
+are in system/licenses, which both builders install too.
 """
 
 import os
@@ -14,8 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 # (DejaVu file on the host, name under /system/fonts)
 HOST_FACES = [
-    ("DejaVuSans.ttf", "font.ttf"),                  # the UI face
-    ("DejaVuSans-Bold.ttf", "bold.ttf"),
+    ("DejaVuSans.ttf", "fallback.ttf"),              # what Inter lacks (font.h: THE FALLBACK)
     ("DejaVuSansCondensed.ttf", "condensed.ttf"),
     ("DejaVuSansCondensed-Bold.ttf", "condensed-bold.ttf"),
     ("DejaVuSerif.ttf", "serif.ttf"),
@@ -24,8 +25,10 @@ HOST_FACES = [
     ("DejaVuSansMono-Bold.ttf", "mono-bold.ttf"),
 ]
 
-# (file in the tree, name under /system/fonts): Terminal's faces
+# (file in the tree, name under /system/fonts): the UI's faces, Terminal's
 TREE_FACES = [
+    ("third_party/fonts/inter/Inter-Regular.ttf", "font.ttf"),      # the UI face
+    ("third_party/fonts/inter/Inter-SemiBold.ttf", "bold.ttf"),     # its emphasis
     ("third_party/fonts/meslo-nf/MesloLGSNerdFontMono-Regular.ttf", "meslo-nf-mono.ttf"),
     ("third_party/fonts/meslo-nf/MesloLGSNerdFontMono-Bold.ttf", "meslo-nf-mono-bold.ttf"),
     ("third_party/fonts/meslo-nf/MesloLGSNerdFontMono-Italic.ttf", "meslo-nf-mono-italic.ttf"),
