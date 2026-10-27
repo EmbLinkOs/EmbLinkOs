@@ -738,6 +738,30 @@ int main(void) {
         CHECK(em_spring("enter8",0.0f,1.0f,EmSmooth)==1.0f,"with reduced motion a spring is its target");
     }
 
+    /* em_spring_throw: a gesture hands a spring its place and its speed */
+    {
+        struct ui_appearance moving={.density=1,.text_scale=100,.radius=8};
+        ui_theme_configure(&moving);g_ms+=10000;
+        em_spring_throw("thrown",100.0f,0.0f);
+        CHECK(em_spring("thrown",0.0f,100.0f,EmSmooth)==100.0f && !em_spring_moving("thrown"),
+              "held by a hand, a spring is where the hand put it -- not at `from`");
+        em_spring_throw("thrown",100.0f,3000.0f);         /* let go toward 400, fast */
+        em_spring_throw("dropped",100.0f,0.0f);           /* ...and one let go still */
+        (void)em_spring("thrown",0.0f,400.0f,EmSmooth);(void)em_spring("dropped",0.0f,400.0f,EmSmooth);
+        g_ms+=60;
+        float thrown=em_spring("thrown",0.0f,400.0f,EmSmooth),dropped=em_spring("dropped",0.0f,400.0f,EmSmooth);
+        CHECK(thrown>dropped+40.0f,"thrown, it is well ahead of one let go still");   /* v0 t e^-wt: 61 px at best */
+        em_spring_throw("back",300.0f,3000.0f);           /* thrown the wrong way: it turns */
+        (void)em_spring("back",0.0f,0.0f,EmSmooth);
+        g_ms+=30;float b1=em_spring("back",0.0f,0.0f,EmSmooth);
+        for(int i=0;i<300 && em_spring_moving("back");i++){g_ms+=8;(void)em_spring("back",0.0f,0.0f,EmSmooth);}
+        CHECK(b1>300.0f && em_spring("back",0.0f,0.0f,EmSmooth)==0.0f,"thrown away from home, it carries on, turns and comes to rest home");
+        struct ui_appearance still={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
+        ui_theme_configure(&still);
+        em_spring_throw("still",50.0f,3000.0f);
+        CHECK(em_spring("still",0.0f,400.0f,EmSmooth)==400.0f,"with reduced motion a throw lands at once");
+    }
+
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

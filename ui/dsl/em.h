@@ -734,7 +734,7 @@ int   em_take_clicks(uint64_t *when_ms);
 
 void  em_feed_pointer(float x, float y, int left_down, int right_down,
                       int wheel, int focused);
-void em_shell_band(int bottom, int height); /* translucent shell strip geometry */
+void em_shell_band(int bottom, int height); /* translucent shell strip geometry: the window is a bar, kept that thin but for open menus */
 void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
 /* The window shows through: its canvas starts transparent, what the view
  * paints is composited by its own alpha, over what is behind the window
@@ -937,6 +937,12 @@ float em_spring(const char *id, float from, float to, int response_ms, int dampi
 #define EmBouncy 450, 700
 /* Whether the id's spring is still moving (or not yet seen). */
 int em_spring_moving(const char *id);
+/* A HAND LETTING GO: the id's spring is put at `value`, moving at `velocity`
+ * (per second) -- where a drag left it and how fast it was going. The next
+ * em_spring(id, ...) carries on from there toward its `to`: a flick thrown
+ * far enough flies on, one let go still springs home. Called every frame
+ * while the hand holds it (velocity 0), the spring is simply where the hand is. */
+void em_spring_throw(const char *id, float value, float velocity);
 
 /* Reusable views are just C functions. This is optional sugar for the no-arg
  * case so `Component(ProfileCard) { ... }` reads nicely; call it as ProfileCard(). */

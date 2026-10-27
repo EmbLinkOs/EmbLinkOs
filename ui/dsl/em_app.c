@@ -292,7 +292,7 @@ static void appearance_start(const struct oscfg *initial) {
     /* Long-lived services run several windows sequentially in one process. */
     if(!g_appearance_worker_started && embk_thread_create(appearance_worker,0)>=0)g_appearance_worker_started=1;
 }
-static int g_shell_bottom,g_shell_height=34,g_follow_display_width;
+static int g_shell_bottom,g_shell_height=34,g_shell_band,g_follow_display_width;
 
 /* THE MONITORS. The desktop is one surface over every monitor
  * (embk_monitor.h); an app places, maximizes and tiles on the monitor its
@@ -354,7 +354,7 @@ int em_output_at(int px,int py,int *x,int *y,int *w,int *h) {
     return o.primary;
 }
 void em_app_follow_display_width(int enabled){g_follow_display_width=!!enabled;}
-void em_shell_band(int bottom,int height){g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
+void em_shell_band(int bottom,int height){g_shell_band=1;g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
 static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
     if(!old)return NULL;
     uint32_t *next=realloc(old,(size_t)w*h*4);
@@ -832,8 +832,11 @@ int em_app_run(const EmApp *app) {
         /* Translucent menu bar: a dropdown can't paint outside its window, so
          * grow the (thin) bar window tall enough to show the open dropdown, then
          * shrink back on close. The extra height is fully transparent, so the
-         * bar still reads as a thin strip; only the dropdown paints into it. */
-        if (translucent) {
+         * bar still reads as a thin strip; only the dropdown paints into it.
+         * ONLY A BAR (em_shell_band): the banners are translucent too, and
+         * this squeezed their window to a bar's 34 px -- a banner showed its
+         * top 24 px. */
+        if (translucent && g_shell_band) {
             int want = em_menu_any_open();
             /* Chrome normally leaves keys with the app. An open dropdown
              * borrows them until dismissal, including when resize fails. */

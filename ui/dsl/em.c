@@ -554,6 +554,18 @@ float em_spring(const char *id, float from, float to, int response_ms, int dampi
     return em_spring_to(&g_springs[s].m, to, (uint32_t)(response_ms > 4 ? response_ms : 4),
                         (uint32_t)(damping_permille > 0 ? damping_permille : 1000));
 }
+void em_spring_throw(const char *id, float value, float velocity) {
+    if (!id) return;
+    int s = em_spring_slot(id, 0);
+    if (s < 0) s = em_spring_slot(id, 1);
+    g_springs[s].used = ++g_spring_tick;
+    em_spring_set(&g_springs[s].m, value);
+    uint64_t now_ms = em_now_ms();
+    if (velocity != 0 && now_ms && !TH->reduced_motion) {
+        spring_kick(&g_springs[s].m.s, em_q(velocity), now_ms * 1000000ull);
+        em_request_frame();
+    }
+}
 int em_spring_moving(const char *id) {
     int s = id ? em_spring_slot(id, 0) : -1;
     return s < 0 || g_springs[s].m.s.moving;

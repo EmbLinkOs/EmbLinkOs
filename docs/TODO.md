@@ -152,7 +152,16 @@ the default target). Measured before and after every step
   - [ ] The hop starts when the spawn call returns: the desktop renders nothing while it is in
         `embk_spawn_env`, which under TCG is seconds after the click. Spawning off the render
         loop would let the icon answer the click itself.
-  - [ ] Notifications: a spring slide, stacking, and dismissal by a flick.
+  - [x] Notifications: banners slide in from the screen's edge, stack newest on top and glide as
+        others come and go, slide out when their time is up (held while the pointer is on one),
+        spring home from a short drag and fly off when flicked (`em_spring_throw`;
+        `tools/banner_motion_smoke.py`). The banner window had been squeezed to the menu bar's
+        34 px since the Contour foundations -- the toolkit thinned every translucent window, not
+        just bars -- so a banner showed only its top 24 px; only a window that declares a shell
+        band (`em_shell_band`) is a bar now.
+  - [ ] arm64 has no system notices (sessions and their notice ring are x86-only), so
+        `perf notice` and the banner smoke are x86-only; banners from programs (the notify
+        service) work there.
   - [ ] Menu bar popovers that scale in on a spring.
   - [ ] A double click on a title bar should zoom the window as on macOS, now that the
         compositor owns the drag that the first click starts. Live resize (the compositor

@@ -50,7 +50,9 @@ Three ways to read it:
   frame clock the display is a fixed 120 Hz one (a VRR one, the real one);
   `perf beat N` keeps the beat for N seconds composing nothing; `perf cursor
   hw|sw` puts the pointer on the cursor plane or draws it; `perf windows` lists
-  the window stack.
+  the window stack, the dock's tiles and every ghost in flight; `perf slowmo N`
+  slows the compositor's motions N times; `perf notice TITLE` posts a system
+  notice, which comes up as a banner (x86: arm64 has no system notices).
 - `embk_comp_stats()` (`user/lib/embk_comp_stats.h`) hands any program the
   snapshot. It says how long composing takes and why, never what a window shows.
 

@@ -43,7 +43,7 @@ application-specific interaction coverage.
 | Terminal | Shared chrome and scoped monospace transcript; native search/launch/capture passes |
 | Editor and Note++ | Shared chrome, code/document palettes and metrics; three-boot save/dirty-close/recovery/reopen workflow passes |
 | Calculator, Monitor, Photos and Music | Shared native chrome/tokens and usable minimum sizes; native launch/close/captures pass; Calculator arithmetic checked |
-| Notification history and banners | Aligned history/empty state and banner work-area placement; history launch/close verified; banner edge combinations not separately exercised |
+| Notification history and banners | Aligned history/empty state and banner work-area placement; history launch/close verified; banners in motion (in, stack, out, hold, spring home, flick) checked from captures on x86; banner edge combinations not separately exercised |
 | Login, setup and lock | Shared default/session styling; authenticated setup/login, themed lock, blocked workspace shortcuts and password unlock pass |
 | Clock widget and examples | Shared runtime appearance and real wall clock/date/uptime; clock source compile checked; example galleries not individually guest-tested |
 | Vellum / NetSurf | Shared native toolkit/chrome; browser engine and content development remain with the user |
@@ -181,7 +181,7 @@ be turned around mid-way from where it is, at the speed it has.
 | Token | Response, damping | Used by |
 |---|---|---|
 | snappy | 250 ms, 0.9 | the close pull's spring back, the toast, the dock's plate |
-| smooth | 350 ms, 1.0 | a window's flight to and from the dock; the workspace slide |
+| smooth | 350 ms, 1.0 | a window's flight to and from the dock; the workspace slide; banners |
 | bouncy | 450 ms, 0.7 | the dock's launch hop |
 | (open) | 240 ms, 0.9 | a window opening |
 | (close) | 200 ms, 1.0 | a window closing: decisive, never overshooting |
@@ -212,6 +212,14 @@ be turned around mid-way from where it is, at the speed it has.
   icon moves is after the click: it hops while its app starts, until the
   app's window is up (at most four seconds), and settles where it was
   (`tools/dock_motion_smoke.py`).
+- **Notifications.** A banner slides in from the screen's edge, newest on
+  top; the ones already up glide down to make room and up again when one
+  goes. It leaves the way it came: when its six seconds are up (they do not
+  run while the pointer is on it), when it is clicked, or when it is thrown
+  -- dragged sideways it follows the hand, and let go far or fast enough it
+  flies off at the speed it was thrown; otherwise it springs home
+  (`em_spring_throw` hands a drag's place and speed to a spring;
+  `tools/banner_motion_smoke.py`).
 - **Scrolling.** A notch of the wheel moves where a view is going and the view
   glides there; notches 40 ms apart count three times. Pushed past an edge, the
   content gives (Apple's rubber-band curve) and springs back once the wheel is

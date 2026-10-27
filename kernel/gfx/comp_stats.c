@@ -20,6 +20,9 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"     /* sched_precise_lead_ns */
+#if defined(__x86_64__)
+#include "ipc/notify.h"
+#endif
 
 #define RING     512           /* recent composes kept for percentiles */
 #define FRAME_RING 256         /* recent frame intervals */
@@ -325,6 +328,16 @@ int comp_stats_command(const char *cmd)
         if (!n || n > 20) { kprintf("perf: slowmo <1-20>\n"); return 1; }
         compositor_slowmo(n);
         kprintf("perf: slowmo %u\n", n);
+        return 1;
+    }
+    if (!strncmp(cmd, "perf notice ", 12)) {
+        /* a system notice, as the kernel posts one: the banners' own test */
+#if defined(__x86_64__)
+        notify_system(0, cmd + 12, "Posted from the serial console.");
+        kprintf("perf: notice\n");
+#else
+        kprintf("perf: notice: no system notices on this architecture\n");   /* sessions are x86-only */
+#endif
         return 1;
     }
     if (!strncmp(cmd, "perf beat ", 10)) {
