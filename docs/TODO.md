@@ -74,7 +74,10 @@ the default target). Measured before and after every step
         any frame rate (c38f573; `make spring-test`).
   - [x] Window motion on springs: any number of windows at once, interruptible, into the window's
         own dock tile; GUI+M minimises; `perf slowmo` (dd046be; `tools/motion_smoke.py`).
-  - [ ] The ghost is scaled nearest-neighbour; bilinear filtering on the CPU path.
+  - [x] The ghost is filtered (bilinear) on the CPU path while the frame can afford it, six times
+        nearest's cost; nearest when frames cost over half the period (under TCG, always).
+  - [ ] A ghost shrinking far (into the dock) still aliases: bilinear reads 2 x 2 pixels, and at
+        a twentieth of the size a mip level is what is wanted.
   - [ ] Toolkit transitions, menus and toasts on springs.
   - [ ] Momentum scrolling with a rubber band; pixel-precise scrolling.
   - [ ] Pointer acceleration; a USB HID mouse driver; event timestamps for velocity.
