@@ -486,6 +486,22 @@ static void t10_inter(void) {
     float adv_a = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'A', 100)->advance_px;
     CHECK(g_kn == 2 && g_kx[1] > adv_a + av - 0.01f && g_kx[1] < adv_a + av + 0.01f,
           "the text walk puts V at A's advance plus the kerning");
+    /* a box exactly as wide as the kerned word holds all of it: the fit test
+     * once left the pair's kerning out and wrapped the last letter away
+     * ("Keyboar", "Slat" in Settings) */
+    const char *words[] = { "Keyboard", "Slate", "preview", "Update", "AVATAR" };
+    int whole = 1;
+    for (int i = 0; i < 5; i++) {
+        float w = 0; uint32_t prev = 0;
+        for (const char *p = words[i]; *p; p++) {
+            w += font_kern_px(f, prev, (uint32_t)*p, 14) + glyph_cache_lookup_or_rasterize(font_global_atlas(), f, (uint32_t)*p, 14)->advance_px;
+            prev = (uint32_t)*p;
+        }
+        if (font_layout_text(f, words[i], 14, w, NULL, NULL) != 1) { whole = 0; printf("        (\"%s\" wrapped at its own width %.3f)\n", words[i], w); }
+        g_kn = 0;
+        if (font_layout_text(f, words[i], 14, w, kern_visit, 0) != 1) whole = 0;
+    }
+    CHECK(whole, "a word in a box its own kerned width stays on one line, measured and drawn");
 }
 
 int main(void) {

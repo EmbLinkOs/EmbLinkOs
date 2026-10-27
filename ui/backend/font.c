@@ -1107,9 +1107,11 @@ int font_layout_text(struct font *f,const char *text,float size,float width,
         }
         while(p<end) {
             uint32_t cp;int n=font_utf8_decode(p,&cp);p+=n;scanned+=n;
-            float advance=layout_advance(f,cp,size);
-            if(width>0 && x>0 && x+advance>width+.01f){line++;x=0;prev=0;}
-            x+=font_kern_px(f,prev,cp,size);
+            /* the pair's kerning before the fit test: a box measured to the
+             * kerned width must hold its last glyph, not wrap it away */
+            float advance=layout_advance(f,cp,size),kern=font_kern_px(f,prev,cp,size);
+            if(width>0 && x>0 && x+kern+advance>width+.01f){line++;x=0;prev=0;kern=0;}
+            x+=kern;
             if(visit)visit(context,cp,x,line*line_height);
             x+=advance;prev=cp;
         }
