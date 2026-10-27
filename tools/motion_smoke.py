@@ -17,8 +17,13 @@ in the air: its kind, rect, opacity and target). It asserts:
              the air at once
   scroll     one notch of the wheel over Settings glides: several frames of
              motion, not one jump
+  slide      changing workspace (GUI+2, GUI+1) slides the windows: Settings
+             goes off to the left going up the spaces and comes back in from
+             the left going down, landing exactly where it was; switching
+             back mid-slide turns it round in flight
 
-and captures frames mid-flight. --arch aarch64 runs it on arm64 under HVF.
+and captures frames mid-flight. --arch aarch64 runs it on arm64 under HVF;
+--graphics virgl composes on the host's GPU (Linux, as tools/virgl_smoke.py).
 """
 import argparse
 import tempfile
@@ -31,7 +36,8 @@ MIN_LIGHT = (52, 16)        # the minimise light, from the window's top-left (ui
 
 
 def state(d):
-    """Windows by title, ghosts in the air, and the dock's tiles by app."""
+    """Windows by title, ghosts in the air, and the dock's tiles by app; the
+    workspace shown is left in d.space."""
     text = d.g.command('perf windows', b'perf: end', 60)
     wins, ghosts, dock = {}, [], {}
     for line in text.splitlines():
@@ -39,8 +45,10 @@ def state(d):
             continue
         kind, _, rest = line[6:].partition(' ')
         pairs = dict(kv.split('=', 1) for kv in rest.split() if '=' in kv)
-        if kind == 'window':
-            wins[pairs['title'].replace('_', ' ')] = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h')}
+        if kind == 'workspace':
+            d.space = int(pairs['now'])
+        elif kind == 'window':
+            wins[pairs['title'].replace('_', ' ')] = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'space')}
         elif kind == 'ghost':
             g = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'alpha')}
             g['kind'], g['app'] = pairs['kind'], pairs['app']
@@ -84,6 +92,18 @@ def frame_rect(win):
     return [win['x'], win['y'], win['w'], win['h']]
 
 
+def settle(d, space, seconds=10.0):
+    """Wait for `space` to be the one shown with nothing in the air; returns
+    the ghosts seen on the way."""
+    seen, end = [], time.monotonic() + seconds
+    while time.monotonic() < end:
+        wins, ghosts, _ = state(d)
+        seen.extend(ghosts)
+        if d.space == space and not ghosts:
+            return seen, wins
+    raise AssertionError(f'space {space} did not settle: shown {d.space}, ghosts {ghosts}')
+
+
 def near(a, b, tol=3):
     return all(abs(x - y) <= tol for x, y in zip(a, b))
 
@@ -103,6 +123,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--arch', choices=('x86_64', 'aarch64'), default='x86_64')
     ap.add_argument('--accel', choices=('hvf', 'tcg'), default='hvf', help='aarch64 only')
+    ap.add_argument('--graphics', choices=('virtio', 'virgl'), default='virtio', help='x86_64 only')
     args = ap.parse_args()
     out = Path(tempfile.mkdtemp(prefix='emblink-motion-'))
     print(f'Logs and captures: {out}', flush=True)
@@ -196,6 +217,57 @@ def main():
         watch(d, 'settings.elf'); watch(d, 'term.elf')
         print('together: two ghosts in the air at once', flush=True)
 
+        # SLIDE: Settings back out on space 1, then the spaces changed under it
+        tap(d, tile[0] + tile[2] // 2, tile[1] + tile[3] // 2)
+        _, win = until_back(d, 'Settings', 'settings.elf')
+        assert win and win['space'] == 0, f'Settings is not back on the first space: {win}'
+        home = frame_rect(win)
+        d.key('meta_l-2')                   # up a space: it leaves to the left
+        flight, wins = settle(d, 1)
+        out_ = [g for g in flight if g['app'] == 'settings.elf']
+        assert out_ and all(g['kind'] == 'slide-out' for g in out_), f'going up a space, Settings did not slide out: {flight}'
+        assert all(g['to'][1:] == home[1:] and g['to'][0] + g['to'][2] <= 0 for g in out_), \
+            f'it was not aimed off the left of the screen: {out_[0]["to"]} from {home}'
+        xs = [g['x'] for g in out_]
+        assert xs == sorted(xs, reverse=True) and all(g['w'] == home[2] and g['alpha'] == 255 for g in out_), \
+            f'it did not slide steadily left, whole: {[(g["x"], g["w"], g["alpha"]) for g in out_]}'
+        assert frame_rect(wins['Settings']) == home and wins['Settings']['space'] == 0, \
+            f'the slide moved the window itself: {wins["Settings"]} vs {home}'
+        print(f'slide: up a space, Settings slid out left over {len(out_)} samples, x {xs[0]} -> {xs[-1]}', flush=True)
+        d.key('meta_l-1')                   # down again: it comes back from the left
+        flight, wins = settle(d, 0)
+        in_ = [g for g in flight if g['app'] == 'settings.elf']
+        assert in_ and all(g['kind'] == 'slide-in' and g['to'] == home for g in in_), \
+            f'coming back, Settings did not slide in to {home}: {in_}'
+        xs = [g['x'] for g in in_]
+        assert xs == sorted(xs) and xs[0] < home[0], f'it did not come in from the left: {xs}'
+        assert frame_rect(wins['Settings']) == home, f'Settings did not land where it was: {wins["Settings"]}'
+        print(f'slide: down again, in from the left over {len(in_)} samples, landed at {home}', flush=True)
+        # interrupted: up and straight back down -- it turns round mid-slide
+        n0 = len(d.g.seen)
+        d.key('meta_l-2')                   # (sends, then waits 0.2 s)
+        d.key('meta_l-1')
+        d.g.wait(b'workspace slide turned around in flight', 20, start=n0)
+        _, wins = settle(d, 0)
+        assert frame_rect(wins['Settings']) == home, \
+            f'interrupted, Settings did not land where it was: {wins["Settings"]} vs {home}'
+        print('slide: switched back mid-slide, it turned round and landed home', flush=True)
+        # and photographed on the way, ten times slower
+        d.g.command('perf slowmo 10', b'perf: slowmo', 60)
+        d.key('meta_l-2')
+        slides, end = [], time.monotonic() + 30
+        while len(slides) < 6 and time.monotonic() < end:
+            _, ghosts, _ = state(d)
+            mine = [g for g in ghosts if g['app'] == 'settings.elf']
+            if not mine:
+                break
+            path = d.g.capture(out / f'slide-{len(slides)}.ppm')
+            slides.append(f"{path} (Settings at x {mine[-1]['x']})")
+            time.sleep(0.5)
+        d.g.command('perf slowmo 1', b'perf: slowmo', 60)
+        d.key('meta_l-1'); settle(d, 0)
+        print('slide captures:\n  ' + '\n  '.join(slides), flush=True)
+
         # FRAMES MID-FLIGHT, for the record: Settings restored, then parked
         # again ten times slower (`perf slowmo`, the same motion) and
         # photographed on the way into its tile
@@ -217,7 +289,8 @@ def main():
     finally:
         d.g.close()
     print('PASS: a window parks into its own dock tile and comes back out of it, turns around '
-          'mid-flight when interrupted, and two windows move at once', flush=True)
+          'mid-flight when interrupted, two windows move at once, and changing workspace slides '
+          'the windows, turning round when switched back mid-slide', flush=True)
 
 
 if __name__ == '__main__':

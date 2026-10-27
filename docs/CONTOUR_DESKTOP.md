@@ -181,7 +181,7 @@ be turned around mid-way from where it is, at the speed it has.
 | Token | Response, damping | Used by |
 |---|---|---|
 | snappy | 250 ms, 0.9 | the close pull's spring back, the toast |
-| smooth | 350 ms, 1.0 | a window's flight to and from the dock |
+| smooth | 350 ms, 1.0 | a window's flight to and from the dock; the workspace slide |
 | bouncy | 450 ms, 0.7 | reserved for the dock's launch bounce (P5) |
 | (open) | 240 ms, 0.9 | a window opening |
 | (close) | 200 ms, 1.0 | a window closing: decisive, never overshooting |
@@ -194,6 +194,17 @@ be turned around mid-way from where it is, at the speed it has.
   or coming back takes clicks and keys at its real place while its ghost is in
   the air. GUI+M minimises the front window. `perf slowmo N` slows every window
   motion N times; `tools/motion_smoke.py` watches them in flight.
+- **Workspaces.** Changing space slides: the space being left goes off one
+  side while the next comes in from the other -- leftwards going up the
+  spaces, as on the Mac -- whether the change came from the keys, the top
+  bar's Space menu or the dock (an app whose window is on another space). Each window is drawn as
+  itself, shadow, corners and material, wherever its four springs have got
+  to, so it lands without a seam; a translucent window carries the blur it
+  kept rather than blurring again under itself as it moves. Switched back
+  mid-slide, the windows turn round in flight. The windows coming in take
+  clicks and keys at their real places from the start. Reduced motion
+  changes space at once. With several monitors the desktop slides as one
+  strip.
 - **Scrolling.** A notch of the wheel moves where a view is going and the view
   glides there; notches 40 ms apart count three times. Pushed past an edge, the
   content gives (Apple's rubber-band curve) and springs back once the wheel is

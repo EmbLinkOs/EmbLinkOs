@@ -190,7 +190,7 @@ def boot(args, out):
     else:
         disk = out / 'perf.img'
         shutil.copyfile(ROOT / 'uefi-usb.img', disk)
-        d = Desktop(out / 'guest', disk)
+        d = Desktop(out / 'guest', disk, graphics=getattr(args, 'graphics', 'virtio'))
     return d
 
 

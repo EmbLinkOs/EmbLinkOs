@@ -129,8 +129,27 @@ the default target). Measured before and after every step
         settled, most likely. Watch it.
   - [ ] The token pass and a light/dark audit.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
-      A double click on a title bar should zoom the window as on macOS, now that the
-      compositor owns the drag that the first click starts.
+  - [x] Apps have springs of their own: `em_spring(id, from, to, response, damping)` and the
+        EmSnappy/EmSmooth/EmBouncy tokens (`make em-test`).
+  - [x] The library (launcher) comes in and goes out on a spring over its scrim, its tiles
+        staggered; closing hands input back at once, so a dock click during it is not lost.
+  - [x] Glass inside an opacity group frosts what the group lands on, not its empty scratch.
+  - [x] Changing workspace slides the spaces: the one left goes off one side while the next comes
+        in from the other, each window drawn as itself (shadow, corners, material) on four
+        springs; switching back mid-slide turns them round in flight. The keys, the top bar's
+        Space menu and the dock all slide (`tools/motion_smoke.py`: x86 and arm64 on the CPU,
+        and `--graphics virgl` on the GPU path in the Lima VM; gallery 217). A translucent window
+        carries the blur it kept while it slides rather than blurring again under itself.
+  - [ ] With several monitors the desktop slides as one strip: a window crosses its neighbour
+        on the way. Per-display spaces (the Mac's default) would need a space per output.
+  - [ ] Traffic lights that show their glyphs only on hover were not adopted: Contour draws
+        them always, by design (CONTOUR_DESKTOP.md). Revisit only with the design.
+  - [ ] Dock: a spring hover plate and a launch bounce (the bouncy token is reserved for it).
+  - [ ] Notifications: a spring slide, stacking, and dismissal by a flick.
+  - [ ] Menu bar popovers that scale in on a spring.
+  - [ ] A double click on a title bar should zoom the window as on macOS, now that the
+        compositor owns the drag that the first click starts. Live resize (the compositor
+        scaling the old buffer until the app catches up).
 - [ ] P6 Overview, touchpad gestures, tiling previews.
 
 ## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
