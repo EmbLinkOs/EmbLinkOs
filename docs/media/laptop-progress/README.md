@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-223 actual EmbLinkOS captures document the original laptop work, its
+224 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, and every window at once. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, and a tile shown before it is taken. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -113,6 +113,12 @@ The Applications library in the reduced effects tier (`perf effects reduced`; Se
 GUI+Up: the overview. Settings and the Terminal, each flown on springs to a place of its own over the dimmed desktop -- the windows themselves, scaled and live, with their corners and shadows. A click on one brings it in front as both fly home; Esc leaves them as they were. Under TCG.
 
 ![The EmbLinkOS overview: the Settings and Terminal windows side by side, scaled down, over a dimmed desktop](223-overview.png)
+
+### Where it will go
+
+Settings dragged by its bar against the left edge and held: the outline of the left half it will take when let go, over the window, and the accent's wash under it. Let go, it flies there. Under TCG.
+
+![The EmbLinkOS Settings window held against the left edge, with an accent outline marking the left half of the screen](224-tile-preview.png)
 
 ## The prompt, Powerlevel10k-style
 

@@ -4397,6 +4397,26 @@
       "featured": false,
       "milestone": "Fluid desktop P6: advanced",
       "historical": false
+    },
+    {
+      "id": "224-tile-preview",
+      "phase": "Fluid desktop",
+      "title": "Where it will go",
+      "caption": "Settings dragged by its bar against the left edge and held: the outline of the left half it will take when let go, over the window, and the accent's wash under it. Let go, it flies there. Under TCG.",
+      "alt": "The EmbLinkOS Settings window held against the left edge, with an accent outline marking the left half of the screen",
+      "file": "224-tile-preview.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "43f1317ce421e79a3e36681b0546996d025ed1f8533d6b175584cf38e7d6cd92",
+      "source_capture": "emblink-tile-blmwvhsz/tile-left.ppm",
+      "source_sha256": "cc8c62ce67c09c34ba73ccecc39b89b931e6d582082a0b1df17beefa0b5f35a5",
+      "source_commit": "e076bd9",
+      "featured": false,
+      "milestone": "Fluid desktop P6: advanced",
+      "historical": false
     }
   ]
 }
