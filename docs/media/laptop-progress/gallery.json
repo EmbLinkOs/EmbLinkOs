@@ -4337,6 +4337,26 @@
       "featured": false,
       "milestone": "Fluid desktop P5: shell",
       "historical": false
+    },
+    {
+      "id": "221-zoom",
+      "phase": "Fluid desktop",
+      "title": "Zooming",
+      "caption": "A double click on Settings' bar, photographed as the window zooms to fill the work area: drawn from its new pixels, on its way from the old frame to the new on a spring, with its rounded corners and shadow. Slowed ten times (`perf slowmo 10`) to be photographed; scaled nearest-neighbour here because frames under TCG are too dear for filtering. Under TCG.",
+      "alt": "The EmbLinkOS Settings window, nearly filling the screen, part-way through zooming to the full work area",
+      "file": "221-zoom.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU x86_64 (TCG), 2 CPUs, UEFI, disposable NVMe; virtio-vga 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "7d1e1d2aa0dc2e3bfcc9d74717fbce92e25d17d5d8302d795e6d77e238743eda",
+      "source_capture": "emblink-motion-t2do4fby/zoom-1.ppm",
+      "source_sha256": "357b7eaae1a1b7beb103aae64c04b0b24659b3f4abf69cf070fe710bdc701dae",
+      "source_commit": "5cde636",
+      "featured": false,
+      "milestone": "Fluid desktop P5: shell",
+      "historical": false
     }
   ]
 }
