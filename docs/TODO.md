@@ -144,7 +144,14 @@ the default target). Measured before and after every step
         on the way. Per-display spaces (the Mac's default) would need a space per output.
   - [ ] Traffic lights that show their glyphs only on hover were not adopted: Contour draws
         them always, by design (CONTOUR_DESKTOP.md). Revisit only with the design.
-  - [ ] Dock: a spring hover plate and a launch bounce (the bouncy token is reserved for it).
+  - [x] Dock: one pointer's plate that glides from tile to tile (snappy), and an icon that hops
+        while its app starts (bouncy) until the app's window is up (`tools/dock_motion_smoke.py`,
+        both arches; gallery 218-219). The plate the dock was designed with had never appeared:
+        the hovered tile was asked for before the dock's rect was known that frame, so it was
+        always none; what showed was the icon button's own highlight, now quiet in the dock.
+  - [ ] The hop starts when the spawn call returns: the desktop renders nothing while it is in
+        `embk_spawn_env`, which under TCG is seconds after the click. Spawning off the render
+        loop would let the icon answer the click itself.
   - [ ] Notifications: a spring slide, stacking, and dismissal by a flick.
   - [ ] Menu bar popovers that scale in on a spring.
   - [ ] A double click on a title bar should zoom the window as on macOS, now that the

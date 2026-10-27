@@ -901,6 +901,10 @@ bool em_image_button_tinted(const char *path, float size, Color tint);
 bool em_image_button_key(const char *path, float size, uint64_t key);
 #define ImageButtonKey(path, size, key) \
     em_image_button_key((path), (size), (uint64_t)(uintptr_t)(key))
+/* Image buttons built while this is on do not light on hover (a press still
+ * shades them): for a surface that draws its own hover, as the dock's plate
+ * does. Turn it off again after. */
+void em_quiet_hover(bool on);
 void em_background_image(const char *path);
 #define BackgroundImage(path) em_background_image(path)
 void em_theme_use(EmTheme t);

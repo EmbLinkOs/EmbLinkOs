@@ -3039,6 +3039,17 @@ void em_image_view(const char *path, EmProps p) {
     ui_image((uint64_t)(uintptr_t)px, px, w, h, p.height > 0 ? p.height : (float)h);
 }
 
+static bool g_quiet_hover;
+void em_quiet_hover(bool on) { g_quiet_hover = on; }
+/* An image button's plate: shaded while pressed, lit while hovered (unless
+ * the surface around it draws its own hover), clear otherwise -- always set:
+ * a highlight set only on hover is retained and stays lit after the pointer
+ * leaves. */
+static struct paint image_button_paint(bool hov, bool pressed) {
+    if (hov && (pressed || !g_quiet_hover)) return solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f));
+    return solid((Color){0, 0, 0, 0});
+}
+
 bool em_image_button_key(const char *path, float size, uint64_t key) {
     em_flush();
     uint32_t w = 0, h = 0;
@@ -3056,10 +3067,7 @@ bool em_image_button_key(const char *path, float size, uint64_t key) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_corner_radius(12);
-    /* ALWAYS set the paint: a hover highlight set only on hover is retained and
-     * would stay lit after the pointer leaves. Transparent when not hovered. */
-    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
-                     : solid((Color){0, 0, 0, 0}));
+    ui_set_paint(image_button_paint(hov, pressed));
     /* The leaf's key must be STABLE, and the pixel pointer is not: it names
      * the mip level, and an icon that magnifies swaps levels as it swells. A
      * key that changes destroys and recreates the instance -- and a press edge
@@ -3100,8 +3108,7 @@ bool em_image_button_tinted(const char *path, float size, Color tint) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_corner_radius(10);
-    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
-                     : solid((Color){0, 0, 0, 0}));
+    ui_set_paint(image_button_paint(hov, pressed));
     /* The leaf retains its identity across live tint and mip changes. The
      * scene setter already marks changed stencil colour as damaged content. */
     ui_image_sized_tinted(0x1CA7, px, w, h, inner, inner, tint);

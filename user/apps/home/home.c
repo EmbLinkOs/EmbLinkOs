@@ -561,6 +561,7 @@ static const char *monochrome_icon(const char *path) {
     return "/system/images/ui-grid.eic";
 }
 
+static float g_icon_dx, g_icon_dy;   /* a dock icon's launch hop (dock_hop), for the next drag_icon */
 static void drag_icon(struct app_item it, int size, int kind, int idx) {
     /* Key by the app's IDENTITY (its unique path), NOT its slot index. When the
      * list shifts (remove/reorder), an index-keyed instance gets reused for a
@@ -573,8 +574,11 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
     ui_set_align(ALIGN_CENTER);
     /* ALWAYS set opacity, so an instance never stays dimmed after its drag ends */
     ui_set_opacity((g_drag == kind && g_drag_i == idx && g_drag_moved) ? 0.3f : 1.0f);
+    ui_set_offset(g_icon_dx, g_icon_dy);   /* always: an instance never keeps an old hop */
+    em_quiet_hover(kind == 2);               /* the dock's plate is its hover */
     if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(it.icon),size,kind==1?g_desk_ink:ui_theme()->text);
     else ImageButton(it.icon, size);         /* styling only; click/drag handled below */
+    em_quiet_hover(false);
     if (ui_is_active()) {
         g_any_active = 1;
         float px, py; ui_pointer_pos(&px, &py);
@@ -594,6 +598,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
 /* The dock: a centered pill sized to its apps. Captures its own world rect so
  * the drop can hit-test against it. */
 static int dock_running(const char *path);   /* below, with g_running */
+static int dock_launching(const char *path);
 static void wins_poll(void);                 /* likewise: the live window list */
 
 /* THE DOCK DOES NOT REACT TO THE POINTER. It reacts to the MACHINE.
@@ -616,7 +621,9 @@ static void wins_poll(void);                 /* likewise: the live window list *
  *     behind its icon. Not a dot underneath: the dot is a footnote, and
  *     whether an app is running is the single most useful thing this strip
  *     knows. A socket is visible from across the room;
- *   * the pointer gets a quiet backplate, nothing more.
+ *   * the pointer gets a quiet backplate, nothing more -- one plate that
+ *     glides from tile to tile (dock_hover_plate). The one motion an icon
+ *     makes is AFTER the click: a hop while its app starts (dock_hop).
  *
  * What has NOT changed: the floating label that names the icon under the
  * pointer. Every dock ever built names what you point at, because dock art is
@@ -897,9 +904,63 @@ static void dock_label(void) {
     ui_end_stack();
 }
 
+/* Each tile's rect, as last laid out: where the plate goes. */
+#define DOCK_MAX ((int)(sizeof g_dock / sizeof g_dock[0]))
+static float g_tile[DOCK_MAX][4];
+
+/* THE POINTER'S PLATE: one quiet plate under the tile the pointer is over,
+ * gliding from tile to tile on a spring as the pointer runs along the dock --
+ * the plate moves, the icons never do -- and fading at the dock's ends. Back
+ * from outside the dock, it appears where it is wanted rather than sliding in
+ * from where it was left. A first child out of flow (placed from the dock's
+ * own corner: the stack the dock sits in carries the dock's position), so it
+ * is drawn under the tiles -- over a running app's lit socket it slides
+ * beneath it. */
+static void dock_hover_plate(int hov) {
+    const struct ui_theme *t = ui_theme();
+    static int last = -1, gen;
+    static char id[2][24];
+    float a = em_spring("dock.plate", 0, hov >= 0 ? 1.f : 0.f, EmSnappy);
+    if (hov >= 0 && hov < DOCK_MAX && g_tile[hov][2] > 0) {
+        if (last < 0 || a < .05f) gen++;            /* it was gone: no slide in */
+        last = hov;
+    }
+    if (last < 0 || a < .01f) return;
+    snprintf(id[0], sizeof id[0], "dock.plate.x%d", gen);
+    snprintf(id[1], sizeof id[1], "dock.plate.y%d", gen);
+    float x = em_spring(id[0], g_tile[last][0], g_tile[last][0], EmSnappy);
+    float y = em_spring(id[1], g_tile[last][1], g_tile[last][1], EmSnappy);
+    Color fill = t->surface_alt, edge = t->border_strong;
+    fill.a *= a; edge.a *= a;
+    ui_begin_vstack(0x9a7e);
+    ui_set_overlay(true); ui_set_hit_passthrough(true);
+    ui_set_size((struct layout_size){.mode = SIZE_FIXED, .fixed_value = g_tile[last][2]},
+                (struct layout_size){.mode = SIZE_FIXED, .fixed_value = g_tile[last][3]});
+    ui_set_offset(x - g_dockr[0], y - g_dockr[1]);
+    ui_set_paint((struct paint){.kind = PAINT_SOLID, .solid = fill});
+    ui_set_corner_radius(10); ui_set_border(1, edge);
+    ui_end_stack();
+}
+
+/* THE LAUNCH HOP: the one time a dock icon moves -- after the click, never
+ * under the aim. While its app starts the icon hops on the bouncy spring,
+ * until the app puts a window up (or LAUNCH_HOP_MS pass), and settles where
+ * it always was. A click whose answer takes a second has to be seen to have
+ * landed; the socket alone lights only once there is a process. */
+#define LAUNCH_HOP_PX 12.0f
+static float dock_hop(int i, const char *path) {
+    static int up[DOCK_MAX];
+    if (i < 0 || i >= DOCK_MAX) return 0;
+    char id[16]; snprintf(id, sizeof id, "dock.hop%d", i);
+    float y = em_spring(id, 0, up[i] ? -LAUNCH_HOP_PX : 0, EmBouncy);
+    if (up[i] && y <= -LAUNCH_HOP_PX * .9f) up[i] = 0;          /* over the top: fall */
+    else if (!up[i] && y >= -1.f && dock_launching(path)) up[i] = 1;   /* landing: again */
+    return y;
+}
+
 static void dock_pill(void) {
     const struct ui_theme *t = ui_theme();
-    int hov = dock_hover_index();
+    int hov;
 
     /* THE RACK. Not a pill: corner 14 against the pill's 20, which is the
      * theme's own radius_lg -- the same curve every card and panel in the OS
@@ -919,6 +980,11 @@ static void dock_pill(void) {
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
           if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; dock_publish_targets(); } }
+        /* AFTER the rect: each frame starts without one (home_ui), so asked
+         * before this the dock never knew the pointer was over it -- the
+         * pointer's plate this dock was designed with never once appeared */
+        hov = dock_hover_index();
+        dock_hover_plate(hov);
         for (int i = 0; i < g_dock_n; i++) {
             int running = dock_running(g_dock[i].app);
             int over    = (i == hov) && !g_drag;
@@ -944,11 +1010,7 @@ static void dock_pill(void) {
                 edge   = t->border_strong;
                 edge_w = 1;
             }
-            if (over) {
-                plate  = t->surface_alt;
-                edge   = running && g_cfg.dock_dots ? t->accent : t->border_strong;
-                edge_w = 1;
-            }
+            if (over && running && g_cfg.dock_dots) edge = t->accent;   /* the plate is dock_hover_plate's */
 
             /* FIXED-width slot: the tile never moves and never resizes, so the
              * press you aimed is the press that lands. (The Mac trades this
@@ -957,7 +1019,15 @@ static void dock_pill(void) {
             VStack(.width = DOCK_SLOT_W, .height = DOCK_SLOT_W + 6, .align = Center,
                    .justify = Center, .corner = 10, .background = plate,
                    .border = edge_w, .border_color = edge) {
+                float sx, sy, sw, sh;
+                if (ui_open_rect(&sx, &sy, &sw, &sh)) {
+                    g_tile[i][0] = sx; g_tile[i][1] = sy; g_tile[i][2] = sw; g_tile[i][3] = sh;
+                }
+                float hop = dock_hop(i, g_dock[i].app);   /* away from the screen's edge */
+                g_icon_dx = g_cfg.dock_edge == 1 ? -hop : g_cfg.dock_edge == 2 ? hop : 0;
+                g_icon_dy = g_cfg.dock_edge ? 0 : hop;
                 drag_icon(g_dock[i], (int)DOCK_BASE, 2, i);
+                g_icon_dx = g_icon_dy = 0;
                 HStack(.width=running && g_cfg.dock_dots?12:1,.height=2,.background=running && g_cfg.dock_dots?t->accent:T.clear,.corner=1) {}
             }
         }
@@ -1619,6 +1689,7 @@ static struct {
     char start_dir[256];    /* "" = none; distinguishes independent Files shortcuts */
     int  used;
     int  handle_p1;
+    uint64_t launched_ms;   /* when the dock started it: its icon hops till a window comes */
 } g_running[MAX_TRACKED];
 
 /* WHAT IS ACTUALLY ON SCREEN, as opposed to what this process remembers
@@ -1671,6 +1742,18 @@ static uint32_t win_pid_for(const char *path) {
  *
  * The dock's job is to say what is running on the machine, not what this
  * particular process happens to have started. */
+/* Started from here a moment ago, alive, and with no window up yet. */
+#define LAUNCH_HOP_MS 4000u
+static int dock_launching(const char *path) {
+    if (!path) return 0;
+    uint64_t now = embk_uptime_ms();
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (g_running[i].used && g_running[i].handle_p1 > 0 && !strcmp(g_running[i].path, path) &&
+            now - g_running[i].launched_ms < LAUNCH_HOP_MS && embk_proc_alive(g_running[i].handle_p1 - 1) == 1)
+            return win_pid_for(path) == 0;
+    return 0;
+}
+
 static int dock_running(const char *path) {
     if (!path) return 0;
     for (int i = 0; i < MAX_TRACKED; i++)
@@ -1820,6 +1903,7 @@ static void spawn_app(const char *path, const char *start_dir) {
         snprintf(g_running[slot].start_dir, sizeof g_running[slot].start_dir, "%s", sd);
         g_running[slot].used = 1;
         g_running[slot].handle_p1 = h + 1;
+        g_running[slot].launched_ms = embk_uptime_ms();
     }
     else {
         char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h);

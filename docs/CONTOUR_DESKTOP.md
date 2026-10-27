@@ -180,9 +180,9 @@ be turned around mid-way from where it is, at the speed it has.
 
 | Token | Response, damping | Used by |
 |---|---|---|
-| snappy | 250 ms, 0.9 | the close pull's spring back, the toast |
+| snappy | 250 ms, 0.9 | the close pull's spring back, the toast, the dock's plate |
 | smooth | 350 ms, 1.0 | a window's flight to and from the dock; the workspace slide |
-| bouncy | 450 ms, 0.7 | reserved for the dock's launch bounce (P5) |
+| bouncy | 450 ms, 0.7 | the dock's launch hop |
 | (open) | 240 ms, 0.9 | a window opening |
 | (close) | 200 ms, 1.0 | a window closing: decisive, never overshooting |
 | (scroll) | 180 ms, 1.0 | the wheel's glide |
@@ -205,6 +205,13 @@ be turned around mid-way from where it is, at the speed it has.
   clicks and keys at their real places from the start. Reduced motion
   changes space at once. With several monitors the desktop slides as one
   strip.
+- **The dock.** Its icons still never move under the aim and never swell.
+  The pointer's plate is one plate that glides from tile to tile on a spring
+  as the pointer runs along the dock, fading at its ends; the icon button
+  inside does not light a second one (`em_quiet_hover`). The one time an
+  icon moves is after the click: it hops while its app starts, until the
+  app's window is up (at most four seconds), and settles where it was
+  (`tools/dock_motion_smoke.py`).
 - **Scrolling.** A notch of the wheel moves where a view is going and the view
   glides there; notches 40 ms apart count three times. Pushed past an edge, the
   content gives (Apple's rubber-band curve) and springs back once the wheel is
