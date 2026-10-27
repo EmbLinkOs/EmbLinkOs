@@ -283,12 +283,24 @@ static int on_workspace(const struct comp_window *w) {
  * before it was removed for looking like a screenshot artefact. Depth is the
  * signal: the front window casts a deeper, wider shadow than the ones behind
  * it, exactly as stacked paper does. */
-#define SHADOW_W_FOCUS  16  /* band width, focused                          */
-#define SHADOW_W_IDLE   11  /* ...and unfocused: shallower, still grounded  */
-#define SHADOW_A_FOCUS  74 /* peak alpha at the window edge (0-255)        */
-#define SHADOW_A_IDLE    38
-#define SHADOW_DY        3  /* cast DOWNWARD: light comes from above        */
-#define SHADOW_PAD (SHADOW_W_FOCUS + SHADOW_DY + 2)   /* repaint growth     */
+/* TWO LAYERS, as a lit object casts them: a KEY shadow, wide, soft and well
+ * below the window (the light is above and in front), and an AMBIENT one,
+ * tight around the edge where the window meets the surface. One band alone is
+ * either a halo or a smudge. Rounded with the window's corners -- the band
+ * this replaces was square-cornered, a rectangle's shadow under a rounded
+ * window. The front window floats higher: a deeper, wider key. */
+static const struct fb_shadow_layer SHADOW_FOCUS[2] = { { 14, 40, 64 }, { 1, 6, 50 } };
+static const struct fb_shadow_layer SHADOW_IDLE[2]  = { {  8, 26, 40 }, { 1, 4, 34 } };
+#define SHADOW_PAD (40 + 14 + 2)   /* repaint growth: the widest key's reach */
+/* this window's layers, at the desktop's shadow strength (0 none, 2 strong) */
+static int shadow_layers(int focused, struct fb_shadow_layer out[2]) {
+    const struct fb_shadow_layer *s = focused ? SHADOW_FOCUS : SHADOW_IDLE;
+    for (int i = 0; i < 2; i++) {
+        out[i] = s[i];
+        out[i].peak = s[i].peak * (g_desktop.shadows == 2 ? 3u : 2u) / 2u;
+    }
+    return g_desktop.shadows ? 2 : 0;
+}
 #define WORK_TOP ((int)g_desktop.top)         /* universal system/status bar */
 #define WORK_BOTTOM ((int)g_desktop.bottom)      /* desktop taskbar */
 
@@ -677,16 +689,6 @@ struct corner_box {
 static struct corner_box g_corner[4];
 static int g_corner_n;
 
-static uint32_t isqrt32(uint32_t x) {
-    uint32_t r = 0, b = 1u << 30;
-    while (b > x) b >>= 2;
-    while (b) {
-        if (x >= r + b) { x -= r + b; r = (r >> 1) + b; }
-        else r >>= 1;
-        b >>= 2;
-    }
-    return r;
-}
 
 /* The four corner boxes of a window's frame, and their arc centres. */
 static int corner_boxes(const struct comp_window *w, int bx[4], int by[4],
@@ -738,8 +740,6 @@ static void corners_carve(const struct comp_window *w, int focused) {
     const int rr8 = (r * 8) * (r * 8);          /* radius^2 in eighth-pixels  */
     int has_border = (!w->desktop && !w->chromeless);
     fb_color_t bcol = focused?g_desktop.accent:g_desktop.text;
-    int sw = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-    int sa = g_desktop.shadows?(focused?SHADOW_A_FOCUS:SHADOW_A_IDLE)*(g_desktop.shadows==2?3:2)/2:0;
 
     for (int i = 0; i < g_corner_n; i++) {
         struct corner_box *c = &g_corner[i];
@@ -757,22 +757,13 @@ static void corners_carve(const struct comp_window *w, int focused) {
                 }
                 if (cov == 16) continue;              /* untouched interior */
 
+                /* the backdrop, saved after the shadow was drawn -- which
+                 * reaches under the arc (fb_shadow_layers), so it is carried
+                 * around the curve already */
                 uint32_t bak = c->px[(y - c->y0) * r + (x - c->x0)];
                 uint32_t cur = fb_get_pixel((uint32_t)x, (uint32_t)y);
                 int br = (int)((bak >> 16) & 255), bg = (int)((bak >> 8) & 255),
                     bb = (int)(bak & 255);
-
-                /* carry the drop shadow AROUND the arc: outside the curve this
-                 * pixel is no longer window, so it owes the same darkening its
-                 * neighbours outside the frame already got. */
-                int hx = (x - c->cx) * 2 + 1, hy = (y - c->cy) * 2 + 1;
-                int dout = (int)isqrt32((uint32_t)(hx * hx + hy * hy)) - r * 2;
-                if (dout > 0 && win_shadows(w)) {
-                    int a = sa - sa * dout / (sw * 2);
-                    if (a > 0) { br = br * (255 - a) / 255;
-                                 bg = bg * (255 - a) / 255;
-                                 bb = bb * (255 - a) / 255; }
-                }
 
                 int cr = (int)((cur >> 16) & 255), cg = (int)((cur >> 8) & 255),
                     cb = (int)(cur & 255);
@@ -1308,13 +1299,11 @@ static void paint_window(struct comp_window *w, int focused,
     /* what is behind a window that shows through, before it casts its shadow */
     if (mat_blurs(w)) mat_capture(w, rx0, ry0, rx1, ry1);
 
-    /* the drop shadow: drawn first (outside the frame) so the window content
-     * lands on top of it, offset downward, and deeper while focused. */
+    /* the shadow: drawn first so the window lands on top of it -- and under
+     * its corners' arcs, so the carve below finds it already in the backdrop */
     if (shadow && g_desktop.shadows) {
-        int sw_  = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-        int sa_  = (focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE) * (g_desktop.shadows==2?3:2)/2;
-        fb_glow_rect(fx0, fy0 + SHADOW_DY, fx1, fy1 + SHADOW_DY, sw_,
-                     0, 0, 0, (uint8_t)sa_, rx0, ry0, rx1, ry1);
+        struct fb_shadow_layer sl[2];
+        fb_shadow_layers(fx0, fy0, fx1, fy1, WIN_RADIUS, sl, shadow_layers(focused, sl), rx0, ry0, rx1, ry1);
     }
 
     /* stash the corner backdrops NOW: everything below this line overwrites
@@ -1649,10 +1638,12 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
     uint32_t ring_rgb = focused ? g_desktop.accent : g_desktop.text;
 
     if (shadow && g_desktop.shadows) {
-        int sw_ = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-        int sa_ = (focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE) * (g_desktop.shadows == 2 ? 3 : 2) / 2;
-        struct gpu_rect cast = { fx0, fy0 + SHADOW_DY, fx1 - fx0, fy1 - fy0 };
-        gc->shadow(&cast, &frame, radius, (uint32_t)sw_, (uint32_t)sa_);
+        struct fb_shadow_layer sl[2];
+        int nl = shadow_layers(focused, sl);
+        for (int i = 0; i < nl; i++) {          /* the CPU's two layers, one call each */
+            struct gpu_rect cast = { fx0, fy0 + sl[i].dy, fx1 - fx0, fy1 - fy0 };
+            gc->shadow(&cast, &frame, radius, (uint32_t)sl[i].width, sl[i].peak);
+        }
     }
 
     if (chrome) {

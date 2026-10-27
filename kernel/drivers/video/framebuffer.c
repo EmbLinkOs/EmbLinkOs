@@ -770,6 +770,113 @@ void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius) 
     kfree(b); kfree(a);
 }
 
+/* ---- the window shadow (see framebuffer.h) ---- */
+static uint32_t isqrt_u32(uint32_t v) {
+    uint32_t r = 0, b = 1u << 30;
+    while (b > v) b >>= 2;
+    while (b) {
+        if (v >= r + b) { v -= r + b; r = (r >> 1) + b; }
+        else r >>= 1;
+        b >>= 2;
+    }
+    return r;
+}
+
+/* Signed distance from pixel (x, y)'s centre to a rounded rect, in 1/16 px:
+ * negative inside. Inside the straight part it reports -r, which is all a
+ * shadow needs to know (fully under it). */
+static inline int32_t rr_sdf16(int32_t x, int32_t y, int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t r) {
+    int32_t X = x * 16 + 8, Y = y * 16 + 8;
+    int32_t ax = (x0 + r) * 16, bx = (x1 - r) * 16, ay = (y0 + r) * 16, by = (y1 - r) * 16;
+    int32_t dx = X < ax ? ax - X : X > bx ? X - bx : 0;
+    int32_t dy = Y < ay ? ay - Y : Y > by ? Y - by : 0;
+    int32_t d = dx && dy ? (int32_t)isqrt_u32((uint32_t)(dx * dx + dy * dy)) : (dx > dy ? dx : dy);
+    return d - r * 16;
+}
+
+#define SHADOW_LAYERS_MAX 3
+#define SHADOW_FALL_MAX   (96 * 16)      /* the widest falloff a table holds, 1/16 px */
+void fb_shadow_layers(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t radius,
+                      const struct fb_shadow_layer *L, int n,
+                      int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
+    if (n <= 0 || fx1 <= fx0 || fy1 <= fy0) return;
+    if (n > SHADOW_LAYERS_MAX) n = SHADOW_LAYERS_MAX;
+    int32_t m = (fx1 - fx0 < fy1 - fy0 ? fx1 - fx0 : fy1 - fy0) / 2, r = radius > m ? m : radius;
+    if (r < 0) r = 0;
+    /* each layer's falloff by distance, once per call: (1 - e/w)^2 * peak */
+    static uint8_t fall[SHADOW_LAYERS_MAX][SHADOW_FALL_MAX + 1];
+    int32_t bx0 = fx0, by0 = fy0, bx1 = fx1, by1 = fy1, wq[SHADOW_LAYERS_MAX];
+    for (int l = 0; l < n; l++) {
+        int32_t w = L[l].width < 1 ? 1 : L[l].width > 96 ? 96 : L[l].width;
+        wq[l] = w * 16;
+        for (int32_t e = 0; e <= wq[l]; e++) {
+            uint32_t t = (uint32_t)(wq[l] - e);
+            fall[l][e] = (uint8_t)((uint64_t)L[l].peak * t * t / ((uint64_t)wq[l] * wq[l]));
+        }
+        if (fx0 - w < bx0) bx0 = fx0 - w;
+        if (fx1 + w > bx1) bx1 = fx1 + w;
+        if (fy0 + L[l].dy - w < by0) by0 = fy0 + L[l].dy - w;
+        if (fy1 + L[l].dy + w > by1) by1 = fy1 + L[l].dy + w;
+    }
+    if (bx0 < clx0) bx0 = clx0; if (by0 < cly0) by0 = cly0;
+    if (bx1 > clx1) bx1 = clx1; if (by1 > cly1) by1 = cly1;
+    if (bx0 < 0) bx0 = 0; if (by0 < 0) by0 = 0;
+    if (bx1 > (int32_t)fb.width)  bx1 = (int32_t)fb.width;
+    if (by1 > (int32_t)fb.height) by1 = (int32_t)fb.height;
+    if (bx1 <= bx0 || by1 <= by0) return;
+    /* WHERE THE SHAPE IS STRAIGHT, the shadow depends on one coordinate: in
+     * the columns between the corners it is the same along a row, and in the
+     * rows between every layer's corners the same down a column. Only the
+     * corner zones need the distance in two dimensions -- a few thousand
+     * pixels against the band's hundreds of thousands. */
+    int32_t dmin = L[0].dy, dmax = L[0].dy;
+    for (int l = 1; l < n; l++) { if (L[l].dy < dmin) dmin = L[l].dy; if (L[l].dy > dmax) dmax = L[l].dy; }
+    int32_t sx0 = fx0 + r, sx1 = fx1 - r;                 /* straight columns */
+    int32_t sy0 = fy0 + dmax + r, sy1 = fy1 + dmin - r;   /* straight rows, every layer */
+    static uint8_t colkeep[8192];
+    int32_t bw = bx1 - bx0 < 8192 ? bx1 - bx0 : 8192;
+    #define KEEP_AT(x_, y_) ({ uint32_t k_ = 255; \
+        for (int l_ = 0; l_ < n; l_++) { \
+            int32_t e_ = rr_sdf16((x_), (y_), fx0, fy0 + L[l_].dy, fx1, fy1 + L[l_].dy, r); \
+            if (e_ < 0) e_ = 0; \
+            if (e_ < wq[l_]) k_ = k_ * (255u - fall[l_][e_]) / 255u; } \
+        k_; })
+    if (sy1 > sy0) {
+        int32_t ymid = sy0 + (sy1 - sy0) / 2;
+        for (int32_t i = 0; i < bw; i++) colkeep[i] = (uint8_t)KEEP_AT(bx0 + i, ymid);
+    }
+    int fast = fb_fast();
+    for (int32_t y = by0; y < by1; y++) {
+        int straight_row = y >= sy0 && y < sy1;
+        int covered_row = y >= fy0 + r && y < fy1 - r;     /* the window covers its whole width */
+        uint32_t rowkeep = sx1 > sx0 ? KEEP_AT(sx0 + (sx1 - sx0) / 2, y) : 255;
+        uint8_t *rowp = fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
+        for (int32_t x = bx0; x < bx1; x++) {
+            if (covered_row && x >= fx0 && x < fx1) { x = fx1 - 1; continue; }
+            uint32_t keep;
+            if (straight_row && (x < fx0 || x >= fx1) && x - bx0 < bw) keep = colkeep[x - bx0];
+            else if (x >= sx0 && x < sx1 && (y < fy0 || y >= fy1)) keep = rowkeep;
+            else {
+                /* under the window's own rounded shape: it will be painted over */
+                if (x >= fx0 && x < fx1 && y >= fy0 && y < fy1 && rr_sdf16(x, y, fx0, fy0, fx1, fy1, r) < -8) continue;
+                keep = KEEP_AT(x, y);
+            }
+            if (keep >= 255) continue;
+            if (fast) {
+                uint32_t *p = (uint32_t *)rowp + (x - bx0);
+                *p = pix_mix(0, *p, 255u - keep);
+            } else {
+                uint8_t *p = rowp + (size_t)(x - bx0) * fb_bypp;
+                fb_color_t d = fb_unpack(fb_load(p));
+                fb_store(p, fb_pack(FB_RGB(((d >> 16) & 0xFF) * keep / 255, ((d >> 8) & 0xFF) * keep / 255,
+                                           (d & 0xFF) * keep / 255)));
+            }
+        }
+    }
+    #undef KEEP_AT
+    fb_mark_dirty((uint32_t)bx0, (uint32_t)by0, (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+}
+
 // Soft accent GLOW around the OUTSIDE of a rect [fx0,fy0)-(fx1,fy1): a band of
 // width `gw` whose alpha falls off quadratically with distance from the edge,
 // blended over the framebuffer. Clipped to the given rect (the caller's repaint
