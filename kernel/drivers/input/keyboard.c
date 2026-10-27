@@ -276,6 +276,7 @@ static void lock_toggle(uint8_t ekm, uint16_t code, int pressed,int leds)
  * x86, and every HID keyboard (USB, I2C) feeds it on both architectures, so a
  * USB keyboard on a Raspberry Pi gets the same layouts, modifiers and key
  * identities as a laptop's PS/2 one. */
+static int interface_key(uint16_t key, uint32_t base, uint32_t cp);   /* below */
 static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
     int extended = *prefix;     /* the previous byte was the 0xE0 prefix */
 
@@ -330,6 +331,8 @@ static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
         }
         kbd_event_push(kc, pressed);
         uint8_t pad = (make == 0x1C || make == 0x35) ? KBF_KEYPAD : 0;
+        /* the system's own first (GUI+Up), as every other key is */
+        if (pressed && ch && interface_key(kc, 0, (uint32_t)(unsigned char)ch)) return;
         if (pressed && ch) deliver_key(kc, pad, ch);
         else if (pressed) keyboard_deliver_key_only(kc, 0);
         return;
@@ -453,7 +456,11 @@ void keyboard_inject_hid_usage(uint16_t usage,int down) {
  * path -- and a virtio keyboard never passes through there: on arm64 GUI+Tab,
  * GUI+W, GUI+Space and the rest typed a tab, a w and a space. Caller holds
  * input_state_lock. */
+int compositor_overview_shown(void);   /* gfx/compositor.h; a flag read */
 static int interface_key(uint16_t key, uint32_t base, uint32_t cp) {
+    /* Esc while the overview is up leaves it: the overview has the keys
+     * (no window is in front to take them) */
+    if (cp == 0x1b && compositor_overview_shown()) { g_syskey = SYSKEY_OVERVIEW; return 1; }
     /* GUI + letter -> an editing command. The interface's modifier, kept
      * separate from the terminal's: Ctrl+C is an INTERRUPT in this OS and
      * always will be, so the clipboard cannot live there. See EK_SEL_ALL and
@@ -470,6 +477,7 @@ static int interface_key(uint16_t key, uint32_t base, uint32_t cp) {
         if(system=='w'){g_syskey=SYSKEY_CLOSE_WINDOW;return 1;}
         if(system=='q'){g_syskey=SYSKEY_QUIT_APP;return 1;}
         if(system=='m'){g_syskey=SYSKEY_MINIMIZE;return 1;}
+        if(key==EKC_UP){g_syskey=SYSKEY_OVERVIEW;return 1;}
         if(system==' '){g_syskey=SYSKEY_LAUNCHER;return 1;}
         if(system=='['){g_syskey=SYSKEY_SPACE_PREVIOUS;return 1;}
         if(system==']'){g_syskey=SYSKEY_SPACE_NEXT;return 1;}

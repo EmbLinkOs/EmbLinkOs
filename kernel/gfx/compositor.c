@@ -847,8 +847,10 @@ static void corners_carve(const struct comp_window *w, int focused) {
  * clicked back in the dock flies back from where it had got to, at the speed
  * it had, instead of finishing its trip first. Any number of windows move at
  * once, each its own ghost; a fixed-duration curve allowed one. */
-enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE, ANIM_SLIDE_IN, ANIM_SLIDE_OUT, ANIM_ZOOM };
-static const char *const anim_names[] = { "none", "open", "park", "unpark", "close", "slide-in", "slide-out", "zoom" };
+enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE, ANIM_SLIDE_IN, ANIM_SLIDE_OUT, ANIM_ZOOM,
+                 ANIM_OVERVIEW };
+static const char *const anim_names[] = { "none", "open", "park", "unpark", "close", "slide-in", "slide-out", "zoom",
+                                          "overview" };
 
 #define ANIM_CLOSE_TO   92   /* shrink to 92% while fading -- a collapse, not a fly-off */
 #define ANIM_OPEN_FROM  88   /* open starts at 88% and grows in -- a small move;
@@ -861,6 +863,7 @@ static const char *const anim_names[] = { "none", "open", "park", "unpark", "clo
 #define ANIM_SPRING_PARK   SPRING_SMOOTH
 #define ANIM_SPRING_SLIDE  SPRING_SMOOTH
 #define ANIM_SPRING_ZOOM   300u, 1000u
+#define ANIM_SPRING_OVERVIEW SPRING_SMOOTH
 /* Landed: every edge within half a pixel and nearly still. A spring's own
  * rest is 1/64 px, and the last pixel of a critically damped approach is a
  * long crawl nobody can see but every frame of which recomposes the window. */
@@ -1106,7 +1109,10 @@ static void anim_finish(struct ghost *g) {
     for (int i = 0; i < 4; i++) last[i] = g->last[i];
     ghost_free(g);
     /* a slide changes nothing about the window: it was on its space all along */
-    if (w && !slides) { w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK || kind == ANIM_ZOOM); w->arriving = 0; }
+    if (w && !slides) {
+        w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK || kind == ANIM_ZOOM || kind == ANIM_OVERVIEW);
+        w->arriving = 0;
+    }
     /* repaint the window's footprint AND wherever the ghost last was */
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     if (w && w->used && (!slides || on_workspace(w))) win_repaint_rect(w, &x0, &y0, &x1, &y1);
@@ -1149,8 +1155,20 @@ static void slide_offset(const struct comp_window *w, int *dx, int *dy) {
 }
 
 /* Every motion lands at once: the desktop is being reconfigured under them. */
+/* The overview's state (compositor_overview_toggle, below). */
+static int      g_ov;            /* 1 from GUI+Up until the last window is home */
+static int      g_ov_leaving;    /* on the way home */
+static uint32_t g_ov_hover;      /* the window under the pointer, if any */
+static struct spring g_ov_dim;   /* the desktop's dimming, 0..OV_DIM, Q16.16 */
+static volatile int g_ov_held;   /* its windows still in their places (anim_frame) */
+/* Its windows landed by someone else (a space change, the display): over. */
+static void ov_reset(void) {
+    g_ov = g_ov_leaving = 0; g_ov_hover = 0; g_ov_held = 0;
+    spring_set(&g_ov_dim, 0, time_get_ns());
+}
 static void ghosts_land_all(void) {
     for (int i = 0; i < GHOSTS_MAX; i++) if (g_ghosts[i].kind != ANIM_NONE) anim_finish(&g_ghosts[i]);
+    if (g_ov) ov_reset();
 }
 
 /* CHANGING WORKSPACE, as a slide: the space being left goes off one side of
@@ -1168,6 +1186,7 @@ static void workspace_slide(unsigned from, unsigned to) {
     if (!fi || from == to || (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION)) { ghosts_land_all(); return; }
     for (int i = 0; i < GHOSTS_MAX; i++)
         if (g_ghosts[i].kind != ANIM_NONE && !ghost_slides(&g_ghosts[i])) anim_finish(&g_ghosts[i]);
+    if (g_ov) ov_reset();
     int shift = to > from ? (int)fi->width : -(int)fi->width, turned = 0;
     uint64_t now = time_get_ns();
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
@@ -1246,6 +1265,176 @@ static void zoom_release(struct comp_window *w, struct ghost *g) {
     win_frame_rect(w, &to[0], &to[1], &to[2], &to[3]);
     to[2] -= to[0]; to[3] -= to[1];
     ghost_aim(g, to, 255, ANIM_SPRING_ZOOM, time_get_ns());
+}
+
+/* THE OVERVIEW (GUI+Up; Mission Control on the Mac). Every window on the
+ * space flies, on springs, into a grid of its own over the dimmed desktop --
+ * each the window itself, scaled, live: an app that draws while it is up is
+ * seen drawing. The pointer and Esc belong to the overview while it is up:
+ * a click on a window brings it in front as they all fly home; a click
+ * anywhere else, Esc or GUI+Up again, sends them home as they were. Windows
+ * are hidden behind their ghosts the whole time and real again as each lands.
+ * A grid, not the Mac's packing: in the order the windows stand on the
+ * screen, row by row, each as large as its cell allows and never larger than
+ * itself. Caller holds g_comp_lock. */
+#define OV_MAX       GHOSTS_MAX
+#define OV_GAP       28          /* between cells, and the margin */
+#define OV_DIM       140
+int compositor_overview_shown(void) { return g_ov && !g_ov_leaving; }
+
+static int ov_member(const struct comp_window *w) {
+    return w->used && w->visible && w->presented && w->content && !w->desktop && !w->widget && !w->translucent &&
+           !w->minimized && on_workspace(w) && session_ui_allowed(w->pid) && !ghost_of(w->id);
+}
+
+/* The thumbnail rect of each member, in screen order. Returns how many. */
+static int ov_layout(struct comp_window *wins[OV_MAX], int rects[OV_MAX][4]) {
+    int n = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS && n < OV_MAX; i++)
+        if (ov_member(&g_wins[i])) wins[n++] = &g_wins[i];
+    /* the order they stand in: by their middles, top to bottom, then left to right */
+    for (int a = 1; a < n; a++)
+        for (int b = a; b > 0; b--) {
+            const struct comp_window *p = wins[b - 1], *q = wins[b];
+            int py = p->y + (int)(win_titlebar_h(p) + p->ch) / 2, qy = q->y + (int)(win_titlebar_h(q) + q->ch) / 2;
+            int px = p->x + (int)p->cw / 2, qx = q->x + (int)q->cw / 2;
+            if (py / 160 < qy / 160 || (py / 160 == qy / 160 && px <= qx)) break;
+            struct comp_window *t = wins[b]; wins[b] = wins[b - 1]; wins[b - 1] = t;
+        }
+    if (!n) return 0;
+    /* the work area of the primary, inside a margin */
+    outputs_whole(fb_get_info());
+    const struct layout_rect *o = &g_outs[0];
+    int ax = o->x + (int)g_desktop.left + OV_GAP, ay = o->y + WORK_TOP + OV_GAP;
+    int aw = (int)o->w - (int)g_desktop.left - (int)g_desktop.right - 2 * OV_GAP;
+    int ah = (int)o->h - WORK_TOP - WORK_BOTTOM - 2 * OV_GAP;
+    int cols = 1;
+    while (cols * cols < n) cols++;
+    int rows = (n + cols - 1) / cols;
+    int cw = (aw - (cols - 1) * OV_GAP) / cols, ch = (ah - (rows - 1) * OV_GAP) / rows;
+    for (int k = 0; k < n; k++) {
+        const struct comp_window *w = wins[k];
+        int fw = (int)w->cw, fh = win_titlebar_h(w) + (int)w->ch;
+        /* as large as the cell allows, never larger than the window */
+        int64_t sw = fw, sh = fh;
+        if (sw > cw) { sh = sh * cw / sw; sw = cw; }
+        if (sh > ch) { sw = sw * ch / sh; sh = ch; }
+        int r = k / cols, c = k % cols;
+        int in_row = r == rows - 1 ? n - r * cols : cols;            /* the last row, centred */
+        int row_x = ax + (aw - (in_row * cw + (in_row - 1) * OV_GAP)) / 2;
+        rects[k][0] = row_x + c * (cw + OV_GAP) + (cw - (int)sw) / 2;
+        rects[k][1] = ay + r * (ch + OV_GAP) + (ch - (int)sh) / 2;
+        rects[k][2] = (int)sw; rects[k][3] = (int)sh;
+    }
+    return n;
+}
+
+static void ov_repaint_all(void) {
+    const fb_info_t *fi = fb_get_info();
+    if (fi) paint_region(0, 0, (int)fi->width, (int)fi->height);
+}
+
+static void ov_enter(void) {
+    struct comp_window *wins[OV_MAX]; int rects[OV_MAX][4];
+    int n = ov_layout(wins, rects);
+    uint64_t now = time_get_ns();
+    g_ov = 1; g_ov_leaving = 0; g_ov_hover = 0;
+    spring_to(&g_ov_dim, SPRING_PX(OV_DIM), spring_params(ANIM_SPRING_OVERVIEW), now);
+    for (int k = 0; k < n; k++) {
+        struct comp_window *w = wins[k];
+        struct ghost *g = 0;
+        for (int i = 0; i < GHOSTS_MAX && !g; i++) if (g_ghosts[i].kind == ANIM_NONE) g = &g_ghosts[i];
+        if (!g) break;
+        int f[4];
+        win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+        f[2] -= f[0]; f[3] -= f[1];
+        g->kind = ANIM_OVERVIEW; g->win_id = w->id; g->have_last = 0;
+        g->chrome = (uint8_t)win_shadows(w); g->focus = 1;
+        for (int i = 0; i < 4; i++) spring_init(&g->r[i], SPRING_PX(f[i]), now);
+        g->a0 = g->a1 = 255; g->s0 = f[2]; g->axis = 0;
+        g_nghosts++;
+        ghost_aim(g, rects[k], 255, ANIM_SPRING_OVERVIEW, now);
+        w->visible = 0; w->arriving = 0;
+    }
+    reset_pointer_capture_locked();
+    kprintf("compositor: overview of %d windows\n", n);
+    ov_repaint_all();
+}
+
+/* Home, all of them; `pick` in front. */
+static void ov_leave(uint32_t pick) {
+    uint64_t now = time_get_ns();
+    g_ov_leaving = 1; g_ov_hover = 0; g_ov_held = 0;
+    spring_to(&g_ov_dim, 0, spring_params(ANIM_SPRING_OVERVIEW), now);
+    struct comp_window *pw = pick ? win_by_id(pick) : 0;
+    if (pw) pw->z = g_next_z++;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (!w) continue;
+        int f[4];
+        win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+        f[2] -= f[0]; f[3] -= f[1];
+        ghost_aim(g, f, 255, ANIM_SPRING_OVERVIEW, now);
+    }
+    kprintf("compositor: overview closed%s%s\n", pw ? ", in front: " : "", pw ? (pw->app[0] ? pw->app : "a window") : "");
+    ov_repaint_all();
+}
+
+void compositor_overview_toggle(uint32_t pick) {
+    spin_lock(&g_comp_lock);
+    if (session_input_owner()) { comp_unlock(); return; }
+    if (!g_ov) ov_enter();
+    else if (!g_ov_leaving) ov_leave(pick);
+    comp_unlock();
+}
+
+/* The overview window under (x, y), drawn last on top: 0 if none. */
+static uint32_t ov_hit(int x, int y) {
+    uint32_t hit = 0;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW) continue;
+        int r[4], a; ghost_rect(g, r, &a);
+        if (x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]) hit = g->win_id;
+    }
+    return hit;
+}
+
+/* The pointer, while the overview is up: hover and the click. */
+static void ov_pointer(int x, int y, int pressed) {
+    uint32_t hit = ov_hit(x, y);
+    if (hit != g_ov_hover) {
+        /* the ring moves: what both thumbnails cover */
+        for (int i = 0; i < GHOSTS_MAX; i++) {
+            const struct ghost *g = &g_ghosts[i];
+            if (g->kind != ANIM_OVERVIEW || (g->win_id != hit && g->win_id != g_ov_hover)) continue;
+            int r[4], a; ghost_rect(g, r, &a);
+            paint_region(r[0] - 6, r[1] - 6, r[0] + r[2] + 6, r[1] + r[3] + 6);
+        }
+        g_ov_hover = hit;
+    }
+    if (pressed) { ov_leave(hit); g_buttons_suppressed = 1; }   /* the press ends here */
+}
+
+/* The ring around the window under the pointer, and the dimming, in a region. */
+static void fill_clip(int x, int y, int w, int h, fb_color_t c, int rx0, int ry0, int rx1, int ry1);
+#define OV_RING 3
+static void ov_draw_ring(const int r[4], int rx0, int ry0, int rx1, int ry1) {
+    int x0 = r[0] - OV_RING - 2, y0 = r[1] - OV_RING - 2, x1 = r[0] + r[2] + 2, y1 = r[1] + r[3] + 2;
+    fill_clip(x0, y0, x1 + OV_RING - x0, OV_RING, g_desktop.accent, rx0, ry0, rx1, ry1);
+    fill_clip(x0, y1, x1 + OV_RING - x0, OV_RING, g_desktop.accent, rx0, ry0, rx1, ry1);
+    fill_clip(x0, y0, OV_RING, y1 + OV_RING - y0, g_desktop.accent, rx0, ry0, rx1, ry1);
+    fill_clip(x1, y0, OV_RING, y1 + OV_RING - y0, g_desktop.accent, rx0, ry0, rx1, ry1);
+}
+static uint32_t g_ov_black[8192];        /* a row of black, read with a stride of 0 */
+static void ov_dim_cpu(int rx0, int ry0, int rx1, int ry1) {
+    int a = spring_px(&g_ov_dim);
+    if (a <= 0) return;
+    int w = rx1 - rx0;
+    if (w <= 0 || ry1 <= ry0 || w > (int)(sizeof g_ov_black / sizeof *g_ov_black)) return;
+    fb_blit_uniform(rx0, ry0, w, ry1 - ry0, g_ov_black, 0, (uint32_t)(a > 255 ? 255 : a));
 }
 
 /* A DOUBLE CLICK where a window is dragged by -- its title bar, or a zone the
@@ -2082,6 +2271,18 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         drawn++;
     }
 
+    if (g_ov && spring_px(&g_ov_dim) > 0) {
+        /* the overview's dimming: one black pixel, stretched, at its opacity */
+        static uint32_t black_px = 0xFF000000u;
+        static uint32_t black_img;
+        if (!black_img && g_gc->image_create(&black_px, 1, 1, 4, &black_img)) black_img = 0;
+        if (black_img) {
+            int a = spring_px(&g_ov_dim);
+            struct gpu_draw dd = { .image = black_img, .src = { 0, 0, 1, 1 }, .dst = { rx0, ry0, rx1 - rx0, ry1 - ry0 },
+                                   .opaque = 1, .opacity = (uint8_t)(a > 255 ? 255 : a) };
+            gc->draw(&dd);
+        }
+    }
     for (int gi = 0; gi < GHOSTS_MAX; gi++) {
         struct ghost *g = &g_ghosts[gi];
         if (g->kind == ANIM_NONE || ghost_slides(g)) continue;   /* a slide is drawn as its window */
@@ -2114,6 +2315,12 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
                 struct gpu_draw d = { .image = ghost, .src = { 0, 0, sw_, sh_ }, .dst = fr,
                                       .opaque = 1, .opacity = (uint8_t)alpha, .radius = (uint8_t)radius, .frame = fr };
                 gc->draw(&d);
+                if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover) {
+                    int x0 = r[0] - OV_RING - 2, y0 = r[1] - OV_RING - 2, x1 = r[0] + r[2] + 2, y1 = r[1] + r[3] + 2;
+                    struct gpu_rect e[4] = { { x0, y0, x1 + OV_RING - x0, OV_RING }, { x0, y1, x1 + OV_RING - x0, OV_RING },
+                                             { x0, y0, OV_RING, y1 + OV_RING - y0 }, { x1, y0, OV_RING, y1 + OV_RING - y0 } };
+                    for (int k = 0; k < 4; k++) gc->fill(&e[k], g_desktop.accent);
+                }
             }
         }
     }
@@ -2288,6 +2495,9 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
         drawn++;
     }
 
+    /* 2a) the overview's dimming, over the desktop and under its windows */
+    if (g_ov) ov_dim_cpu(rx0, ry0, rx1, ry1);
+
     /* 2b) the ghosts of windows in motion. Drawn HERE -- above the windows,
      *     below the cursor -- so every repaint composes them correctly,
      *     whatever triggered the repaint. */
@@ -2316,6 +2526,7 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
             fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], src, sw_, sh_,
                                    (uint32_t)sw_, (uint32_t)alpha, g_ghost_smooth, rx0, ry0, rx1, ry1);
             if (round) corners_carve_ring(0, 0);
+            if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover) ov_draw_ring(r, rx0, ry0, rx1, ry1);
         }
     }
 
@@ -2785,6 +2996,13 @@ int64_t compositor_win_damage(int pid, uint32_t id,
         return 0;
     }
     paint_region(sx0, sy0, sx0 + (int)rw, sy0 + (int)rh);
+    {   /* in the air (the overview, a flight): where it is drawn changed too */
+        struct ghost *gg = ghost_of(w->id);
+        if (gg && !gg->snap && !ghost_slides(gg)) {
+            int r[4], a; ghost_rect(gg, r, &a);
+            paint_region(r[0], r[1], r[0] + r[2], r[1] + r[3]);
+        }
+    }
     comp_unlock();
     return 0;
 }
@@ -3369,14 +3587,30 @@ void compositor_reap_pid(int pid) {
  * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
  * which is almost always. */
 static void anim_frame(void) {
-    if (!g_nghosts) return;                  /* cheap unlocked pre-check */
+    if (!g_nghosts && !g_ov) return;         /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
     g_src = EMBK_COMP_SRC_ANIM;
     uint64_t now = time_get_ns();
+    int held = 0;                            /* overview windows still in their places */
+    if (g_ov) {
+        /* the dimming, on its spring: all the screen, while it moves */
+        int was = spring_px(&g_ov_dim);
+        spring_step(&g_ov_dim, now);
+        if (spring_px(&g_ov_dim) != was) ov_repaint_all();
+        int left = 0;
+        for (int gi = 0; gi < GHOSTS_MAX; gi++) left += g_ghosts[gi].kind == ANIM_OVERVIEW;
+        if (g_ov_leaving && !left && !g_ov_dim.moving) {
+            g_ov = 0; g_ov_leaving = 0;
+            enforce_focus(); ov_repaint_all();
+        }
+    }
     for (int gi = 0; gi < GHOSTS_MAX; gi++) {
         struct ghost *g = &g_ghosts[gi];
         if (g->kind == ANIM_NONE) continue;
         struct comp_window *w = win_by_id(g->win_id);
+        if (g->kind == ANIM_OVERVIEW && !g_ov_leaving && ghost_landed(g)) {
+            if (g->have_last) { held++; continue; } /* in its place: it stays, still */
+        }
         if (g->kind == ANIM_ZOOM && w && w->zoom_wait) {
             /* held until the app has drawn at its new size -- not for ever */
             if (timer_uptime_ms() - w->zoom_since_ms < ZOOM_WAIT_MS) continue;
@@ -3394,7 +3628,8 @@ static void anim_frame(void) {
                 if (g->r[i].target != SPRING_PX(f[i])) spring_to(&g->r[i], SPRING_PX(f[i]), g->r[i].p, now);
         }
         for (int i = 0; i < 4; i++) spring_step(&g->r[i], now);
-        if (ghost_landed(g)) { anim_finish(g); continue; }
+        /* landed -- but a window in the overview stays a ghost until it goes home */
+        if (ghost_landed(g) && !(g->kind == ANIM_OVERVIEW && !g_ov_leaving)) { anim_finish(g); continue; }
         int x0, y0, x1, y1;
         ghost_dirty(g, &x0, &y0, &x1, &y1);
         int r[4], a; ghost_rect(g, r, &a);
@@ -3402,6 +3637,7 @@ static void anim_frame(void) {
         g->have_last = 1;
         paint_region(x0, y0, x1, y1);        /* draws the ghosts itself */
     }
+    g_ov_held = held;
     comp_unlock();
 }
 
@@ -3576,6 +3812,12 @@ static void pointer_frame(void) {
         else { cursor_capture_and_draw(); fb_present(); }
     }
 
+    if (g_ov && !g_ov_leaving) {
+        /* THE OVERVIEW HAS THE POINTER: hover rings a window, a press picks
+         * one (or none); nothing reaches an app */
+        ov_pointer(x, y, presses || (left && !prev));
+        presses = 0; b &= ~(uint32_t)MOUSE_BTN_LEFT; left = 0;
+    }
     int raised = 0;
     int close_pid = 0;   /* unused since closing became a request, kept so the
                           * unlock-then-act shape below stays obvious */
@@ -4194,10 +4436,13 @@ void compositor_beat_test(uint32_t seconds) {
     comp_wake();
 }
 
-/* Work that keeps frames coming without a kick: window motion in flight, or
- * a beat being measured. */
+/* Work that keeps frames coming without a kick: window motion in flight, the
+ * overview's dimming coming or going (and its end), or a beat being measured. */
 static int comp_continuous(void) {
-    return g_nghosts || time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
+    /* (windows held still in the overview are not motion: an app drawing
+     * in one kicks a frame like any present) */
+    return g_nghosts > g_ov_held || (g_ov && (g_ov_leaving || g_ov_dim.moving)) ||
+           time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
 }
 
 static void comp_thread_main(void) {
@@ -4312,8 +4557,8 @@ void compositor_print_windows(void) {
         char name[COMP_TITLE_MAX + 1]; int k = 0;
         for (; w->title[k] && k < COMP_TITLE_MAX; k++) name[k] = w->title[k] == ' ' ? '_' : w->title[k];
         name[k] = 0;
-        kprintf("perf: window title=%s x=%d y=%d w=%u h=%u space=%u drag_n=%u drag0=%d,%d,%d,%d\n", name, (int)w->x, (int)w->y,
-                w->cw, w->ch, w->workspace, (unsigned)w->drag_n, w->drag_n ? w->drag_r[0][0] : 0, w->drag_n ? w->drag_r[0][1] : 0,
+        kprintf("perf: window title=%s x=%d y=%d w=%u h=%u space=%u z=%d drag_n=%u drag0=%d,%d,%d,%d\n", name, (int)w->x, (int)w->y,
+                w->cw, w->ch, w->workspace, w->z, (unsigned)w->drag_n, w->drag_n ? w->drag_r[0][0] : 0, w->drag_n ? w->drag_r[0][1] : 0,
                 w->drag_n ? w->drag_r[0][2] : 0, w->drag_n ? w->drag_r[0][3] : 0);
     }
     kprintf("perf: workspace now=%u count=%u\n", g_desktop.workspace, g_desktop.workspace_count);

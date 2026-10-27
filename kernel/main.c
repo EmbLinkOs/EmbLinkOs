@@ -2392,6 +2392,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             else if (sk == SYSKEY_PERF_HUD) compositor_hud_toggle();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
             else if (sk == SYSKEY_MINIMIZE) compositor_minimize_front();
+            else if (sk == SYSKEY_OVERVIEW) compositor_overview_toggle(0);
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
                 if (pid) process_kill((uint32_t)pid);

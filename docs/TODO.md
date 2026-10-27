@@ -183,6 +183,18 @@ the default target). Measured before and after every step
   - [ ] Ghost shadows cost a band per frame on the CPU path; under TCG that slowed the park
         flight enough that the interrupt test needed `perf slowmo`. Not measured on hardware.
 - [ ] P6 Overview, touchpad gestures, tiling previews.
+  - [x] The overview (GUI+Up): the space's windows in a grid of their own, live, over the dimmed
+        desktop; hover rings one, a click brings it in front as they fly home, Esc or a click
+        elsewhere leaves them as they were; at rest it composes nothing (`tools/overview_smoke.py`:
+        x86 and arm64 on the CPU, virgl in the Lima VM; gallery 223).
+  - [ ] The overview's layout is a grid in screen order, not the Mac's packing that keeps each
+        window near where it stands; at most GHOSTS_MAX (16) windows take part.
+  - [ ] In the overview: no strip of spaces to drag a window to, no arrow keys between windows,
+        and the ring is square around rounded corners. The desktop under it still sees the
+        pointer (its dock labels show).
+  - [ ] Asked for again while it is closing, it is ignored until the windows are home.
+  - [ ] Touchpad gestures (three fingers up for the overview, sideways for spaces).
+  - [ ] Tiling previews; a minimise warp on the GPU path.
 
 ## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
 

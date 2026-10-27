@@ -53,7 +53,7 @@ def state(d):
         elif kind == 'pointer':
             d.ptr = (int(pairs['x']), int(pairs['y']))
         elif kind == 'window':
-            wins[pairs['title'].replace('_', ' ')] = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'space')}
+            wins[pairs['title'].replace('_', ' ')] = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'space', 'z') if k in pairs}
             wins[pairs['title'].replace('_', ' ')]['drag0'] = [int(v) for v in pairs['drag0'].split(',')]
         elif kind == 'ghost':
             g = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'alpha')}

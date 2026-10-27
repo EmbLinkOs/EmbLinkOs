@@ -215,6 +215,10 @@ int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4],
 int compositor_dock_targets(int pid, const struct embk_dock_target *t, unsigned n);
 /* `perf slowmo N`: window motion N times slower (1: as designed). */
 void compositor_slowmo(uint32_t n);
+/* THE OVERVIEW: every window on the space at once, side by side (GUI+Up).
+ * Toggled; `pick` a window id to bring in front as it closes (0: none). */
+void compositor_overview_toggle(uint32_t pick);
+int  compositor_overview_shown(void);
 /* `perf effects`: 0 the desktop's Effects setting, 1 hold full, 2 hold reduced. */
 void compositor_effects_override(int mode);
 /* GUI+M: the front window into the dock. */

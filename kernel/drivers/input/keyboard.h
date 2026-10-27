@@ -92,6 +92,7 @@ enum {
     SYSKEY_KERNEL_LOG,       /* GUI+K: show/hide the kernel log on screen */
     SYSKEY_PERF_HUD,         /* GUI+Shift+P: the compositor's statistics overlay */
     SYSKEY_MINIMIZE,         /* GUI+M: the front window into the dock */
+    SYSKEY_OVERVIEW,         /* GUI+Up (and Esc while it is up): every window at once */
     SYSKEY_SPACE_1=16, SYSKEY_MOVE_SPACE_1=32,
 };
 /* Take the pending system shortcut, if any, and clear it. */

@@ -98,7 +98,7 @@ editing keys. See [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md) for contracts and limit
 Assistive-technology semantics and arbitrary shortcut recording remain further
 work. System shortcuts offer Super or Ctrl+Alt as their modifier:
 Space opens the library, Tab cycles windows, W closes, Q quits, M minimises
-into the dock, 1–6 selects a
+into the dock, Up shows every window of the space at once (the overview), 1–6 selects a
 workspace, Shift+1–6 moves a window, and [ / ] walks spaces; Shift+P shows what
 composing costs ([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)). Editing
 shortcuts retain their existing meanings.
@@ -206,6 +206,13 @@ be turned around mid-way from where it is, at the speed it has.
   has drawn at its new size, then it flies to the new frame on a spring,
   drawn from the new pixels. The corner grip, a step at a time, is drawn as
   it comes.
+- **The overview.** GUI+Up flies every window of the space, on springs, to a
+  place of its own in a grid over the dimmed desktop -- each the window
+  itself, scaled, live (an app drawing while it is up is seen drawing), with
+  its corners and shadow. The pointer and Esc are the overview's while it is
+  up: the window under the pointer is ringed, a click on it brings it in
+  front as they all fly home, and a click elsewhere, Esc or GUI+Up again
+  sends them home as they were. Still, it composes nothing.
 - **Workspaces.** Changing space slides: the space being left goes off one
   side while the next comes in from the other -- leftwards going up the
   spaces, as on the Mac -- whether the change came from the keys, the top
