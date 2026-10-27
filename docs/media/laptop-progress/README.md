@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-221 actual EmbLinkOS captures document the original laptop work, its
+222 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, and windows that zoom. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, and effects that give way. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -101,6 +101,12 @@ A second notice arriving: its banner slides in from the screen's edge on top whi
 A double click on Settings' bar, photographed as the window zooms to fill the work area: drawn from its new pixels, on its way from the old frame to the new on a spring, with its rounded corners and shadow. Slowed ten times (`perf slowmo 10`) to be photographed; scaled nearest-neighbour here because frames under TCG are too dear for filtering. Under TCG.
 
 ![The EmbLinkOS Settings window, nearly filling the screen, part-way through zooming to the full work area](221-zoom.png)
+
+### Effects, reduced
+
+The Applications library in the reduced effects tier (`perf effects reduced`; Settings > Appearance > Effects): no blur to compute, the sheet's own tint drawn whole -- what the compositor falls back to while frames run long, and the toolkit with it. Compare 215, the same sheet in the full tier, the wallpaper frosted through it. arm64 under HVF.
+
+![The EmbLinkOS Applications library as an opaque grey sheet over the dark wallpaper](222-effects-reduced.png)
 
 ## The prompt, Powerlevel10k-style
 

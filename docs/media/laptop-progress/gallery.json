@@ -4357,6 +4357,26 @@
       "featured": false,
       "milestone": "Fluid desktop P5: shell",
       "historical": false
+    },
+    {
+      "id": "222-effects-reduced",
+      "phase": "Fluid desktop",
+      "title": "Effects, reduced",
+      "caption": "The Applications library in the reduced effects tier (`perf effects reduced`; Settings > Appearance > Effects): no blur to compute, the sheet's own tint drawn whole -- what the compositor falls back to while frames run long, and the toolkit with it. Compare 215, the same sheet in the full tier, the wallpaper frosted through it. arm64 under HVF.",
+      "alt": "The EmbLinkOS Applications library as an opaque grey sheet over the dark wallpaper",
+      "file": "222-effects-reduced.png",
+      "capture_date": "2026-10-27",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "05187e9559ca8e84f9ecff392113bd2f2f657ba92a1af8e72e88ea4e8aa3071b",
+      "source_capture": "emblink-fxglass-2_qlfk0b/library-reduced.ppm",
+      "source_sha256": "955ef8c2d22806c11d93e6c2d6c0c9cc1a272db95857cb4c13cc151bdd608404",
+      "source_commit": "4761e1b",
+      "featured": false,
+      "milestone": "Fluid desktop P3: materials",
+      "historical": false
     }
   ]
 }
