@@ -26,6 +26,22 @@
         *(.rodata .rodata.* .gnu.linkonce.r.*)
     } :text
 
+    /* Unwind tables. C++'s exceptions need them found at run time, and with
+     * -nostartfiles nothing registers them (crtbegin is what feeds libgcc's
+     * unwinder), so the unwinder that LIBC=emblibc links -- EmbCC's,
+     * lib/rt/unwind.c -- scans .eh_frame between these two symbols instead.
+     * Named here rather than left an orphan so the symbols exist; KEEP so a
+     * --gc-sections link cannot take the tables a throw will need. */
+    .eh_frame : {
+        __eh_frame_start = .;
+        KEEP(*(.eh_frame))
+        __eh_frame_end = .;
+    } :text
+
+    .gcc_except_table : {
+        *(.gcc_except_table .gcc_except_table.*)
+    } :text
+
     . = ALIGN(0x1000);       /* new page: writable data below, W^X boundary */
 
     /* --- Thread-local storage ------------------------------------------------

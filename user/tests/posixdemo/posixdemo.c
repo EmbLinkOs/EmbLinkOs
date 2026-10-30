@@ -180,7 +180,7 @@ static void test_clocks(void) {
     ck("clock_getres(MONOTONIC)", clock_getres(CLOCK_MONOTONIC, &res) == 0);
     ck("  reports 1ms (not a fictional 1ns)", res.tv_sec == 0 && res.tv_nsec == 1000000L);
     ck("clock_getres(REALTIME)", clock_getres(CLOCK_REALTIME, &res) == 0);
-    ck("  reports 1s (the RTC's real granularity)", res.tv_sec == 0 && res.tv_nsec == 1000000000L);
+    ck("  reports 1s (the RTC's real granularity)", res.tv_sec == 1 && res.tv_nsec == 0);
 
     /* An unknown clock id must be REFUSED, not quietly answered with the
      * monotonic value. Note we can't name CLOCK_PROCESS_CPUTIME_ID here: newlib

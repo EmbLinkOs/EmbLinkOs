@@ -6697,6 +6697,29 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* The C++ standard library past cxxdemo's floor: exceptions through the
+     * unwinder, streams, containers, std::thread, std::filesystem. Built
+     * only under LIBC=emblibc, by EmbCC (user/tests/cxxlib); without it on
+     * the image this is a SKIP, as test cxx is without a C++ toolchain. */
+    if (strcmp(cmd, "test cxxlib") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test cxxlib: VFS not registered\n");
+            return 1;
+        }
+        struct vfs_stat st;
+        if (vfs_stat("/data/apps/cxxlib/cxxlib.elf", &st) != EMBK_OK) {
+            kprintf("\n[cmd] test cxxlib: SKIP -- cxxlib.elf not on the image "
+                    "(built under LIBC=emblibc)\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/cxxlib/cxxlib.elf", NULL };
+        int pid = process_create("/data/apps/cxxlib/cxxlib.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test cxxlib: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* The POSIX layer in user/lib/syscalls.c. posixdemo.elf self-checks the
      * things that break quietly rather than loudly: opendir()'s grow-and-retry
      * loop against a >64-entry directory (the kernel's readdir truncates

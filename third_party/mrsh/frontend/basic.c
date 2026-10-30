@@ -24,7 +24,11 @@
 #include "sh_complete.h"
 #ifdef EMBLINK_TARGET
 #include "embk.h"
+/* newlib declares getline only for the targets it knows; EmbCC's libc
+ * (LIBC=emblibc) declares it, as POSIX.1-2008 says */
+#ifndef EMBK_LIBC_EMBLIBC
 #define getline __getline
+#endif
 #endif
 
 static struct editor *editor;
