@@ -126,15 +126,25 @@ Not the library's, and the same under newlib:
 - `test blockrace` reads a 9 MB `cxxdemo.elf` (the g++ build's), and
   `test shell cwd` runs git: neither port is on an image built here.
 
-Open: `test fd-sharing`'s parallel readers (four processes on one shared
-open file) failed 3 times in 16 runs with this library and 0 in 4 with
-newlib's `fdprobe.elf` in the same image -- not yet enough to say which.
+`errno` and `__thread` variables are per thread. `crt0.c` builds the first
+thread's block -- from `__tls_geom` under `newlib.ld`, from the program
+headers (`__ehdr_start`, PT_TLS) for the dynamically linked apps -- and
+then fills in the library's `__emblibc_tls` with the template it used.
+The library copies that template onto each new thread's stack before the
+thread runs (EmbCC's `lib/libc/os/tls-template.h` is the layout's other
+copy). Under newlib `__emblibc_tls` is undefined and nothing changes.
+
+Open: `test fd-sharing`'s parallel readers fail now and then (5 of 29 runs
+with this library). Caught with the reader instrumented: all four readers
+read the 256 records the parent wrote and then go on into the previous
+phase's writer records -- the parent's `open(O_TRUNC)` did not stick. The
+independent writers just before open the same file themselves, and their
+`process_reap` lines come after the parent's `waitpid` returned, so the
+likely cause is a child's descriptor being released after its parent
+truncated the file, restoring the old size. Both libraries make the same
+system calls there; this one only changes the timing.
 
 ## Known gaps
 
-- `errno` is one variable, as newlib's was here: `crt0.c` builds a TLS block
-  for the first thread of a static program only, and none for the dynamically
-  linked apps or for new threads. A per-thread `errno` needs the library to
-  set up each thread's block itself.
 - `fcntl` record locks, `mmap` of files, signals between processes: the
   kernel has none of them.
