@@ -116,6 +116,7 @@ this library; the rest are freestanding). On QEMU, through
 | Shells | `test posix-shell` (mrsh, 338 checks), `test shell`, `test shellio`, `test shellscript`, `test extern`, `test externdiag` |
 | On-OS toolchain | `test tcc`, `test tcc compile`, `test embbuild`, `test embbuild self` (fresh boot: it wants a clean build) |
 | C++ | `test cxx`, `test cxxlib` |
+| Threads | `test pthreads`: EmbCC's `tests/exec/posix-threads.c` (POSIX and C11 threads, mutexes, condition variables, read-write locks, barriers, semaphores, keys), the program glibc and the library both pass on Linux |
 
 Not the library's, and the same under newlib:
 

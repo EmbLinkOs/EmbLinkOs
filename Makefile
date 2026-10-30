@@ -467,13 +467,14 @@ USER_INC     = -Iuser/lib
 # the C++ programs instead, see CXX_APPS). A binary of theirs in build/ is a
 # static newlib program, whole in itself, packed as it is.
 LIBC ?= newlib
-ifeq ($(LIBC),emblibc)
-EMBLIBC     := yes
 EMBCC_ROOT  ?= $(HOME)/EmbCC
 # one library per machine: build/libc/emblinkos (x86_64), emblinkos-aarch64
+# -- named in either mode, as `make emblibc` builds it from a newlib tree
 EMBLIBC_ARCH = $(if $(filter aarch64,$(ARCH)),aarch64,x86_64)
 EMBLIBC_SFX  = $(if $(filter aarch64,$(ARCH)),-aarch64,)
 EMBLIBC_DIR  = $(EMBCC_ROOT)/build/libc/emblinkos$(EMBLIBC_SFX)
+ifeq ($(LIBC),emblibc)
+EMBLIBC     := yes
 EMBLIBC_A    = $(EMBLIBC_DIR)/libc.a
 # The library's headers first -- ahead of user/lib, whose <time.h>, <termios.h>
 # and <sys/*.h> are newlib's missing pieces and would otherwise shadow them --
@@ -793,6 +794,18 @@ build/cxxlib.o: user/tests/cxxlib/cxxlib.cc | $(BUILD)
 	$(EMBCXX) $(EMBCXX_INC) -MD -MP -MF $@.d -c $< -o $@
 build/cxxdemo.elf build/cxxlib.elf: build/%.elf: build/%.o build/crt0.o build/syscalls.o $(EMBLIBCXX_A) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(EMBCXX_LIBS) -o $@
+
+# POSIX threads, checked by the same program EmbCC checks its library
+# with on Linux against glibc (tests/exec/posix-threads.c): `test pthreads`.
+# fork is ENOSYS here, which it allows for.
+PTHREAD_PROBE_SRC = $(EMBCC_ROOT)/tests/exec/posix-threads.c
+ifneq ($(wildcard $(PTHREAD_PROBE_SRC)),)
+CXX_APPS += build/pthreadprobe.elf
+build/pthreadprobe.o: $(PTHREAD_PROBE_SRC) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/pthreadprobe.elf: build/pthreadprobe.o build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< -lc -lgcc -o $@
+endif
 else ifeq ($(HAVE_CXX),yes)
 CXX_APPS = build/cxxdemo.elf
 
@@ -934,7 +947,7 @@ endif
 # itself; a different one is an error, here at parse time, before any object
 # of the other library is linked to this one.
 # A build/ with objects and no record predates LIBC, so it is newlib's.
-ifneq ($(filter clean distclean,$(MAKECMDGOALS)),)
+ifneq ($(filter clean distclean emblibc,$(MAKECMDGOALS)),)
 else ifneq ($(wildcard build/.libc),)
 ifneq ($(shell cat build/.libc),$(LIBC))
 $(error build/ was built with LIBC=$(shell cat build/.libc), not LIBC=$(LIBC): `make clean` first)
