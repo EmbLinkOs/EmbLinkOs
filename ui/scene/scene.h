@@ -211,6 +211,9 @@ struct scene_node {
                             * pixels themselves, so a group's kept pixels
                             * (scene_render's group cache) survive them. Any
                             * other content change sets this too. */
+    bool  dirty_comp;      /* ...and the other half: how the node is composited
+                            * changed (opacity, group scale) -- every pixel of
+                            * its subtree with it. */
 
     /* Opaque tag Piece 3 never interprets -- exists purely so a consumer above
      * (Piece 7's declarative layer) can stash its own identifier (e.g. a packed

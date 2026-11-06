@@ -9,7 +9,8 @@ markers, then sums each scene's `prof:` lines per application:
 
   menu      the top bar's EmbLink menu dropped in, and closed with Esc
   tooltip   Settings' close button hovered until its tooltip shows, then left
-  context   a right-click in Files' empty folder space, and Esc
+  files     Files opening from the dock (its first frame is a whole one)
+  context   then a right-click in its empty folder space, and Esc
   launcher  the library (GUI+Space) zoomed in, and out with Esc
   dock      the pointer gliding along the dock and away
   scroll    eight wheel notches down Settings' pane and back
@@ -97,9 +98,11 @@ def main():
 
         scene('menu', lambda: (P.click(d, 72, 16), d.g.pump(1.5), d.key('esc')))
         scene('tooltip', lambda: (P.move(d, S[0] + 20, S[1] + 17), d.g.pump(2.0)))
-        def context():
+        def files():
             P.click(d, 555, P.DOCK_Y)
             d.g.wait(b'Files: first frame presented'); d.g.pump(3)
+        scene('files', files)
+        def context():
             w = frame_rect(state(d)[0]['Files'])
             right_click(d, w[0] + w[2] - 120, w[1] + w[3] - 80); d.g.pump(1.5)
             d.key('esc')

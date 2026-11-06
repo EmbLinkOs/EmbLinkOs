@@ -172,9 +172,8 @@ the default target). Measured before and after every step
         painted once into a layer, in and out on the compositor's springs (`make backend-test`
         T20, `tools/layer_menu_smoke.py`, gallery 232). Files' context menu: 29 app frames -> 9,
         11.6 M px presented -> 1.2 M.
-  - [ ] A menu opening still repaints its window once: EmUI bumps the epoch on open and close,
-        which the runtime answers with a full repaint, though on layers the menu is not in the
-        window. Opening a menu could be an ordinary frame there.
+  - [x] A menu opening is an ordinary frame on layers (no epoch), and a node that paints nothing
+        marks nothing (T21): Files' context menu presents 0.79 M px (M0 11.6 M), 0 full repaints.
   - [ ] The top bar's menus are not promoted: the bar shows through, and their glass has to frost
         the desktop, which needs the layer material (`EMBK_LM_BLUR`) above.
   - [ ] Toasts are not promoted: `em_toast_host` asks for a frame every frame of its 2.5 s to know
@@ -182,7 +181,17 @@ the default target). Measured before and after every step
         missing piece. (No application raises toasts yet.)
   - [ ] A promoted subtree is repainted whole when anything in it changes -- a hover moving down
         an open menu repaints the menu's layer each time.
-  - [ ] M5: dialogs and sheets that scale in; the close pull moved by the compositor.
+  - [x] M5: EmUI's dialogs and sheets arrive on layers (scale and fade in, sink out).
+  - [ ] The scrim behind a sheet still dims at once: promoting it would take the sheet into its
+        window-sized layer (a promoted subtree's descendants are its pixels); a second layer
+        under the sheet's own would fade it.
+  - [ ] While a sheet is up the runtime still builds a frame every frame (`em_overlay_active`,
+        the scrim-click debounce), painting nothing; it could wait for input like any other.
+  - [ ] `overview_smoke.py` failed once on x86 under TCG at its turn-back step (the windows were
+        still in flight when sampled) and passed alone on x86 and arm64; its wait for the windows
+        to land should be a wait for the condition, not a fixed pause.
+  - [ ] The close pull moved by the compositor (`embk_win_props`, syscall 169 in the plan) is not
+        done: nothing uses `em_close_grip` yet, so there is no motion to move.
   - [ ] M6: the library's glass as a layer over a kept blur.
   - [ ] Nothing uses `em_toast` or the close grip (`em_close_grip`) yet: both are toolkit
         features without an application, so their motion is untested in the guest.

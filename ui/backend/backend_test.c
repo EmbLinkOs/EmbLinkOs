@@ -847,6 +847,33 @@ static void t20_promoted(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- T21: a node that paints nothing stains nothing -- a menu's scrim, a
+ * window-sized transparent box, coming and going repaints no pixel -------- */
+static void t21_invisible(void) {
+    printf("T21 a box that paints nothing marks nothing when it comes, goes or moves:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(120, 80);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 120, 80);
+    struct paint gp = solidp(0.2f, 0.3f, 0.4f, 1); scene_set_paint(&a, ground, &gp);
+    scene_render_frame(&r, &a, root, &rt);
+    struct node_handle scrim = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, scrim, 120, 80);
+    struct paint cp = solidp(0, 0, 0, 0); scene_set_paint(&a, scrim, &cp);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0 && !r.full, "a transparent window-sized box arriving repaints nothing");
+    scene_set_transform(&a, scrim, 10, 10, 0, 0,0,0,1, 1,1,1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0, "nor moving");
+    scene_destroy_node(&a, scrim);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0, "nor going");
+    CHECK(differs_from_fresh(&a, root, &rt) == 0, "and the picture is still the one painting it whole gives");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -869,6 +896,7 @@ int main(void) {
     t18_group_motion();
     t19_group_dirty();
     t20_promoted();
+    t21_invisible();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

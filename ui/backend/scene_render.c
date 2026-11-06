@@ -163,6 +163,10 @@ struct noderec {
      * and frect_overlap treats empty as touching nothing. */
     struct frect       vis;
     struct frect       clipbox;      /* the ancestor clip itself, for the OLD foot */
+    /* a node that paints nothing whose compositing changed (opacity, scale):
+     * every pixel of its subtree is new, though it stains none itself */
+    struct frect       extent;
+    int                has_extent;
     int                has_clipbox;
 };
 
@@ -191,6 +195,16 @@ static struct frect node_footprint(const struct scene_node *n, struct frect ab) 
     return f;
 }
 
+static struct frect subtree_footprint(struct scene_arena *a, struct node_handle h, const float wparent[16]);
+
+static int node_paints_nothing(const struct scene_node *n) {
+    if (n->clip_children || n->shadow_enabled || n->backdrop_blur_enabled) return 0;
+    if (n->kind == SCENE_NODE_GROUP) return 1;
+    if (n->kind != SCENE_NODE_RECT || n->border_width > 0) return 0;
+    const struct paint *p = &n->data.rect.fill;
+    return p->kind == PAINT_NONE || (p->kind == PAINT_SOLID && p->solid.a <= 0.002f);
+}
+
 /* A layer host keeps promoted subtrees this frame: the window leaves them out
  * (scene_render_set_layer_host). */
 static int g_promote_live;
@@ -210,6 +224,17 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     rec->h = h;
     rec->aabb = node_world_aabb(node, world);
     rec->foot = node_footprint(node, rec->aabb);
+    /* A NODE THAT PAINTS NOTHING STAINS NOTHING: a group, or a box with no
+     * fill, border, shadow or glass. Its coming, going and moving change no
+     * pixel -- its children, which do, mark their own -- and it used to mark
+     * its whole area: a menu's window-sized transparent scrim opening was a
+     * repaint of the whole window. Not a box that clips, though: changing the
+     * clip changes what its children show. */
+    rec->has_extent = 0;
+    if (node_paints_nothing(node)) {
+        rec->foot = frect_empty();
+        if (node->dirty_comp) { rec->extent = subtree_footprint(a, h, wparent); rec->has_extent = 1; }
+    }
     rec->is_blur = node->backdrop_blur_enabled;
     rec->has_group = has_group;
     rec->group_bounds = gbounds;
@@ -603,7 +628,7 @@ static struct frect subtree_footprint(struct scene_arena *a, struct node_handle 
 static void subtree_clean(struct scene_arena *a, struct node_handle h, int depth) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n || depth > 1024) return;
-    n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0;
+    n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0; n->dirty_comp = 0;
     if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0;
     struct node_handle c = n->first_child;
     uint32_t guard = 512;
@@ -1023,7 +1048,8 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                     : frect_empty();
                 if (is_content) {
                     if (frect_overlap(vnew, recs[ci].aabb) ||
-                        frect_overlap(vold, recs[ci].aabb)) {
+                        frect_overlap(vold, recs[ci].aabb) ||
+                        (recs[i].has_extent && frect_overlap(recs[i].extent, recs[ci].aabb))) {
                         ok = 0;
 #ifdef SCROLL_DEBUG
                         struct scene_node *vn = scene_resolve(a, recs[i].h);
@@ -1135,6 +1161,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                                      (recs[i].moved && !recs[i].has_old);
                     if (!is_content) continue;
                     dirty_add(r, recs[i].foot);
+                    if (recs[i].has_extent) dirty_add(r, recs[i].extent);
                     if (recs[i].has_old) dirty_add(r, recs[i].old);
                 }
                 scrolled = 1;
@@ -1161,6 +1188,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                 continue;
             }
             dirty_add(r, rec->foot);                                  /* new footprint */
+            if (rec->has_extent) dirty_add(r, rec->extent);           /* a group recomposited */
             if (rec->has_old) dirty_add(r, rec->old);                 /* old ghost */
         }
     }
@@ -1243,7 +1271,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
             r->cache[idx].valid = 1;
         }
         struct scene_node *n = scene_resolve(a, recs[i].h);
-        if (n) { n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0; if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0; }
+        if (n) { n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0; n->dirty_comp = 0; if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0; }
     }
     free(recs);
 

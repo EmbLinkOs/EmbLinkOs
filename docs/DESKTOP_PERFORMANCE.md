@@ -604,3 +604,24 @@ repainted once anyway. The tooltip's frames are the hover the app watches for
 its delay; none of them paints. The top bar's menus are not promoted: the bar
 is a window that shows through, and their glass must frost the desktop under
 it, which needs a layer material in the compositor (M3's open item).
+
+### M5: sheets arrive, and what paints nothing marks nothing
+
+- **Sheets.** On layers an EmUI dialog arrives from 0.95 of its size about
+  its middle and 8 px low as it fades in, on a slightly springy curve, and
+  sinks back out when dismissed; the scrim behind it dims at once, as before.
+  Without layers it appears where it stands, as it always did.
+- **A menu opening is an ordinary frame.** EmUI marked menus opening and
+  closing as structural changes, which the runtime answers with a repaint of
+  the whole window; on layers the menu is not in the window, and they no
+  longer are.
+- **A node that paints nothing stains nothing.** A group, or a box with no
+  fill, border, shadow or glass that does not clip, used to mark its whole
+  area when it came, went or moved -- a menu's window-sized transparent scrim
+  opening repainted the window. Its children mark their own changes; when its
+  opacity or scale changes (`dirty_comp`), its subtree's footprint is marked,
+  for every pixel of it is new. `make backend-test` T21.
+
+Files' context menu on arm64 under HVF, opened and dismissed in an open
+window: 0 full repaints (M0: 19) and 0.79 M pixels presented (M0: 11.6 M), the
+rest being the hover the pointer crossing its rows draws.

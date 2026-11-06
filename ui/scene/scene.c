@@ -487,7 +487,7 @@ void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacit
     if (n->opacity == opacity) return;
     /* the pixels change, not just where they are: content, so a pure fade
      * (no move to carry it) repaints */
-    DMARK(n); n->opacity = opacity; n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->opacity = opacity; n->dirty = true; n->dirty_content = true; n->dirty_comp = true;
 }
 
 void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float scale, float anchor_x, float anchor_y) {
@@ -497,7 +497,7 @@ void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float sc
     if (scale > 1.0f) scale = 1.0f;
     if (n->group_scale == scale && n->anchor_x == anchor_x && n->anchor_y == anchor_y) return;
     DMARK(n); n->group_scale = scale; n->anchor_x = anchor_x; n->anchor_y = anchor_y;
-    n->dirty = true; n->dirty_content = true;
+    n->dirty = true; n->dirty_content = true; n->dirty_comp = true;
 }
 
 void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float radius) {

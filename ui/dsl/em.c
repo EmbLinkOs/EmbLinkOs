@@ -666,6 +666,13 @@ void em_dialog_(EmProps p)  {
      * Supply the semantic default through props, as Card and Sidebar do. */
     if(p.background.a<=0)p.background=TH->surface;
     em_apply_box(p);
+    /* ON LAYERS A SHEET ARRIVES: up from 0.95 of its size about its middle and
+     * 8 px low, as it fades in, on a snappy spring -- and sinks back out when
+     * it is dismissed. The scrim behind it dims at once, as before. Without
+     * layers it appears where it stands. */
+    { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms*2.4f:0);
+      struct scene_layer_motion in={0,950,500,500,0,8,r,900},out={0,970,500,500,0,4,(uint16_t)(r*2/3),1000};
+      ui_set_promoted(g_em_layers!=0,&in,&out); }
 }
 void em_dialog_end_(void)   { em_flush(); ui_dialog_end(); }
 /* True while a page transition is fading in. The host loop should force a full
@@ -3405,6 +3412,15 @@ static void em_menu_hidden_open(uint64_t key) {
     ui_set_size(sz_fixed(0), sz_fixed(0));
 }
 
+/* A MENU OPENED OR CLOSED. In the window it is a structural change (the
+ * epoch: a full repaint, the safe answer to a big part of the tree coming and
+ * going). On layers the menu is not in the window at all -- what changes there
+ * is a transparent scrim -- so it is an ordinary frame. */
+static void em_menu_epoch(void) {
+    if (g_em_layers) em_request_frame();
+    else g_em_epoch++;
+}
+
 void em_menu_(const char *label, EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
@@ -3446,7 +3462,7 @@ void em_menu_(const char *label, EmProps p) {
                 ui_pointer_pos(&x,&y);g_menu_ax=x;g_menu_ay=y+8.0f;
             }
         }
-        g_em_epoch++;
+        em_menu_epoch();
         is_open = (g_menu_open == (const void *)label);
     }
     g_menu_cur_open = is_open;
@@ -3465,7 +3481,7 @@ void em_menu_(const char *label, EmProps p) {
 void em_menu_end_(void) {
     em_flush();
     if (g_menu_cur_open) {
-        if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; }
+        if (em_menu_panel_close()) { g_menu_open = 0; em_menu_epoch(); }
         else if(g_menu_start_last){ui_focus_edge(true);g_menu_start_last=0;}
     }
     else {
@@ -3488,7 +3504,7 @@ void em_menu_end_(void) {
 int em_menu_any_open(void) { return g_menu_open != 0; }
 int em_menu_dismiss(void) {
     if (!g_menu_open) return 0;
-    g_menu_open=0;g_em_epoch++;return 1;
+    g_menu_open=0;em_menu_epoch();return 1;
 }
 
 bool em_menu_item(const char *label, const char *shortcut) {
@@ -3513,7 +3529,7 @@ bool em_menu_item(const char *label, const char *shortcut) {
     }
     bool activated=g_controls_hidden?ui_consume_click(self):ui_control_interact(self);
     ui_end_stack();
-    if(activated) { g_menu_open = 0; g_menu_item_chosen = 1; g_em_epoch++; return true; }
+    if(activated) { g_menu_open = 0; g_menu_item_chosen = 1; em_menu_epoch(); return true; }
     return false;
 }
 
@@ -3547,7 +3563,7 @@ void em_context_menu_end_(void) {
         int scrim_hit = em_menu_panel_close();
         if ((scrim_hit || g_menu_item_chosen) && g_ctx_open_flag) {
             *g_ctx_open_flag = false;
-            g_em_epoch++;
+            em_menu_epoch();
         }
     } else {
         ui_end_stack(); ui_end_stack();   /* inner mirror + hidden box */
@@ -3559,7 +3575,7 @@ int em_menu_key(int code) {
     int context=g_ctx_cur_open && g_ctx_open_flag && *g_ctx_open_flag;
     if(!g_menu_open && !context)return 0;
     if(code==27) {
-        if(context){*g_ctx_open_flag=false;g_ctx_cur_open=0;g_em_epoch++;}
+        if(context){*g_ctx_open_flag=false;g_ctx_cur_open=0;em_menu_epoch();}
         else em_menu_dismiss();
         return 1;
     }
