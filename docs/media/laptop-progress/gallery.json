@@ -4517,6 +4517,26 @@
       "featured": false,
       "milestone": "Fluid desktop P4: type and tokens",
       "historical": false
+    },
+    {
+      "id": "230-scrolled-by-moving",
+      "phase": "Fluid desktop",
+      "title": "Scrolled by moving",
+      "caption": "Settings caught mid-glide, eight notches down its Appearance page. Each frame that moved the page copied the rows it already had and painted only the strip it uncovered -- the scroll bar's thumb, moving the other way, no longer stops that -- and the view shifts by whole pixels, so what is copied is exactly what painting it would give. Scrolled back to the top, the pane is the same picture to the pixel. A scroll frame here costs 0.44-1.23 ms where it cost 2.85-3.84. arm64 under HVF, on EmbCC's C library.",
+      "alt": "The EmbLinkOS Settings window scrolled partway down its Appearance page, palette, typography and materials options showing, the scroll bar thumb a third of the way down",
+      "file": "230-scrolled-by-moving.png",
+      "capture_date": "2026-11-06",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "f04322a46624aed14b22fd95f50053aa7de4a72cbe8cc62b4c3d4d3d3074ae2d",
+      "source_capture": "cap/scrolled.ppm",
+      "source_sha256": "c45aaf09b6f35254247ee77b1ac6078c2076e983f34016d98b53b61b35ef405d",
+      "source_commit": "97409fd",
+      "featured": false,
+      "milestone": "Fluid desktop P3: materials and rendering",
+      "historical": false
     }
   ]
 }
