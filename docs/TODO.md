@@ -141,8 +141,15 @@ the default target). Measured before and after every step
   compositor animates it on its own clock.
   - [x] M0: `perf apps on` and `tools/app_prof_smoke.py` -- what each app's frames cost it, per
         run of frames; baselines for menus, tooltips, the library, the dock and scrolling.
-  - [ ] M1: the toolkit's group cache (and the scratch-space culling bug in a group's paint:
-        a child's footprint in scratch coordinates is tested against window-space dirty rects).
+  - [x] M1: groups keep their flattened pixels (`struct group_cache`), dirty rects merge at the
+        cap, and a group's children are no longer culled against window-space rects in its own
+        buffer (`make backend-test` T17-T19). Menus' full repaints 25 -> 2.
+  - [ ] A group's buffer is repainted whole when anything inside it changes (a hover inside an
+        open menu repaints the menu); repainting only its own dirty rects into the kept buffer
+        would make those frames as cheap as the rest.
+  - [ ] Glass inside a group is never kept (its pixels depend on what is behind it): the menus'
+        drop-in still paints its blur every frame. Compositor layers with `material=blur` (M3,
+        M4) are the answer; until then menus pay about 0.9 ms a frame on an M5 core.
   - [ ] M2: a premultiplied, per-pixel-alpha scaled blit in the compositor.
   - [ ] M3: kernel layers (syscalls 166-169).
   - [ ] M4: menus, popovers, toasts and tooltips on layers; the top bar's dropdowns.

@@ -468,3 +468,44 @@ canvas that holds its dropdowns, so each of those repaints is most of a
 screen. The library repaints the whole desktop for a third of its frames. The
 desktop also builds a frame in every scene (about 35 a scene, 60 us each, no
 pixels) -- the clock and the dock's hover checks; cheap, but not nothing.
+
+### M1: groups keep their pixels, and a moving group is not the whole window
+
+Three changes in the toolkit's renderer (`ui/backend/scene_render.c`):
+
+- **A group's children were culled against the wrong coordinates.** Inside an
+  opacity or scale group the subtree is painted into a buffer of its own, and
+  each child's footprint -- in that buffer's coordinates -- was tested against
+  the frame's dirty rects, which are the window's. On any frame that was not a
+  full repaint, a group away from the window's origin lost the children that
+  test missed. It hid behind the next item, which made nearly every animating
+  frame a full repaint. A group's buffer is now painted whole (`no_cull`), and
+  footprints are tested in the window's coordinates (`make backend-test` T17).
+- **At the 16-rect cap the dirty rects merge** into the rect that grows least,
+  where they used to give up and repaint everything. A group moving is every
+  one of its children moving, each adding its old place and its new one (T19).
+- **A group keeps its flattened pixels** (`struct group_cache`): while nothing
+  inside it changes but its opacity, its scale and where it stands by whole
+  pixels, a frame composites the kept buffer instead of painting the subtree.
+  Glass inside a group is not kept -- what it shows depends on what is behind
+  it. `dirty_look` tells a node's look changing from its compositing changing;
+  `scene_set_corner_radius` is a real setter now (the declare layer wrote the
+  field and marked it a move). T18: a group fading, growing and moving for 21
+  frames is painted twice and composited 19 times, every frame equal to
+  painting it whole.
+
+The same scenes, arm64 under HVF:
+
+| Scene | App | Full repaints (M0 -> M1) | Pixels presented | Paint avg |
+|---|---|---|---|---|
+| Top-bar menu | TopBar | 25 -> 2 | 24.0 M -> 4.1 M | 1.14 -> 0.93 ms |
+| Files context menu | Files | 19 -> 1 | 11.6 M -> 1.8 M | 1.22 -> 0.88 ms |
+| The library | Desktop | 23 -> 9 | 23.6 M -> 32.8 M | 5.12 -> 4.06 ms |
+
+(The M1 run was a noisier machine: an idle desktop frame built in 80-90 us
+against 50-60 in M0, so the paint times flatter M0.) The menus still paint
+about 0.9 ms a frame: their drop-in is glass, which blurs what is behind it and
+so cannot be kept -- that is what the compositor's layers are for (M3, M4).
+The library presents more pixels for fewer full repaints: home presents one
+bounding rect of its dirty rects, and merged rects around a near-full-screen
+sheet bound most of the screen. It is M6's.

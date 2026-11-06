@@ -252,7 +252,7 @@ void scene_reparent(struct scene_arena *a, struct node_handle h,
                 n->next_sibling = NODE_HANDLE_NULL;
         }
     }
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 /* ---- mutation setters --------------------------------------------------- */
@@ -299,7 +299,7 @@ void scene_set_paint(struct scene_arena *a, struct node_handle h, const struct p
     if (!n || !p) return;
     if (paint_eq(&n->data.rect.fill, p)) return;
     n->data.rect.fill = *p;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 /* FNV-1a over the string. Short strings, called once per text node per frame. */
@@ -344,7 +344,7 @@ void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf
     n->data.text.size_px = size_px;
     n->data.text.color = color;
     n->data.text.paint.kind = PAINT_NONE;   /* solid unless a gradient is set next */
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 /* Fill the glyphs with a gradient (over the text's own box) instead of a flat
@@ -354,13 +354,13 @@ void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const 
     if (!n || !paint) return;
     n->data.text.paint = *paint;
     if (paint->n_stops > 0) n->data.text.color = paint->stops[0].color;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_text_wrap(struct scene_arena *a,struct node_handle h,bool wrap) {
     struct scene_node *n=scene_resolve(a,h);
     if(!n || n->kind!=SCENE_NODE_TEXT || n->data.text.no_wrap==!wrap)return;
-    n->data.text.no_wrap=!wrap;DMARK(n);n->dirty=n->dirty_content=true;
+    n->data.text.no_wrap=!wrap;DMARK(n);n->dirty=n->dirty_content=n->dirty_look=true;
 }
 
 void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg) {
@@ -374,7 +374,7 @@ void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color
      * content as MOVED -- which is exactly right for a transform and exactly
      * wrong here. Marked only `dirty`, a selection highlight was applied to the
      * scene, copied correctly, and never drew a single pixel. */
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 /* Explicit dirty for callers whose new content ALIASES the stored pointer (the
@@ -394,7 +394,7 @@ void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pi
     n->data.image.pixels = pixels;
     n->data.image.w = w; n->data.image.h = ht; n->data.image.fmt = fmt;
     n->data.image.damage = 2;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_image_damage(struct scene_arena *a, struct node_handle h,
@@ -415,7 +415,7 @@ void scene_set_image_damage(struct scene_arena *a, struct node_handle h,
     }
     n->data.image.damage = 1;
     n->data.image.dmg_x = x; n->data.image.dmg_y = y; n->data.image.dmg_w = w; n->data.image.dmg_h = ht;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
@@ -428,14 +428,14 @@ void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
         return;                                  /* unchanged -> stay clean */
     n->data.image.tinted = enabled;
     n->data.image.tint = tint;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_layer(struct scene_arena *a, struct node_handle h, uint8_t layer) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n || n->layer == layer) return;
     n->layer = layer;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
@@ -447,7 +447,7 @@ void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
     n->shadow_enabled = enabled;
     n->shadow_dx = dx; n->shadow_dy = dy; n->shadow_blur_radius = blur;
     n->shadow_color = color;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color) {
@@ -457,7 +457,7 @@ void scene_set_border(struct scene_arena *a, struct node_handle h, float width, 
         n->border_paint.kind == PAINT_NONE) return;
     n->border_width = width; n->border_color = color;
     n->border_paint.kind = PAINT_NONE;   /* solid mode */
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 /* Stroke the border with a gradient paint (linear/radial). Falls back to the
@@ -469,7 +469,7 @@ void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
     n->border_width  = width;
     n->border_paint  = *paint;
     n->border_color  = paint->n_stops > 0 ? paint->stops[0].color : n->border_color;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius) {
@@ -478,7 +478,7 @@ void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool e
     if (n->backdrop_blur_enabled == enabled && n->backdrop_blur_radius == radius) return;
     n->backdrop_blur_enabled = enabled;
     n->backdrop_blur_radius = radius;
-    DMARK(n); n->dirty = true; n->dirty_content = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity) {
@@ -498,6 +498,13 @@ void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float sc
     if (n->group_scale == scale && n->anchor_x == anchor_x && n->anchor_y == anchor_y) return;
     DMARK(n); n->group_scale = scale; n->anchor_x = anchor_x; n->anchor_y = anchor_y;
     n->dirty = true; n->dirty_content = true;
+}
+
+void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float radius) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || n->corner_radius == radius) return;
+    /* new pixels at the corners: content, not a move */
+    DMARK(n); n->corner_radius = radius; n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip) {

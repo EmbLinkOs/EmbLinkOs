@@ -16,6 +16,23 @@
 
 struct rect_cache { float x, y, w, h; uint32_t generation; int valid; };
 
+/* A GROUP'S KEPT PIXELS (Section 5, cached). An opacity or scale group is
+ * painted whole into a buffer of its own and then composited once; while
+ * nothing inside it changes -- only how it is composited: its opacity, its
+ * scale, where it stands by whole pixels -- the buffer is still right, and
+ * the frame composites it again instead of painting the subtree. A menu
+ * fading in is then one blit a frame, not its whole tree. */
+#define SCENE_GROUP_CACHE 16
+struct group_cache {
+    uint32_t  index, generation;   /* the group's root node */
+    uint32_t *px; uint32_t w, h;   /* premultiplied, w x h, as painted */
+    uint32_t  cap;                 /* pixels the buffer holds */
+    float     fx, fy;              /* where it stood, past the whole pixel */
+    uint32_t  sig;                 /* the subtree's shape when painted */
+    int       reduced;             /* the effects tier it was painted at */
+    int       used;                /* met this frame */
+};
+
 struct scene_renderer {
     struct render_backend *be;
     struct rect_cache     *cache;      /* per-node world rect from last frame */
@@ -33,6 +50,14 @@ struct scene_renderer {
      * onto, and its offset -- where glass in the group finds its backdrop. */
     struct render_target  *backdrop;
     float                  bd_ox, bd_oy;
+    /* Painting a group's subtree into its own buffer: cull nothing. The frame's
+     * dirty rects say what is to change ON SCREEN; the buffer is composited
+     * whole (and, scaled, not where its children's own rects say), so every
+     * child belongs in it. */
+    int                    no_cull;
+    struct group_cache     groups[SCENE_GROUP_CACHE];
+    /* frames whose groups were composited from kept pixels / painted anew */
+    uint32_t               group_hits, group_paints;
 };
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be);

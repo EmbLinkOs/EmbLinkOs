@@ -620,6 +620,108 @@ static void t16_large_blur(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- the group tests' shared scene: a translucent card away from the window
+ * origin, holding a row of boxes -- a menu, as the toolkit builds one ------ */
+struct card { struct node_handle root, grp, box[40]; int n; };
+static struct paint solidp(float r, float g, float b, float a) {
+    struct paint p; memset(&p, 0, sizeof p); p.kind = PAINT_SOLID; p.solid = (struct color){ r, g, b, a }; return p;
+}
+static void card_build(struct scene_arena *a, struct card *c, int n) {
+    c->n = n;
+    c->root = scene_create_node(a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(a, SCENE_NODE_RECT, c->root);
+    scene_set_size(a, ground, 200, 160);
+    struct paint gp = solidp(0.1f, 0.12f, 0.14f, 1); scene_set_paint(a, ground, &gp);
+    c->grp = scene_create_node(a, SCENE_NODE_RECT, c->root);
+    scene_set_size(a, c->grp, 120, 100);
+    scene_set_transform(a, c->grp, 40.5f, 30.25f, 0, 0,0,0,1, 1,1,1);   /* off the origin, between pixels */
+    scene_set_corner_radius(a, c->grp, 8);
+    struct paint cp = solidp(0.9f, 0.9f, 0.95f, 0.9f); scene_set_paint(a, c->grp, &cp);
+    for (int i = 0; i < n; i++) {
+        c->box[i] = scene_create_node(a, SCENE_NODE_RECT, c->grp);
+        scene_set_size(a, c->box[i], 10, 8);
+        scene_set_transform(a, c->box[i], 4.0f + (float)(i % 8) * 14.0f, 6.0f + (float)(i / 8) * 18.0f, 0, 0,0,0,1, 1,1,1);
+        scene_set_corner_radius(a, c->box[i], 2);
+        struct paint bp = solidp(0.2f + 0.1f * (float)(i % 5), 0.3f, 0.7f, 1); scene_set_paint(a, c->box[i], &bp);
+    }
+}
+/* how many pixels of `rt` differ from painting the scene from nothing */
+static int differs_from_fresh(struct scene_arena *a, struct node_handle root, struct render_target *rt) {
+    struct render_target f = make_target((int)rt->width, (int)rt->height);
+    struct scene_renderer r2; scene_render_init(&r2, cpu_backend_get());
+    scene_render_frame(&r2, a, root, &f);
+    int n = 0;
+    for (uint32_t y = 0; y < rt->height; y++)
+        for (uint32_t x = 0; x < rt->width; x++) if (px_at(rt, (int)x, (int)y) != px_at(&f, (int)x, (int)y)) n++;
+    scene_render_destroy(&r2); free(f.pixels);
+    return n;
+}
+
+/* ---- T17: a partial frame of a group away from the origin keeps all of it.
+ * Inside a group's offscreen pass a child's footprint is in the scratch's own
+ * coordinates; it was tested against the frame's dirty rects in the window's,
+ * so on any frame that was not a full repaint the children of a group that
+ * did not sit at the origin were culled, and the group came back without them. */
+static void t17_partial_group(void) {
+    printf("T17 a partial frame of an offset group keeps all its children:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(200, 160);
+    struct card c; card_build(&a, &c, 6);
+    scene_set_opacity(&a, c.grp, 0.6f);
+    scene_render_frame(&r, &a, c.root, &rt);
+    struct paint np = solidp(1, 0.5f, 0, 1); scene_set_paint(&a, c.box[5], &np);   /* one child changes */
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(!r.full, "the change is a partial frame");
+    CHECK(differs_from_fresh(&a, c.root, &rt) == 0, "and it is what painting it all gives: no child culled");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T18: a group that fades, moves and shrinks is the same picture, frame by
+ * frame, as painting it from nothing -- whether its flattened pixels were kept
+ * or remade, and with a child changing halfway ---------------------------- */
+static void t18_group_motion(void) {
+    printf("T18 a group fading, moving and growing is right every frame:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(200, 160);
+    struct card c; card_build(&a, &c, 12);
+    int wrong = 0;
+    for (int f = 0; f <= 20; f++) {
+        float t = (float)f / 20.0f;
+        scene_set_opacity(&a, c.grp, 0.05f + 0.9f * t);
+        scene_set_group_scale(&a, c.grp, 0.94f + 0.05f * t, 0.0f, 0.0f);
+        scene_set_transform(&a, c.grp, 40.5f, 30.25f - (float)(20 - f), 0, 0,0,0,1, 1,1,1);   /* whole-pixel steps */
+        if (f == 10) { struct paint np = solidp(1, 0.5f, 0, 1); scene_set_paint(&a, c.box[3], &np); }
+        scene_render_frame(&r, &a, c.root, &rt);
+        if (differs_from_fresh(&a, c.root, &rt)) wrong++;
+    }
+    printf("        (%u frames composited from kept pixels, %u painted anew)\n", r.group_hits, r.group_paints);
+    CHECK(wrong == 0, "every frame of it is what painting it whole gives");
+    CHECK(r.group_hits >= 17 && r.group_paints <= 3,
+          "and it was painted twice -- at the start and when a child changed -- and only composited after");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T19: a group moving is a few dirty rects, not a full repaint. Each of
+ * its children moved too, and each added its old and new place, so a menu of
+ * more than eight things blew the cap and repainted the window ------------ */
+static void t19_group_dirty(void) {
+    printf("T19 a moving group of many children is not a full repaint:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(200, 160);
+    struct card c; card_build(&a, &c, 40);
+    scene_set_opacity(&a, c.grp, 0.5f);
+    scene_render_frame(&r, &a, c.root, &rt);
+    scene_set_transform(&a, c.grp, 40.5f, 32.25f, 0, 0,0,0,1, 1,1,1);
+    scene_set_opacity(&a, c.grp, 0.6f);
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(!r.full, "forty children moving with their group: still a partial frame");
+    CHECK(differs_from_fresh(&a, c.root, &rt) == 0, "and the right picture");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -638,6 +740,9 @@ int main(void) {
     t14_fade_alone();
     t15_gradient_table();
     t16_large_blur();
+    t17_partial_group();
+    t18_group_motion();
+    t19_group_dirty();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

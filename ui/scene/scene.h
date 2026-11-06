@@ -184,6 +184,12 @@ struct scene_node {
                             * (paint, text, image, border...) invalidates the
                             * pixels themselves. The renderer's scroll fast
                             * path tells the two apart with this bit. */
+    bool  dirty_look;      /* dirty_content MINUS how the node is composited:
+                            * opacity and group scale change what a group's
+                            * flattened pixels LOOK like on screen, not the
+                            * pixels themselves, so a group's kept pixels
+                            * (scene_render's group cache) survive them. Any
+                            * other content change sets this too. */
 
     /* Opaque tag Piece 3 never interprets -- exists purely so a consumer above
      * (Piece 7's declarative layer) can stash its own identifier (e.g. a packed
@@ -259,6 +265,7 @@ void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius);
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity);
 void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float scale, float anchor_x, float anchor_y);
+void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float radius);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);
 void scene_set_z(struct scene_arena *a, struct node_handle h, float z);
 

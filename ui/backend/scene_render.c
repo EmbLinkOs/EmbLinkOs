@@ -88,7 +88,28 @@ static struct frect subtree_bounds(struct scene_arena *a, struct node_handle h,
 
 static void dirty_add(struct scene_renderer *r, struct frect f) {
     if (r->full || frect_is_empty(f)) return;
-    if (r->n_dirty >= 16) { r->full = 1; return; }   /* Section 0 cap -> full-screen */
+    if (r->n_dirty >= 16) {
+        /* AT THE CAP, MERGE -- into the rect that grows least taking it in.
+         * This used to repaint everything instead, and a group moving is
+         * every one of its children moving, each adding its old place and its
+         * new: a menu of nine things fading in repainted its whole window
+         * every frame. Their places all lie inside the group's own, so the
+         * merged rects stay about the size of what really changed. */
+        float x0 = floorf(f.x), y0 = floorf(f.y), x1 = ceilf(f.x + f.w), y1 = ceilf(f.y + f.h);
+        int best = 0; float grow = 0;
+        for (int i = 0; i < r->n_dirty; i++) {
+            struct clip_rect *d = &r->dirty[i];
+            float ux0 = d->x < x0 ? d->x : x0, uy0 = d->y < y0 ? d->y : y0;
+            float ux1 = d->x + d->w > x1 ? d->x + d->w : x1, uy1 = d->y + d->h > y1 ? d->y + d->h : y1;
+            float g = (ux1 - ux0) * (uy1 - uy0) - d->w * d->h;
+            if (i == 0 || g < grow) { grow = g; best = i; }
+        }
+        struct clip_rect *d = &r->dirty[best];
+        float ux0 = d->x < x0 ? d->x : x0, uy0 = d->y < y0 ? d->y : y0;
+        float ux1 = d->x + d->w > x1 ? d->x + d->w : x1, uy1 = d->y + d->h > y1 ? d->y + d->h : y1;
+        d->x = ux0; d->y = uy0; d->w = ux1 - ux0; d->h = uy1 - uy0;
+        return;
+    }
     /* WHOLE PIXELS, rounded outward. A pixel is repainted when its CENTRE is in
      * a dirty rect, but a node at a fractional place stains the pixel its edge
      * only partly covers: an anti-aliased edge does, and text does more, its
@@ -101,7 +122,7 @@ static void dirty_add(struct scene_renderer *r, struct frect f) {
     r->dirty[r->n_dirty++] = c;
 }
 static int dirty_hits(struct scene_renderer *r, struct frect f) {
-    if (r->full) return 1;
+    if (r->full || r->no_cull) return 1;
     for (int i = 0; i < r->n_dirty; i++) {
         struct frect d = { r->dirty[i].x, r->dirty[i].y, r->dirty[i].w, r->dirty[i].h };
         if (frect_overlap(f, d)) return 1;
@@ -242,7 +263,9 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
         if (sx1 > px1) px1 = sx1;
         if (sy1 > py1) py1 = sy1;
     }
-    struct frect foot = { px0 - ox, py0 - oy, px1 - px0, py1 - py0 };
+    /* in the WINDOW's coordinates, as the dirty rects are -- not the target's:
+     * inside a group the target is its own buffer, offset by (ox, oy) */
+    struct frect foot = { px0, py0, px1 - px0, py1 - py0 };
 #ifdef SCENE_TRACE
     fprintf(stderr, "paint kind=%d layer=%d rect=(%.0f,%.0f %.0fx%.0f) hit=%d\n",
             n->kind, n->layer, ab.x, ab.y, ab.w, ab.h, dirty_hits(r, foot));
@@ -294,6 +317,78 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
         case SCENE_NODE_GROUP:
         default: break;
     }
+}
+
+/* ---- the group cache (scene_render.h struct group_cache) ----------------- */
+
+/* Did anything inside the group change this frame, other than how the group
+ * itself is composited? Any descendant touched at all (moved within it,
+ * repainted, resized), or the root's own look. `sig` gathers the subtree's
+ * shape -- which nodes, in what order -- because a child added or taken away
+ * marks nothing dirty; `blur`, whether any of it is glass, whose pixels
+ * depend on what lies behind and so cannot be kept. */
+static int g_gc_depth;
+static int group_changed_walk(struct scene_arena *a, struct node_handle h, int is_root,
+                              uint32_t *sig, int *blur) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || g_gc_depth > 1024) return 1;
+    *sig = (*sig ^ (h.index * 2654435761u) ^ (h.generation << 7) ^ (uint32_t)n->kind) * 16777619u;
+    if (n->backdrop_blur_enabled) *blur = 1;
+    int changed = is_root ? n->dirty_look : n->dirty;
+    g_gc_depth++;
+    struct node_handle c = n->first_child;
+    uint32_t guard = 512;
+    while (!node_handle_is_null(c) && guard-- != 0) {
+        struct scene_node *cn = scene_resolve(a, c);
+        struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
+        changed |= group_changed_walk(a, c, 0, sig, blur);
+        c = next;
+    }
+    g_gc_depth--;
+    return changed;
+}
+static int group_changed(struct scene_arena *a, struct node_handle h, uint32_t *sig, int *blur) {
+    *sig = 2166136261u; *blur = 0;
+    return group_changed_walk(a, h, 1, sig, blur);
+}
+
+#define GROUP_CACHE_BYTES (24u << 20)   /* all kept groups together */
+
+static struct group_cache *group_find(struct scene_renderer *r, struct node_handle h) {
+    for (int i = 0; i < SCENE_GROUP_CACHE; i++)
+        if (r->groups[i].index == h.index && r->groups[i].generation == h.generation && h.index)
+            return &r->groups[i];
+    return 0;
+}
+static void group_drop(struct group_cache *g) {
+    free(g->px);
+    memset(g, 0, sizeof *g);
+}
+static uint64_t group_bytes(const struct scene_renderer *r) {
+    uint64_t n = 0;
+    for (int i = 0; i < SCENE_GROUP_CACHE; i++) n += (uint64_t)r->groups[i].cap * 4;
+    return n;
+}
+/* a slot for a group about to be painted: a free one, or one not met yet this
+ * frame; none when keeping it would pass the byte cap (it is painted each time) */
+static struct group_cache *group_take(struct scene_renderer *r, struct node_handle h, uint32_t px) {
+    struct group_cache *g = 0;
+    for (int i = 0; i < SCENE_GROUP_CACHE && !g; i++) if (!r->groups[i].index) g = &r->groups[i];
+    for (int i = 0; i < SCENE_GROUP_CACHE && !g; i++) if (!r->groups[i].used) { group_drop(&r->groups[i]); g = &r->groups[i]; }
+    if (!g) return 0;
+    if (group_bytes(r) + (uint64_t)px * 4 > GROUP_CACHE_BYTES) return 0;
+    g->index = h.index; g->generation = h.generation; g->used = 1;
+    return g;
+}
+static int group_buffer(struct group_cache *g, uint32_t w, uint32_t h) {
+    uint32_t need = w * h;
+    if (g->cap < need) {
+        uint32_t *p = (uint32_t *)realloc(g->px, (size_t)need * 4);
+        if (!p) return 0;
+        g->px = p; g->cap = need;
+    }
+    g->w = w; g->h = h;
+    return 1;
 }
 
 /* Elevated subtrees found during the flow pass, painted afterwards in
@@ -386,19 +481,58 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
         int bx = (int)floorf(b.x), by = (int)floorf(b.y);
         int bw = (int)ceilf(b.x + b.w) - bx, bh = (int)ceilf(b.y + b.h) - by;
         if (bw <= 0 || bh <= 0) return;
-        if (!dirty_hits(r, b)) return;   /* whole group outside dirty -> skip */
 
-        struct render_target *scratch = cpu_scratch_acquire((uint32_t)bw, (uint32_t)bh);
+        /* KEPT PIXELS: the group as it was last painted, if nothing in it has
+         * changed since but how it is composited (struct group_cache). */
+        uint32_t sig = 0; int blur = 0;
+        int changed = group_changed(a, h, &sig, &blur);
+        float fx = b.x - (float)bx, fy = b.y - (float)by;
+        struct group_cache *gc = group_find(r, h);
+        if (gc) gc->used = 1;
+        if (!dirty_hits(r, b)) {          /* whole group outside dirty -> skip */
+            if (gc && changed) group_drop(gc);   /* what it kept is no longer it */
+            return;
+        }
+        int reuse = gc && !changed && !blur && gc->px && gc->w == (uint32_t)bw && gc->h == (uint32_t)bh &&
+                    gc->sig == sig && fabsf(gc->fx - fx) < 1e-3f && fabsf(gc->fy - fy) < 1e-3f &&
+                    gc->reduced == g_effects_reduced;
+        struct render_target kept;
+        struct render_target *scratch = 0;
+        if (reuse) {
+            r->group_hits++;
+            memset(&kept, 0, sizeof kept);
+            kept.pixels = gc->px; kept.width = gc->w; kept.height = gc->h; kept.stride = gc->w * 4;
+            kept.format = EMBK_PIXFMT_BGRA8888_PRE;
+            scratch = &kept;
+        } else {
+            r->group_paints++;
+            if (!blur && !gc) gc = group_take(r, h, (uint32_t)bw * (uint32_t)bh);
+            if (!blur && gc && group_buffer(gc, (uint32_t)bw, (uint32_t)bh)) {
+                memset(&kept, 0, sizeof kept);
+                kept.pixels = gc->px; kept.width = gc->w; kept.height = gc->h; kept.stride = gc->w * 4;
+                kept.format = EMBK_PIXFMT_BGRA8888_PRE;
+                memset(gc->px, 0, (size_t)bw * (size_t)bh * 4);   /* transparent, so it composites */
+                scratch = &kept;
+                gc->fx = fx; gc->fy = fy; gc->sig = sig; gc->reduced = g_effects_reduced;
+            } else {
+                if (gc) group_drop(gc);                   /* glass inside: painted each time */
+                scratch = cpu_scratch_acquire((uint32_t)bw, (uint32_t)bh);
+            }
+            if (scratch) {
+                struct clip_saved sv;
+                /* glass in the group blurs what the group lands on: the outermost
+                 * group's target (a nested group's is a half-rendered scratch) */
+                int outer = !r->backdrop;
+                if (outer) { r->backdrop = target; r->bd_ox = ox; r->bd_oy = oy; }
+                int was = r->no_cull; r->no_cull = 1;
+                cpu_clip_save_and_clear(&sv);   /* isolate scratch coords + lift dirty */
+                render_subtree_opaque(r, a, h, wparent, scratch, (float)bx, (float)by);
+                cpu_clip_restore(&sv);
+                r->no_cull = was;
+                if (outer) r->backdrop = 0;
+            }
+        }
         if (scratch) {
-            struct clip_saved sv;
-            /* glass in the group blurs what the group lands on: the outermost
-             * group's target (a nested group's is a half-rendered scratch) */
-            int outer = !r->backdrop;
-            if (outer) { r->backdrop = target; r->bd_ox = ox; r->bd_oy = oy; }
-            cpu_clip_save_and_clear(&sv);   /* isolate scratch coords + lift dirty */
-            render_subtree_opaque(r, a, h, wparent, scratch, (float)bx, (float)by);
-            cpu_clip_restore(&sv);
-            if (outer) r->backdrop = 0;
             /* blit flattened result; coverage_at clips this to the dirty union */
             /* flattened subtree: already-rendered pixels, never a stencil */
             /* ...smaller toward its anchor when the group is scaled (inside its
@@ -409,7 +543,7 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
             r->be->draw_image(target, dx - ox, dy - oy, dw, dh,
                               scratch->pixels, (uint32_t)bw, (uint32_t)bh, scratch->stride,
                               scratch->format, n->opacity, NULL);
-            cpu_scratch_release(scratch);
+            if (scratch != &kept) cpu_scratch_release(scratch);
         }
         return;
     }
@@ -440,9 +574,12 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
 void scene_render_init(struct scene_renderer *r, struct render_backend *be) {
     r->be = be; r->cache = 0; r->cache_cap = 0; r->n_dirty = 0; r->full = 0; r->has_scroll_present = 0;
     r->backdrop = 0; r->bd_ox = r->bd_oy = 0;
+    r->no_cull = 0; r->group_hits = r->group_paints = 0;
+    memset(r->groups, 0, sizeof r->groups);
 }
 void scene_render_destroy(struct scene_renderer *r) {
     free(r->cache); r->cache = 0; r->cache_cap = 0;
+    for (int i = 0; i < SCENE_GROUP_CACHE; i++) group_drop(&r->groups[i]);
 }
 
 int scene_render_set_reduced(int on) {
@@ -453,7 +590,9 @@ int scene_render_set_reduced(int on) {
 }
 
 void scene_render_invalidate(struct scene_renderer *r) {
-    if (!r || !r->cache) return;
+    if (!r) return;
+    for (int i = 0; i < SCENE_GROUP_CACHE; i++) group_drop(&r->groups[i]);
+    if (!r->cache) return;
     for (uint32_t i = 0; i < r->cache_cap; i++) r->cache[i].valid = 0;
 }
 
@@ -872,6 +1011,12 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
         for (int i = 0; i < el.n; i++)
             render_node(r, a, el.e[i].h, el.e[i].wparent, target, 0.0f, 0.0f, 1, 0);
         r->be->end_frame(target);
+        /* a group not met this frame is gone (or no longer a group): let its
+         * pixels go */
+        for (int i = 0; i < SCENE_GROUP_CACHE; i++) {
+            if (r->groups[i].index && !r->groups[i].used) group_drop(&r->groups[i]);
+            r->groups[i].used = 0;
+        }
     }
 
     /* update cache to this frame's rects + clear consumed dirty flags */
@@ -884,7 +1029,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
             r->cache[idx].valid = 1;
         }
         struct scene_node *n = scene_resolve(a, recs[i].h);
-        if (n) { n->dirty = 0; n->dirty_content = 0; if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0; }
+        if (n) { n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0; if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0; }
     }
     free(recs);
 }

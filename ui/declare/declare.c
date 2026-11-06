@@ -495,8 +495,7 @@ void ui_set_corner_radius(float r) {
     struct instance *b = cur_box(); if (!b) return;
     if (b->shadow.has_corner && b->shadow.corner_radius == r) return;
     b->shadow.corner_radius = r; b->shadow.has_corner = true;
-    struct scene_node *sn = scene_resolve(g_sa, b->scene_node);
-    if (sn) { sn->corner_radius = r; sn->dirty = true; }
+    scene_set_corner_radius(g_sa, b->scene_node, r);   /* content: the corners' pixels change */
     g_mutation_count++;
 }
 void ui_set_padding(float top, float right, float bottom, float left) {
