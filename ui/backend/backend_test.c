@@ -722,6 +722,131 @@ static void t19_group_dirty(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- T20: a PROMOTED subtree is a layer's, not the window's --------------
+ * A fake layer host keeps the layers as the application runtime would hand
+ * them to the compositor, and counts what it was asked. */
+struct fake_layer { uint32_t *px; uint32_t w, h; int presents, gos, froms, destroys; struct scene_layer_state at; };
+static struct fake_layer g_fl[8];
+static int g_fl_n;
+static uint32_t fl_create(void *ctx, uint32_t w, uint32_t h, uint32_t **px) {
+    (void)ctx;
+    if (g_fl_n >= 8) return 0;
+    struct fake_layer *l = &g_fl[g_fl_n++];
+    memset(l, 0, sizeof *l);
+    l->px = calloc((size_t)w * h, 4); l->w = w; l->h = h;
+    *px = l->px;
+    return (uint32_t)g_fl_n;
+}
+static void fl_present(void *ctx, uint32_t id, int x, int y, int w, int h) {
+    (void)ctx; (void)x; (void)y; (void)w; (void)h;
+    g_fl[id - 1].presents++;
+}
+static void fl_go(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
+                  uint16_t resp, uint16_t damp, int destroy, int at_present) {
+    (void)ctx; (void)resp; (void)damp; (void)at_present;
+    struct fake_layer *l = &g_fl[id - 1];
+    l->gos++; l->froms += from != 0; l->destroys += destroy; l->at = *to;
+}
+static const struct scene_layer_host g_fake_host = { 0, fl_create, fl_present, fl_go };
+
+/* the ground and a card -- a menu, its shadow, a row in it -- promoted or not */
+static struct node_handle t20_scene(struct scene_arena *ap, struct node_handle *card_out, struct node_handle *row_out,
+                                    int promote) {
+#define a (*ap)
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 200, 160);
+    struct paint gp = solidp(0.1f, 0.2f, 0.6f, 1); scene_set_paint(&a, ground, &gp);
+    struct node_handle card = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, card, 100, 60);
+    scene_set_transform(&a, card, 40, 30, 0, 0,0,0,1, 1,1,1);
+    scene_set_corner_radius(&a, card, 8);
+    struct paint cp = solidp(0.95f, 0.95f, 0.97f, 0.9f); scene_set_paint(&a, card, &cp);
+    scene_set_shadow(&a, card, true, 0, 4, 10, (struct color){ 0, 0, 0, 0.3f });
+    struct node_handle row = scene_create_node(&a, SCENE_NODE_RECT, card);
+    scene_set_size(&a, row, 80, 12); scene_set_transform(&a, row, 10, 10, 0, 0,0,0,1, 1,1,1);
+    struct paint rp = solidp(0.2f, 0.6f, 0.3f, 1); scene_set_paint(&a, row, &rp);
+    struct scene_layer_motion in = { 0, 940, 0, 0, 0, -5, 240, 1000 }, out = { 0, 960, 0, 0, 0, 0, 200, 1000 };
+    if (promote) scene_set_promoted(&a, card, true, &in, &out);
+    *card_out = card; *row_out = row;
+    return root;
+#undef a
+}
+
+static void t20_promoted(void) {
+    printf("T20 a promoted subtree is painted once into a layer, and moved by it:\n");
+    g_fl_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host);
+    struct render_target rt = make_target(200, 160);
+    struct node_handle card, row, root = t20_scene(&a, &card, &row, 1);
+
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == 0 && r.wants_frame, "the first frame it is seen, it settles: no layer yet, and a frame asked for");
+    scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && l->presents == 1, "the card is painted into one layer, presented once");
+    CHECK(l->gos == 1 && l->froms == 1 && l->at.x <= 40 && l->at.opacity == 255,
+          "and sent in from its appear end, to where it stands");
+    CHECK(px_at(&rt, 90, 50) == px_at(&rt, 5, 5), "the window under it is the ground: the card is not in it");
+    /* the layer over the window is the card painted where it stands */
+    {
+        struct render_target f = make_target(200, 160);
+        struct scene_renderer r2; scene_render_init(&r2, cpu_backend_get());
+        struct scene_arena a2; scene_arena_init(&a2);
+        struct node_handle c2, w2, root2 = t20_scene(&a2, &c2, &w2, 0);   /* the same, painted in place */
+        scene_render_frame(&r2, &a2, root2, &f);
+        int worst = 0;
+        for (int y = 0; y < 160; y++)
+            for (int x = 0; x < 200; x++) {
+                uint32_t d = px_at(&rt, x, y), o = d;
+                int lx = x - l->at.x, ly = y - l->at.y;
+                if (lx >= 0 && ly >= 0 && lx < (int)l->w && ly < (int)l->h) {
+                    uint32_t sp = l->px[ly * l->w + lx], ia = 255 - (sp >> 24);
+                    o = 0;
+                    for (int sh = 0; sh < 32; sh += 8)
+                        o |= ((((sp >> sh) & 255) + (((d >> sh) & 255) * ia + 127) / 255) > 255 ? 255u :
+                              (((sp >> sh) & 255) + (((d >> sh) & 255) * ia + 127) / 255)) << sh;
+                }
+                uint32_t want = px_at(&f, x, y);
+                /* AN EDGE IS NOT THE SAME EDGE: painted into the window its
+                 * coverage is blended against the ground, painted into a layer
+                 * it is alpha (blend_cov) -- leave the card's outline out */
+                int ex = x < 40 ? 40 - x : x >= 140 ? x - 139 : 0, ey = y < 30 ? 30 - y : y >= 90 ? y - 89 : 0;
+                int in_x = x >= 40 && x < 140, in_y = y >= 30 && y < 90;
+                int near_edge = (in_x && in_y && (x < 42 || x >= 138 || y < 32 || y >= 88 ||
+                                 ((x < 50 || x >= 130) && (y < 40 || y >= 80)))) ||
+                                ((ex || ey) && ex <= 1 && ey <= 1);
+                if (near_edge) continue;
+                for (int sh = 0; sh < 24; sh += 8) {
+                    int e = (int)((o >> sh) & 255) - (int)((want >> sh) & 255);
+                    if (e < 0) e = -e;
+                }
+            }
+        printf("        (the layer over the window, against painting it in place: %d levels at most)\n", worst);
+        CHECK(worst <= 2, "the layer composited over the window is the card painted in it");
+        scene_render_destroy(&r2); free(f.pixels); scene_arena_destroy(&a2);
+    }
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->presents == 1 && l->gos == 1, "a frame where nothing changed asks nothing of it");
+    scene_set_transform(&a, card, 46, 30, 0, 0,0,0,1, 1,1,1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->presents == 1 && l->gos == 2 && l->froms == 1 && l->at.x >= 46 - 20,
+          "moved, it is told where to go and not painted again");
+    struct paint np = solidp(0.9f, 0.3f, 0.2f, 1); scene_set_paint(&a, row, &np);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->presents == 2 && l->gos == 2, "a child repainted: the layer's pixels again, no move");
+    uint32_t paints = r.layer_paints;
+    scene_destroy_node(&a, card);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->destroys == 1 && l->at.opacity == 0 && l->at.scale_milli == 960 && r.layer_paints == paints,
+          "gone, it leaves on its disappear motion, and the layer goes after");
+    CHECK(px_at(&rt, 90, 50) == px_at(&rt, 5, 5), "and the window was never painted with it");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -743,6 +868,8 @@ int main(void) {
     t17_partial_group();
     t18_group_motion();
     t19_group_dirty();
+    t20_promoted();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }
+

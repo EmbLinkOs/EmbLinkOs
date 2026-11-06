@@ -445,6 +445,58 @@ static uint64_t present_changes(int win, uint32_t *px, const uint32_t *back, int
     return (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
 }
 
+/* ---- LAYERS: promoted subtrees, handed to the compositor ---------------
+ * The renderer paints a menu or a tooltip once into a layer of the window
+ * (scene_layer_host) and these hand it on (user/lib/embk_layer.h): the
+ * compositor brings it in, moves it and takes it away on its own frame clock,
+ * and this application does not draw a frame of it. */
+static int g_lh_win;
+static uint32_t lh_create(void *ctx, uint32_t w, uint32_t h, uint32_t **px) {
+    (void)ctx;
+    uint64_t va = 0;
+    int64_t id = embk_layer_create(g_lh_win, w, h, &va);
+    if (id <= 0 || !va) return 0;
+    *px = (uint32_t *)(uintptr_t)va;
+    return (uint32_t)id;
+}
+static void lh_present(void *ctx, uint32_t id, int x, int y, int w, int h) {
+    (void)ctx;
+    embk_layer_present(g_lh_win, id, x, y, w, h);
+}
+static void lh_op(struct embk_layer_op *op, uint32_t id, const struct scene_layer_state *s) {
+    memset(op, 0, sizeof *op);
+    op->id = id; op->set = EMBK_LP_POS | EMBK_LP_OPACITY | EMBK_LP_SCALE;
+    op->x = s->x; op->y = s->y; op->opacity = s->opacity; op->scale_milli = s->scale_milli;
+    op->anchor_x_milli = s->anchor_x_milli; op->anchor_y_milli = s->anchor_y_milli;
+}
+static void lh_go(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
+                  uint16_t response_ms, uint16_t damping_milli, int destroy, int at_present) {
+    (void)ctx;
+    struct embk_layer_op op[2]; uint32_t n = 0;
+    if (from) { lh_op(&op[n], id, from); op[n].snap = op[n].set; n++; }
+    lh_op(&op[n], id, to);
+    if (!response_ms) op[n].snap = op[n].set;
+    op[n].move.response_ms = op[n].fade.response_ms = op[n].grow.response_ms = response_ms;
+    op[n].move.damping_milli = op[n].fade.damping_milli = op[n].grow.damping_milli = damping_milli;
+    if (destroy) op[n].op = EMBK_LOP_DESTROY;
+    n++;
+    embk_layer_set(g_lh_win, op, n, at_present ? EMBK_LS_AT_PRESENT : 0);
+}
+static const struct scene_layer_host g_layer_host = { 0, lh_create, lh_present, lh_go };
+/* Can this window have layers? The kernel says by giving one (a pixel, let go
+ * at once). Not for a window that shows through: glass in a menu frosts what
+ * is behind it in this window's pixels, and there that is nothing. */
+static int layers_probe(int win, int shows_through) {
+    if (shows_through) return 0;
+    uint64_t va = 0;
+    int64_t id = embk_layer_create(win, 1, 1, &va);
+    if (id <= 0) return 0;
+    struct embk_layer_op op; memset(&op, 0, sizeof op);
+    op.id = (uint32_t)id; op.op = EMBK_LOP_DESTROY;
+    embk_layer_set(win, &op, 1, 0);
+    return 1;
+}
+
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;
@@ -591,6 +643,9 @@ int em_app_run(const EmApp *app) {
     rt.clear_dirty = translucent;
     if (back) memcpy(back, px, (size_t)winw * (size_t)winh * 4);
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    /* menus and tooltips the compositor moves, where it can */
+    g_lh_win = win;
+    if (layers_probe(win, translucent || g_mat_alpha)) { scene_render_set_layer_host(&r, &g_layer_host); em_set_layers(1); }
     { char b[64]; snprintf(b, sizeof b, "%s: interactive loop running\n", title); embk_puts(1, b); }
 
     int pace = app->pace_ms > 0 ? app->pace_ms : 10;
@@ -694,7 +749,7 @@ int em_app_run(const EmApp *app) {
                         g_viewport_w=nw;g_viewport_h=nh;em_set_viewport(nw,nh);
                         int ny=P.y+(g_follow_display_width && g_shell_bottom && !menu_expanded?P.h-nh:0);
                         embk_win_place(win,P.x,ny);if(chromeless)em_window_bind(win,P.x,ny);
-                        scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());em_structure_changed();em_request_frame();
+                        scene_render_invalidate(&r);em_structure_changed();em_request_frame();
                     }else display_pending=1;
                 }else geometry_pending=1;
             }
@@ -836,7 +891,7 @@ int em_app_run(const EmApp *app) {
                 if(passive_layout)embk_win_place(win,nx,ny);else embk_win_move(win,nx,ny);
                 if(chromeless)em_window_bind(win,nx,ny);
                 wx_now = nx; wy_now = ny;
-                scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                scene_render_invalidate(&r);
                 em_request_frame();
                 layout_now = want;
 
@@ -874,7 +929,7 @@ int em_app_run(const EmApp *app) {
                         and the dismiss click sailed under it */
                     rt.pixels = back ? back : px;
                     rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
-                    scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                    scene_render_invalidate(&r);
                     em_request_frame();
                     menu_expanded = expanded;
                     em_window_move_to(P.x,P.y+(g_shell_bottom && !want?P.h-nh:0));
@@ -891,6 +946,13 @@ int em_app_run(const EmApp *app) {
             if (embk_win_set_material(win, g_mat_alpha, g_mat_blur) == 0 || !g_mat_alpha)
                 g_mat_told = g_mat_alpha << 8 | g_mat_blur;
             else g_mat_alpha = g_mat_blur = 0, g_mat_told = 0, g_mat_full = 1, em_window_set_clear(0);   /* refused: opaque, as it is */
+            /* layers while the window is opaque: a window that shows through
+             * has nothing behind a menu for its glass to frost */
+            if (!translucent && (g_mat_alpha != 0) == em_layers_on()) {
+                int on = !g_mat_alpha && layers_probe(win, 0);
+                scene_render_set_layer_host(&r, on ? &g_layer_host : 0);
+                em_set_layers(on);
+            }
         }
         int had_key = 0;
         for (int64_t input; (input = embk_key_poll_key()) > 0; ) {
@@ -1007,7 +1069,9 @@ int em_app_run(const EmApp *app) {
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
             uint32_t *clr = back ? back : px;
             for (int i = 0; i < winw * winh; i++) clr[i] = bg;
-            scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+            /* everything painted again -- the layers kept: a menu that is open
+             * stays open, not out and in again */
+            scene_render_invalidate(&r);
             prev_epoch = em_ui_epoch();
             force_full = true;
         }
@@ -1021,6 +1085,7 @@ int em_app_run(const EmApp *app) {
         uint64_t pf2 = em_prof_now(&g_prof);
         rt.clear_dirty = translucent || g_mat_alpha;     /* the material can change at any time */
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        if (r.wants_frame) em_request_frame();      /* a layer settling into place */
         uint64_t pf3 = em_prof_now(&g_prof);
 
         /* Park, don't quit: the app keeps running with no pixels on screen
@@ -1109,7 +1174,7 @@ int em_app_run(const EmApp *app) {
                             | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
                 uint32_t *clr = back ? back : px;
                 for (int i = 0; i < winw * winh; i++) clr[i] = bg;
-                scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                scene_render_invalidate(&r);
                 ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
                 ui_run_layout((float)winw, (float)winh);
                 if (g_em_post_layout) g_em_post_layout();

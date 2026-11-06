@@ -461,6 +461,13 @@ void em_set_clock(uint64_t (*fn)(void)) { g_clock = fn; }
 uint64_t em_now_ms(void) { return g_clock ? g_clock() : 0; }
 int em_dt_ms(void) { return g_dt_ms; }
 
+/* LAYERS: the runtime says whether the compositor will move promoted
+ * subtrees for this window (em_set_layers); without, they are painted and
+ * moved here, frame by frame, as before. */
+static int g_em_layers;
+void em_set_layers(int on) { g_em_layers = on; }
+int  em_layers_on(void) { return g_em_layers; }
+
 static int g_tip_seen,g_tip_visible;
 static char g_tip_label[128];static float g_tip_rect[4];static uint64_t g_tip_since;
 void em_tooltip(const char *label) {
@@ -474,7 +481,7 @@ void em_tooltip(const char *label) {
 int em_tooltip_visible(void){return g_tip_visible;}
 void em_tooltip_host(void) {
     int visible=g_tip_seen && em_now_ms() && em_now_ms()-g_tip_since>=600;
-    if(visible!=g_tip_visible){g_tip_visible=visible;em_structure_changed();em_request_frame();}
+    if(visible!=g_tip_visible){g_tip_visible=visible;if(!g_em_layers)em_structure_changed();em_request_frame();}
     if(!g_tip_seen){g_tip_since=0;g_tip_label[0]=0;}
     if(!visible || em_viewport_height()<g_tip_rect[3]+32)return;
     float width=em_text_width(g_tip_label,TH->text_caption)+18;
@@ -488,6 +495,10 @@ void em_tooltip_host(void) {
     ui_set_overlay(true);ui_set_layer(3);ui_set_hit_passthrough(true);
     ui_set_size(sz_fixed(0),sz_fixed(0));ui_set_clip_children(false);
     ui_begin_vstack(1);ui_set_offset(x,y);ui_set_size(sz_fixed(width),sz_intrinsic());
+    /* on layers it fades in and out (the compositor's), with no repaint of the window */
+    { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms:0);
+      struct scene_layer_motion in={0,1000,500,500,0,0,r,1000},out={0,1000,500,500,0,0,r,1000};
+      ui_set_promoted(g_em_layers!=0,&in,&out); }
     ui_set_paint(solid(TH->surface));ui_set_border(1,TH->border_strong);ui_set_corner_radius(TH->radius_sm);
     ui_set_padding(TH->control_py,TH->sp2,TH->control_py,TH->sp2);ui_set_font(TH->font_regular);ui_set_text_size(TH->text_caption);ui_set_text_color(TH->text);
     ui_text("%s",g_tip_label);ui_end_stack();ui_end_stack();
@@ -3328,9 +3339,18 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal) {
     static uint64_t s_anim_key;
     static struct em_spring s_menu_m;
     if (s_anim_key != key) { s_anim_key = key; em_spring_set(&s_menu_m, 0.0f); }
-    float mt = em_spring_to(&s_menu_m, 1.0f, (uint32_t)(t->motion_ms > 0 ? t->motion_ms * 2.0f : 240.0f), 1000u);
+    uint32_t drop_ms = (uint32_t)(t->motion_ms > 0 ? t->motion_ms * 2.0f : 240.0f);
+    /* ON LAYERS the compositor does all of it -- from transparent, 0.94 of its
+     * size and 5 px up, to where it rests, and back out when it closes -- and
+     * the panel is built here at rest: no frame of the drop-in is ours. */
+    if (g_em_layers) em_spring_set(&s_menu_m, 1.0f);
+    float mt = g_em_layers ? 1.0f : em_spring_to(&s_menu_m, 1.0f, drop_ms, 1000u);
     if (mt > 1.0f) mt = 1.0f;
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
+    { uint16_t r = (uint16_t)(t->motion_ms > 0 ? drop_ms : 0), up = ay < 0 ? 1000 : 0;
+      struct scene_layer_motion in = { 0, 940, 0, up, 0, -5, r, 1000 };
+      struct scene_layer_motion out = { 0, 970, 0, up, 0, -3, (uint16_t)(r * 2 / 3), 1000 };
+      ui_set_promoted(g_em_layers != 0, &in, &out); }
     ui_set_opacity(mt);
     /* ...and it grows out of the corner it opens from, as a popover does:
      * the top (or, opening upward, the bottom) at its anchor */
@@ -3376,6 +3396,7 @@ static void em_menu_hidden_open(uint64_t key) {
     ui_set_size(sz_fixed(0), sz_fixed(0));
     ui_set_clip_children(true);
     ui_begin_vstack(1);                   /* mirror the panel level */
+    ui_set_promoted(false, 0, 0);
     ui_set_offset(0, 0);
     ui_set_shadow(false, 0, 0, 0, (Color){0,0,0,0});
     ui_set_backdrop_blur(false, 0);

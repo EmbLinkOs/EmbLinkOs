@@ -559,3 +559,48 @@ one call, sleeping in between. arm64 under HVF:
 The same passes on x86 under TCG and composed by virgl in the Lima VM, and
 `tests/drivers/compose_checks.h` holds both GPU backends to a scaled, faded
 picture keeping its own alpha.
+
+### M4: menus and tooltips on layers
+
+A subtree can be PROMOTED (`ui_set_promoted`, `scene_node.promoted`): where the
+application runtime has layers, the renderer leaves it out of the window and
+paints it once into a layer -- its shadow in it, and its glass frosted from the
+window behind it -- with an appear motion and a disappear motion the
+compositor plays. EmUI promotes its menus, context menus and tooltips; the
+menu panel is built at rest and every frame of its drop-in is the
+compositor's. Once the subtree is gone the layer still leaves, so menus and
+tooltips now fade OUT as well (before, a menu vanished and a tooltip popped).
+The runtime (`em_app.c`) hands the layers to the compositor, only for windows
+that do not show through (their glass would frost nothing), and keeps them
+across its structural repaints. Two things it took:
+
+- **A blend for edges over transparency.** `blend_cov` blended coverage in
+  linear light against what was there -- over a transparent buffer, a colour
+  boosted past its own alpha, which composited a bright fringe round every
+  rounded edge painted into a layer or an opacity group. Over a transparent
+  destination coverage is now plain alpha, as Core Animation's layers have it.
+- **Settling before arriving.** A menu measures its place against the frame
+  before, so its first frame stands somewhere else; a layer sent in from there
+  and then told where it is would jump and lose its arrival. A promoted
+  subtree waits, unpainted, until it stands still two frames running.
+
+`make backend-test` T20 holds the contract with a fake host (painted once, the
+window under it untouched, the layer over the window equal to painting it in
+place away from its outline, a frame with no change asking nothing, a move
+moving without repainting, a change repainting without moving, a leave
+leaving). `tools/layer_menu_smoke.py` opens Files' context menu: caught
+arriving at opacity 130 and scale 0.971, Files building 6-9 frames for it, Esc
+and the layer leaves after the toolkit has forgotten it. The same scenes as
+M0, arm64 under HVF:
+
+| Scene | App | Frames (M0 -> M4) | Full repaints | Pixels presented |
+|---|---|---|---|---|
+| Files context menu | Files | 29 -> 9 | 19 -> 1 | 11.6 M -> 1.2 M |
+| Close-button tooltip | Settings | 46 -> 46 | 2 -> 0 | 1.3 M -> 0 |
+
+The menu's one full repaint is its opening, which EmUI marks a structural
+change (the epoch); the menu is no longer in the window, but the window is
+repainted once anyway. The tooltip's frames are the hover the app watches for
+its delay; none of them paints. The top bar's menus are not promoted: the bar
+is a window that shows through, and their glass must frost the desktop under
+it, which needs a layer material in the compositor (M3's open item).

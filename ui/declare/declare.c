@@ -563,6 +563,10 @@ void ui_set_scale(float scale, float anchor_x, float anchor_y) {
     struct instance *b = cur_box(); if (!b) return;
     scene_set_group_scale(g_sa, b->scene_node, scale, anchor_x, anchor_y);   /* guarded */
 }
+void ui_set_promoted(bool on, const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_promoted(g_sa, b->scene_node, on, appear, disappear);   /* guarded */
+}
 void ui_set_offset(float x, float y) {
     struct instance *b = cur_box(); if (!b) return;
     /* post-layout translate: layout adds this to the resolved position when it

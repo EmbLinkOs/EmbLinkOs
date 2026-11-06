@@ -980,6 +980,10 @@ void em_overlay_(void);
 void em_overlay_end_(void);
 int  em_overlay_dismissed(void);
 int  em_overlay_active(void);
+/* LAYERS: the runtime turns them on when the compositor will move promoted
+ * subtrees for the window -- menus, tooltips -- painted once (ui_set_promoted). */
+void em_set_layers(int on);
+int  em_layers_on(void);
 void em_dialog_(EmProps p);
 void em_dialog_end_(void);
 #define NavigationStack(root) em_nav(root)

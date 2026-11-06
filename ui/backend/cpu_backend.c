@@ -72,6 +72,14 @@ static void blend_cov(struct render_target *rt, int ix, int iy, struct color c, 
     if (ix < 0 || iy < 0 || (uint32_t)ix >= rt->width || (uint32_t)iy >= rt->height) return;
     uint32_t *px = &rt_row(rt, (uint32_t)iy)[ix];
     int db, dg, dr, da; px_unpack(*px, &db, &dg, &dr, &da);
+    /* ...but only over something OPAQUE. Over a picture that is itself
+     * transparent there -- a layer, a group's own buffer, a window that shows
+     * through -- linear light has no ground to be measured against: lerping
+     * toward transparent black in it boosts the colour past its own alpha,
+     * which is no premultiplied pixel at all, and the edge composites a
+     * bright fringe. There coverage is plain alpha, as Core Animation's
+     * layers have it: the paint, scaled by its coverage, over. */
+    if (da < 255) { float k = a * cov; blend_over(rt, ix, iy, c.r * k, c.g * k, c.b * k, k); return; }
     float inv = 1.0f - a, k = cov, ik = 1.0f - cov;
     float lr = dr / 255.0f, lg = dg / 255.0f, lb = db / 255.0f;
     float orr = c.r * a + lr * inv, og = c.g * a + lg * inv, ob = c.b * a + lb * inv;   /* paint over, sRGB */

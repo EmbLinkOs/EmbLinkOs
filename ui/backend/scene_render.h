@@ -33,6 +33,43 @@ struct group_cache {
     int       used;                /* met this frame */
 };
 
+/* LAYERS: who keeps promoted subtrees (scene_node.promoted) for the renderer
+ * -- the application runtime, which hands them to the compositor
+ * (user/lib/embk_layer.h). The renderer paints a promoted subtree once into a
+ * layer, and says where it is to be and how it gets there; the host does the
+ * rest. Coordinates are the window's. */
+struct scene_layer_state {
+    int32_t  x, y;                 /* the layer's top-left at full size */
+    uint8_t  opacity;              /* 0..255 */
+    uint16_t scale_milli, anchor_x_milli, anchor_y_milli;
+};
+struct scene_layer_host {
+    void *ctx;
+    /* a layer w x h: its id (> 0), its pixels -- premultiplied, w a row,
+     * transparent -- in *px; 0 when there is none to be had */
+    uint32_t (*create)(void *ctx, uint32_t w, uint32_t h, uint32_t **px);
+    /* its pixels in (x, y, w, h) changed */
+    void (*present)(void *ctx, uint32_t id, int x, int y, int w, int h);
+    /* go to `to` on the spring (response ms, damping permille; 0: jump), from
+     * `from` if given (jumped to first); then gone when `destroy`. With
+     * `at_present` it takes effect at the layer's next present. */
+    void (*go)(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
+               uint16_t response_ms, uint16_t damping_milli, int destroy, int at_present);
+};
+#define SCENE_LAYERS 8
+struct scene_promoted {
+    uint32_t  index, generation;   /* the promoted node */
+    uint32_t  id;                  /* the host's layer */
+    uint32_t *px; uint32_t w, h;
+    struct scene_layer_state at;   /* where it was last told to rest */
+    struct scene_layer_motion disappear;
+    float     nx, ny, nw, nh;      /* the node's own box: where its anchors are */
+    float     fx, fy;              /* its place past the whole pixel, as painted */
+    uint32_t  sig;
+    int       reduced, seen;
+    int       waiting;             /* seen, not yet settled: no layer yet (frames waited) */
+};
+
 struct scene_renderer {
     struct render_backend *be;
     struct rect_cache     *cache;      /* per-node world rect from last frame */
@@ -58,6 +95,11 @@ struct scene_renderer {
     struct group_cache     groups[SCENE_GROUP_CACHE];
     /* frames whose groups were composited from kept pixels / painted anew */
     uint32_t               group_hits, group_paints;
+    /* the layer host, and the promoted subtrees it holds for us */
+    const struct scene_layer_host *host;
+    struct scene_promoted  promoted[SCENE_LAYERS];
+    uint32_t               layer_paints;   /* promoted subtrees painted (tests) */
+    int                    wants_frame;    /* a promoted subtree is settling: build the next */
 };
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be);
@@ -82,5 +124,8 @@ void scene_render_invalidate(struct scene_renderer *r);
  * draws no blur, only its own tint made whole. Per process; 1 if it changed --
  * the caller then invalidates its renderer so every glass node is drawn anew. */
 int  scene_render_set_reduced(int on);
+/* Hand promoted subtrees to `host` (NULL: paint them in the window, as any
+ * other subtree). Layers it holds are let go when it is changed. */
+void scene_render_set_layer_host(struct scene_renderer *r, const struct scene_layer_host *host);
 
 #endif /* __EMBLINK_UI_SCENE_RENDER_H__ */

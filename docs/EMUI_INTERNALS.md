@@ -475,6 +475,33 @@ is lost. That happened under emulation: the third click of a triple click, and
 sometimes the second click of a double. When the live path delivers a latched
 press, the press still carries the time it was made, not the time of the poll.
 
+## Layers: pieces of a window the compositor moves
+
+Since P7 a window can have LAYERS (`user/lib/embk_layer.h`, syscalls 166-168):
+pictures the application painted once, attached to its window, which the
+compositor places, fades and scales on springs in its own frame thread. The
+toolkit reaches them through PROMOTION:
+
+- `ui_set_promoted(on, &appear, &disappear)` on an open box marks its subtree
+  (`scene_node.promoted`, `struct scene_layer_motion` for each end: how
+  transparent, how much smaller about which anchor, how far off, on which
+  spring).
+- `scene_render` with a layer host (`scene_render_set_layer_host`) leaves a
+  promoted subtree out of the window, and in a pass after the window's own
+  painting gives it a layer: painted when anything in it changed (its glass
+  frosted from the window behind it), moved when its place changed, sent in
+  from `appear` the first time it stands still two frames running, and sent
+  out to `disappear` once it is gone from the tree. Without a host it is
+  painted in place like any other subtree.
+- `em_app.c` is the host: it hands layers to the compositor for windows that
+  do not show through (`layers_probe`), and EmUI (`em_layers_on`) then builds
+  menus and tooltips at rest, leaving their motion to the compositor.
+
+A promoted subtree must be built every frame it is meant to stay; the frame it
+is not, it leaves. Hit-testing is unchanged: the toolkit tests its own scene,
+which holds where the subtree rests -- not where the compositor has it on the
+way there.
+
 ## Adding a new component
 
 The mechanical steps, using the existing components as the template:

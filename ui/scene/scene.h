@@ -91,6 +91,17 @@ struct paint {
     float           center_x, center_y, radius;    /* PAINT_RADIAL_GRADIENT, node-local */
 };
 
+/* One end of a promoted subtree's motion: relative to where it rests, how
+ * transparent, how much smaller (about its anchor, thousandths of its size)
+ * and how far off it is there, and the spring it travels on. */
+struct scene_layer_motion {
+    uint8_t  opacity;              /* 0..255 */
+    uint16_t scale_milli;          /* 1000: its own size */
+    uint16_t anchor_x_milli, anchor_y_milli;
+    int16_t  dx, dy;
+    uint16_t response_ms, damping_milli;   /* 0 response: it jumps */
+};
+
 struct scene_node {
     bool hit_passthrough; /* decorative subtree, skipped by UI hit testing */
     struct node_handle self;                       /* for validation/debug; self.index
@@ -145,6 +156,16 @@ struct scene_node {
      * 0,0 top-left, .5,.5 the middle) -- a popover growing out of where it
      * opens. Shrinking only, so its unscaled bounds stay where it can draw. */
     float group_scale, anchor_x, anchor_y;
+
+    /* PROMOTED: this subtree is a piece of the window the COMPOSITOR moves (a
+     * menu, a toast, a tooltip). Where the renderer has a layer host
+     * (scene_render_set_layer_host), it is painted once into a layer of its
+     * own -- not into the window -- and arrives, moves and leaves on the
+     * compositor's springs: `appear` says where it comes FROM, `disappear`
+     * where it goes once the subtree is gone. Without a host it is painted
+     * where it stands, like any other. */
+    bool promoted;
+    struct scene_layer_motion appear, disappear;
 
     /* --- kind-specific payload --- */
     union {
@@ -266,6 +287,10 @@ void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool e
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity);
 void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float scale, float anchor_x, float anchor_y);
 void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float radius);
+/* Promote a subtree to a layer the compositor moves (scene_node.promoted), or
+ * not (on = 0). The motions are copied. */
+void scene_set_promoted(struct scene_arena *a, struct node_handle h, bool on,
+                        const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);
 void scene_set_z(struct scene_arena *a, struct node_handle h, float z);
 

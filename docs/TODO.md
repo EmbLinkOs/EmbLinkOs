@@ -168,7 +168,20 @@ the default target). Measured before and after every step
         fade (the pages would have to outlive the address space, on a doomed list).
   - [ ] Parked layers keep their client mapping: a window's parked pages count against its
         8 MB, and the client VA they hold is not returned until the window goes.
-  - [ ] M4: menus, popovers, toasts and tooltips on layers; the top bar's dropdowns.
+  - [x] M4: EmUI's menus, context menus and tooltips are promoted subtrees (`ui_set_promoted`):
+        painted once into a layer, in and out on the compositor's springs (`make backend-test`
+        T20, `tools/layer_menu_smoke.py`, gallery 232). Files' context menu: 29 app frames -> 9,
+        11.6 M px presented -> 1.2 M.
+  - [ ] A menu opening still repaints its window once: EmUI bumps the epoch on open and close,
+        which the runtime answers with a full repaint, though on layers the menu is not in the
+        window. Opening a menu could be an ordinary frame there.
+  - [ ] The top bar's menus are not promoted: the bar shows through, and their glass has to frost
+        the desktop, which needs the layer material (`EMBK_LM_BLUR`) above.
+  - [ ] Toasts are not promoted: `em_toast_host` asks for a frame every frame of its 2.5 s to know
+        when to leave, which on a layer would still wake the app throughout; a timed wake is the
+        missing piece. (No application raises toasts yet.)
+  - [ ] A promoted subtree is repainted whole when anything in it changes -- a hover moving down
+        an open menu repaints the menu's layer each time.
   - [ ] M5: dialogs and sheets that scale in; the close pull moved by the compositor.
   - [ ] M6: the library's glass as a layer over a kept blur.
   - [ ] Nothing uses `em_toast` or the close grip (`em_close_grip`) yet: both are toolkit

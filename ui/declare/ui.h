@@ -36,6 +36,11 @@ void ui_set_opacity(float opacity);   /* 0..1; wraps the subtree in a group */
  * (fractions of its bounds): a popover growing out of where it opens. Hit
  * testing keeps the unscaled bounds; a motion, not a layout. */
 void ui_set_scale(float scale, float anchor_x, float anchor_y);
+/* THE OPEN BOX AS A LAYER the compositor moves (scene_set_promoted): it
+ * arrives from `appear` and leaves to `disappear` on the compositor's springs,
+ * painted once, where the runtime has layers. Say it every frame the box is
+ * built; off (false) to paint it in the window again. */
+void ui_set_promoted(bool on, const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear);
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);

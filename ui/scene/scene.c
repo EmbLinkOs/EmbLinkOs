@@ -507,6 +507,17 @@ void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float 
     DMARK(n); n->corner_radius = radius; n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
+void scene_set_promoted(struct scene_arena *a, struct node_handle h, bool on,
+                        const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n) return;
+    if (appear) n->appear = *appear;
+    if (disappear) n->disappear = *disappear;
+    if (n->promoted == on) return;
+    /* in or out of the window's own pixels: both are new pixels there */
+    DMARK(n); n->promoted = on; n->dirty = true; n->dirty_content = true; n->dirty_look = true;
+}
+
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;

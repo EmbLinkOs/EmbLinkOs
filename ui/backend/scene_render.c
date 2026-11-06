@@ -4,7 +4,7 @@
  * it's easy to get subtly wrong). */
 
 #include "scene_render.h"
-#if defined(SCENE_TRACE) || defined(SCROLL_DEBUG)
+#if defined(SCENE_TRACE) || defined(SCROLL_DEBUG) || defined(PROMOTE_TRACE)
 #include <stdio.h>
 #endif
 #include <stdlib.h>
@@ -191,12 +191,17 @@ static struct frect node_footprint(const struct scene_node *n, struct frect ab) 
     return f;
 }
 
+/* A layer host keeps promoted subtrees this frame: the window leaves them out
+ * (scene_render_set_layer_host). */
+static int g_promote_live;
+
 static void gather(struct scene_arena *a, struct node_handle h, const float wparent[16],
                    int has_group, struct frect gbounds,
                    int has_clip, struct frect clipr,
                    struct noderec *list, int *n, int cap) {
     struct scene_node *node = scene_resolve(a, h);
     if (!node || *n >= cap) return;
+    if (node->promoted && g_promote_live) return;   /* not the window's: a layer's */
     float local[16], world[16];
     scene_trs_to_matrix(node, local);
     scene_mat4_mul(wparent, local, world);
@@ -457,6 +462,7 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
                               int in_elev, struct elev_list *el) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
+    if (n->promoted && r->host) return;     /* a layer's, painted in the promoted pass */
 
     /* an elevated subtree met during the FLOW pass: stash it for the deferred
      * pass instead of painting it here in document position */
@@ -571,13 +577,219 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
 /* frame                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/* ---- promoted subtrees: layers the compositor moves (scene_node.promoted) -- */
+
+/* all a subtree stains: every node's footprint, shadows included */
+static struct frect subtree_footprint(struct scene_arena *a, struct node_handle h, const float wparent[16]) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || g_sb_depth > 1024) return frect_empty();
+    g_sb_depth++;
+    float local[16], world[16];
+    scene_trs_to_matrix(n, local);
+    scene_mat4_mul(wparent, local, world);
+    struct frect b = node_footprint(n, node_world_aabb(n, world));
+    struct node_handle c = n->first_child;
+    uint32_t guard = 512;
+    while (!node_handle_is_null(c) && guard-- != 0) {
+        struct scene_node *cn = scene_resolve(a, c);
+        struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
+        b = frect_union(b, subtree_footprint(a, c, world));
+        c = next;
+    }
+    g_sb_depth--;
+    return b;
+}
+/* the renderer clears what it gathered; a promoted subtree is not gathered */
+static void subtree_clean(struct scene_arena *a, struct node_handle h, int depth) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || depth > 1024) return;
+    n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0;
+    if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0;
+    struct node_handle c = n->first_child;
+    uint32_t guard = 512;
+    while (!node_handle_is_null(c) && guard-- != 0) {
+        struct scene_node *cn = scene_resolve(a, c);
+        struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
+        subtree_clean(a, c, depth + 1);
+        c = next;
+    }
+}
+
+static struct scene_promoted *promoted_find(struct scene_renderer *r, struct node_handle h) {
+    for (int i = 0; i < SCENE_LAYERS; i++)
+        if (r->promoted[i].id && r->promoted[i].index == h.index && r->promoted[i].generation == h.generation)
+            return &r->promoted[i];
+    return 0;
+}
+static int clamp255(float v) { return v <= 0 ? 0 : v >= 1 ? 255 : (int)(v * 255.0f + 0.5f); }
+
+/* where the subtree goes at one end of its motion: from where it rests */
+static struct scene_layer_state promoted_end(const struct scene_layer_state *at, const struct scene_layer_motion *m,
+                                             struct frect node, int bx, int by, int bw, int bh) {
+    struct scene_layer_state e = *at;
+    e.opacity = (uint8_t)((uint32_t)m->opacity * at->opacity / 255u);
+    e.scale_milli = m->scale_milli ? m->scale_milli : 1000;
+    /* the anchor is the node's own, and the layer is its footprint: map it */
+    float axw = node.x + node.w * (float)m->anchor_x_milli / 1000.0f;
+    float ayw = node.y + node.h * (float)m->anchor_y_milli / 1000.0f;
+    e.anchor_x_milli = (uint16_t)(bw > 0 ? fminf(1000.0f, fmaxf(0.0f, (axw - (float)bx) * 1000.0f / (float)bw)) : 500);
+    e.anchor_y_milli = (uint16_t)(bh > 0 ? fminf(1000.0f, fmaxf(0.0f, (ayw - (float)by) * 1000.0f / (float)bh)) : 500);
+    e.x += m->dx; e.y += m->dy;
+    return e;
+}
+
+static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
+                           struct scene_node *n, const float wparent[16], struct render_target *target) {
+    const struct scene_layer_host *host = r->host;
+    struct frect b = subtree_footprint(a, h, wparent);
+    int bx = (int)floorf(b.x), by = (int)floorf(b.y);
+    int bw = (int)ceilf(b.x + b.w) - bx, bh = (int)ceilf(b.y + b.h) - by;
+    if (bw <= 0 || bh <= 0) return;
+    float local[16], world[16];
+    scene_trs_to_matrix(n, local);
+    scene_mat4_mul(wparent, local, world);
+    struct frect nb = node_world_aabb(n, world);
+    uint32_t sig = 0; int blur = 0;
+    int changed = group_changed(a, h, &sig, &blur);
+    float fx = b.x - (float)bx, fy = b.y - (float)by;
+
+    struct scene_promoted *p = promoted_find(r, h);
+    int fresh = 0, resized = 0;
+#ifdef PROMOTE_TRACE
+    fprintf(stderr, "promote: node %u seen p=%d %dx%d changed=%d\n", h.index, p != 0, bw, bh, changed);
+#endif
+    if (p && (p->w != (uint32_t)bw || p->h != (uint32_t)bh)) {
+        /* another size: another layer, standing where the old one stood */
+        host->go(host->ctx, p->id, 0, &p->at, 0, 0, 1, 0);
+        memset(p, 0, sizeof *p); p = 0; resized = 1;
+    }
+    if (!p) {
+        /* SETTLED FIRST. A subtree's place can lag its first frame by one --
+         * a menu measures where it opens against the frame before -- and a
+         * layer sent in from the wrong place, then told where it really is,
+         * would jump there and lose its arrival. So it waits, unpainted, until
+         * it stands in one place two frames running (three at most), and asks
+         * for the frame that tells. */
+        struct scene_promoted *w = 0;
+        for (int i = 0; i < SCENE_LAYERS && !w; i++)
+            if (r->promoted[i].waiting && r->promoted[i].index == h.index && r->promoted[i].generation == h.generation)
+                w = &r->promoted[i];
+        if (!w) {
+            for (int i = 0; i < SCENE_LAYERS && !w; i++) if (!r->promoted[i].id && !r->promoted[i].waiting) w = &r->promoted[i];
+            if (!w) return;
+            memset(w, 0, sizeof *w);
+            w->index = h.index; w->generation = h.generation; w->waiting = 1;
+            w->at.x = bx; w->at.y = by; w->w = (uint32_t)bw; w->h = (uint32_t)bh;
+            w->seen = 1; r->wants_frame = 1;
+            return;
+        }
+        w->seen = 1;
+        if ((w->at.x != bx || w->at.y != by || w->w != (uint32_t)bw || w->h != (uint32_t)bh) && w->waiting < 3) {
+            w->at.x = bx; w->at.y = by; w->w = (uint32_t)bw; w->h = (uint32_t)bh;
+            w->waiting++; r->wants_frame = 1;
+            return;
+        }
+        p = w; p->waiting = 0;
+        uint32_t *px = 0;
+        uint32_t id = host->create(host->ctx, (uint32_t)bw, (uint32_t)bh, &px);
+        if (!id || !px) { memset(p, 0, sizeof *p); return; }
+        p->id = id; p->px = px; p->w = (uint32_t)bw; p->h = (uint32_t)bh;
+        p->index = h.index; p->generation = h.generation;
+        fresh = 1;
+    }
+    p->seen = 1;
+
+    struct scene_layer_state at = { bx, by, (uint8_t)clamp255(n->opacity), 1000, 500, 500 };
+    if (n->group_scale < 1.0f) {                       /* a scale the app set itself */
+        at.scale_milli = (uint16_t)(n->group_scale * 1000.0f + 0.5f);
+        at.anchor_x_milli = (uint16_t)fminf(1000.0f, fmaxf(0.0f, (nb.x + nb.w * n->anchor_x - (float)bx) * 1000.0f / (float)bw));
+        at.anchor_y_milli = (uint16_t)fminf(1000.0f, fmaxf(0.0f, (nb.y + nb.h * n->anchor_y - (float)by) * 1000.0f / (float)bh));
+    }
+    /* repaint its pixels when anything in it changed -- or, for glass, when
+     * what is behind it in the window did */
+    int repaint = fresh || changed || p->sig != sig || fabsf(p->fx - fx) > 1e-3f || fabsf(p->fy - fy) > 1e-3f ||
+                  p->reduced != g_effects_reduced || (blur && (r->full || dirty_hits(r, b)));
+    if (repaint) {
+        memset(p->px, 0, (size_t)p->w * p->h * 4);
+        struct render_target lt; memset(&lt, 0, sizeof lt);
+        lt.pixels = p->px; lt.width = p->w; lt.height = p->h; lt.stride = p->w * 4;
+        lt.format = EMBK_PIXFMT_BGRA8888_PRE;
+        struct clip_saved sv;
+        struct render_target *was_bd = r->backdrop; float wox = r->bd_ox, woy = r->bd_oy;
+        r->backdrop = target; r->bd_ox = 0; r->bd_oy = 0;   /* glass in it frosts the window behind it */
+        int was = r->no_cull; r->no_cull = 1;
+        cpu_clip_save_and_clear(&sv);
+        render_subtree_opaque(r, a, h, wparent, &lt, (float)bx, (float)by);
+        cpu_clip_restore(&sv);
+        r->no_cull = was; r->backdrop = was_bd; r->bd_ox = wox; r->bd_oy = woy;
+        p->sig = sig; p->fx = fx; p->fy = fy; p->reduced = g_effects_reduced;
+        r->layer_paints++;
+    }
+#ifdef PROMOTE_TRACE
+    fprintf(stderr, "promote: id %u fresh=%d resized=%d repaint=%d at %d,%d op=%d appear op=%d resp=%d\n", p->id, fresh, resized, repaint, at.x, at.y, at.opacity, n->appear.opacity, n->appear.response_ms);
+#endif
+    if (fresh) {
+        struct scene_layer_state from = promoted_end(&at, &n->appear, nb, bx, by, bw, bh);
+        at.anchor_x_milli = from.anchor_x_milli; at.anchor_y_milli = from.anchor_y_milli;
+        host->go(host->ctx, p->id, resized ? 0 : &from, &at, n->appear.response_ms, n->appear.damping_milli, 0, 1);
+    } else if (memcmp(&at, &p->at, sizeof at)) {
+        if (at.scale_milli == 1000) { at.anchor_x_milli = p->at.anchor_x_milli; at.anchor_y_milli = p->at.anchor_y_milli; }
+        if (memcmp(&at, &p->at, sizeof at))
+            host->go(host->ctx, p->id, 0, &at, 0, 0, 0, repaint);   /* the app moved it: it is there */
+    }
+    if (repaint) host->present(host->ctx, p->id, 0, 0, bw, bh);
+    p->at = at;
+    p->disappear = n->disappear;        /* where it goes when it is gone... */
+    p->nx = nb.x; p->ny = nb.y; p->nw = nb.w; p->nh = nb.h;   /* ...about the node as it is now */
+    subtree_clean(a, h, 0);
+}
+
+static void promoted_walk(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
+                          const float wparent[16], struct render_target *target, int depth) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || depth > 1024) return;
+    if (n->promoted) { promoted_layer(r, a, h, n, wparent, target); return; }
+    float local[16], world[16];
+    scene_trs_to_matrix(n, local);
+    scene_mat4_mul(wparent, local, world);
+    struct node_handle c = n->first_child;
+    uint32_t guard = 512;
+    while (!node_handle_is_null(c) && guard-- != 0) {
+        struct scene_node *cn = scene_resolve(a, c);
+        struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
+        promoted_walk(r, a, c, world, target, depth + 1);
+        c = next;
+    }
+}
+
+/* a promoted subtree that is gone: it leaves as it said it would, and the
+ * host lets the layer go once it is there */
+static void promoted_leave(struct scene_renderer *r, struct scene_promoted *p) {
+    const struct scene_layer_host *host = r->host;
+#ifdef PROMOTE_TRACE
+    fprintf(stderr, "promote: id %u leaves\n", p->id);
+#endif
+    struct frect nb = { p->nx, p->ny, p->nw, p->nh };
+    struct scene_layer_state to = promoted_end(&p->at, &p->disappear, nb, p->at.x, p->at.y, (int)p->w, (int)p->h);
+    if (host) host->go(host->ctx, p->id, 0, &to, p->disappear.response_ms, p->disappear.damping_milli, 1, 0);
+    memset(p, 0, sizeof *p);
+}
+
+void scene_render_set_layer_host(struct scene_renderer *r, const struct scene_layer_host *host) {
+    if (r->host == host) return;
+    for (int i = 0; i < SCENE_LAYERS; i++) if (r->promoted[i].id) promoted_leave(r, &r->promoted[i]);
+    r->host = host;
+}
+
 void scene_render_init(struct scene_renderer *r, struct render_backend *be) {
     r->be = be; r->cache = 0; r->cache_cap = 0; r->n_dirty = 0; r->full = 0; r->has_scroll_present = 0;
     r->backdrop = 0; r->bd_ox = r->bd_oy = 0;
     r->no_cull = 0; r->group_hits = r->group_paints = 0;
     memset(r->groups, 0, sizeof r->groups);
+    r->host = 0; memset(r->promoted, 0, sizeof r->promoted); r->layer_paints = 0; r->wants_frame = 0;
 }
 void scene_render_destroy(struct scene_renderer *r) {
+    for (int i = 0; i < SCENE_LAYERS; i++) if (r->promoted[i].id) promoted_leave(r, &r->promoted[i]);
     free(r->cache); r->cache = 0; r->cache_cap = 0;
     for (int i = 0; i < SCENE_GROUP_CACHE; i++) group_drop(&r->groups[i]);
 }
@@ -592,6 +804,7 @@ int scene_render_set_reduced(int on) {
 void scene_render_invalidate(struct scene_renderer *r) {
     if (!r) return;
     for (int i = 0; i < SCENE_GROUP_CACHE; i++) group_drop(&r->groups[i]);
+    for (int i = 0; i < SCENE_LAYERS; i++) r->promoted[i].sig = 0;   /* their pixels, painted again */
     if (!r->cache) return;
     for (uint32_t i = 0; i < r->cache_cap; i++) r->cache[i].valid = 0;
 }
@@ -618,6 +831,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
     if (!recs) return;
     int nrec = 0;
     float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    g_promote_live = r->host != 0;
     gather(a, root, ident, 0, frect_empty(), 0, frect_empty(), recs, &nrec, (int)cap);
 
     /* --- Step 1: dirty accumulation (own dirty flag OR world rect moved OR
@@ -1032,4 +1246,17 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
         if (n) { n->dirty = 0; n->dirty_content = 0; n->dirty_look = 0; if (n->kind == SCENE_NODE_IMAGE) n->data.image.damage = 0; }
     }
     free(recs);
+
+    /* THE PROMOTED PASS: each promoted subtree to its layer -- painted when it
+     * changed, moved when its place did, sent away when it is gone. Every
+     * frame, after the window's own pixels, which its glass is frosted from. */
+    if (r->host) {
+        r->wants_frame = 0;
+        for (int i = 0; i < SCENE_LAYERS; i++) r->promoted[i].seen = 0;
+        promoted_walk(r, a, root, ident, target, 0);
+        for (int i = 0; i < SCENE_LAYERS; i++) {
+            if (r->promoted[i].id && !r->promoted[i].seen) promoted_leave(r, &r->promoted[i]);
+            else if (r->promoted[i].waiting && !r->promoted[i].seen) memset(&r->promoted[i], 0, sizeof r->promoted[i]);
+        }
+    }
 }
