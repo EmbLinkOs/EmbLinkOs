@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-231 actual EmbLinkOS captures document the original laptop work, its
+232 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, windows resized as they are dragged, an overview the keys can walk, both themes audited for contrast, pages that scroll by moving their pixels, and layers the compositor moves while their app sleeps. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, windows resized as they are dragged, an overview the keys can walk, both themes audited for contrast, pages that scroll by moving their pixels, layers the compositor moves while their app sleeps, and menus that come and go on them. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -161,6 +161,12 @@ Settings caught mid-glide, eight notches down its Appearance page. Each frame th
 A layer, caught half way in: a card the application painted once, hanging below its window the way a menu does, its rounded corners and translucent body its own alpha -- the Terminal's text shows through it. The application sent it in with one call and went back to sleep; the compositor is moving it, on springs, on its own frame clock: 122 frames at a steady 16.67 ms while the app presented nothing. Slowed six times to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.
 
 ![A small window titled Layer demo with a translucent, rounded, striped card hanging below it, half faded in and slightly smaller than full size](231-a-layer-in-motion.png)
+
+### A menu on a layer
+
+Files' context menu, half way in. The toolkit painted it once -- its frosted tint, its border, its shadow -- into a layer of the window, and the compositor brings it in on a spring, from transparent, a little smaller and a few pixels up, and takes it out again when it closes, after the toolkit has already forgotten it. Files builds a handful of frames for the whole arrival where it used to build one a frame and repaint its window nineteen times. Slowed to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS Files window with a small context menu offering New Folder and Refresh, caught part-way through fading in](232-a-menu-on-a-layer.png)
 
 ## The prompt, Powerlevel10k-style
 

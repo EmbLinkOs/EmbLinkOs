@@ -4557,6 +4557,26 @@
       "featured": false,
       "milestone": "P7 Layers: a render server",
       "historical": false
+    },
+    {
+      "id": "232-a-menu-on-a-layer",
+      "phase": "Layers",
+      "title": "A menu on a layer",
+      "caption": "Files' context menu, half way in. The toolkit painted it once -- its frosted tint, its border, its shadow -- into a layer of the window, and the compositor brings it in on a spring, from transparent, a little smaller and a few pixels up, and takes it out again when it closes, after the toolkit has already forgotten it. Files builds a handful of frames for the whole arrival where it used to build one a frame and repaint its window nineteen times. Slowed to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.",
+      "alt": "The EmbLinkOS Files window with a small context menu offering New Folder and Refresh, caught part-way through fading in",
+      "file": "232-a-menu-on-a-layer.png",
+      "capture_date": "2026-11-06",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "ef7b2c60b901b0ee95062ff10791c253c7e7ae8f86402c86df0707146ee24396",
+      "source_capture": "cap/menu-slow.ppm",
+      "source_sha256": "831083aeb6e5616364746d9353fd059043cdc31b49a8923b2568724afcb4c876",
+      "source_commit": "e745e2a",
+      "featured": false,
+      "milestone": "P7 Layers: a render server",
+      "historical": false
     }
   ]
 }
