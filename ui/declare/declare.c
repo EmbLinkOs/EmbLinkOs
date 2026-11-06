@@ -693,6 +693,14 @@ void ui_set_align(enum layout_align a) {
  * ui_set_clip_children to make a scroll viewport). Re-layouts only on change. */
 void ui_set_scroll_offset(float dy) {
     struct instance *b = cur_box(); if (!b) return;
+    /* WHOLE PIXELS. The view's own position (a spring's) is fractional and
+     * stays so; what the content is SHIFTED by is not. A fractional shift
+     * resamples every glyph and edge in the view each frame -- they shimmer
+     * as it glides -- and it is a move no renderer can make by copying rows,
+     * so every glide frame and the clamped last step of a scroll repainted
+     * the whole viewport. Rounded, the frame IS the last one moved, and
+     * scene_render's scroll blit takes it. */
+    dy = (float)(long)(dy < 0 ? dy - 0.5f : dy + 0.5f);
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
     if (ln && ln->scroll_offset != dy) { ln->scroll_offset = dy; ln->dirty = true; }
 }

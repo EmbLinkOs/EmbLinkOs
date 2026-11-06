@@ -386,3 +386,56 @@ Where it went, and what changed:
   without a coverage test, and the backdrop is read a row at a time.
 - What remains: rect fills (the scrim and wallpaper among them) about 5 ms,
   the blur about 6, drawing the scaled sheet about 4, shadows about 1.
+
+## The toolkit's own frame: a page scrolling
+
+Settings scrolled by the wheel, 24 notches over its pane, measured the same way
+(`embk_thread_cpu_ns` around `scene_render_frame`, batches of 30 frames, one
+M5 core under HVF):
+
+| | Render per frame (batch averages) | Worst frame |
+|---|---|---|
+| Before | 2.85-3.84 ms | 8.7 ms |
+| After | 0.44-1.23 ms | 2.9 ms |
+
+The renderer has had a scroll blit for a long time -- copy the rows the view
+already has, paint the strip the move uncovered -- and on a page like Settings
+it was almost never taken. Three things stood in the way, and one more made it
+dear when it was:
+
+- **The scroll bar's thumb.** The blit wanted every move in the frame to be the
+  same one, and the thumb moves the other way, a fraction as far. Every page
+  with a bar -- every page that scrolls -- vetoed itself. The scroll's delta is
+  now the one most of the moves share; a node that moved another way is held to
+  what a content change is held to (it must lie outside the blitted region) and
+  repaints as its own rect.
+- **Fractional moves.** A glide sits between pixels, and so does the last step,
+  clamped to the end of the page. No copy can reproduce a move of 73.8 px, and
+  copying by 74 left every glyph in the view 0.2 px off. A scroll view now
+  shifts its content by whole pixels (`ui_set_scroll_offset`; its spring keeps
+  its fractional state), and the blit refuses a fractional move outright.
+- **Two edge blends in one rect.** A rect's side columns took a gamma blend
+  when it lay wholly inside its clips and its top and bottom rows a plain one,
+  and every pixel took the plain one once it did not. So a row drew its edges
+  differently the moment it slid under the clip's edge -- a picture that
+  depends on where the clip is cannot be scrolled by copying. And the gamma
+  blend linearised the paint's alpha as well, so a translucent row had a
+  lighter one-pixel seam down both sides. Now there is one: the paint over the
+  ground in sRGB, as the interior is, and only coverage in linear light.
+- **The dirty bounding box.** Taken, the blit was dearer than painting it all
+  (4.1 ms against 1.6 on the host): every primitive was clamped to the box
+  around the dirty rects, and a strip at the bottom of a view plus a band at
+  its top is the whole view, so the page's background walked every pixel of it
+  through the per-pixel test and the exact edge path for nothing. Rects now
+  walk, row by row, only the spans of the dirty rects that cross it (merged, so
+  a translucent fill is never blended twice where two rects overlap).
+
+`make kit-test` scrolls a page under a bar for 420 frames on a fake clock --
+down, at rest against the end, back up -- and holds every frame that moved to
+the blit and every frame to what painting it from nothing gives (a corner pixel
+may round one level the other way; float geometry at positions a whole pixel
+apart). On the renderer before this, 24 of its 244 moves were blitted and those
+left 144,850 pixels wrong. `tools/scroll_smoke.py` scrolls Settings down and
+back on a real desktop and requires the pane to come back the same picture.
+The browser's own scroll-blit check (`make web-corpus`) said "the blit path was
+never exercised" on three corpus pages; it passes on all three now.

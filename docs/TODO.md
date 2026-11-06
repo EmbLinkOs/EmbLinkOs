@@ -125,9 +125,17 @@ the default target). Measured before and after every step
         a reciprocal box blur and a row-major vertical pass: the library's entrance frame went from
         43-66 ms to 17 ms (DESKTOP_PERFORMANCE.md; T15, T16). Gradients were projected from the
         rect's corner and showed only the second half of their stops; now from the centre.
-  - [ ] The toolkit's span rasterizer, one blend policy, layer caching (a group that only fades or
-        scales could reuse its last flattened pixels; the library's tiles animate inside it, so it
-        would not help there).
+  - [x] Scrolling by moving pixels: the scroll blit takes a page under a bar (the thumb's move no
+        longer vetoes it), a scroll view shifts by whole pixels, rects walk only the dirty spans
+        of their rows, and a rect's partly covered pixels have one blend wherever its clip is.
+        Settings' scroll frames went from 2.85-3.84 ms to 0.44-1.23 ms (DESKTOP_PERFORMANCE.md;
+        `make kit-test`, `tools/scroll_smoke.py`, gallery 230).
+  - [ ] The rest of the span rasterizer: shadows, borders, images and glyphs still clamp to the
+        dirty bounding box, so a primitive between two far-apart dirty rects still walks the gap.
+  - [ ] One blend policy everywhere: rects and borders now share one (paint in sRGB, coverage in
+        linear light); text, the kernel compositor and the virgl shaders keep their own.
+  - [ ] Layer caching (a group that only fades or scales could reuse its last flattened pixels;
+        the library's tiles animate inside it, so it would not help there).
 - [ ] P4 Type and tokens.
   - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
         stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its
@@ -7608,7 +7616,12 @@ unsigned-char rule index). These are what remain.
       the top of declare.c).
 - [ ] python.org fails the scroll-blit pixel-exactness check ("pixels differ").
       Not yet diagnosed -- the blit path is taken and disagrees with a full
-      repaint, which is a correctness bug in the fast path.
+      repaint, which is a correctness bug in the fast path. Two causes of
+      exactly that were found and fixed in the toolkit since (a fractional move
+      copied by a rounded amount; a rect whose edges blended differently once
+      it slid under its clip -- DESKTOP_PERFORMANCE.md, "a page scrolling"),
+      so re-run it against the live page before digging further: the fetched
+      copy was not at hand to check.
 - [ ] `:is()`, `:not()` and `:has()` with a COMMA inside are split on that
       comma by the selector-group scanner, which produces one bogus selector
       per argument. They currently fail to match rather than mis-matching, so

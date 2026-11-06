@@ -52,26 +52,34 @@ static void blend_over(struct render_target *rt, int ix, int iy,
     *px = px_pack(nb, ng, nr, na);
 }
 
-/* Gamma-correct (linear-light, ~gamma 2.0) over-blend for ANTI-ALIASED EDGES:
- * `c` is the straight src color, `eff` its effective coverage/alpha at this
- * pixel. Blending edge coverage in linear light removes the dark fringe naive
- * sRGB blending leaves at high-contrast edges -- the same reason text does it.
- * Only ever called on partial-coverage pixels (interiors take the opaque fast
- * path), so the per-pixel sqrtf is confined to the thin AA band. */
-static void blend_edge_gamma(struct render_target *rt, int ix, int iy, struct color c, float eff) {
-    if (eff <= 0.0f) return;
+/* ONE BLEND FOR EVERY PIXEL A SHAPE ONLY PARTLY COVERS. The paint goes over
+ * what is there in sRGB, exactly as the shape's interior does; then COVERAGE,
+ * and only coverage, is applied in linear light, which is what keeps a
+ * high-contrast edge from the dark fringe a plain sRGB blend leaves.
+ *
+ * There used to be two edge blends inside one rect: a gamma blend on the
+ * side columns when the rect sat wholly inside its clips, blend_over on its
+ * top and bottom rows and on every pixel once it did not. The gamma one also
+ * linearised the PAINT's alpha, so a translucent row's straight edges came out
+ * lighter than its interior -- a one-pixel seam down both sides -- and a row
+ * drew its edges differently the moment it slid under a clip's edge. A
+ * picture that depends on where its clip happens to be cannot be scrolled by
+ * copying it; this is one picture wherever the shape is. At full coverage it
+ * is blend_over, the interior's blend. */
+static void blend_cov(struct render_target *rt, int ix, int iy, struct color c, float a, float cov) {
+    if (a <= 0.0f || cov <= 0.0f) return;
+    if (cov >= 0.999f) { blend_over(rt, ix, iy, c.r * a, c.g * a, c.b * a, a); return; }
     if (ix < 0 || iy < 0 || (uint32_t)ix >= rt->width || (uint32_t)iy >= rt->height) return;
     uint32_t *px = &rt_row(rt, (uint32_t)iy)[ix];
     int db, dg, dr, da; px_unpack(*px, &db, &dg, &dr, &da);
-    float inv = 1.0f - eff;
-    float sr = c.r * c.r, sg = c.g * c.g, sb = c.b * c.b;          /* linearise src */
-    float lr = (dr / 255.0f) * (dr / 255.0f);                      /* linearise dst */
-    float lg = (dg / 255.0f) * (dg / 255.0f);
-    float lb = (db / 255.0f) * (db / 255.0f);
-    int nr = clampi((int)(sqrtf(sr * eff + lr * inv) * 255.0f + 0.5f), 0, 255);
-    int ng = clampi((int)(sqrtf(sg * eff + lg * inv) * 255.0f + 0.5f), 0, 255);
-    int nb = clampi((int)(sqrtf(sb * eff + lb * inv) * 255.0f + 0.5f), 0, 255);
-    int na = clampi((int)(eff * 255.0f + da * inv + 0.5f), 0, 255);
+    float inv = 1.0f - a, k = cov, ik = 1.0f - cov;
+    float lr = dr / 255.0f, lg = dg / 255.0f, lb = db / 255.0f;
+    float orr = c.r * a + lr * inv, og = c.g * a + lg * inv, ob = c.b * a + lb * inv;   /* paint over, sRGB */
+    float oa = a + (da / 255.0f) * inv;
+    int nr = clampi((int)(sqrtf(orr * orr * k + lr * lr * ik) * 255.0f + 0.5f), 0, 255);
+    int ng = clampi((int)(sqrtf(og * og * k + lg * lg * ik) * 255.0f + 0.5f), 0, 255);
+    int nb = clampi((int)(sqrtf(ob * ob * k + lb * lb * ik) * 255.0f + 0.5f), 0, 255);
+    int na = clampi((int)((oa * k + (da / 255.0f) * ik) * 255.0f + 0.5f), 0, 255);
     *px = px_pack(nb, ng, nr, na);
 }
 
@@ -247,6 +255,21 @@ static int clamp_to_dirty(struct render_target *rt, int *x0, int *y0, int *x1, i
  * Conservative by construction: it must never claim coverage the exact path
  * would not give, so a clip stack deeper than CLIP_MAX (whose extra entries we
  * did not record) answers no. */
+/* The clip half of box_fully_covered: every pixel of the box in the
+ * fast-accept interior of every clip, the dirty region not asked about. */
+static int box_clip_covered(int bx0, int by0, int bx1, int by1) {
+    if (bx1 <= bx0 || by1 <= by0) return 1;
+    float fx0 = (float)bx0 + 0.5f, fy0 = (float)by0 + 0.5f;
+    float fx1 = (float)bx1 - 0.5f, fy1 = (float)by1 - 0.5f;
+    if (g_clip_n > CLIP_MAX) return 0;               /* clips we never stored */
+    for (int i = 0; i < g_clip_n; i++) {
+        struct clip_rect *c = &g_clip[i];
+        float inset = c->corner_radius + 0.5f;       /* same margin as coverage_full_at */
+        if (fx0 < c->x + inset || fx1 > c->x + c->w - inset) return 0;
+        if (fy0 < c->y + inset || fy1 > c->y + c->h - inset) return 0;
+    }
+    return 1;
+}
 static int box_fully_covered(int bx0, int by0, int bx1, int by1) {
     if (bx1 <= bx0 || by1 <= by0) return 1;          /* empty: vacuously true */
     float fx0 = (float)bx0 + 0.5f, fy0 = (float)by0 + 0.5f;   /* first centre */
@@ -265,14 +288,41 @@ static int box_fully_covered(int bx0, int by0, int bx1, int by1) {
         }
         if (!inside) return 0;
     }
-    if (g_clip_n > CLIP_MAX) return 0;               /* clips we never stored */
-    for (int i = 0; i < g_clip_n; i++) {
-        struct clip_rect *c = &g_clip[i];
-        float inset = c->corner_radius + 0.5f;       /* same margin as coverage_full_at */
-        if (fx0 < c->x + inset || fx1 > c->x + c->w - inset) return 0;
-        if (fy0 < c->y + inset || fy1 > c->y + c->h - inset) return 0;
+    return box_clip_covered(bx0, by0, bx1, by1);
+}
+
+/* THE DIRTY REGION ALONG ONE ROW, as disjoint spans [a,b) inside [x0,x1).
+ *
+ * A primitive clamped to the dirty BOUNDING BOX does work over everything
+ * between the rects: a scroll repaints a strip at the bottom of the view and a
+ * band at its top, and the box of those two is the whole view -- every pixel
+ * of the page's background then paid the per-pixel dirty test and the exact
+ * SDF path only to be thrown away, which made a blitted scroll frame dearer
+ * than painting everything. Per row the rects reduce to a few spans; walking
+ * those makes a primitive's cost the dirty area it actually covers. Merged, so
+ * a pixel two overlapping rects share is painted once -- a translucent fill
+ * blended twice would be visibly darker exactly there. Pixel ix is in a rect
+ * when its centre is, as in dirty_coverage. */
+static int dirty_row_spans(float fy, int x0, int x1, int *sa, int *sb) {
+    if (g_dirty_full) { sa[0] = x0; sb[0] = x1; return x1 > x0; }
+    int n = g_dirty_n < DIRTY_MAX ? g_dirty_n : DIRTY_MAX, k = 0;
+    for (int i = 0; i < n; i++) {
+        struct clip_rect *c = &g_dirty[i];
+        if (!(fy >= c->y && fy < c->y + c->h)) continue;
+        int a = (int)ceilf(c->x - 0.5f), b = (int)ceilf(c->x + c->w - 0.5f);
+        if (a < x0) a = x0;
+        if (b > x1) b = x1;
+        if (b <= a) continue;
+        int j = k++;                                  /* insertion by start */
+        while (j > 0 && sa[j - 1] > a) { sa[j] = sa[j - 1]; sb[j] = sb[j - 1]; j--; }
+        sa[j] = a; sb[j] = b;
     }
-    return 1;
+    int m = 0;
+    for (int i = 0; i < k; i++) {
+        if (m && sa[i] <= sb[m - 1]) { if (sb[i] > sb[m - 1]) sb[m - 1] = sb[i]; }
+        else { sa[m] = sa[i]; sb[m] = sb[i]; m++; }
+    }
+    return m;
 }
 
 /* Public accessors for the Piece-4b text blit (separate translation unit). */
@@ -560,55 +610,58 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
                (ROW)[IX] = px_pack(lutB[_b], lutG[_g], lutR[_r], lutA[_a]); }  \
     } while (0)
 
-    /* the interior box is provably at coverage 1.0 -> the fill degenerates to a
-     * bare row of stores. Asked once for the whole rect, not once per pixel. */
-    int cov_trivial = box_fully_covered(x0 > in_x0 ? x0 : in_x0, y0 > in_y0 ? y0 : in_y0,
-                                        x1 < in_x1 ? x1 : in_x1, y1 < in_y1 ? y1 : in_y1);
+    /* the interior box is provably inside every clip -> within a dirty span
+     * (dirty_row_spans: wholly damaged by construction) the fill degenerates
+     * to a bare row of stores. Asked once for the whole rect, not per pixel. */
+    int cov_trivial = box_clip_covered(x0 > in_x0 ? x0 : in_x0, y0 > in_y0 ? y0 : in_y0,
+                                       x1 < in_x1 ? x1 : in_x1, y1 < in_y1 ? y1 : in_y1);
+    const int rx0 = x0, rx1 = x1;
+    int spa[DIRTY_MAX], spb[DIRTY_MAX];
 
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         uint32_t *row = rt_row(rt, (uint32_t)iy);
         int row_interior = (fast_solid || fast_alpha || fast_grad) && iy >= in_y0 && iy < in_y1;
-        int sp_a = in_x0 > x0 ? in_x0 : x0, sp_b = in_x1 < x1 ? in_x1 : x1;
-        if (row_interior && cov_trivial && sp_a < sp_b) {
-            int a = sp_a, b = sp_b;
-            if (fast_grad) {                     /* t stepped along the row */
-                int32_t tq = GRAD_TQ(a + 0.5f, fy);
-                int32_t dtq = (int32_t)(g_dx / g_den * (GRAD_LUT - 1) * 65536.0f);
-                for (int ix = a; ix < b; ix++, tq += dtq) CPU_GRAD_PIX(ix, iy, tq);
-            } else
-            for (int ix = a; ix < b; ix++) CPU_INTERIOR_STORE(row, ix);
-            /* left/right AA columns still take the exact path below */
+        int nsp = dirty_row_spans(fy, rx0, rx1, spa, spb);
+        for (int si = 0; si < nsp; si++) {
+            int x0 = spa[si], x1 = spb[si];
+            int sp_a = in_x0 > x0 ? in_x0 : x0, sp_b = in_x1 < x1 ? in_x1 : x1;
+            if (row_interior && cov_trivial && sp_a < sp_b) {
+                int a = sp_a, b = sp_b;
+                if (fast_grad) {                     /* t stepped along the row */
+                    int32_t tq = GRAD_TQ(a + 0.5f, fy);
+                    int32_t dtq = (int32_t)(g_dx / g_den * (GRAD_LUT - 1) * 65536.0f);
+                    for (int ix = a; ix < b; ix++, tq += dtq) CPU_GRAD_PIX(ix, iy, tq);
+                } else
+                for (int ix = a; ix < b; ix++) CPU_INTERIOR_STORE(row, ix);
+                /* left/right AA columns still take the exact path below */
+                for (int ix = x0; ix < x1; ix++) {
+                    if (ix == a) { ix = b - 1; continue; }   /* skip the filled span */
+                    float fx = ix + 0.5f;
+                    float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
+                    float cov = sdf_coverage(dist);
+                    if (cov <= 0.0f) continue;
+                    cov *= coverage_at(fx, fy);
+                    if (cov <= 0.0f) continue;
+                    struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
+                    blend_cov(rt, ix, iy, c, c.a * opacity, cov);
+                }
+                continue;
+            }
             for (int ix = x0; ix < x1; ix++) {
-                if (ix == a) { ix = b - 1; continue; }   /* skip the filled span */
                 float fx = ix + 0.5f;
+                if (row_interior && ix >= in_x0 && ix < in_x1 && coverage_full_at(fx, fy)) {
+                    CPU_INTERIOR_STORE(row, ix);
+                    continue;
+                }
                 float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
                 float cov = sdf_coverage(dist);
                 if (cov <= 0.0f) continue;
                 cov *= coverage_at(fx, fy);
                 if (cov <= 0.0f) continue;
                 struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
-                float eff = c.a * cov * opacity;
-                if (eff <= 0.0f) continue;
-                blend_edge_gamma(rt, ix, iy, c, eff);
+                blend_cov(rt, ix, iy, c, c.a * opacity, cov);
             }
-            continue;
-        }
-        for (int ix = x0; ix < x1; ix++) {
-            float fx = ix + 0.5f;
-            if (row_interior && ix >= in_x0 && ix < in_x1 && coverage_full_at(fx, fy)) {
-                CPU_INTERIOR_STORE(row, ix);
-                continue;
-            }
-            float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
-            float cov = sdf_coverage(dist);
-            if (cov <= 0.0f) continue;
-            cov *= coverage_at(fx, fy);
-            if (cov <= 0.0f) continue;
-            struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
-            float eff = c.a * cov * opacity;
-            if (eff <= 0.0f) continue;
-            blend_over(rt, ix, iy, c.r * eff, c.g * eff, c.b * eff, eff);
         }
     }
     #undef CPU_INTERIOR_STORE
@@ -1021,8 +1074,7 @@ static void cpu_draw_border(struct render_target *rt, float x, float y, float w,
                 if (ring <= 0.0f) continue;
                 struct color bc = has_grad ? cpu_paint_at(paint, fx - x, fy - y, w, h) : color;
                 if (bc.a <= 0.0f) continue;
-                float eff = bc.a * ring;
-                blend_edge_gamma(rt, ix, iy, bc, eff);
+                blend_cov(rt, ix, iy, bc, bc.a, ring);
             }
         }
     }

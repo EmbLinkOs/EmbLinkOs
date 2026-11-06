@@ -128,6 +128,11 @@ struct noderec {
     int                has_old;
     int                own_dirty;
     int                moved;
+    /* a pure translation (moved, same size) and by how much -- and whether it
+     * went some OTHER way than the frame's scroll did (Step 1a) */
+    int                trans;
+    float              tdx, tdy;
+    int                odd;
     int                clips;
     /* What this node can actually STAIN: `foot` intersected with every
      * clipping ancestor. A node scrolled past the bottom of its container has
@@ -184,6 +189,7 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     rec->group_bounds = gbounds;
     rec->dirty = 0;
     rec->has_old = 0; rec->own_dirty = 0; rec->moved = 0;
+    rec->trans = 0; rec->odd = 0; rec->tdx = rec->tdy = 0;
     rec->clips = node->clip_children ? 1 : 0;
     rec->vis = has_clip ? frect_isect(rec->foot, clipr) : rec->foot;
     rec->clipbox = clipr; rec->has_clipbox = has_clip;
@@ -532,11 +538,39 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
 #endif
             }
             else {
-                float dx = rec->foot.x - rec->old.x, dy = rec->foot.y - rec->old.y;
-                if (!n_moved) { mdx = dx; mdy = dy; }
-                else if (fabsf(dx - mdx) > 0.5f || fabsf(dy - mdy) > 0.5f) uniform = 0;
-                n_moved++;
+                rec->trans = 1;
+                rec->tdx = rec->foot.x - rec->old.x;
+                rec->tdy = rec->foot.y - rec->old.y;
             }
+        }
+    }
+    /* THE SCROLL'S DELTA IS THE ONE MOST OF THE MOVES SHARE. A scroll view
+     * that overflows shows a bar, and the bar's thumb moves the other way, a
+     * fraction as far: insisting that EVERY move be the same one meant the
+     * thumb alone vetoed the blit for every page with a scroll bar -- which is
+     * every page the blit exists for. The other moves are the frame's own
+     * business: they are held to what content changes are held to below
+     * (outside the blitted region, repainted as ordinary rects). */
+    {
+        struct { float dx, dy; int n; } bk[8];
+        int nb = 0;
+        for (int i = 0; i < nrec && uniform; i++) {
+            if (!recs[i].trans) continue;
+            int b = 0;
+            while (b < nb && (fabsf(recs[i].tdx - bk[b].dx) > 0.5f || fabsf(recs[i].tdy - bk[b].dy) > 0.5f)) b++;
+            if (b == nb) {
+                if (nb == 8) { uniform = 0; break; }   /* no one delta to speak of */
+                bk[nb].dx = recs[i].tdx; bk[nb].dy = recs[i].tdy; bk[nb].n = 0; nb++;
+            }
+            bk[b].n++;
+        }
+        int best = -1;
+        for (int b = 0; uniform && b < nb; b++) if (best < 0 || bk[b].n > bk[best].n) best = b;
+        if (best >= 0) {
+            mdx = bk[best].dx; mdy = bk[best].dy; n_moved = bk[best].n;
+            for (int i = 0; i < nrec; i++)
+                if (recs[i].trans && (fabsf(recs[i].tdx - mdx) > 0.5f || fabsf(recs[i].tdy - mdy) > 0.5f))
+                    recs[i].odd = 1;
         }
     }
     int n_vacated = 0;
@@ -544,7 +578,10 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
         if (r->cache[i].valid && seen && !seen[i]) n_vacated++;
 
     /* --- Step 1s: THE SCROLL BLIT. When many nodes translated by one shared
-     * vertical delta and NOTHING else changed, this frame is a scroll -- and a
+     * whole-pixel vertical delta and nothing INSIDE the scrolled clip did
+     * anything else (a thumb beside it moving its own way is fine -- Step 1a
+     * calls that an odd move and it repaints as content), this frame is a
+     * scroll -- and a
      * scroll does not need its pixels recomputed, it needs them MOVED. The
      * old frame already contains almost every pixel of the new one, |dy|
      * higher or lower. So: find the clip container being scrolled (the
@@ -572,11 +609,16 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
      * alongside the strip. The intersection check happens after R is known. */
     (void)n_content;
     if (!r->full && uniform && n_moved >= 8 &&
-        fabsf(mdx) < 0.5f && fabsf(mdy) >= 1.0f && target && target->pixels) {
+        fabsf(mdx) < 0.5f && fabsf(mdy) >= 1.0f &&
+        /* a copy moves WHOLE rows: a fractional move resamples, and copying
+         * it by the rounded amount leaves everything in the view off by the
+         * difference (ui_set_scroll_offset shifts by whole pixels for this) */
+        fabsf(mdy - (float)(int)(mdy < 0 ? mdy - 0.5f : mdy + 0.5f)) < 0.02f &&
+        target && target->pixels) {
         /* the union of the moving content, old and new */
         struct frect mb; int have_mb = 0;
         for (int i = 0; i < nrec; i++) {
-            if (!(recs[i].moved && recs[i].has_old)) continue;
+            if (!(recs[i].moved && recs[i].has_old) || recs[i].odd) continue;
             struct frect u = recs[i].foot;
             if (!have_mb) { mb = u; have_mb = 1; }
             float x1 = mb.x + mb.w, y1 = mb.y + mb.h;
@@ -614,7 +656,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                 int resized = recs[i].moved && recs[i].has_old &&
                               (fabsf(recs[i].old.w - recs[i].foot.w) > 0.01f ||
                                fabsf(recs[i].old.h - recs[i].foot.h) > 0.01f);
-                int is_content = recs[i].own_dirty || resized ||
+                int is_content = recs[i].own_dirty || resized || recs[i].odd ||
                                  (recs[i].moved && !recs[i].has_old);
                 /* VISIBLE extents, not raw footprints: a node scrolled past the
                  * bottom of its container stains nothing, so it can neither
@@ -717,12 +759,26 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                 { struct frect e1 = { R.x, R.y - 1.0f, R.w, 3.0f };
                   struct frect e2 = { R.x, R.y + R.h - 2.0f, R.w, 3.0f };
                   dirty_add(r, e1); dirty_add(r, e2); }
+                /* and its ROUNDED CORNERS: there the clip's own coverage
+                 * depends on the height, so a pixel copied from a few rows
+                 * away carries the wrong amount of the clip with it */
+                { struct scene_node *cn = scene_resolve(a, recs[ci].h);
+                  float cr = cn ? cn->corner_radius : 0.0f;
+                  if (cr > 0.0f) {
+                      float k = cr + 2.0f;
+                      struct frect c4[4] = {
+                          { R.x - 1.0f,         R.y - 1.0f,         k, k },
+                          { R.x + R.w + 1.0f - k, R.y - 1.0f,       k, k },
+                          { R.x - 1.0f,         R.y + R.h + 1.0f - k, k, k },
+                          { R.x + R.w + 1.0f - k, R.y + R.h + 1.0f - k, k, k } };
+                      for (int q = 0; q < 4; q++) dirty_add(r, c4[q]);
+                  } }
                 /* content changes OUTSIDE R repaint as ordinary dirty rects */
                 for (int i = 0; i < nrec; i++) {
                     int resized = recs[i].moved && recs[i].has_old &&
                                   (fabsf(recs[i].old.w - recs[i].foot.w) > 0.01f ||
                                    fabsf(recs[i].old.h - recs[i].foot.h) > 0.01f);
-                    int is_content = recs[i].own_dirty || resized ||
+                    int is_content = recs[i].own_dirty || resized || recs[i].odd ||
                                      (recs[i].moved && !recs[i].has_old);
                     if (!is_content) continue;
                     dirty_add(r, recs[i].foot);
