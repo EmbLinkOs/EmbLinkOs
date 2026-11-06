@@ -16,6 +16,7 @@
 #include <time.h>
 #include <math.h>
 #include "gfx/pix.h"
+#include "sc_bridge.h"
 
 static unsigned checks, failures;
 #define CHECK(x, what) do { checks++; if (!(x)) { failures++; printf("  FAIL: %s (line %d)\n", what, __LINE__); } \
@@ -209,6 +210,38 @@ static int bench(void) {
         }
     double t7 = now_ms();
     printf("a 980 x 660 window at 88%%: nearest %.2f ms, bilinear %.2f ms\n", (t6 - t5) / 10, (t7 - t6) / 10);
+    /* a LAYER: a 260 x 400 menu, its own alpha, at 94% and 0.6 opacity, and
+     * at its own size -- what a menu's drop-in costs the compositor a frame */
+    {
+        enum { LW = 260, LH = 400 };
+        uint32_t *lay = malloc((size_t)LW * LH * 4);
+        for (int i = 0; i < LW * LH; i++) lay[i] = (i % 7 ? 0xe0u : 0xffu) << 24 | 0x00505050u;
+        int dw = LW * 94 / 100, dh = LH * 94 / 100;
+        uint32_t lsx = ((uint32_t)LW << 16) / (uint32_t)dw, lsy = ((uint32_t)LH << 16) / (uint32_t)dh;
+        double l0 = now_ms();
+        for (int k = 0; k < 50; k++)
+            for (int y = 0; y < dh; y++) {
+                int32_t sy = (int32_t)(((int64_t)(2 * y + 1) * lsy) / 2) - 32768;
+                if (sy < 0) sy = 0;
+                int r0 = sy >> 16, r1 = r0 + 1 < LH ? r0 + 1 : r0;
+                pix_scale_over_row(dst + y * W, dw, lay + r0 * LW, lay + r1 * LW, LW,
+                                   (int32_t)lsx / 2 - 32768, (int32_t)lsx, ((uint32_t)sy >> 8) & 255, 153, 1, 0);
+            }
+        double l1 = now_ms();
+        for (int k = 0; k < 50; k++)
+            for (int y = 0; y < dh; y++) {
+                int32_t sy = (int32_t)(((int64_t)(2 * y + 1) * lsy) / 2) - 32768;
+                pix_scale_over_row(dst + y * W, dw, lay + (sy < 0 ? 0 : sy >> 16) * LW, 0, LW,
+                                   (int32_t)lsx / 2 - 32768, (int32_t)lsx, 0, 153, 0, 0);
+            }
+        double l2 = now_ms();
+        for (int k = 0; k < 50; k++)
+            for (int y = 0; y < LH; y++) pix_over_fade_row(dst + y * W, lay + y * LW, LW, 153, 0);
+        double l3 = now_ms();
+        printf("a 260 x 400 layer at 94%%, 0.6 opacity: bilinear %.3f ms, nearest %.3f ms; at its own size %.3f ms\n",
+               (l1 - l0) / 50, (l2 - l1) / 50, (l3 - l2) / 50);
+        free(lay);
+    }
     free(src); free(dst); free(tmp); free(col);
     return 0;
 }
@@ -252,6 +285,89 @@ static int scale_matches(void) {
     pix_scale_row(dst, 300, r0, r1, 97, -20000, 21000, 128, 255, 0);
     for (int i = 0; i < 300; i++) if (dst[i] != 0x003c7ab9u) { bad = 1; break; }
     return bad;
+}
+
+/* ---- a layer's row against the compositor's reference draw ----------------
+ * soft_compose.c's sc_draw is the virgl shaders' letter in integers: a
+ * premultiplied picture, filtered between texel centres when scaled, faded,
+ * over. The layer row does the same in two-lane arithmetic, rounding each
+ * step to the nearest level -- and both are held to exact arithmetic. */
+static uint32_t premul_rnd(void) {
+    uint32_t a = rnd() % 4 == 0 ? 0 : rnd() % 4 == 0 ? 255 : rnd() & 255;
+    uint32_t r = a ? rnd() % (a + 1) : 0, g = a ? rnd() % (a + 1) : 0, b = a ? rnd() % (a + 1) : 0;
+    return a << 24 | r << 16 | g << 8 | b;
+}
+static int layer_rows_match(void) {
+    enum { SW = 61, SH = 37, DWM = 140, DHM = 90 };
+    static uint32_t img[SW * SH], a[DWM * DHM], b[DWM * DHM], o[DWM * DHM];
+    int worst = 0;
+    double off_row = 0, off_ref = 0;   /* each, against exact arithmetic */
+    for (int trial = 0; trial < 300; trial++) {
+        int sw = 2 + (int)(rnd() % (SW - 1)), sh = 2 + (int)(rnd() % (SH - 1));
+        int dw = trial % 5 == 0 ? sw : 1 + (int)(rnd() % DWM), dh = trial % 5 == 0 ? sh : 1 + (int)(rnd() % DHM);
+        uint32_t op = trial % 3 == 0 ? 255 : rnd() & 255;
+        for (int i = 0; i < sw * sh; i++) img[i] = premul_rnd();
+        for (int i = 0; i < dw * dh; i++) a[i] = b[i] = o[i] = 0xff000000u | (rnd() & 0xffffffu);
+        sc_bridge_draw(a, dw, dh, img, sw, sh, op);      /* the reference */
+        /* the row, as fb_blit_scaled_over walks it */
+        if (dw == sw && dh == sh) {
+            for (int y = 0; y < dh; y++) pix_over_fade_row(b + y * dw, img + y * sw, dw, op, 0);
+        } else {
+            uint32_t stepx = ((uint32_t)sw << 16) / (uint32_t)dw, stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
+            int32_t sx0 = (int32_t)(((int64_t)1 * stepx) / 2) - 32768;
+            for (int y = 0; y < dh; y++) {
+                int32_t sy = (int32_t)(((int64_t)(2 * y + 1) * stepy) / 2) - 32768;
+                if (sy < 0) sy = 0;
+                int32_t r0 = sy >> 16, r1 = r0 + 1;
+                uint32_t fy = ((uint32_t)sy >> 8) & 0xffu;
+                if (r0 >= sh - 1) { r0 = r1 = sh - 1; fy = 0; }
+                pix_scale_over_row(b + y * dw, dw, img + r0 * sw, img + r1 * sw, sw, sx0, (int32_t)stepx, fy, op, 1, 0);
+            }
+        }
+        for (int y = 0; y < dh; y++) for (int x = 0; x < dw; x++) {
+            double u = x, v = y;
+            if (dw != sw || dh != sh) { u = (x + 0.5) * sw / dw - 0.5; v = (y + 0.5) * sh / dh - 0.5; }
+            int u0 = (int)floor(u), v0 = (int)floor(v); double fu = u - u0, fv = v - v0;
+            int xs[2] = { u0, u0 + 1 }, ys[2] = { v0, v0 + 1 };
+            for (int k = 0; k < 2; k++) { if (xs[k] < 0) xs[k] = 0; if (xs[k] >= sw) xs[k] = sw - 1;
+                                          if (ys[k] < 0) ys[k] = 0; if (ys[k] >= sh) ys[k] = sh - 1; }
+            double ch[4];
+            for (int c = 0; c < 4; c++) {
+                int sf = c * 8;
+                double p00 = (img[ys[0] * sw + xs[0]] >> sf) & 255, p10 = (img[ys[0] * sw + xs[1]] >> sf) & 255;
+                double p01 = (img[ys[1] * sw + xs[0]] >> sf) & 255, p11 = (img[ys[1] * sw + xs[1]] >> sf) & 255;
+                ch[c] = ((p00 * (1 - fu) + p10 * fu) * (1 - fv) + (p01 * (1 - fu) + p11 * fu) * fv) * op / 255.0;
+            }
+            for (int c = 0; c < 3; c++) {
+                int sf = c * 8;
+                double want = ch[c] + ((o[y * dw + x] >> sf) & 255) * (1 - ch[3] / 255.0);
+                double e1 = fabs((double)((b[y * dw + x] >> sf) & 255) - want), e2 = fabs((double)((a[y * dw + x] >> sf) & 255) - want);
+                if (e1 > off_row) off_row = e1;
+                if (e2 > off_ref) off_ref = e2;
+            }
+        }
+        for (int i = 0; i < dw * dh; i++)
+            for (int sh8 = 0; sh8 < 24; sh8 += 8) {
+                int e = (int)((a[i] >> sh8) & 255) - (int)((b[i] >> sh8) & 255);
+                if (e < 0) e = -e;
+                if (e > worst) worst = e;
+            }
+    }
+    printf("        (the most a channel differs from sc_draw: %d; from exact arithmetic: the row %.2f, sc_draw %.2f)\n",
+           worst, off_row, off_ref);
+    /* Both quantise the filter's position to 1/256 of a texel, which between
+     * two neighbours far apart is a level an axis: three from exact is the
+     * floor for either. The row must be no further than the reference. */
+    return off_row > off_ref + 0.5 || worst > 4;
+}
+static int fade_exact(void) {
+    for (uint32_t o = 0; o < 256; o++)
+        for (uint32_t v = 0; v < 256; v++) {
+            uint32_t c = v << 24 | (255 - v) << 16 | (v / 2) << 8 | (v / 3), f = pix_fade4(c, o);
+            for (int s = 0; s < 32; s += 8)
+                if (((f >> s) & 255) != (((c >> s) & 255) * o + 127) / 255) return 1;
+        }
+    return 0;
 }
 
 static int saturate_matches(void) {
@@ -304,6 +420,8 @@ int main(int argc, char **argv) {
     CHECK(rows_match(1) == 0, "rows on an R,G,B,X scanout, the source put into its order");
     CHECK(blur_matches() == 0, "the box blur equals the old two passes, every size and radius tried");
     CHECK(saturate_matches() == 0, "vibrancy is the textbook saturation, either byte order; grey, black and white stay");
+    CHECK(fade_exact() == 0, "a premultiplied pixel faded is every channel, alpha too, times o / 255, to the nearest level");
+    CHECK(layer_rows_match() == 0, "a layer's row -- its own alpha, scaled, faded, over -- is as close to exact arithmetic as the reference draw, and within four levels of it");
     CHECK(scale_matches() == 0, "a filtered scaled row is the textbook bilinear, any scale, alpha or order; a flat colour stays flat");
     printf("=== pix: %u checks, %u failures ===\n", checks, failures);
     return failures ? 1 : 0;

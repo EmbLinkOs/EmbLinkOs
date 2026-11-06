@@ -150,7 +150,11 @@ the default target). Measured before and after every step
   - [ ] Glass inside a group is never kept (its pixels depend on what is behind it): the menus'
         drop-in still paints its blur every frame. Compositor layers with `material=blur` (M3,
         M4) are the answer; until then menus pay about 0.9 ms a frame on an M5 core.
-  - [ ] M2: a premultiplied, per-pixel-alpha scaled blit in the compositor.
+  - [x] M2: a premultiplied, per-pixel-alpha scaled blit (`pix_scale_over_row`,
+        `fb_blit_scaled_over`; `make pix-test` against exact arithmetic and `sc_draw`).
+  - [ ] Translucent windows still do not fly (open, close, minimise): the blit that would let
+        them is here, but the notification banners and the top bar already move themselves, and
+        a compositor zoom over that would be motion twice. Decide per kind of window.
   - [ ] M3: kernel layers (syscalls 166-169).
   - [ ] M4: menus, popovers, toasts and tooltips on layers; the top bar's dropdowns.
   - [ ] M5: dialogs and sheets that scale in; the close pull moved by the compositor.

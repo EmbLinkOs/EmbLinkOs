@@ -95,6 +95,53 @@ static inline uint32_t pix_lerp(uint32_t a, uint32_t b, uint32_t f)
 void pix_scale_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1, int sw,
                    int32_t sx, int32_t step, uint32_t fy, uint32_t alpha, int swap);
 
+/* All four channels of two premultiplied pixels, (a * (256 - f) + b * f + 128)
+ * >> 8: the bilinear step for a picture that has its own alpha. ROUNDED: two
+ * truncating steps darken a filtered picture by up to two levels, which is
+ * what pix_scale_row does and the reference draw does not (lanes stay below
+ * 255 * 256 + 128). */
+static inline uint32_t pix_lerp4(uint32_t a, uint32_t b, uint32_t f)
+{
+    uint32_t k = 256u - f;
+    uint32_t rb = (((a & 0x00ff00ffu) * k + (b & 0x00ff00ffu) * f + 0x00800080u) >> 8) & 0x00ff00ffu;
+    uint32_t ag = ((((a >> 8) & 0x00ff00ffu) * k + ((b >> 8) & 0x00ff00ffu) * f + 0x00800080u) >> 8) & 0x00ff00ffu;
+    return rb | (ag << 8);
+}
+
+/* A premultiplied pixel at opacity o (0..255): every channel, alpha too,
+ * times o / 255, to the nearest level. */
+static inline uint32_t pix_fade4(uint32_t c, uint32_t o)
+{
+    return pix_div255_2((c & 0x00ff00ffu) * o + 0x007f007fu) |
+           (pix_div255_2(((c >> 8) & 0x00ff00ffu) * o + 0x007f007fu) << 8);
+}
+
+/* Premultiplied over, to the nearest level: s + round(d * (255 - a) / 255),
+ * clamped. pix_over floors -- it is the old loops' arithmetic, bit for bit --
+ * and a layer's row, which filters and fades first, would stack that on two
+ * more roundings. Alpha byte 0. */
+static inline uint32_t pix_over_round(uint32_t s, uint32_t d)
+{
+    uint32_t k = 255u - (s >> 24);
+    uint32_t rb = (s & 0x00ff00ffu) + pix_div255_2((d & 0x00ff00ffu) * k + 0x007f007fu);
+    rb = (rb | (((rb & 0x01000100u) >> 8) * 0xffu)) & 0x00ff00ffu;
+    uint32_t g = ((s >> 8) & 0xffu) + pix_div255(((d >> 8) & 0xffu) * k + 127u);
+    if (g > 255u) g = 255u;
+    return rb | (g << 8);
+}
+
+/* A LAYER'S ROW: a picture with its own alpha -- premultiplied, as the
+ * toolkit paints it -- scaled and composited over the destination at
+ * `opacity`. As pix_scale_row samples (`sx`, `step` 16.16 from pixel centre
+ * to pixel centre, `fy` between the rows), filtered when `smooth`, else the
+ * nearest source pixel of `r0`. Where pix_scale_row lays a window's colour
+ * down whole and fades it, this lets what is transparent in the picture stay
+ * transparent: a menu's rounded corners and soft shadow, a toast. */
+void pix_scale_over_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1, int sw,
+                        int32_t sx, int32_t step, uint32_t fy, uint32_t opacity, int smooth, int swap);
+/* The same at the picture's own size: premultiplied over, at `opacity`. */
+void pix_over_fade_row(uint32_t *dst, const uint32_t *src, int n, uint32_t opacity, int swap);
+
 /* VIBRANCY: each colour moved away from its own grey by `s` (Q8: 256 keeps
  * it, 435 is 1.7 times), clamped -- grey being the luma 0.30 R + 0.59 G +
  * 0.11 B, in eighths of 256. A blurred backdrop on its own goes muddy; frosted

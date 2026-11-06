@@ -3001,11 +3001,11 @@ spring-test: | $(BUILD)
 # would time NEON/SSE the kernel can never use.
 pix-test: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-	    -Ikernel tests/gfx/pix_test.c kernel/gfx/pix.c -o $(BUILD)/pix_test
+	    -Ikernel -I. tests/gfx/pix_test.c kernel/gfx/pix.c tests/gfx/sc_bridge.c kernel/gfx/soft_compose.c -o $(BUILD)/pix_test
 	$(BUILD)/pix_test
 pix-bench: | $(BUILD)
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -fno-tree-vectorize -fno-tree-slp-vectorize \
-	    -Ikernel tests/gfx/pix_test.c kernel/gfx/pix.c -o $(BUILD)/pix_bench
+	    -Ikernel -I. tests/gfx/pix_test.c kernel/gfx/pix.c tests/gfx/sc_bridge.c kernel/gfx/soft_compose.c -o $(BUILD)/pix_bench
 	$(BUILD)/pix_bench --bench
 
 .PHONY: backdrop-test

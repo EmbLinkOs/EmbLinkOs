@@ -52,6 +52,43 @@ void pix_scale_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1,
     }
 }
 
+void pix_scale_over_row(uint32_t *dst, int n, const uint32_t *r0, const uint32_t *r1, int sw,
+                        int32_t sx, int32_t step, uint32_t fy, uint32_t opacity, int smooth, int swap)
+{
+    for (int i = 0; i < n; i++, sx += step) {
+        uint32_t c;
+        if (smooth) {
+            int32_t s = sx < 0 ? 0 : sx;
+            int x0 = s >> 16;
+            uint32_t fx = ((uint32_t)s >> 8) & 0xffu;
+            int x1 = x0 + 1;
+            if (x0 >= sw - 1) { x0 = x1 = sw - 1; fx = 0; }
+            c = pix_lerp4(pix_lerp4(r0[x0], r0[x1], fx), pix_lerp4(r1[x0], r1[x1], fx), fy);
+        } else {
+            int32_t x = (sx + 32768) >> 16;           /* the nearest centre */
+            if (x < 0) x = 0;
+            if (x > sw - 1) x = sw - 1;
+            c = r0[x];
+        }
+        if (opacity < 255u) c = pix_fade4(c, opacity);
+        uint32_t a = c >> 24;
+        if (a == 0) continue;
+        if (swap) c = pix_swap_rb(c);
+        dst[i] = a == 255u ? (c & 0x00ffffffu) : pix_over_round(c, dst[i]);
+    }
+}
+
+void pix_over_fade_row(uint32_t *dst, const uint32_t *src, int n, uint32_t opacity, int swap)
+{
+    if (opacity >= 255u) { pix_over_row(dst, src, n, swap); return; }
+    for (int i = 0; i < n; i++) {
+        uint32_t c = pix_fade4(src[i], opacity), a = c >> 24;
+        if (a == 0) continue;
+        if (swap) c = pix_swap_rb(c);
+        dst[i] = a == 255u ? (c & 0x00ffffffu) : pix_over_round(c, dst[i]);
+    }
+}
+
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 void pix_saturate_row(uint32_t *px, int n, uint32_t s, int swap)

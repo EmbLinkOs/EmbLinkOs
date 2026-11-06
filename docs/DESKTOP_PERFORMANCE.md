@@ -509,3 +509,22 @@ so cannot be kept -- that is what the compositor's layers are for (M3, M4).
 The library presents more pixels for fewer full repaints: home presents one
 bounding rect of its dirty rects, and merged rects around a near-full-screen
 sheet bound most of the screen. It is M6's.
+
+### M2: the compositor draws a picture with its own alpha
+
+A window's pixels are opaque to the compositor -- the alpha they carry is
+ignored, which is why only opaque windows ever flew. A layer is a menu or a
+toast, whose rounded corners and soft edges ARE its alpha. `pix_scale_over_row`
+filters all four premultiplied channels between texel centres, fades them and
+composites over; `fb_blit_scaled_over` walks it (and `pix_over_fade_row` at
+the picture's own size). Each step rounds to the nearest level, and
+`make pix-test` holds the row against exact arithmetic beside soft_compose.c's
+`sc_draw`, the virgl shaders' letter: both are 3.03 levels from exact at
+worst, the quantised filter position's floor, and within 4 of each other.
+`make pix-bench`, one M5 core, scalar as the kernel is built:
+
+| A 260 x 400 layer at 94 %, opacity 0.6 | Time |
+|---|---|
+| Filtered | 0.52 ms |
+| Nearest (the governor's choice when frames are dear) | 0.28 ms |
+| At its own size, where every motion lands | 0.23 ms |

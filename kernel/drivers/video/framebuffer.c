@@ -670,6 +670,74 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
     fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
 }
 
+// A LAYER: a picture with its own alpha (premultiplied 0xAARRGGBB, as the
+// toolkit paints it) scaled into a destination rect and composited OVER what
+// is there at `opacity`, clipped as fb_blit_scaled_uniform is. Where that one
+// lays a window's colour down whole -- a window is opaque, and the alpha it
+// carries is the compositor's to ignore -- this keeps what is transparent in
+// the picture transparent: a menu's rounded corners and soft shadow fly as
+// they are. Filtered (pix_scale_over_row) when `smooth`, else the nearest
+// source pixel; at the picture's own size a premultiplied over.
+void fb_blit_scaled_over(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                         const uint32_t *argb, int32_t sw, int32_t sh,
+                         uint32_t stride, uint32_t opacity, int smooth,
+                         int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || !argb || opacity == 0) return;
+    if (opacity > 255) opacity = 255;
+    int32_t x0 = dx > clx0 ? dx : clx0, y0 = dy > cly0 ? dy : cly0;
+    int32_t x1 = dx + dw < clx1 ? dx + dw : clx1, y1 = dy + dh < cly1 ? dy + dh : cly1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)fb.width)  x1 = (int32_t)fb.width;
+    if (y1 > (int32_t)fb.height) y1 = (int32_t)fb.height;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    uint32_t stepx = ((uint32_t)sw << 16) / (uint32_t)dw;
+    uint32_t stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
+    uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
+    if (fb_fast()) {
+        int swap = fb_swap();
+        if (dw == sw && dh == sh) {
+            for (int32_t y = y0; y < y1; y++, row += fb.pitch)
+                pix_over_fade_row((uint32_t *)row, argb + (uint64_t)(y - dy) * stride + (x0 - dx),
+                                  x1 - x0, opacity, swap);
+        } else {
+            int32_t sx0 = (int32_t)(((int64_t)(2 * (x0 - dx) + 1) * stepx) / 2) - 32768;
+            for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+                int32_t sy = (int32_t)(((int64_t)(2 * (y - dy) + 1) * stepy) / 2) - 32768;
+                if (sy < 0) sy = 0;
+                int32_t r0 = sy >> 16, r1 = r0 + 1;
+                uint32_t fy = ((uint32_t)sy >> 8) & 0xffu;
+                if (r0 >= sh - 1) { r0 = r1 = sh - 1; fy = 0; }
+                if (!smooth) { r0 = (sy + 32768) >> 16; if (r0 > sh - 1) r0 = sh - 1; r1 = r0; }
+                pix_scale_over_row((uint32_t *)row, x1 - x0, argb + (uint64_t)r0 * stride,
+                                   argb + (uint64_t)r1 * stride, sw, sx0, (int32_t)stepx, fy,
+                                   opacity, smooth, swap);
+            }
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
+    /* any other depth: nearest, a pixel at a time */
+    for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+        uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
+        if (sy >= (uint32_t)sh) sy = (uint32_t)sh - 1;
+        const uint32_t *srow = argb + (uint64_t)sy * stride;
+        uint32_t sx_fx = (uint32_t)(x0 - dx) * stepx;
+        uint8_t *p = row;
+        for (int32_t x = x0; x < x1; x++, p += fb_bypp, sx_fx += stepx) {
+            uint32_t sx = sx_fx >> 16;
+            if (sx >= (uint32_t)sw) sx = (uint32_t)sw - 1;
+            uint32_t c = opacity < 255 ? pix_fade4(srow[sx], opacity) : srow[sx], a = c >> 24;
+            if (a == 0) continue;
+            fb_color_t d = fb_unpack(fb_load(p));
+            uint32_t o = a == 255 ? (c & 0x00ffffffu) : pix_over_round(c, d & 0x00ffffffu);
+            fb_store(p, fb_pack(FB_RGB((o >> 16) & 0xFF, (o >> 8) & 0xFF, o & 0xFF)));
+        }
+    }
+    fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+}
+
 // In-place separable box blur of an fb_draw region (the backdrop behind a glass
 // window). Two passes (H then V) with a rolling per-channel sum ~= a small
 // Gaussian. Clamped-edge sampling. Silently no-ops if scratch can't be had.

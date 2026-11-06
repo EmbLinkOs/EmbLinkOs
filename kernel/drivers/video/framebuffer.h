@@ -88,6 +88,12 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             const uint32_t *argb, int32_t sw, int32_t sh,
                             uint32_t stride, uint32_t alpha, int smooth,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
+/* A picture with its own (premultiplied) alpha, scaled and composited over at
+ * `opacity` -- a compositor layer; see framebuffer.c. */
+void fb_blit_scaled_over(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                         const uint32_t *argb, int32_t sw, int32_t sh,
+                         uint32_t stride, uint32_t opacity, int smooth,
+                         int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 // The composed pixels of a rect, as 0x00RRGGBB, into `dst` (stride in pixels):
 // the backdrop a window that shows through keeps. The part off the screen is
 // left as it was; returns 0 when none of it is on the screen.
