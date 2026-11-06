@@ -93,6 +93,9 @@ enum {
     SYSKEY_PERF_HUD,         /* GUI+Shift+P: the compositor's statistics overlay */
     SYSKEY_MINIMIZE,         /* GUI+M: the front window into the dock */
     SYSKEY_OVERVIEW,         /* GUI+Up (and Esc while it is up): every window at once */
+    SYSKEY_OVERVIEW_LEFT, SYSKEY_OVERVIEW_RIGHT,   /* the arrows, while it is up: */
+    SYSKEY_OVERVIEW_UP, SYSKEY_OVERVIEW_DOWN,      /* the ring to the next window */
+    SYSKEY_OVERVIEW_PICK,    /* Return, while it is up: the ringed window in front */
     SYSKEY_SPACE_1=16, SYSKEY_MOVE_SPACE_1=32,
 };
 /* Take the pending system shortcut, if any, and clear it. */

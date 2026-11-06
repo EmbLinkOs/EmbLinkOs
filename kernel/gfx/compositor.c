@@ -1160,7 +1160,8 @@ static void slide_offset(const struct comp_window *w, int *dx, int *dy) {
 /* The overview's state (compositor_overview_toggle, below). */
 static int      g_ov;            /* 1 from GUI+Up until the last window is home */
 static int      g_ov_leaving;    /* on the way home */
-static uint32_t g_ov_hover;      /* the window under the pointer, if any */
+static uint32_t g_ov_hover;      /* the window ringed: under the pointer, or the keys' */
+static int      g_ov_keyed;      /* the keys moved the ring, and the pointer has not since */
 static struct spring g_ov_dim;   /* the desktop's dimming, 0..OV_DIM, Q16.16 */
 static volatile int g_ghosts_still;   /* ghosts held still: the overview's in their places, a swipe's under resting fingers (anim_frame) */
 /* A SWIPE between spaces holds its windows where the fingers put them:
@@ -1412,17 +1413,24 @@ static void zoom_release(struct comp_window *w, struct ghost *g) {
  * a click on a window brings it in front as they all fly home; a click
  * anywhere else, Esc or GUI+Up again, sends them home as they were. Windows
  * are hidden behind their ghosts the whole time and real again as each lands.
- * A grid, not the Mac's packing: in the order the windows stand on the
- * screen, row by row, each as large as its cell allows and never larger than
- * itself. Caller holds g_comp_lock. */
+ * A grid, each window as large as its cell allows and never larger than
+ * itself, and each in the cell nearest where it stands: the screen shrunk
+ * into the overview's area, every window to the free cell closest to its
+ * place there, the closest pair first -- so a window on the left is found
+ * on the left. The arrows move the ring between them, Return picks the one
+ * ringed. Asked for again while it closes, it turns back: the windows still
+ * in the air are aimed at their places again from where they are.
+ * Caller holds g_comp_lock. */
 #define OV_MAX       GHOSTS_MAX
 #define OV_GAP       28          /* between cells, and the margin */
 #define OV_DIM       140
 int compositor_overview_shown(void) { return g_ov && !g_ov_leaving; }
 
 static int ov_member(const struct comp_window *w) {
-    return w->used && w->visible && w->presented && w->content && !w->desktop && !w->widget && !w->translucent &&
-           !w->minimized && on_workspace(w) && session_ui_allowed(w->pid) && !ghost_of(w->id);
+    if (!w->used || !w->presented || !w->content || w->desktop || w->widget || w->translucent ||
+        w->minimized || !on_workspace(w) || !session_ui_allowed(w->pid)) return 0;
+    const struct ghost *g = ghost_of(w->id);
+    return g ? g->kind == ANIM_OVERVIEW : w->visible;   /* on its way home from one: turned back */
 }
 
 /* The thumbnail rect of each member, in screen order. Returns how many. */
@@ -1430,15 +1438,6 @@ static int ov_layout(struct comp_window *wins[OV_MAX], int rects[OV_MAX][4]) {
     int n = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS && n < OV_MAX; i++)
         if (ov_member(&g_wins[i])) wins[n++] = &g_wins[i];
-    /* the order they stand in: by their middles, top to bottom, then left to right */
-    for (int a = 1; a < n; a++)
-        for (int b = a; b > 0; b--) {
-            const struct comp_window *p = wins[b - 1], *q = wins[b];
-            int py = p->y + (int)(win_titlebar_h(p) + p->ch) / 2, qy = q->y + (int)(win_titlebar_h(q) + q->ch) / 2;
-            int px = p->x + (int)p->cw / 2, qx = q->x + (int)q->cw / 2;
-            if (py / 160 < qy / 160 || (py / 160 == qy / 160 && px <= qx)) break;
-            struct comp_window *t = wins[b]; wins[b] = wins[b - 1]; wins[b - 1] = t;
-        }
     if (!n) return 0;
     /* the work area of the primary, inside a margin */
     outputs_whole(fb_get_info());
@@ -1450,6 +1449,37 @@ static int ov_layout(struct comp_window *wins[OV_MAX], int rects[OV_MAX][4]) {
     while (cols * cols < n) cols++;
     int rows = (n + cols - 1) / cols;
     int cw = (aw - (cols - 1) * OV_GAP) / cols, ch = (ah - (rows - 1) * OV_GAP) / rows;
+    /* the cells' top-left corners, row by row, the last row centred */
+    int cell[OV_MAX][2];
+    for (int k = 0; k < n; k++) {
+        int r = k / cols, c = k % cols;
+        int in_row = r == rows - 1 ? n - r * cols : cols;
+        int row_x = ax + (aw - (in_row * cw + (in_row - 1) * OV_GAP)) / 2;
+        cell[k][0] = row_x + c * (cw + OV_GAP); cell[k][1] = ay + r * (ch + OV_GAP);
+    }
+    /* where each window stands, the screen shrunk into the area; then each
+     * to the free cell nearest that, the nearest of all pairs first */
+    int at[OV_MAX][2], cell_of[OV_MAX], taken[OV_MAX] = { 0 };
+    for (int k = 0; k < n; k++) {
+        const struct comp_window *w = wins[k];
+        int wx = w->x + (int)w->cw / 2 - o->x, wy = w->y + (win_titlebar_h(w) + (int)w->ch) / 2 - o->y;
+        at[k][0] = ax + (int)((int64_t)wx * aw / (int64_t)imax((int)o->w, 1));
+        at[k][1] = ay + (int)((int64_t)wy * ah / (int64_t)imax((int)o->h, 1));
+        cell_of[k] = -1;
+    }
+    for (int round = 0; round < n; round++) {
+        int64_t best = -1; int bk = 0, bc = 0;
+        for (int k = 0; k < n; k++) {
+            if (cell_of[k] >= 0) continue;
+            for (int c = 0; c < n; c++) {
+                if (taken[c]) continue;
+                int64_t dx = cell[c][0] + cw / 2 - at[k][0], dy = cell[c][1] + ch / 2 - at[k][1];
+                int64_t d = dx * dx + dy * dy;
+                if (best < 0 || d < best) { best = d; bk = k; bc = c; }
+            }
+        }
+        cell_of[bk] = bc; taken[bc] = 1;
+    }
     for (int k = 0; k < n; k++) {
         const struct comp_window *w = wins[k];
         int fw = (int)w->cw, fh = win_titlebar_h(w) + (int)w->ch;
@@ -1457,11 +1487,9 @@ static int ov_layout(struct comp_window *wins[OV_MAX], int rects[OV_MAX][4]) {
         int64_t sw = fw, sh = fh;
         if (sw > cw) { sh = sh * cw / sw; sw = cw; }
         if (sh > ch) { sw = sw * ch / sh; sh = ch; }
-        int r = k / cols, c = k % cols;
-        int in_row = r == rows - 1 ? n - r * cols : cols;            /* the last row, centred */
-        int row_x = ax + (aw - (in_row * cw + (in_row - 1) * OV_GAP)) / 2;
-        rects[k][0] = row_x + c * (cw + OV_GAP) + (cw - (int)sw) / 2;
-        rects[k][1] = ay + r * (ch + OV_GAP) + (ch - (int)sh) / 2;
+        const int *c = cell[cell_of[k]];
+        rects[k][0] = c[0] + (cw - (int)sw) / 2;
+        rects[k][1] = c[1] + (ch - (int)sh) / 2;
         rects[k][2] = (int)sw; rects[k][3] = (int)sh;
     }
     return n;
@@ -1476,11 +1504,16 @@ static void ov_enter(void) {
     struct comp_window *wins[OV_MAX]; int rects[OV_MAX][4];
     int n = ov_layout(wins, rects);
     uint64_t now = time_get_ns();
-    g_ov = 1; g_ov_leaving = 0; g_ov_hover = 0;
+    int turned = g_ov && g_ov_leaving;
+    g_ov = 1; g_ov_leaving = 0; g_ov_hover = 0; g_ghosts_still = 0; g_ov_keyed = 0;
     spring_to(&g_ov_dim, SPRING_PX(OV_DIM), spring_params(ANIM_SPRING_OVERVIEW), now);
     for (int k = 0; k < n; k++) {
         struct comp_window *w = wins[k];
-        struct ghost *g = 0;
+        struct ghost *g = ghost_of(w->id);
+        if (g) {                                   /* still in the air: back from where it is */
+            ghost_aim(g, rects[k], 255, ANIM_SPRING_OVERVIEW, now);
+            continue;
+        }
         for (int i = 0; i < GHOSTS_MAX && !g; i++) if (g_ghosts[i].kind == ANIM_NONE) g = &g_ghosts[i];
         if (!g) break;
         int f[4];
@@ -1495,7 +1528,7 @@ static void ov_enter(void) {
         w->visible = 0; w->arriving = 0;
     }
     reset_pointer_capture_locked();
-    kprintf("compositor: overview of %d windows\n", n);
+    kprintf("compositor: overview of %d windows%s\n", n, turned ? ", turned back" : "");
     ov_repaint_all();
 }
 
@@ -1523,8 +1556,8 @@ static void ov_leave(uint32_t pick) {
 void compositor_overview_toggle(uint32_t pick) {
     spin_lock(&g_comp_lock);
     if (session_input_owner()) { comp_unlock(); return; }
-    if (!g_ov) ov_enter();
-    else if (!g_ov_leaving) ov_leave(pick);
+    if (!g_ov || g_ov_leaving) ov_enter();
+    else ov_leave(pick);
     comp_unlock();
 }
 
@@ -1540,31 +1573,104 @@ static uint32_t ov_hit(int x, int y) {
     return hit;
 }
 
-/* The pointer, while the overview is up: hover and the click. */
-static void ov_pointer(int x, int y, int pressed) {
-    uint32_t hit = ov_hit(x, y);
-    if (hit != g_ov_hover) {
-        /* the ring moves: what both thumbnails cover */
-        for (int i = 0; i < GHOSTS_MAX; i++) {
-            const struct ghost *g = &g_ghosts[i];
-            if (g->kind != ANIM_OVERVIEW || (g->win_id != hit && g->win_id != g_ov_hover)) continue;
-            int r[4], a; ghost_rect(g, r, &a);
-            paint_region(r[0] - 6, r[1] - 6, r[0] + r[2] + 6, r[1] + r[3] + 6);
-        }
-        g_ov_hover = hit;
+/* The ring moves to `to`: what both thumbnails cover. */
+static void ov_ring_to(uint32_t to) {
+    if (to == g_ov_hover) return;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW || (g->win_id != to && g->win_id != g_ov_hover)) continue;
+        int r[4], a; ghost_rect(g, r, &a);
+        paint_region(r[0] - 6, r[1] - 6, r[0] + r[2] + 6, r[1] + r[3] + 6);
     }
+    g_ov_hover = to;
+}
+
+/* The pointer, while the overview is up: hover and the click. Once the keys
+ * have moved the ring it stays theirs until the pointer moves, so a pointer
+ * left resting on one window does not take it back. */
+static void ov_pointer(int x, int y, int pressed) {
+    static int lx = -1, ly = -1;
+    uint32_t hit = ov_hit(x, y);
+    if (x != lx || y != ly) { lx = x; ly = y; g_ov_keyed = 0; }
+    if (!g_ov_keyed) ov_ring_to(hit);
     if (pressed) { ov_leave(hit); g_buttons_suppressed = 1; }   /* the press ends here */
+}
+
+/* The window the arrows move the ring to (dir 1 left, 2 right, 3 up, 4 down):
+ * the nearest whose middle lies that way, distance across counting twice;
+ * from nothing ringed, the window in front. */
+static uint32_t ov_neighbour(int dir) {
+    const struct ghost *cur = 0, *front = 0;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW) continue;
+        if (g->win_id == g_ov_hover) cur = g;
+        const struct comp_window *w = win_by_id(g->win_id), *fw = front ? win_by_id(front->win_id) : 0;
+        if (w && (!fw || w->z > fw->z)) front = g;
+    }
+    if (!cur) return front ? front->win_id : 0;
+    int r[4], a; ghost_rect(cur, r, &a);
+    int cx = r[0] + r[2] / 2, cy = r[1] + r[3] / 2;
+    uint32_t best = cur->win_id; int64_t score = -1;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW || g == cur) continue;
+        int q[4]; ghost_rect(g, q, &a);
+        int dx = q[0] + q[2] / 2 - cx, dy = q[1] + q[3] / 2 - cy;
+        int along = dir == 1 ? -dx : dir == 2 ? dx : dir == 3 ? -dy : dy;
+        int across = dir <= 2 ? imax(dy, -dy) : imax(dx, -dx);
+        if (along <= 0) continue;
+        int64_t sc = (int64_t)along + 2 * (int64_t)across;
+        if (score < 0 || sc < score) { score = sc; best = g->win_id; }
+    }
+    return best;
+}
+
+void compositor_overview_key(int dir) {
+    spin_lock(&g_comp_lock);
+    if (g_ov && !g_ov_leaving) {
+        if (!dir) ov_leave(g_ov_hover);          /* Return: the one ringed, in front (or none) */
+        else { g_ov_keyed = 1; ov_ring_to(ov_neighbour(dir)); }
+    }
+    comp_unlock();
 }
 
 /* The ring around the window under the pointer, and the dimming, in a region. */
 static void fill_clip(int x, int y, int w, int h, fb_color_t c, int rx0, int ry0, int rx1, int ry1);
+/* It hugs the thumbnail: OV_RING px around it, its arcs concentric with the
+ * thumbnail's corners (radius `rad`), so it is an even band all the way
+ * round -- the arcs 4x4 supersampled, as a window's own corners are. */
 #define OV_RING 3
-static void ov_draw_ring(const int r[4], int rx0, int ry0, int rx1, int ry1) {
-    int x0 = r[0] - OV_RING - 2, y0 = r[1] - OV_RING - 2, x1 = r[0] + r[2] + 2, y1 = r[1] + r[3] + 2;
-    fill_clip(x0, y0, x1 + OV_RING - x0, OV_RING, g_desktop.accent, rx0, ry0, rx1, ry1);
-    fill_clip(x0, y1, x1 + OV_RING - x0, OV_RING, g_desktop.accent, rx0, ry0, rx1, ry1);
-    fill_clip(x0, y0, OV_RING, y1 + OV_RING - y0, g_desktop.accent, rx0, ry0, rx1, ry1);
-    fill_clip(x1, y0, OV_RING, y1 + OV_RING - y0, g_desktop.accent, rx0, ry0, rx1, ry1);
+static void ov_draw_ring(const int r[4], int rad, int rx0, int ry0, int rx1, int ry1) {
+    int ox = r[0] - OV_RING, oy = r[1] - OV_RING, ow = r[2] + 2 * OV_RING, oh = r[3] + 2 * OV_RING;
+    int ro = rad + OV_RING;
+    fb_color_t c = g_desktop.accent;
+    fill_clip(ox + ro, oy, ow - 2 * ro, OV_RING, c, rx0, ry0, rx1, ry1);
+    fill_clip(ox + ro, oy + oh - OV_RING, ow - 2 * ro, OV_RING, c, rx0, ry0, rx1, ry1);
+    fill_clip(ox, oy + ro, OV_RING, oh - 2 * ro, c, rx0, ry0, rx1, ry1);
+    fill_clip(ox + ow - OV_RING, oy + ro, OV_RING, oh - 2 * ro, c, rx0, ry0, rx1, ry1);
+    const int ro8 = (ro * 8) * (ro * 8), ri8 = (rad * 8) * (rad * 8);
+    int lr = (int)((c >> 16) & 255), lg = (int)((c >> 8) & 255), lb = (int)(c & 255);
+    for (int k = 0; k < 4; k++) {
+        int bx = (k & 1) ? ox + ow - ro : ox, by = (k & 2) ? oy + oh - ro : oy;
+        int cx = (k & 1) ? bx : bx + ro, cy = (k & 2) ? by : by + ro;       /* the arcs' centre */
+        for (int y = imax(by, ry0); y < imin(by + ro, ry1); y++)
+            for (int x = imax(bx, rx0); x < imin(bx + ro, rx1); x++) {
+                int cov = 0;
+                for (int sy = 0; sy < 4; sy++)
+                    for (int sx = 0; sx < 4; sx++) {
+                        int dx = (x - cx) * 8 + sx * 2 + 1, dy = (y - cy) * 8 + sy * 2 + 1;
+                        int d = dx * dx + dy * dy;
+                        cov += d <= ro8 && d > ri8;
+                    }
+                if (!cov) continue;
+                uint32_t cur = fb_get_pixel((uint32_t)x, (uint32_t)y);
+                int cr = (int)((cur >> 16) & 255), cg = (int)((cur >> 8) & 255), cb = (int)(cur & 255);
+                fb_put_pixel_c((uint32_t)x, (uint32_t)y, FB_RGB((lr * cov + cr * (16 - cov)) / 16,
+                                                                (lg * cov + cg * (16 - cov)) / 16,
+                                                                (lb * cov + cb * (16 - cov)) / 16));
+            }
+    }
 }
 static uint32_t g_ov_black[8192];        /* a row of black, read with a stride of 0 */
 static void ov_dim_cpu(int rx0, int ry0, int rx1, int ry1) {
@@ -2578,15 +2684,26 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
                         gc->shadow(&cast, &fr, radius, (uint32_t)sl[k].width, sl[k].peak * (uint32_t)alpha / 255u);
                     }
                 }
+                if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover) {
+                    /* the ring: a plate of the accent under the thumbnail, OV_RING
+                     * px larger and its radius as much larger -- concentric arcs,
+                     * so what shows is an even band */
+                    static uint32_t ring_px, ring_img, ring_rgb = 0xFFFFFFFFu;
+                    if (ring_img && ring_rgb != g_desktop.accent) gpu_image_doom(&ring_img);
+                    if (!ring_img) {
+                        ring_px = 0xFF000000u | g_desktop.accent; ring_rgb = g_desktop.accent;
+                        if (gc->image_create(&ring_px, 1, 1, 4, &ring_img)) ring_img = 0;
+                    }
+                    if (ring_img) {
+                        struct gpu_rect o = { r[0] - OV_RING, r[1] - OV_RING, r[2] + 2 * OV_RING, r[3] + 2 * OV_RING };
+                        struct gpu_draw rd = { .image = ring_img, .src = { 0, 0, 1, 1 }, .dst = o, .opaque = 1,
+                                               .opacity = (uint8_t)alpha, .radius = (uint8_t)(radius + OV_RING), .frame = o };
+                        gc->draw(&rd);
+                    }
+                }
                 struct gpu_draw d = { .image = ghost, .src = { 0, 0, sw_, sh_ }, .dst = fr,
                                       .opaque = 1, .opacity = (uint8_t)alpha, .radius = (uint8_t)radius, .frame = fr };
                 gc->draw(&d);
-                if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover) {
-                    int x0 = r[0] - OV_RING - 2, y0 = r[1] - OV_RING - 2, x1 = r[0] + r[2] + 2, y1 = r[1] + r[3] + 2;
-                    struct gpu_rect e[4] = { { x0, y0, x1 + OV_RING - x0, OV_RING }, { x0, y1, x1 + OV_RING - x0, OV_RING },
-                                             { x0, y0, OV_RING, y1 + OV_RING - y0 }, { x1, y0, OV_RING, y1 + OV_RING - y0 } };
-                    for (int k = 0; k < 4; k++) gc->fill(&e[k], g_desktop.accent);
-                }
             }
         }
     }
@@ -2794,7 +2911,8 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
             fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], src, sw_, sh_,
                                    (uint32_t)sw_, (uint32_t)alpha, g_ghost_smooth, rx0, ry0, rx1, ry1);
             if (round) corners_carve_ring(0, 0);
-            if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover) ov_draw_ring(r, rx0, ry0, rx1, ry1);
+            if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover)
+                ov_draw_ring(r, round ? WIN_RADIUS : 0, rx0, ry0, rx1, ry1);
         }
     }
 
@@ -4379,7 +4497,9 @@ static void pointer_frame(void) {
     }
 
     g_ptr_pid = 0;
-    if (!g_dragging) {
+    /* under the overview no app has the pointer: the dock under it would
+     * light its labels for a pointer that is the overview's */
+    if (!g_dragging && !(g_ov && !g_ov_leaving)) {
         if (!(b & MOUSE_BTN_LEFT)) g_cap_pid = 0;      /* release ends capture */
         struct comp_window *cap = g_cap_pid ? win_find(g_cap_pid, g_cap_win) : 0;
         if (cap && cap->visible) {
@@ -4920,10 +5040,11 @@ void compositor_print_windows(void) {
         if (g->kind == ANIM_NONE) continue;
         const struct comp_window *w = win_by_id(g->win_id);
         int r[4], a; ghost_rect(g, r, &a);
-        kprintf("perf: ghost kind=%s app=%s x=%d y=%d w=%d h=%d alpha=%d to=%d,%d,%d,%d\n", anim_names[g->kind],
+        kprintf("perf: ghost kind=%s app=%s x=%d y=%d w=%d h=%d alpha=%d to=%d,%d,%d,%d ring=%d\n", anim_names[g->kind],
                 w && w->app[0] ? w->app : "-", r[0], r[1], r[2], r[3], a,
                 spring_px(&(struct spring){ .x = g->r[0].target }), spring_px(&(struct spring){ .x = g->r[1].target }),
-                spring_px(&(struct spring){ .x = g->r[2].target }), spring_px(&(struct spring){ .x = g->r[3].target }));
+                spring_px(&(struct spring){ .x = g->r[2].target }), spring_px(&(struct spring){ .x = g->r[3].target }),
+                g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover);
     }
     comp_unlock();
     kprintf("perf: end\n");

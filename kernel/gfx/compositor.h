@@ -221,6 +221,9 @@ void compositor_slowmo(uint32_t n);
 /* THE OVERVIEW: every window on the space at once, side by side (GUI+Up).
  * Toggled; `pick` a window id to bring in front as it closes (0: none). */
 void compositor_overview_toggle(uint32_t pick);
+/* While it is up: an arrow (1 left, 2 right, 3 up, 4 down) moves the ring;
+ * 0, Return, brings the ringed window in front as they all fly home. */
+void compositor_overview_key(int dir);
 int  compositor_overview_shown(void);
 /* `perf effects`: 0 the desktop's Effects setting, 1 hold full, 2 hold reduced. */
 void compositor_effects_override(int mode);

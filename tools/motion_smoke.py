@@ -58,6 +58,7 @@ def state(d):
         elif kind == 'ghost':
             g = {k: int(pairs[k]) for k in ('x', 'y', 'w', 'h', 'alpha')}
             g['kind'], g['app'] = pairs['kind'], pairs['app']
+            g['ring'] = pairs.get('ring') == '1'
             g['to'] = [int(v) for v in pairs['to'].split(',')]
             g['t'] = time.monotonic()
             ghosts.append(g)

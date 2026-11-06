@@ -5,13 +5,17 @@ Boots a disposable desktop, opens Settings and the Terminal, and asserts:
 
   in       GUI+Up flies both windows (`overview` ghosts) to places of their
            own: inside the work area, apart, each its own shape and no larger
-           than itself
+           than itself, and each on the side it stands -- the Terminal, moved
+           left of Settings, is on the left
   pick     a click on the window that was behind brings it in front as both
            fly home -- each lands exactly where it was
   out      GUI+Up again and Esc sends them home as they were: the one in
            front stays in front
   still    an overview at rest composes (nearly) nothing: windows held in
            their places are not motion
+  keys     the arrows move the ring from window to window, Return brings the
+           ringed one in front
+  back     asked for again while it closes, it turns back
 
 and photographs the overview. --arch aarch64 runs it on arm64 under HVF;
 --graphics virgl composes on the host's GPU (Linux, as tools/virgl_smoke.py).
@@ -70,6 +74,17 @@ def main():
         d.g.wait(b'Terminal: first frame presented', start=n0); d.g.pump(3)
         before = home(d)
         assert before['Terminal']['z'] > before['Settings']['z'], 'the Terminal did not open in front'
+        # the Terminal dragged left of Settings
+        t = before['Terminal']; dz = t['drag0']
+        gx, gy = t['x'] + dz[0] + dz[2] // 2, t['y'] + dz[1] + dz[3] // 2
+        P.move(d, gx, gy); d.g.pump(0.3); P.press(d, True); d.g.pump(0.3)
+        P.glide(d, gx - 300, gy + 120); d.g.pump(0.3); P.press(d, False); d.g.pump(1)
+        P.move(d, 12, 400); d.g.pump(1)               # clear of every thumbnail
+        before = home(d)
+        mid = {k: before[k]['x'] + before[k]['w'] // 2 for k in ('Settings', 'Terminal')}
+        assert mid['Terminal'] < mid['Settings'] - 150, f'the Terminal did not move left of Settings: {before}'
+        print('moved: ' + ', '.join(f"{k} at {before[k]['x']},{before[k]['y']} {before[k]['w']}x{before[k]['h']}"
+                                    for k in ('Settings', 'Terminal')), flush=True)
 
         # IN
         n0 = len(d.g.seen)
@@ -86,6 +101,8 @@ def main():
         (a, ra), (b, rb) = places.items()
         apart = ra[0] + ra[2] <= rb[0] or rb[0] + rb[2] <= ra[0] or ra[1] + ra[3] <= rb[1] or rb[1] + rb[3] <= ra[1]
         assert apart, f'the windows overlap in the overview: {places}'
+        assert places['term.elf'][0] < places['settings.elf'][0], \
+            f'the Terminal stands left of Settings but is not left of it in the overview: {places}'
         shot = d.g.capture(out / 'overview.ppm')
         print(f'in: both windows apart in the work area ({shot})', flush=True)
         # STILL: an overview at rest is not motion -- it composes (nearly) nothing
@@ -118,6 +135,45 @@ def main():
         assert again['Settings']['z'] > again['Terminal']['z'], 'Esc changed which window is in front'
         assert b'overview closed, in front' not in d.g.seen[n0:], 'Esc picked a window'
         print('out: Esc sent them home as they were', flush=True)
+
+        # KEYS: from nothing ringed, an arrow rings the window in front; then
+        # across to the other, and Return brings that one in front
+        def ringed():
+            return [g['app'] for g in state(d)[1] if g['kind'] == 'overview' and g['ring']]
+        P.move(d, 12, 400); d.g.pump(1)               # the pick left it on a thumbnail
+        n0 = len(d.g.seen)
+        d.key('meta_l-up')
+        d.g.wait(b'compositor: overview of 2 windows', 20, start=n0)
+        settled(d, 'overview', 2)
+        assert ringed() == [], f'a window was ringed before any key or pointer: {ringed()}'
+        d.key('right'); d.g.pump(0.5)
+        assert ringed() == ['settings.elf'], f'Right from nothing did not ring the window in front: {ringed()}'
+        d.key('left'); d.g.pump(0.5)
+        assert ringed() == ['term.elf'], f'Left did not move the ring to the Terminal: {ringed()}'
+        ring_shot = d.g.capture(out / 'ringed.ppm')
+        d.key('ret')
+        d.g.wait(b'overview closed, in front: term.elf', 20, start=n0)
+        again = home(d)
+        assert again['Terminal']['z'] > again['Settings']['z'], 'Return did not bring the ringed window in front'
+        print(f'keys: Right rang Settings, Left the Terminal ({ring_shot}), Return brought it in front', flush=True)
+
+        # BACK: closing, slowed, and asked for again -- it turns back
+        d.g.command('perf slowmo 10', b'perf: slowmo', 60)
+        n0 = len(d.g.seen)
+        d.key('meta_l-up')
+        d.g.wait(b'compositor: overview of 2 windows', 20, start=n0)
+        settled(d, 'overview', 2, seconds=30)
+        d.key('esc')
+        d.g.wait(b'compositor: overview closed', 20, start=n0)
+        d.key('meta_l-up')
+        d.g.wait(b'compositor: overview of 2 windows, turned back', 20, start=n0)
+        back = settled(d, 'overview', 2, seconds=30)
+        assert back == places or all(abs(a - b) <= 2 for k in back for a, b in zip(back[k], places[k])), \
+            f'turned back, the windows did not go to their places: {back} vs {places}'
+        d.g.command('perf slowmo 1', b'perf: slowmo', 60)
+        d.key('esc')
+        home(d)
+        print('back: asked for again while it closed, it turned back to the same places', flush=True)
     finally:
         d.g.close()
     print('PASS: the overview lays the windows out apart, a click brings one in front as they fly '

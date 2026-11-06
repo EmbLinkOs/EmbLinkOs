@@ -461,6 +461,14 @@ static int interface_key(uint16_t key, uint32_t base, uint32_t cp) {
     /* Esc while the overview is up leaves it: the overview has the keys
      * (no window is in front to take them) */
     if (cp == 0x1b && compositor_overview_shown()) { g_syskey = SYSKEY_OVERVIEW; return 1; }
+    /* ...and so are the arrows, which move its ring, and Return, which picks */
+    if (compositor_overview_shown() && !(g_mods & (EKM_GUI | EKM_CTRL | EKM_ALT))) {
+        if (key == EKC_LEFT)  { g_syskey = SYSKEY_OVERVIEW_LEFT;  return 1; }
+        if (key == EKC_RIGHT) { g_syskey = SYSKEY_OVERVIEW_RIGHT; return 1; }
+        if (key == EKC_UP)    { g_syskey = SYSKEY_OVERVIEW_UP;    return 1; }
+        if (key == EKC_DOWN)  { g_syskey = SYSKEY_OVERVIEW_DOWN;  return 1; }
+        if (cp == '\n' || cp == '\r') { g_syskey = SYSKEY_OVERVIEW_PICK; return 1; }
+    }
     /* GUI + letter -> an editing command. The interface's modifier, kept
      * separate from the terminal's: Ctrl+C is an INTERRUPT in this OS and
      * always will be, so the clipboard cannot live there. See EK_SEL_ALL and

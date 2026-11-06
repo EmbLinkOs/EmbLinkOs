@@ -214,10 +214,12 @@ be turned around mid-way from where it is, at the speed it has.
 - **The overview.** GUI+Up flies every window of the space, on springs, to a
   place of its own in a grid over the dimmed desktop -- each the window
   itself, scaled, live (an app drawing while it is up is seen drawing), with
-  its corners and shadow. The pointer and Esc are the overview's while it is
-  up: the window under the pointer is ringed, a click on it brings it in
-  front as they all fly home, and a click elsewhere, Esc or GUI+Up again
-  sends them home as they were. Still, it composes nothing.
+  its corners and shadow, and each in the cell nearest where it stands. The
+  pointer and the keys are the overview's while it is up: the window under
+  the pointer, or the one the arrows move to, is ringed (a rounded band
+  hugging it), a click or Return brings it in front as they all fly home,
+  and a click elsewhere, Esc or GUI+Up again sends them home as they were.
+  GUI+Up while they fly home turns them back. Still, it composes nothing.
 - **Workspaces.** Changing space slides: the space being left goes off one
   side while the next comes in from the other -- leftwards going up the
   spaces, as on the Mac -- whether the change came from the keys, the top

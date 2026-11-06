@@ -211,12 +211,17 @@ the default target). Measured before and after every step
         desktop; hover rings one, a click brings it in front as they fly home, Esc or a click
         elsewhere leaves them as they were; at rest it composes nothing (`tools/overview_smoke.py`:
         x86 and arm64 on the CPU, virgl in the Lima VM; gallery 223).
-  - [ ] The overview's layout is a grid in screen order, not the Mac's packing that keeps each
-        window near where it stands; at most GHOSTS_MAX (16) windows take part.
-  - [ ] In the overview: no strip of spaces to drag a window to, no arrow keys between windows,
-        and the ring is square around rounded corners. The desktop under it still sees the
-        pointer (its dock labels show).
-  - [ ] Asked for again while it is closing, it is ignored until the windows are home.
+  - [x] Each window goes to the grid cell nearest where it stands (the screen shrunk into the
+        overview's area; the nearest window-cell pair first), so a window on the left is found on
+        the left. The arrows move the ring between windows (the nearest that way) and Return
+        brings the ringed one in front; the ring is rounded, an even band concentric with the
+        thumbnail's corners, on the CPU and the GPU; no app has the pointer while it is up (the
+        dock lit its labels under it); asked for again while it closes, it turns back from where
+        the windows are (`tools/overview_smoke.py`; gallery 228).
+  - [ ] Still a grid, not the Mac's packing of windows at their own sizes; at most GHOSTS_MAX (16)
+        windows take part. No strip of spaces to drag a window to.
+  - [ ] The tile preview's outline is still square: drawn over its window, it would need a ring
+        with a hole on the GPU path, which draws filled rects and images only.
   - [x] Three-finger gestures on a touchscreen (`kernel/drivers/input/gesture.c`, fed every contact
         by virtio-input): sideways, the space shown and the next lie side by side and follow the
         hand one to one; lifted past a third of the screen, or flicked (over 400 px/s, from the
