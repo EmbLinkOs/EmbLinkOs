@@ -4477,6 +4477,26 @@
       "featured": false,
       "milestone": "Fluid desktop P5: shell",
       "historical": false
+    },
+    {
+      "id": "228-overview-ring",
+      "phase": "Fluid desktop",
+      "title": "The ring, by the keys",
+      "caption": "The overview, the Terminal ringed by the Left arrow: a rounded band of the accent hugging it, concentric with its corners. Each window sits in the cell nearest where it stands -- the Terminal, on the left of the screen, on the left here. Return brings the ringed window in front as they all fly home; the dock under the overview no longer lights for the pointer. arm64 under HVF, on EmbCC's C library.",
+      "alt": "The EmbLinkOS overview: the Terminal on the left with a rounded accent ring around it, Settings smaller on the right, over the dimmed desktop",
+      "file": "228-overview-ring.png",
+      "capture_date": "2026-11-06",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "f525162722019883c0c6244a71ca1ff1bdc4305be7ab600b4352f76aed535ec1",
+      "source_capture": "emblink-overview-e6xncml_/ringed.ppm",
+      "source_sha256": "b4040599f3700d73a17c83ebd16dfb76bd4e08d8e18a8ecee44a0c6c50fe73ac",
+      "source_commit": "2ac4994",
+      "featured": false,
+      "milestone": "Fluid desktop P6: advanced",
+      "historical": false
     }
   ]
 }

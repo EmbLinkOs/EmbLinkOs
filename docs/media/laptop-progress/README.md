@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-227 actual EmbLinkOS captures document the original laptop work, its
+228 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, and windows resized as they are dragged. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, windows resized as they are dragged, and an overview the keys can walk. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -137,6 +137,12 @@ Three fingers on a touchscreen, held 560 px to the left: the first space (Settin
 Settings held by its corner grip, dragged out from 980 × 660 and not yet let go: already 1127 × 753 and laid out at that size -- its rows wider, its controls at the new right edge. The window is the size the hand says on every frame of the drag, both ways, and never flies. Built on EmbCC's C library; arm64 under HVF.
 
 ![The EmbLinkOS Settings window enlarged almost to the screen's edges while its corner grip is held](227-live-resize.png)
+
+### The ring, by the keys
+
+The overview, the Terminal ringed by the Left arrow: a rounded band of the accent hugging it, concentric with its corners. Each window sits in the cell nearest where it stands -- the Terminal, on the left of the screen, on the left here. Return brings the ringed window in front as they all fly home; the dock under the overview no longer lights for the pointer. arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS overview: the Terminal on the left with a rounded accent ring around it, Settings smaller on the right, over the dimmed desktop](228-overview-ring.png)
 
 ## The prompt, Powerlevel10k-style
 
