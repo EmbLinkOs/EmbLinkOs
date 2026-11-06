@@ -445,6 +445,51 @@ ASM_GAS      = $(USER_TRIPLE)-as   # GNU as for the dynstubs (.set/.weak)
 USER_LD      = $(USER_TRIPLE)-ld
 USER_INC     = -Iuser/lib
 
+# ---- which C library the userland links -------------------------------------
+# LIBC=newlib (the default) is the cross-built newlib under NEWLIB_PREFIX, with
+# user/lib/syscalls.c as its retargeting layer -- everything below as it was.
+#
+# LIBC=emblibc is EmbCC's C library (lib/libc in EMBCC_ROOT, built for this OS
+# by `make emblibc`): ISO C and as much of POSIX as this kernel can carry, with
+# its EmbLinkOS backend in place of syscalls.c. The programs are still compiled
+# by $(USER_CC); only the headers and the archive change. So that every name
+# below keeps meaning one thing, the NEWLIB_* variables are kept and pointed at
+# it -- read NEWLIB_ as "the userland's libc".
+#
+# The two must never meet in one program: an object compiled against newlib's
+# <sys/stat.h> linked with this libc's stat() is a silent wrong layout. Make
+# cannot see a change of LIBC, so build/.libc records the one build/ was made
+# with, and a different one stops the build until `make clean`.
+#
+# What emblibc does not build: the out-of-tree ports configured against
+# newlib -- CPython and git (HAVE_PY/HAVE_GIT are empty) and tcc (copied as
+# built, never relinked) -- and C++ by g++ (HAVE_CXX is empty; EmbCC builds
+# the C++ programs instead, see CXX_APPS). A binary of theirs in build/ is a
+# static newlib program, whole in itself, packed as it is.
+LIBC ?= newlib
+EMBCC_ROOT  ?= $(HOME)/EmbCC
+# one library per machine: build/libc/emblinkos (x86_64), emblinkos-aarch64
+# -- named in either mode, as `make emblibc` builds it from a newlib tree
+EMBLIBC_ARCH = $(if $(filter aarch64,$(ARCH)),aarch64,x86_64)
+EMBLIBC_SFX  = $(if $(filter aarch64,$(ARCH)),-aarch64,)
+EMBLIBC_DIR  = $(EMBCC_ROOT)/build/libc/emblinkos$(EMBLIBC_SFX)
+ifeq ($(LIBC),emblibc)
+EMBLIBC     := yes
+EMBLIBC_A    = $(EMBLIBC_DIR)/libc.a
+# The library's headers first -- ahead of user/lib, whose <time.h>, <termios.h>
+# and <sys/*.h> are newlib's missing pieces and would otherwise shadow them --
+# then the compiler's own (stddef.h, stdarg.h, limits.h), never newlib's.
+# EMBK_LIBC_EMBLIBC tells the code that has to know (syscalls.c).
+EMBLIBC_INC := -I$(EMBCC_ROOT)/lib/libc/include -nostdinc \
+               -isystem $(shell $(USER_CC) -print-file-name=include) \
+               -isystem $(shell $(USER_CC) -print-file-name=include-fixed) \
+               -isystem $(EMBCC_ROOT)/include -DEMBK_LIBC_EMBLIBC=1
+else ifeq ($(LIBC),newlib)
+EMBLIBC     :=
+else
+$(error LIBC=$(LIBC): it is newlib or emblibc)
+endif
+
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
 # Authentication is the default. UI tests select explicit live mode through
@@ -532,8 +577,13 @@ check-tools:
 	if command -v aarch64-elf-gcc >/dev/null 2>&1; then \
 	  printf '  [ ok ]  aarch64-elf-gcc   -- make ARCH=aarch64 && make ARCH=aarch64 run-arm64\n'; \
 	else printf '  [ -- ]  aarch64-elf-gcc  (absent => the x86 build is unaffected; brew install aarch64-elf-gcc)\n'; fi
+ifeq ($(EMBLIBC),yes)
+NEWLIB_INC    =
+NEWLIB_LIB    = -L$(EMBLIBC_DIR)
+else
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/$(USER_TRIPLE)/lib,)
+endif
 # -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
 # in depth against uninitialized-read UB -- and the concrete fix for a git-over-
 # HTTPS heisenbug where libtls's ECDSA verify (user/lib/tls/crypto/ecdsa.c) read
@@ -557,6 +607,13 @@ ifeq ($(ARCH),aarch64)
 NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 else
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+endif
+ifeq ($(EMBLIBC),yes)
+ifeq ($(ARCH),aarch64)
+NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(EMBLIBC_INC) $(USER_INC)
+else
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(EMBLIBC_INC) $(USER_INC)
+endif
 endif
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
@@ -611,10 +668,19 @@ NEWLIB_PIC_PREFIX ?= $(HOME)/cross/newlib-aarch64-pic
 else
 NEWLIB_PIC_PREFIX ?= $(HOME)/cross/newlib-pic
 endif
+ifeq ($(EMBLIBC),yes)
+# One archive serves both links: EmbCC's x86-64 code addresses everything
+# PC-relative, and its data's absolute addresses are R_X86_64_64, which a
+# PIE carries as relative relocations. So there is no second, -fPIC build.
+PIE_OK := yes
+NEWLIB_PIC_INC =
+NEWLIB_PIC_LIB = -L $(EMBLIBC_DIR)
+else
 PIE_OK := $(if $(wildcard $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib/libc.a),yes,)
 
 NEWLIB_PIC_INC = -isystem $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/include
 NEWLIB_PIC_LIB = -L $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib
+endif
 
 # -fPIC on every object of a PIE app, and the PIC libc's headers so a PIE app
 # cannot half-link against the other newlib's.
@@ -683,7 +749,7 @@ pie-check:
 # Constructors are already handled: crt0.c walks .init_array AND .ctors.
 CXX_PREFIX ?= $(HOME)/cross/gcc-cxx
 USER_CXX    = $(CXX_PREFIX)/bin/x86_64-elf-g++
-HAVE_CXX   := $(if $(wildcard $(USER_CXX)),yes,)
+HAVE_CXX   := $(if $(EMBLIBC),,$(if $(wildcard $(USER_CXX)),yes,))
 
 # -fno-exceptions/-fno-rtti for now: both want unwind tables + a personality
 # routine wired into the runtime, which is its own piece of work. Plain C++
@@ -705,7 +771,42 @@ cxx-check:
 # like shell.elf; the g++ driver pulls in libstdc++/libsupc++ (which
 # function-local statics need for __cxa_guard_acquire). CXX_APPS is EMPTY when
 # no C++ toolchain is installed, so the whole tree still builds without one.
-ifeq ($(HAVE_CXX),yes)
+ifeq ($(EMBLIBC),yes)
+# C++ under LIBC=emblibc needs no second toolchain: EmbCC compiles it, against
+# its own C++ library (lib/libcxx, built for this OS by `make emblibc`) over
+# the same C library, and EmbCC's runtime brings the unwinder exceptions need
+# (newlib-body.ld brackets .eh_frame for it). The link is the C programs' --
+# crt0, the script, gcc as the driver -- with the C++ library in front.
+EMBCXX       = $(EMBCC_ROOT)/embcc --target=$(USER_TRIPLE) -x c++ -O2
+EMBCXX_INC   = -I$(EMBCC_ROOT)/lib/libcxx/include -I$(EMBCC_ROOT)/lib/libc/include \
+               $(USER_INC) -DEMBK_LIBC_EMBLIBC=1
+EMBLIBCXX_A  = $(EMBCC_ROOT)/build/libcxx/emblinkos$(EMBLIBC_SFX)/libcxx.a
+EMBCXX_LIBS  = -L$(EMBCC_ROOT)/build/libcxx/emblinkos$(EMBLIBC_SFX) \
+               -Wl,--start-group -lcxx -lrt -lc -Wl,--end-group -lgcc
+CXX_APPS     = $(if $(wildcard $(EMBLIBCXX_A)),build/cxxdemo.elf build/cxxlib.elf,)
+
+# -MD, not -MMD: the C and C++ library headers are EmbCC's own system
+# directories, which -MMD leaves out -- and they are exactly what changes
+# under these objects (their inline functions are compiled INTO them).
+build/cxxdemo.o: user/tests/cxxdemo/cxxdemo.cc | $(BUILD)
+	$(EMBCXX) $(EMBCXX_INC) -MD -MP -MF $@.d -c $< -o $@
+build/cxxlib.o: user/tests/cxxlib/cxxlib.cc | $(BUILD)
+	$(EMBCXX) $(EMBCXX_INC) -MD -MP -MF $@.d -c $< -o $@
+build/cxxdemo.elf build/cxxlib.elf: build/%.elf: build/%.o build/crt0.o build/syscalls.o $(EMBLIBCXX_A) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(EMBCXX_LIBS) -o $@
+
+# POSIX threads, checked by the same program EmbCC checks its library
+# with on Linux against glibc (tests/exec/posix-threads.c): `test pthreads`.
+# fork is ENOSYS here, which it allows for.
+PTHREAD_PROBE_SRC = $(EMBCC_ROOT)/tests/exec/posix-threads.c
+ifneq ($(wildcard $(PTHREAD_PROBE_SRC)),)
+CXX_APPS += build/pthreadprobe.elf
+build/pthreadprobe.o: $(PTHREAD_PROBE_SRC) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/pthreadprobe.elf: build/pthreadprobe.o build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< -lc -lgcc -o $@
+endif
+else ifeq ($(HAVE_CXX),yes)
 CXX_APPS = build/cxxdemo.elf
 
 build/cxxdemo.o: user/tests/cxxdemo/cxxdemo.cc | $(BUILD)
@@ -728,7 +829,7 @@ endif
 # before configuring CPython -- and a libc change means reconfiguring it.
 PY_BUILD ?= $(HOME)/cross/build-py
 PY_BIN   := $(PY_BUILD)/python
-HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
+HAVE_PY  := $(if $(EMBLIBC),,$(if $(wildcard $(PY_BIN)),yes,))
 
 # git, same shape as HAVE_PY: absent cross-built binary == GIT_APPS empty ==
 # the tree still builds. Build it with $(HOME)/cross/build-git-emblink.sh.
@@ -750,7 +851,7 @@ GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
 TCC_SRC ?= $(HOME)/cross/tcc-0.9.27
 TCC_BIN ?= $(TCC_SRC)/tcc
 HAVE_TCC := $(if $(wildcard $(TCC_BIN)),yes,)
-HAVE_GIT := $(if $(wildcard $(GIT_BIN)),yes,)
+HAVE_GIT := $(if $(EMBLIBC),,$(if $(wildcard $(GIT_BIN)),yes,))
 
 PY_SRC   ?= $(HOME)/cross/Python-3.14.6
 
@@ -829,6 +930,65 @@ NEWLIB_DYN_WL      = -Wl,--export-dynamic -Wl,--no-dynamic-linker -Wl,--hash-sty
 
 build/crt0.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+# Under emblibc, syscalls.c compiles to nothing (the library's backend is the
+# layer it was) and the objects stand for the library instead: they depend on
+# its archive, so the relink checks that ask "is syscalls.o newer than this
+# binary?" (python.elf, tcc.elf) keep asking the right question.
+ifeq ($(EMBLIBC),yes)
+build/syscalls.o build/syscalls_pic.o: $(EMBLIBC_A) build/.libc
+$(EMBLIBC_A):
+	@echo "*** LIBC=emblibc: no $@"; \
+	 echo "    build it:  make emblibc   (EMBCC_ROOT=$(EMBCC_ROOT))"; exit 1
+endif
+
+# build/.libc: the C library build/ was compiled against (see LIBC above).
+# Rewritten only when it does not exist, so it never makes anything stale by
+# itself; a different one is an error, here at parse time, before any object
+# of the other library is linked to this one.
+# A build/ with objects and no record predates LIBC, so it is newlib's.
+ifneq ($(filter clean distclean emblibc,$(MAKECMDGOALS)),)
+else ifneq ($(wildcard build/.libc),)
+ifneq ($(shell cat build/.libc),$(LIBC))
+$(error build/ was built with LIBC=$(shell cat build/.libc), not LIBC=$(LIBC): `make clean` first)
+endif
+else ifneq ($(wildcard build/crt0.o),)
+ifneq ($(LIBC),newlib)
+$(error build/ was built with newlib (it has no build/.libc), not LIBC=$(LIBC): `make clean` first)
+endif
+endif
+build/.libc: | $(BUILD)
+	@echo $(LIBC) > $@
+# written by the first compile of either library's startup, so it is there
+# from the first build on (order-only: it never makes those objects stale)
+build/crt0.o build/syscalls.o: | build/.libc
+
+# /system/abi -- what tcc links ON the OS -- stays newlib's under emblibc: its
+# libc.a and headers come from NEWLIB_PREFIX as before, so its crt0 and
+# syscalls must be newlib's too, compiled against newlib's headers here.
+ifeq ($(EMBLIBC),yes)
+ifeq ($(ARCH),aarch64)
+ABI_NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall \
+                    $(USER_INC) -isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include
+else
+ABI_NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall \
+                    $(USER_INC) -isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include
+endif
+ABI_NEWLIB_OBJS = build/abi/crt0.o build/abi/syscalls.o
+build/abi/crt0.o: user/lib/crt0.c | $(BUILD)
+	@mkdir -p build/abi
+	$(USER_CC) $(ABI_NEWLIB_CFLAGS) -c $< -o $@
+build/abi/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
+	@mkdir -p build/abi
+	$(USER_CC) $(ABI_NEWLIB_CFLAGS) -c $< -o $@
+else
+ABI_NEWLIB_OBJS =
+endif
+
+.PHONY: emblibc
+emblibc:
+	$(MAKE) -C $(EMBCC_ROOT) libc-emblinkos libcxx-emblinkos EMBLINKOS=$(CURDIR) \
+	    EMBLINKOS_ARCH=$(EMBLIBC_ARCH)
 
 build/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
@@ -2118,6 +2278,15 @@ TCC_APPS = build/tcc.elf
 # Same libc-embedding problem as python.elf/git.elf (see those rules): tcc links
 # build/crt0.o + build/syscalls.o via LDFLAGS, which its own Makefile treats as
 # raw paths. Relink only when the libc is genuinely newer.
+ifeq ($(EMBLIBC),yes)
+# Under LIBC=emblibc tcc is shipped as it was built: a static newlib program,
+# whole in itself. Relinking it here would hand its newlib link an empty
+# syscalls.o. What it compiles ON the OS is unchanged too -- mkfs still packs
+# newlib's libc.a and headers into /system/abi for it.
+build/tcc.elf: $(TCC_BIN) | $(BUILD)
+	cp -f $(TCC_BIN) $@
+	$(STRIP) $@
+else
 build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	@if [ build/syscalls.o -nt $(TCC_BIN) ] || [ build/crt0.o -nt $(TCC_BIN) ]; then \
 	    echo "  RELINK   tcc     (libc changed under it)"; \
@@ -2127,6 +2296,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	 fi
 	cp -f $(TCC_BIN) $@
 	$(STRIP) $@
+endif
 endif
 
 EMBKFS_APPS := build/updateprobe.elf build/updatectl.elf build/updateworker.elf build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf build/spawnprobe.elf build/shprobe.elf build/fdprobe.elf build/sh.elf $(if $(PIE_OK),build/pieprobe.elf,) \
@@ -2202,7 +2372,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(IMAGE_FONT_INPUTS) $(SHELL_SELFBUILD_SRC) $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(IMAGE_FONT_INPUTS) $(SHELL_SELFBUILD_SRC) $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(ABI_NEWLIB_OBJS) $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -2244,7 +2414,7 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(IMAGE_FONT_INPU
 	EMBK_NEWLIB_LIBM="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libm.a,)" \
 	EMBK_NEWLIB_INC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/include,)" \
 	EMBK_TCC_INC="$(if $(HAVE_TCC),$(TCC_SRC)/include,)" \
-	  python3 tools/embkfs_mkfs/mkfs_embkfs.py
+	$(if $(EMBLIBC),EMBK_ABI_OBJDIR=build/abi )  python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
 # Create a 64MB AHCI test disk (separate from disk.img)

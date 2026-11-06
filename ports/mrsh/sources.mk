@@ -2,6 +2,11 @@
 MRSH_ROOT := third_party/mrsh
 MRSH_SRCS := $(wildcard $(MRSH_ROOT)/*.c $(MRSH_ROOT)/parser/*.c $(MRSH_ROOT)/builtin/*.c $(MRSH_ROOT)/shell/*.c $(MRSH_ROOT)/shell/task/*.c) $(MRSH_ROOT)/frontend/basic.c ports/mrsh/native.c ports/mrsh/ast_codec.c ports/mrsh/utilities.c ports/mrsh/sh_complete.c shell/edit/edit.c shell/edit/wcwidth.c shell/hist/hist.c third_party/newlib-posix/fnmatch.c third_party/newlib-posix/glob.c
 MRSH_INC := -I$(MRSH_ROOT)/include -Iports/mrsh -Ithird_party/newlib-posix -Ishell
+# Under LIBC=emblibc the C library has fnmatch and glob, POSIX's whole;
+# the copies newlib lacked are not built (its <glob.h> comes first anyway)
+ifeq ($(EMBLIBC),yes)
+MRSH_SRCS := $(filter-out third_party/newlib-posix/%,$(MRSH_SRCS))
+endif
 MRSH_OBJS := $(patsubst %.c,build/mrsh/%.o,$(MRSH_SRCS))
 build/mrsh/%.o: %.c
 	@mkdir -p $(dir $@)

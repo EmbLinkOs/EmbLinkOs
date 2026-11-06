@@ -1050,8 +1050,12 @@ def discover_userland_objects(build_dir="build"):
     # the sealed region) and links with `-L/system/abi`; it is an app in /data,
     # not part of the contract. libc.a (~6.6 MB) is the biggest object on the
     # image and earns it: without it `tcc t.c -o t.elf` cannot resolve exit().
+    # EMBK_ABI_OBJDIR: where those two objects are, when it is not build/ --
+    # under LIBC=emblibc, build/'s are EmbCC's C library's, and the ABI tcc
+    # links against stays newlib's (the Makefile builds that pair in build/abi)
+    abi_dir = os.environ.get("EMBK_ABI_OBJDIR") or build_dir
     for tc in ("crt0.o", "syscalls.o"):
-        blob = _read_file(f"{build_dir}/{tc}")
+        blob = _read_file(f"{abi_dir}/{tc}")
         if blob is not None:
             objects.append((b"system/abi/" + tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
     libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None

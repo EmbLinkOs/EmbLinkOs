@@ -20,6 +20,13 @@
  * fork and in-place exec remain unsupported. Native spawn callers explicitly
  * select descriptors, environment and exit-status retention. */
 
+/* Under LIBC=emblibc this file is empty: EmbCC's C library carries its own
+ * EmbLinkOS backend (lib/libc/os/emblinkos/backend.c in EmbCC), which is
+ * this layer rewritten against that library's seam -- the same kernel
+ * calls, the same translations. The Makefile still builds the object so the
+ * rules that depend on it need no second spelling. */
+#ifndef EMBK_LIBC_EMBLIBC
+
 /* newlib's <sys/features.h> only defines _POSIX_TIMERS for targets it knows
  * (RTEMS/Cygwin), never for bare x86_64-elf, so <time.h> hides clock_gettime()
  * and the CLOCK_* ids behind `#if defined(_POSIX_TIMERS)` -- no feature-test
@@ -1245,7 +1252,9 @@ int clock_getres(clockid_t clock_id, struct timespec *res) {
                               ns = 1000000L;    break;  /* HPET exposed as ms */
     default: errno = EINVAL; return -1;
     }
-    if (res) { res->tv_sec = 0; res->tv_nsec = ns; }
+    /* normalised: a timespec's tv_nsec is below a second (POSIX), so the
+     * RTC's second is {1, 0}, not {0, 1000000000} */
+    if (res) { res->tv_sec = ns / 1000000000L; res->tv_nsec = ns % 1000000000L; }
     return 0;
 }
 
@@ -1896,3 +1905,5 @@ void __malloc_unlock(struct _reent *r) {
 
 /* Kept in this retargeting object so installed SDK links need no extra object. */
 #include "spawn_compat.inc"
+
+#endif /* !EMBK_LIBC_EMBLIBC */
