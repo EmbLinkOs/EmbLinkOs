@@ -4457,6 +4457,26 @@
       "featured": false,
       "milestone": "Fluid desktop P6: advanced",
       "historical": false
+    },
+    {
+      "id": "227-live-resize",
+      "phase": "Fluid desktop",
+      "title": "Resized as it is dragged",
+      "caption": "Settings held by its corner grip, dragged out from 980 × 660 and not yet let go: already 1127 × 753 and laid out at that size -- its rows wider, its controls at the new right edge. The window is the size the hand says on every frame of the drag, both ways, and never flies. Built on EmbCC's C library; arm64 under HVF.",
+      "alt": "The EmbLinkOS Settings window enlarged almost to the screen's edges while its corner grip is held",
+      "file": "227-live-resize.png",
+      "capture_date": "2026-11-06",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "4ff0f0b0a292d4ae0c105fbec884259b49ebbe372d7dfa538a8985d99c16bf18",
+      "source_capture": "emblink-resize-lwf1kbnu/held.ppm",
+      "source_sha256": "218c7f453329918cbc8ef13b597f269d80fe03d55f8078597af28f844219320d",
+      "source_commit": "a853c25",
+      "featured": false,
+      "milestone": "Fluid desktop P5: shell",
+      "historical": false
     }
   ]
 }

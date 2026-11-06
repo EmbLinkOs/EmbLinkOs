@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-226 actual EmbLinkOS captures document the original laptop work, its
+227 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, and spaces that follow the hand. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, and windows resized as they are dragged. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -131,6 +131,12 @@ Settings again, with Inter set as its designer publishes it for each size: the t
 Three fingers on a touchscreen, held 560 px to the left: the first space (Settings) going off one side and the second (the Terminal) coming in from the other, both following the hand one to one while the bar, the dock and the wallpaper stay. Let go past a third of the screen, or flicked, the second space is taken and the windows carry on at the hand's speed; short of it they spring back. Three fingers up open the overview. Fingers driven over QMP on a virtio-multitouch device; arm64 under HVF.
 
 ![The EmbLinkOS desktop mid-swipe: Settings sliding off to the left and the Terminal coming in from the right edge](226-spaces-under-the-hand.png)
+
+### Resized as it is dragged
+
+Settings held by its corner grip, dragged out from 980 × 660 and not yet let go: already 1127 × 753 and laid out at that size -- its rows wider, its controls at the new right edge. The window is the size the hand says on every frame of the drag, both ways, and never flies. Built on EmbCC's C library; arm64 under HVF.
+
+![The EmbLinkOS Settings window enlarged almost to the screen's edges while its corner grip is held](227-live-resize.png)
 
 ## The prompt, Powerlevel10k-style
 
