@@ -4537,6 +4537,26 @@
       "featured": false,
       "milestone": "Fluid desktop P3: materials and rendering",
       "historical": false
+    },
+    {
+      "id": "231-a-layer-in-motion",
+      "phase": "Layers",
+      "title": "A layer in motion",
+      "caption": "A layer, caught half way in: a card the application painted once, hanging below its window the way a menu does, its rounded corners and translucent body its own alpha -- the Terminal's text shows through it. The application sent it in with one call and went back to sleep; the compositor is moving it, on springs, on its own frame clock: 122 frames at a steady 16.67 ms while the app presented nothing. Slowed six times to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.",
+      "alt": "A small window titled Layer demo with a translucent, rounded, striped card hanging below it, half faded in and slightly smaller than full size",
+      "file": "231-a-layer-in-motion.png",
+      "capture_date": "2026-11-06",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "81a31067c4a0be56f0f0bb5e4dab6f0ff15e5f2c3b1f34f6c34211c9a8c98f08",
+      "source_capture": "cap/layer-slow.ppm",
+      "source_sha256": "2d778fe98277a169720cc72a6329b6ea8533666e4af74bd9ec91dfdb37e87d6d",
+      "source_commit": "6e40832",
+      "featured": false,
+      "milestone": "P7 Layers: a render server",
+      "historical": false
     }
   ]
 }
