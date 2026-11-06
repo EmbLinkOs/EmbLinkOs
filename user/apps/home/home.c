@@ -29,6 +29,9 @@
 #include "theme.h"
 #include "scene_render.h"
 #include "font.h"
+#include "em_prof.h"
+/* what the desktop's frames cost it, while `perf apps on` holds (em_prof.h) */
+static struct em_prof g_prof;
 
 static uint8_t *read_file(const char *path, size_t *len) {
     int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
@@ -2033,8 +2036,10 @@ int main(int argc, char **argv, char **envp) {
             /* the compositor's effects tier: the library and the dock's glass
              * draw their tint while frames run long (scene_render_set_reduced) */
             { static int fx_tick; struct embk_comp_stats cs;
-              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5 &&
-                  scene_render_set_reduced((int)cs.effects)) { g_invalidate = 2; g_full_present = 2; } }
+              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5) {
+                  if (scene_render_set_reduced((int)cs.effects)) { g_invalidate = 2; g_full_present = 2; }
+                  em_prof_switch(&g_prof, cs.version >= 6 && cs.app_profile, "Desktop");
+              } }
             uint32_t gen_before=g_out_gen;outputs_poll();
             if(g_out_gen!=gen_before && nw==sw && nh==sh) {
                 /* The monitors moved under the same desktop size: re-place, repaint. */
@@ -2175,7 +2180,9 @@ int main(int argc, char **argv, char **envp) {
 
         g_launch = 0;
         g_launch_dir = 0;
+        uint64_t pf0 = em_prof_now(&g_prof);
         ui_frame_begin(); em_new_frame(); home_ui(); em_flush();em_tooltip_host();ui_frame_end();
+        uint64_t pf1 = em_prof_now(&g_prof);
         ui_run_layout((float)sw, (float)sh);
 
         /* Structural transitions invalidate a bounded number of frames above.
@@ -2190,7 +2197,10 @@ int main(int argc, char **argv, char **envp) {
         g_dock_dirty = 0;
 
         if (g_invalidate > 0) { g_invalidate--; scene_render_invalidate(&r); }
+        uint64_t pf2b = em_prof_now(&g_prof);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        uint64_t pf3 = em_prof_now(&g_prof), pf_px = 0;
+        int pf_full = r.full || g_full_present > 0;
 
         /* Nothing dirty is nothing to present. This used to present the whole
          * desktop instead -- a full-screen compose on every frame the desktop
@@ -2200,6 +2210,7 @@ int main(int argc, char **argv, char **envp) {
         if (r.full || g_full_present > 0) {
             if (g_full_present > 0) g_full_present--;
             if(embk_win_present(win, pixels, sw, sh)>=0){restore_presented=1;presented_gen=g_out_gen;}
+            pf_px = (uint64_t)sw * sh;
         } else if (r.n_dirty > 0 || r.has_scroll_present) {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
             if (r.has_scroll_present) {           /* a scroll blit moved pixels */
@@ -2219,8 +2230,15 @@ int main(int argc, char **argv, char **envp) {
             if (y0 < 0) y0 = 0;
             if (x1 > (int)sw) x1 = (int)sw;
             if (y1 > (int)sh) y1 = (int)sh;
-            if (x1 > x0 && y1 > y0)
+            if (x1 > x0 && y1 > y0) {
                 embk_win_present_rect(win, pixels, sw, sh, x0, y0, x1 - x0, y1 - y0);
+                pf_px = (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+            }
+        }
+        if (g_prof.on) {
+            em_prof_frame(&g_prof, pf1 - pf0, pf2b - pf1, pf3 - pf2b,
+                          embk_thread_cpu_ns() - pf3, pf_full, pf_px);
+            if (g_prof.n >= 60) em_prof_flush(&g_prof, "Desktop");
         }
 
         /* a tile was clicked this frame -> launch it as a floating window.
@@ -2239,6 +2257,7 @@ int main(int argc, char **argv, char **envp) {
         if (em_take_frame_request() || g_drag || g_invalidate > 0 || g_full_present > 0)
             em_wait_frame(15);
         else {
+            em_prof_flush(&g_prof, "Desktop");      /* a run of frames ends at the wait */
             uint64_t now = embk_uptime_ms();
             em_wait_input(screen_next > now ? (int)(screen_next - now) : 0);
         }

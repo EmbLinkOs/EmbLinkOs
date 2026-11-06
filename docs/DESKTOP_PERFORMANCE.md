@@ -439,3 +439,32 @@ left 144,850 pixels wrong. `tools/scroll_smoke.py` scrolls Settings down and
 back on a real desktop and requires the pane to come back the same picture.
 The browser's own scroll-blit check (`make web-corpus`) said "the blit path was
 never exercised" on three corpus pages; it passes on all three now.
+
+## What the applications pay for motion (P7 M0)
+
+Everything above is the compositor's side. The other half is what an
+application spends drawing its own motion, and that is what P7 (layers) is
+for: today every menu, tooltip and the library is repainted by its app, frame
+by frame. `perf apps on` on the serial console makes every toolkit runtime say
+what each run of frames cost it (`ui/dsl/em_prof.h`: thread CPU time for
+building, layout, painting and presenting, the frames that repainted
+everything, the pixels handed over); `tools/app_prof_smoke.py` plays the
+motions and sums them. arm64 under HVF, one M5 core:
+
+| Scene | App | Frames | Full repaints | Paint (avg / worst) | Pixels presented |
+|---|---|---|---|---|---|
+| Top-bar menu, open and Esc | TopBar | 41 | 25 | 1.14 / 2.80 ms | 24.0 M |
+| Files context menu, open and Esc | Files | 29 | 19 | 1.22 / 2.18 ms | 11.6 M |
+| Close-button tooltip | Settings | 46 | 2 | 0.13 / 2.50 ms | 1.3 M |
+| The library, in and out | Desktop | 58 | 23 | 5.12 / 18.4 ms | 23.6 M |
+| A glide along the dock | Desktop | 216 | 2 | 0.48 / 6.28 ms | 4.2 M |
+| Eight notches down and back | Settings | 161 | 0 | 0.56 / 1.22 ms | 58.5 M |
+
+A small menu costs its app two dozen whole-window repaints, because opening
+and closing one changes the structure (every structural change repaints the
+window) and the drop-in is an opacity-and-scale group that re-renders its whole
+subtree into scratch every frame. The top bar's window is a tall transparent
+canvas that holds its dropdowns, so each of those repaints is most of a
+screen. The library repaints the whole desktop for a third of its frames. The
+desktop also builds a frame in every scene (about 35 a scene, 60 us each, no
+pixels) -- the clock and the dock's hover checks; cheap, but not nothing.

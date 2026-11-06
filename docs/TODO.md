@@ -136,6 +136,20 @@ the default target). Measured before and after every step
         linear light); text, the kernel compositor and the virgl shaders keep their own.
   - [ ] Layer caching (a group that only fades or scales could reuse its last flattened pixels;
         the library's tiles animate inside it, so it would not help there).
+- [ ] P7 Layers: a render server ([plan](DESKTOP_PERFORMANCE.md#what-the-applications-pay-for-motion-p7-m0)).
+  Apps paint a piece of UI once into a layer and give the compositor targets on a spring; the
+  compositor animates it on its own clock.
+  - [x] M0: `perf apps on` and `tools/app_prof_smoke.py` -- what each app's frames cost it, per
+        run of frames; baselines for menus, tooltips, the library, the dock and scrolling.
+  - [ ] M1: the toolkit's group cache (and the scratch-space culling bug in a group's paint:
+        a child's footprint in scratch coordinates is tested against window-space dirty rects).
+  - [ ] M2: a premultiplied, per-pixel-alpha scaled blit in the compositor.
+  - [ ] M3: kernel layers (syscalls 166-169).
+  - [ ] M4: menus, popovers, toasts and tooltips on layers; the top bar's dropdowns.
+  - [ ] M5: dialogs and sheets that scale in; the close pull moved by the compositor.
+  - [ ] M6: the library's glass as a layer over a kept blur.
+  - [ ] Nothing uses `em_toast` or the close grip (`em_close_grip`) yet: both are toolkit
+        features without an application, so their motion is untested in the guest.
 - [ ] P4 Type and tokens.
   - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
         stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its

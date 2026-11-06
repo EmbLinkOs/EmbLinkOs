@@ -28,6 +28,7 @@
 #include "theme.h"
 #include "scene_render.h"
 #include "font.h"
+#include "em_prof.h"
 
 static int g_app_exit_requested;
 static int g_app_exit_code;
@@ -406,12 +407,16 @@ void em_wait_frame(int pace) {
     if (embk_win_frame(0, 100) < 0) embk_sleep_ms((uint32_t)pace);
 }
 
-static void present_changes(int win, uint32_t *px, const uint32_t *back, int winw, int winh,
-                            const struct scene_renderer *r, bool full) {
+/* what an application's frames cost it, while `perf apps on` holds (em_prof.h) */
+static struct em_prof g_prof;
+
+/* Hands the frame's changes to the compositor; returns how many pixels. */
+static uint64_t present_changes(int win, uint32_t *px, const uint32_t *back, int winw, int winh,
+                                const struct scene_renderer *r, bool full) {
     if (full || r->full) {
         if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
         embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
-        return;
+        return (uint64_t)winw * (uint64_t)winh;
     }
     int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
     if (r->has_scroll_present) {
@@ -431,12 +436,13 @@ static void present_changes(int win, uint32_t *px, const uint32_t *back, int win
     if (y0 < 0) y0 = 0;
     if (x1 > winw) x1 = winw;
     if (y1 > winh) y1 = winh;
-    if (x1 <= x0 || y1 <= y0) return;
+    if (x1 <= x0 || y1 <= y0) return 0;
     /* only the band that changed crosses over */
     if (back)
         for (int y = y0; y < y1; y++)
             memcpy(px + (size_t)y * winw + x0, back + (size_t)y * winw + x0, (size_t)(x1 - x0) * 4);
     embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
+    return (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
 }
 
 int em_app_run(const EmApp *app) {
@@ -637,8 +643,10 @@ int em_app_run(const EmApp *app) {
             /* THE COMPOSITOR'S EFFECTS TIER, followed here: glass draws its tint
              * while frames run long (scene_render_set_reduced) */
             { static int fx_tick; struct embk_comp_stats cs;
-              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5 &&
-                  scene_render_set_reduced((int)cs.effects)) { scene_render_invalidate(&r); em_request_frame(); } }
+              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5) {
+                  if (scene_render_set_reduced((int)cs.effects)) { scene_render_invalidate(&r); em_request_frame(); }
+                  em_prof_switch(&g_prof, cs.version >= 6 && cs.app_profile, title);
+              } }
             struct embk_display_layout was=g_dl;int was_ok=g_dl_ok;
             outputs_refresh();
             int layout_moved=g_dl_ok && g_dl.generation!=g_dl_seen;
@@ -949,6 +957,7 @@ int em_app_run(const EmApp *app) {
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
                     em_overlay_active() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
         if (!build) {
+            em_prof_flush(&g_prof, title);          /* a run of frames ends at the wait */
             cad_idle_tick(&cad);
             /* NOTHING TO DRAW: WAIT FOR SOMETHING TO ANSWER. This used to sample
              * the pointer every 5 ms -- six still windows woke the machine twelve
@@ -1003,12 +1012,16 @@ int em_app_run(const EmApp *app) {
             force_full = true;
         }
 
+        uint64_t pf0 = em_prof_now(&g_prof);
         ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
+        uint64_t pf1 = em_prof_now(&g_prof);
         ui_run_layout((float)winw, (float)winh);
         if (g_em_post_layout) g_em_post_layout();
         if (chromeless) declare_drag_zones(win);
+        uint64_t pf2 = em_prof_now(&g_prof);
         rt.clear_dirty = translucent || g_mat_alpha;     /* the material can change at any time */
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        uint64_t pf3 = em_prof_now(&g_prof);
 
         /* Park, don't quit: the app keeps running with no pixels on screen
          * until its dock icon calls win_restore. Checked before the close
@@ -1038,7 +1051,12 @@ int em_app_run(const EmApp *app) {
             return g_app_exit_requested ? g_app_exit_code : 0;
         }
 
-        present_changes(win, px, back, winw, winh, &r, force_full);
+        uint64_t pf_px = present_changes(win, px, back, winw, winh, &r, force_full);
+        if (g_prof.on) {
+            uint64_t pf4 = embk_thread_cpu_ns();
+            em_prof_frame(&g_prof, pf1 - pf0, pf2 - pf1, pf3 - pf2, pf4 - pf3, force_full || r.full, pf_px);
+            if (g_prof.n >= 60) em_prof_flush(&g_prof, title);
+        }
 
         /* The frame is on screen. What it COST is the budget estimate -- see
          * the cadence note above for why the minimum of several is used and

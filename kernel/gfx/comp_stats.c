@@ -24,6 +24,9 @@
 #include "ipc/notify.h"
 #endif
 
+/* `perf apps on|off`: kept apart from the totals, so a reset does not clear it */
+static volatile uint32_t g_app_profile;
+
 #define RING     512           /* recent composes kept for percentiles */
 #define FRAME_RING 256         /* recent frame intervals */
 #define PTR_RING 256           /* recent pointer latencies */
@@ -243,6 +246,7 @@ void comp_stats_snapshot(struct embk_comp_stats *out)
     out->lead_us = us_of(sched_precise_lead_ns());
     out->rate_peak_mhz = g.rate_peak_mhz;
     out->effects = g.effects; out->effects_mode = g.effects_mode; out->effects_steps = g.effects_steps;
+    out->app_profile = g_app_profile;
     spin_unlock(&g_lock);
 
     const fb_info_t *fi = fb_get_info();
@@ -334,6 +338,11 @@ static void dump(void)
 
 int comp_stats_command(const char *cmd)
 {
+    if (!strcmp(cmd, "perf apps on") || !strcmp(cmd, "perf apps off")) {
+        g_app_profile = cmd[11] == 'n';
+        kprintf("perf: apps %s\n", g_app_profile ? "on" : "off");
+        return 1;
+    }
     if (!strcmp(cmd, "perf")) { dump(); return 1; }
     if (!strcmp(cmd, "perf reset")) { comp_stats_reset(); kprintf("perf: reset\n"); return 1; }
     if (!strcmp(cmd, "perf windows")) { compositor_print_windows(); return 1; }
