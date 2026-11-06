@@ -4577,6 +4577,26 @@
       "featured": false,
       "milestone": "P7 Layers: a render server",
       "historical": false
+    },
+    {
+      "id": "233-the-library-on-layers",
+      "phase": "Layers",
+      "title": "The library on layers",
+      "caption": "The library half way in. The desktop painted its dimming and its glass sheet once each, into two layers of its window, and the compositor brings them in: the dimming fading over the desktop, the sheet rising and growing into place over it. The desktop paints a millisecond a frame of it where it painted five, and repaints its whole surface four times where it did twenty-three. Slowed sixteen times to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.",
+      "alt": "The EmbLinkOS desktop with the Applications library half faded in over a partly dimmed wallpaper, its grid of app icons slightly smaller than full size",
+      "file": "233-the-library-on-layers.png",
+      "capture_date": "2026-11-07",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "c1465c5172b0cba5138919d883d4b17bd17e16df3238b92ea6a8ba3dacdfd1bf",
+      "source_capture": "cap/library-slow.ppm",
+      "source_sha256": "ac29c99dfaace2b56188a2f8a7412232a8dfd9e252ca40c78c3e2fb0e2a3737b",
+      "source_commit": "f09f9eb",
+      "featured": false,
+      "milestone": "P7 Layers: a render server",
+      "historical": false
     }
   ]
 }
