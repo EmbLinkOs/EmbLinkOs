@@ -1249,6 +1249,25 @@ static inline int embk_win_drag_regions(int id, const int32_t (*rects)[4], unsig
     return (int)embk_syscall3(EMBK_SYS_win_drag_regions, id, (int64_t)(intptr_t)rects, n);
 }
 
+/* LAYERS: pieces of a window the compositor moves itself (embk_layer.h). */
+#include "embk_layer.h"
+/* A layer of window `win`, w x h: its id (> 0), its pixels mapped at *va
+ * (premultiplied, w words a row, transparent to start), or -err. */
+static inline int64_t embk_layer_create(int win, uint32_t w, uint32_t h, uint64_t *va) {
+    return embk_syscall4(EMBK_SYS_layer_create, win, w, h, (int64_t)(intptr_t)va);
+}
+/* Where layers go, and how: n ops (at most EMBK_LAYER_OPS_MAX), applied in
+ * order -- now, or with EMBK_LS_AT_PRESENT at each layer's next present. */
+static inline int embk_layer_set(int win, const struct embk_layer_op *ops, uint32_t n, uint32_t flags) {
+    return (int)embk_syscall4(EMBK_SYS_layer_set, win, (int64_t)(intptr_t)ops, n, flags);
+}
+/* The layer's pixels in (x, y, w, h) changed: shown from the next frame. */
+static inline int embk_layer_present(int win, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h) {
+    return (int)embk_syscall4(EMBK_SYS_layer_present, win, id,
+                              (int64_t)(((uint64_t)(uint32_t)x << 32) | (uint32_t)y),
+                              (int64_t)(((uint64_t)(uint32_t)w << 32) | (uint32_t)h));
+}
+
 /* THE DESKTOP SAYS WHERE ITS DOCK TILES ARE: a window of `app` that is
  * minimised flies into that tile, and back out of it when restored. Only the
  * process that owns the desktop layer may say; each call replaces the last

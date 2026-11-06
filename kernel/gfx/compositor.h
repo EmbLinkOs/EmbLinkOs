@@ -87,6 +87,15 @@ int64_t compositor_win_create_translucent(struct process *client, uint32_t cw, u
 /* Resize a shared window's content: in place when it fits its pages, else a
  * fresh backing at a new client VA (out). The caller must switch to the
  * pointer given back immediately. `live`: a step of a grip drag -- no zoom. */
+/* LAYERS (user/lib/embk_layer.h): pieces of a shared window the compositor
+ * places, fades and scales itself. create -> the id, its pixels mapped at
+ * *out_va in `client`; set: ops (copied in already), now or at the next
+ * present; present: the layer's pixels in that rect changed. */
+struct embk_layer_op;
+int64_t compositor_layer_create(struct process *client, uint32_t win, uint32_t w, uint32_t h, uint64_t *out_va);
+int64_t compositor_layer_set(int pid, uint32_t win, const struct embk_layer_op *ops, uint32_t n, uint32_t flags);
+int64_t compositor_layer_present(int pid, uint32_t win, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h);
+
 int64_t compositor_win_resize(struct process *client, uint32_t id,
                               uint32_t nw, uint32_t nh, int live, uint64_t *out_client_va);
 

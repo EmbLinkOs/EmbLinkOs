@@ -233,6 +233,24 @@ static void compose_checks(const struct gpu_compose *ops)
           px(30, H - 41) != 0x123456, "drawn outside the damage: %06x %06x %06x %06x %06x",
           px(29, 40), px(30, 39), px(80, 59), px(79, 60), px(30, H - 41));
 
+    /* 11. A LAYER: a picture with its own alpha -- half-transparent blue on
+     * its left, nothing on its right -- shrunk to half and drawn at half
+     * opacity over white. Its alpha is kept, not dropped: the blue half is
+     * (0, 0, 64) at 64 over white = (191, 191, 255); the empty half leaves
+     * the white alone. The compositor's layers are drawn like this. */
+    uint32_t *lay = check_pixels(32 * 16);
+    for (int y = 0; y < 16; y++) for (int x = 0; x < 32; x++) lay[y * 32 + x] = x < 16 ? 0x80000080u : 0;
+    uint32_t lay_id;
+    assert(gc->image_create(lay, 32, 16, 128, &lay_id) == 0);
+    frame(&all, 0xffffff);
+    struct gpu_draw ld = { lay_id, { 0, 0, 32, 16 }, { 40, 120, 16, 8 }, 0, 128, 0, 0, { 0, 0, 0, 0 }, 0 };
+    gc->draw(&ld);
+    assert(gc->end() == 0);
+    readback();
+    CHECK(near(px(43, 124), 0xbfbfff, 3), "a scaled, faded picture keeps its alpha: %06x", px(43, 124));
+    CHECK(px(53, 124) == 0xffffff, "and its transparent part leaves what is under it: %06x", px(53, 124));
+    gc->image_destroy(lay_id);
+
     gc->image_destroy(pic_id);
     gc->image_destroy(half_id);
     gc->image_destroy(white_id);

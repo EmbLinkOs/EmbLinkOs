@@ -36,6 +36,7 @@
 #include "acpi/display.h"
 #include "drivers/video/gpu.h"
 #include "../../user/lib/embk_gpu.h"
+#include "../../user/lib/embk_layer.h"   /* layers: struct embk_layer_op */
 #include "block/partition.h"
 #define EMBK_DISK_IS_PARTITION 1u
 #include "../../user/lib/embk_child.h"
@@ -1980,6 +1981,33 @@ static int64_t sys_dock_targets(const struct sysargs *a) {
         return -EMBK_EFAULT;
     return compositor_dock_targets(current_process ? (int)current_process->pid : -1, t, n);
 }
+/* LAYERS (user/lib/embk_layer.h). arg 0 = win, 1 = w, 2 = h, 3 = uint64_t *va
+ * (where its pixels are mapped in the caller). */
+static int64_t sys_layer_create(const struct sysargs *a) {
+    uint64_t va = 0;
+    int64_t id = compositor_layer_create(current_process, (uint32_t)a->arg[0], (uint32_t)a->arg[1],
+                                         (uint32_t)a->arg[2], &va);
+    if (id < 0) return id;
+    if (a->arg[3] && copy_to_user((void *)(uintptr_t)a->arg[3], &va, sizeof va)) return -EMBK_EFAULT;
+    return id;
+}
+/* arg 0 = win, 1 = const struct embk_layer_op *, 2 = how many, 3 = flags (EMBK_LS_*).
+ * The ops are copied in before the compositor's lock is taken. */
+static int64_t sys_layer_set(const struct sysargs *a) {
+    _Static_assert(sizeof(struct embk_layer_op) == 44, "the layer op's layout is the ABI");
+    struct embk_layer_op ops[EMBK_LAYER_OPS_MAX];
+    unsigned n = (unsigned)a->arg[2];
+    if (n == 0 || n > EMBK_LAYER_OPS_MAX) return -EMBK_EINVAL;
+    if (copy_from_user(ops, (const void *)(uintptr_t)a->arg[1], n * sizeof ops[0]) != EMBK_OK) return -EMBK_EFAULT;
+    return compositor_layer_set(current_process ? (int)current_process->pid : -1, (uint32_t)a->arg[0],
+                                ops, n, (uint32_t)a->arg[3]);
+}
+/* arg 0 = win, 1 = id, 2 = (x << 32) | y, 3 = (w << 32) | h: the layer's pixels there changed. */
+static int64_t sys_layer_present(const struct sysargs *a) {
+    return compositor_layer_present(current_process ? (int)current_process->pid : -1, (uint32_t)a->arg[0],
+                                    (uint32_t)a->arg[1], (int32_t)(a->arg[2] >> 32), (int32_t)(uint32_t)a->arg[2],
+                                    (int32_t)(a->arg[3] >> 32), (int32_t)(uint32_t)a->arg[3]);
+}
 /* arg 0 = the rate (mHz) this process's motion wants; 0: the display's top. */
 static int64_t sys_win_frame_rate(const struct sysargs *a) {
     return compositor_frame_rate(current_process ? (int)current_process->pid : 0, (uint32_t)a->arg[0]);
@@ -2975,6 +3003,9 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_frame_rate] = sys_win_frame_rate,
     [SYS_win_drag_regions] = sys_win_drag_regions,
     [SYS_dock_targets]     = sys_dock_targets,
+    [SYS_layer_create]     = sys_layer_create,
+    [SYS_layer_set]        = sys_layer_set,
+    [SYS_layer_present]    = sys_layer_present,
     [SYS_key_poll_key] = sys_key_poll_key,
     [SYS_win_focused] = sys_win_focused,
     [SYS_win_set_material] = sys_win_set_material,

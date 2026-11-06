@@ -528,3 +528,34 @@ worst, the quantised filter position's floor, and within 4 of each other.
 | Filtered | 0.52 ms |
 | Nearest (the governor's choice when frames are dear) | 0.28 ms |
 | At its own size, where every motion lands | 0.23 ms |
+
+### M3: layers -- the compositor moves a piece of a window by itself
+
+`user/lib/embk_layer.h`, syscalls 166-168. An application paints a piece of its
+interface once into a layer of its window (`embk_layer_create`: pages mapped
+into it, as a shared window's are), says where the layer goes and how --
+position, opacity and scale, each on a spring, from where to where, in one
+`embk_layer_set` held for the layer's next `embk_layer_present` -- and goes
+back to sleep. The compositor's frame thread steps the springs, damages old and
+new places and draws the layer just above its window's content
+(`fb_blit_scaled_over` on the CPU, a non-opaque draw on virgl and Intel), at
+the display's rate. A layer may reach outside its window; the pointer over its
+opaque pixels goes to the window, at window coordinates that may then be
+negative or past its size. A finished layer is parked with its pages and the
+window's next layer that fits takes them back.
+
+`tools/layer_smoke.py` runs `user/tests/layerdemo`, an app that paints a
+window and a card once and then sends the card in and out every 1.5 s with
+one call, sleeping in between. arm64 under HVF:
+
+| | |
+|---|---|
+| Caught part-way, the app asleep | opacity 138, scale 0.972 |
+| Frames while it moved | 122; interval p50 16.67 ms, p95 18.26 ms on a 16.67 ms beat |
+| The app's presents meanwhile | 0 |
+| A click on the card, below the window | reached the app |
+| The app ends | its layer is gone |
+
+The same passes on x86 under TCG and composed by virgl in the Lima VM, and
+`tests/drivers/compose_checks.h` holds both GPU backends to a scaled, faded
+picture keeping its own alpha.

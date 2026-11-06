@@ -29,6 +29,7 @@
 #include "power/policy.h"       /* the Efficiency profile caps the rate */
 #endif
 #include "../../ui/motion/spring.h"   /* window motion: the toolkit's springs */
+#include "../../user/lib/embk_layer.h" /* layers: pieces of a window the compositor moves */
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -540,6 +541,69 @@ static int imin(int a, int b) { return a < b ? a : b; }
 static int win_shadows(const struct comp_window *w) {
     return w->used && !w->desktop && !w->widget && !w->translucent;
 }
+/* ---- LAYERS (user/lib/embk_layer.h) ---------------------------------------
+ *
+ * A layer is a picture an application painted once, attached to one of its
+ * windows, which the compositor places, fades and scales on springs of its
+ * own -- in the frame thread, at the display's rate, with no help from the
+ * application. It stands in its window's place in the stacking order, just
+ * above the window's content, and may reach outside the window's frame.
+ *
+ * Its properties are springs in Q16.16 like a ghost's: x and y in pixels from
+ * the window's content origin, scale in thousandths, opacity 0..255. Its
+ * pixels are the compositor's pages, mapped into the client as a shared
+ * window's are; a layer the application is done with is PARKED with them, and
+ * the window's next layer that fits takes them back -- a menu opened a
+ * hundred times maps its pages once. */
+#define LAYERS_MAX          64
+#define LAYER_PARKED_PER_WIN 4
+#define LAYER_WIN_BYTES     (8u << 20)    /* one window's layers, parked ones too */
+#define LAYER_ALL_BYTES     (32u << 20)   /* everyone's */
+struct comp_layer {
+    int       used, parked;
+    uint32_t  id, win_id;
+    int       pid;
+    uint32_t  w, h;                       /* the picture, w x h, premultiplied */
+    uint64_t *phys; uint32_t npages;
+    uint64_t  kview, client_va, client_pml4;
+    uint32_t *px;
+    int       presented;
+    struct spring x, y, scale, opacity;
+    uint16_t  ax, ay;                     /* the anchor, thousandths of the size */
+    uint8_t   radius, material, flags;
+    int8_t    sh_dy; uint8_t sh_blur, sh_alpha;
+    int       destroy_at_rest;
+    int       last[4], have_last;         /* the rect it stained last frame */
+    uint32_t  gimg;                       /* its GPU image */
+    struct embk_layer_op pend[4]; int npend;   /* held for the next present */
+};
+static struct comp_layer g_layers[LAYERS_MAX];
+static uint32_t g_layer_next_id = 1;
+static int g_layers_moving;               /* layers whose springs are still going */
+
+/* Where a layer stands on screen now, for window `w` (its content origin as
+ * w->x, w->y say -- a slide's offset included while one is drawn), and how
+ * opaque. r = x, y, w, h. */
+static void layer_geom(const struct comp_layer *L, const struct comp_window *w, int r[4], int *alpha) {
+    int s = spring_px(&L->scale);
+    if (s < 10) s = 10;
+    if (s > 1000) s = 1000;
+    int sw = (int)((int64_t)L->w * s / 1000), sh = (int)((int64_t)L->h * s / 1000);
+    int ox = w->x, oy = w->y + win_titlebar_h(w);
+    r[0] = ox + spring_px(&L->x) + (int)(((int64_t)L->w - sw) * L->ax / 1000);
+    r[1] = oy + spring_px(&L->y) + (int)(((int64_t)L->h - sh) * L->ay / 1000);
+    r[2] = sw; r[3] = sh;
+    int a = spring_px(&L->opacity);
+    *alpha = a < 0 ? 0 : a > 255 ? 255 : a;
+}
+/* ...and all it stains there: its shadow too */
+static void layer_extent(const struct comp_layer *L, const struct comp_window *w,
+                         int *x0, int *y0, int *x1, int *y1) {
+    int r[4], a; layer_geom(L, w, r, &a);
+    int pad = L->sh_alpha && L->sh_blur ? L->sh_blur + (L->sh_dy < 0 ? -L->sh_dy : L->sh_dy) + 2 : 1;
+    *x0 = r[0] - pad; *y0 = r[1] - pad; *x1 = r[0] + r[2] + pad; *y1 = r[1] + r[3] + pad;
+}
+
 /* The rect a repaint must cover for a window: its frame, GROWN by the glow band
  * for glow windows so the halo is drawn / erased with the window (else it trails
  * on move/focus-change). */
@@ -551,6 +615,16 @@ static void win_repaint_rect(const struct comp_window *w,
     if (win_shadows(w)) {
         *x0 -= SHADOW_PAD; *y0 -= SHADOW_PAD;
         *x1 += SHADOW_PAD; *y1 += SHADOW_PAD;
+    }
+    /* and its layers, which may reach past it: they move with it */
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented || L->win_id != w->id) continue;
+        int a, b, c, d; layer_extent(L, w, &a, &b, &c, &d);
+        if (a < *x0) *x0 = a;
+        if (b < *y0) *y0 = b;
+        if (c > *x1) *x1 = c;
+        if (d > *y1) *y1 = d;
     }
 }
 
@@ -600,11 +674,18 @@ static struct comp_window *front_app_window(void) {
     return front;
 }
 
-/* front-most window whose frame contains screen (x,y), or NULL. */
+static int layer_hit(const struct comp_window *w, int x, int y);   /* fwd */
+
+/* front-most window whose frame contains screen (x,y) -- or one of whose
+ * layers that takes the pointer is opaque there -- or NULL. */
 static struct comp_window *topmost_at(int x, int y) {
     struct comp_window *best = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         if (!g_wins[i].used || !win_present(&g_wins[i]) || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+        if (layer_hit(&g_wins[i], x, y)) {
+            if (!best || g_wins[i].z > best->z) best = &g_wins[i];
+            continue;
+        }
         int fx0, fy0, fx1, fy1; win_frame_rect(&g_wins[i], &fx0, &fy0, &fx1, &fy1);
         if(x>=fx0 && x<fx1 && y>=fy0 && y<fy1) {
             struct comp_window *w=&g_wins[i];
@@ -2046,6 +2127,318 @@ static void mat_capture(struct comp_window *w, int rx0, int ry0, int rx1, int ry
     if (ex0 < ix0 || ey0 < iy0 || ex1 > ix1 || ey1 > iy1) mat_more(cx0 + ex0, cy0 + ey0, cx0 + ex1, cy0 + ey1);
 }
 
+/* ---- layers: their pages, their motion, their drawing ------------------- */
+
+static uint64_t layer_bytes(const struct comp_layer *L) { return (uint64_t)L->npages * PAGE_SIZE; }
+
+/* Give the pages back: out of the client (while its address space is still
+ * alive -- the same rule as a shared window's), out of the kernel's view. */
+static void layer_free(struct comp_layer *L) {
+    gpu_image_doom(&L->gimg);
+    if (L->client_pml4 && L->client_va)
+        for (uint32_t i = 0; i < L->npages; i++) vmm_unmap_in(L->client_pml4, L->client_va + (uint64_t)i * PAGE_SIZE);
+    if (L->kview) vmm_kunmap_pages(L->kview, L->npages);
+    if (L->phys) {
+        for (uint32_t i = 0; i < L->npages; i++) pmm_free_page(L->phys[i]);
+        kfree(L->phys);
+    }
+    memset(L, 0, sizeof *L);
+}
+
+/* Repaint where it is and where it was: what a move, a fade or a new picture
+ * changes on screen. */
+static void layer_damage(struct comp_layer *L) {
+    struct comp_window *w = win_by_id(L->win_id);
+    if (!w) return;
+    int x0, y0, x1, y1; layer_extent(L, w, &x0, &y0, &x1, &y1);
+    if (L->have_last) {
+        x0 = imin(x0, L->last[0]); y0 = imin(y0, L->last[1]);
+        x1 = imax(x1, L->last[2]); y1 = imax(y1, L->last[3]);
+    }
+    layer_extent(L, w, &L->last[0], &L->last[1], &L->last[2], &L->last[3]);
+    L->have_last = 1;
+    paint_region(x0, y0, x1, y1);
+}
+
+/* The application is done with it: its pixels stay, for the window's next
+ * layer that fits -- or go, past what one window may keep. */
+static void layer_park(struct comp_layer *L) {
+    if (L->have_last) paint_region(L->last[0], L->last[1], L->last[2], L->last[3]);
+    int parked = 0;
+    for (int i = 0; i < LAYERS_MAX; i++)
+        parked += g_layers[i].used && g_layers[i].parked && g_layers[i].win_id == L->win_id;
+    if (parked >= LAYER_PARKED_PER_WIN) { layer_free(L); return; }
+    gpu_image_doom(&L->gimg);
+    L->parked = 1; L->presented = 0; L->npend = 0; L->have_last = 0; L->destroy_at_rest = 0;
+    L->id = 0;
+}
+
+/* every layer of a window, when the window goes */
+static void layers_free_window(uint32_t win_id) {
+    for (int i = 0; i < LAYERS_MAX; i++)
+        if (g_layers[i].used && g_layers[i].win_id == win_id) layer_free(&g_layers[i]);
+}
+
+static int layer_moving(const struct comp_layer *L) {
+    return L->x.moving || L->y.moving || L->scale.moving || L->opacity.moving;
+}
+static void layers_count_moving(void) {
+    int n = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        n += L->used && !L->parked && L->presented && (layer_moving(L) || L->destroy_at_rest);
+    }
+    g_layers_moving = n;
+}
+
+/* one property toward its target: jumping there, or on its spring */
+static void layer_go(struct spring *sp, int64_t target, int snap, struct embk_spring how, uint64_t now) {
+    if (snap || !how.response_ms) spring_set(sp, target, now);
+    else spring_to(sp, target, spring_params((uint32_t)how.response_ms * g_slowmo,
+                                             how.damping_milli ? how.damping_milli : 1000u), now);
+}
+
+static void layer_apply(struct comp_layer *L, const struct embk_layer_op *op, uint64_t now) {
+    /* REDUCE MOTION: nothing travels or grows -- it is simply there -- and a
+     * fade stays, short, as the Mac keeps its crossfades */
+    int still = (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION) != 0;
+    struct embk_spring fade = op->fade;
+    if (still && fade.response_ms > 150) fade.response_ms = 150;
+    if (op->set & EMBK_LP_POS) {
+        layer_go(&L->x, SPRING_PX(op->x), still || (op->snap & EMBK_LP_POS), op->move, now);
+        layer_go(&L->y, SPRING_PX(op->y), still || (op->snap & EMBK_LP_POS), op->move, now);
+    }
+    if (op->set & EMBK_LP_OPACITY)
+        layer_go(&L->opacity, SPRING_PX(op->opacity), op->snap & EMBK_LP_OPACITY, fade, now);
+    if (op->set & EMBK_LP_SCALE) {
+        uint32_t sc = op->scale_milli < 10 ? 10 : op->scale_milli > 1000 ? 1000 : op->scale_milli;
+        layer_go(&L->scale, SPRING_PX(sc), still || (op->snap & EMBK_LP_SCALE), op->grow, now);
+        L->ax = op->anchor_x_milli > 1000 ? 1000 : op->anchor_x_milli;
+        L->ay = op->anchor_y_milli > 1000 ? 1000 : op->anchor_y_milli;
+    }
+    if (op->set & EMBK_LP_LOOK) {
+        L->radius = op->radius; L->material = op->material; L->flags = op->flags;
+        L->sh_dy = op->shadow_dy; L->sh_blur = op->shadow_blur; L->sh_alpha = op->shadow_alpha;
+    }
+    if (op->op == EMBK_LOP_DESTROY) L->destroy_at_rest = 1;
+}
+
+/* the frame thread, each frame: every moving layer to where its springs are
+ * now; one that is done and was told to go, parked */
+static void layers_step(uint64_t now) {
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented) continue;
+        if (!layer_moving(L) && !L->destroy_at_rest) continue;
+        spring_step(&L->x, now); spring_step(&L->y, now);
+        spring_step(&L->scale, now); spring_step(&L->opacity, now);
+        layer_damage(L);
+        if (!layer_moving(L) && L->destroy_at_rest) layer_park(L);
+    }
+    layers_count_moving();
+}
+
+/* Drawn with its window: are this window's layers on screen at all? */
+static int layers_shown(const struct comp_window *w) {
+    return w->visible && w->presented && session_ui_allowed(w->pid) && win_shown(w) && !g_ov;
+}
+
+static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
+    if (!layers_shown(w)) return;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
+        int x0, y0, x1, y1; layer_extent(L, w, &x0, &y0, &x1, &y1);
+        if (x1 <= rx0 || y1 <= ry0 || x0 >= rx1 || y0 >= ry1) continue;
+        if (L->sh_alpha && L->sh_blur && !fx_reduced()) {
+            struct fb_shadow_layer sl = { L->sh_dy, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u };
+            fb_shadow_layers(r[0], r[1], r[0] + r[2], r[1] + r[3], L->radius, &sl, 1, rx0, ry0, rx1, ry1);
+        }
+        fb_blit_scaled_over(r[0], r[1], r[2], r[3], L->px, (int32_t)L->w, (int32_t)L->h, L->w,
+                            (uint32_t)a, g_ghost_smooth, rx0, ry0, rx1, ry1);
+    }
+}
+
+static int layers_draw_gpu(const struct comp_window *w, const struct gpu_compose *gc) {
+    if (!layers_shown(w)) return 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
+        if (!L->gimg && gc->image_create(L->px, L->w, L->h, L->w * 4, &L->gimg)) { L->gimg = 0; return -1; }
+        struct gpu_rect fr = { r[0], r[1], r[2], r[3] };
+        if (L->sh_alpha && L->sh_blur && !fx_reduced()) {
+            struct gpu_rect cast = { r[0], r[1] + L->sh_dy, r[2], r[3] };
+            gc->shadow(&cast, &fr, L->radius, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u);
+        }
+        struct gpu_draw d = { .image = L->gimg, .src = { 0, 0, (int32_t)L->w, (int32_t)L->h }, .dst = fr,
+                              .opaque = 0, .opacity = (uint8_t)a };
+        gc->draw(&d);
+    }
+    return 0;
+}
+
+/* Is screen (x, y) on an opaque pixel of one of this window's layers that
+ * takes the pointer? */
+static int layer_hit(const struct comp_window *w, int x, int y) {
+    if (!layers_shown(w)) return 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px || !(L->flags & EMBK_LF_HIT)) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        if (a <= 0 || r[2] <= 0 || r[3] <= 0 || x < r[0] || y < r[1] || x >= r[0] + r[2] || y >= r[1] + r[3]) continue;
+        uint32_t lx = (uint32_t)((int64_t)(x - r[0]) * L->w / (uint32_t)r[2]);
+        uint32_t ly = (uint32_t)((int64_t)(y - r[1]) * L->h / (uint32_t)r[3]);
+        if (lx < L->w && ly < L->h && (L->px[(size_t)ly * L->w + lx] >> 24)) return 1;
+    }
+    return 0;
+}
+
+/* ---- the layer calls (syscalls 166-168) ---------------------------------- */
+
+static struct comp_layer *layer_of(int pid, uint32_t win, uint32_t id) {
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (L->used && !L->parked && L->id == id && L->win_id == win && L->pid == pid) return L;
+    }
+    return 0;
+}
+
+int64_t compositor_layer_create(struct process *client, uint32_t win, uint32_t w, uint32_t h, uint64_t *out_va) {
+    const fb_info_t *fi = fb_get_info();
+    if (!client || !fi || !w || !h || w > fi->width || h > fi->height) return -EMBK_EINVAL;
+    int pid = (int)client->pid;
+    uint64_t bytes = (uint64_t)w * h * 4;
+    uint64_t now = time_get_ns();
+
+    /* a parked layer of this window that fits: its pages, again */
+    spin_lock(&g_comp_lock);
+    struct comp_window *cw = win_find(pid, win);
+    if (!cw || !cw->shared) { comp_unlock(); return -EMBK_EINVAL; }
+    int live = 0; uint64_t mine = 0, all = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (!L->used) continue;
+        all += layer_bytes(L);
+        if (L->win_id != win) continue;
+        mine += layer_bytes(L);
+        live += !L->parked;
+    }
+    if (live >= EMBK_LAYER_MAX_PER_WINDOW) { comp_unlock(); return -EMBK_ENOSPC; }
+    struct comp_layer *fit = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (L->used && L->parked && L->win_id == win && layer_bytes(L) >= bytes &&
+            (!fit || L->npages < fit->npages)) fit = L;
+    }
+    if (fit) {
+        fit->parked = 0; fit->id = g_layer_next_id++; fit->w = w; fit->h = h;
+        spring_init(&fit->x, 0, now); spring_init(&fit->y, 0, now);
+        spring_init(&fit->scale, SPRING_PX(1000), now); spring_init(&fit->opacity, SPRING_PX(255), now);
+        fit->ax = fit->ay = 500; fit->radius = fit->material = fit->flags = 0;
+        fit->sh_dy = 0; fit->sh_blur = fit->sh_alpha = 0;
+        uint32_t id = fit->id; uint64_t va = fit->client_va;
+        comp_unlock();
+        if (out_va) *out_va = va;
+        return id;
+    }
+    if (mine + bytes > LAYER_WIN_BYTES || all + bytes > LAYER_ALL_BYTES) { comp_unlock(); return -EMBK_ENOMEM; }
+    comp_unlock();
+
+    /* new pages, mapped into the client as a shared window's are */
+    uint32_t npages = (uint32_t)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint64_t *phys = (uint64_t *)kmalloc((size_t)npages * sizeof(uint64_t));
+    if (!phys) return -EMBK_ENOMEM;
+    uint32_t got = 0;
+    for (; got < npages; got++) { uint64_t p = pmm_alloc_page(); if (!p) break; phys[got] = p; }
+    uint64_t kview = got == npages ? vmm_kmap_pages(phys, npages) : 0;
+    if (!kview) {
+        for (uint32_t i = 0; i < got; i++) pmm_free_page(phys[i]);
+        kfree(phys); return -EMBK_ENOMEM;
+    }
+    memset((void *)(uintptr_t)kview, 0, (size_t)npages * PAGE_SIZE);   /* transparent */
+    uint64_t cva = client->shared_next_va, va = cva;
+    for (uint32_t i = 0; i < npages; i++, va += PAGE_SIZE)
+        if (vmm_map_in(client->pml4_phys, va, phys[i], VMM_USER | VMM_WRITABLE | VMM_NX) < 0) break;
+    if (va != cva + (uint64_t)npages * PAGE_SIZE) {
+        for (uint64_t u = cva; u < va; u += PAGE_SIZE) vmm_unmap_in(client->pml4_phys, u);
+        vmm_kunmap_pages(kview, npages);
+        for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
+        kfree(phys); return -EMBK_ENOMEM;
+    }
+    client->shared_next_va = va;
+
+    spin_lock(&g_comp_lock);
+    struct comp_layer *L = 0;
+    for (int i = 0; i < LAYERS_MAX && !L; i++) if (!g_layers[i].used) L = &g_layers[i];
+    if (!L || !win_find(pid, win)) {
+        comp_unlock();
+        for (uint64_t u = cva; u < va; u += PAGE_SIZE) vmm_unmap_in(client->pml4_phys, u);
+        vmm_kunmap_pages(kview, npages);
+        for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
+        kfree(phys);
+        return L ? -EMBK_EINVAL : -EMBK_ENOSPC;
+    }
+    memset(L, 0, sizeof *L);
+    L->used = 1; L->id = g_layer_next_id++; L->win_id = win; L->pid = pid; L->w = w; L->h = h;
+    L->phys = phys; L->npages = npages; L->kview = kview; L->client_va = cva; L->client_pml4 = client->pml4_phys;
+    L->px = (uint32_t *)(uintptr_t)kview;
+    spring_init(&L->x, 0, now); spring_init(&L->y, 0, now);
+    spring_init(&L->scale, SPRING_PX(1000), now); spring_init(&L->opacity, SPRING_PX(255), now);
+    L->ax = L->ay = 500;
+    uint32_t id = L->id;
+    comp_unlock();
+    if (out_va) *out_va = cva;
+    return id;
+}
+
+int64_t compositor_layer_set(int pid, uint32_t win, const struct embk_layer_op *ops, uint32_t n, uint32_t flags) {
+    uint64_t now = time_get_ns();
+    spin_lock(&g_comp_lock);
+    int64_t rc = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        struct comp_layer *L = layer_of(pid, win, ops[k].id);
+        if (!L) { rc = -EMBK_EINVAL; continue; }
+        if ((flags & EMBK_LS_AT_PRESENT) || (!L->presented && L->npend)) {
+            if (L->npend < 4) L->pend[L->npend++] = ops[k];
+            else { L->pend[3] = ops[k]; }           /* the newest wins the last place */
+            continue;
+        }
+        layer_apply(L, &ops[k], now);
+        if (L->presented) layer_damage(L);
+        if (L->destroy_at_rest && !layer_moving(L)) layer_park(L);
+    }
+    layers_count_moving();
+    comp_unlock();
+    return rc;
+}
+
+int64_t compositor_layer_present(int pid, uint32_t win, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h) {
+    uint64_t now = time_get_ns();
+    spin_lock(&g_comp_lock);
+    struct comp_layer *L = layer_of(pid, win, id);
+    if (!L) { comp_unlock(); return -EMBK_EINVAL; }
+    if (g_gc && L->gimg) {
+        struct gpu_rect r = { x, y, w, h };
+        if (r.x < 0) { r.w += r.x; r.x = 0; }
+        if (r.y < 0) { r.h += r.y; r.y = 0; }
+        if (r.x + r.w > (int32_t)L->w) r.w = (int32_t)L->w - r.x;
+        if (r.y + r.h > (int32_t)L->h) r.h = (int32_t)L->h - r.y;
+        if (r.w > 0 && r.h > 0) g_gc->image_update(L->gimg, &r);
+    }
+    L->presented = 1;
+    for (int k = 0; k < L->npend; k++) layer_apply(L, &L->pend[k], now);
+    L->npend = 0;
+    layer_damage(L);
+    if (L->destroy_at_rest && !layer_moving(L)) layer_park(L);
+    layers_count_moving();
+    comp_unlock();
+    return 0;
+}
+
 static void paint_window(struct comp_window *w, int focused,
                          int rx0, int ry0, int rx1, int ry1) {
     int fx0, fy0, fx1, fy1;
@@ -2630,6 +3023,7 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
             int dx, dy; slide_offset(bw, &dx, &dy);
             bw->x += dx; bw->y += dy;
             int failed = paint_window_gpu(bw, bw->z == tz, rx0, ry0, rx1, ry1);
+            if (!failed) failed = layers_draw_gpu(bw, gc);
             bw->x -= dx; bw->y -= dy;
             if (!failed && bw->id == g_tp.win_id && spring_px(&g_tp.a) * 2 > TP_ALPHA) {   /* its outline, over it */
                 int r[4]; tp_rect(r);
@@ -2873,6 +3267,7 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
             int dx, dy; slide_offset(bw, &dx, &dy);
             bw->x += dx; bw->y += dy;
             paint_window(bw, bw->z == tz, rx0, ry0, rx1, ry1);
+            layers_draw_cpu(bw, rx0, ry0, rx1, ry1);   /* its layers, just above it */
             bw->x -= dx; bw->y -= dy;
             if (bw->id == g_tp.win_id) tp_ring_cpu(rx0, ry0, rx1, ry1);
         }
@@ -2964,6 +3359,7 @@ static void enforce_focus(void) {
  * the client first and freed exactly once here (not again by the client's
  * address-space teardown). */
 static void win_free_backing(struct comp_window *w) {
+    layers_free_window(w->id);
     backdrop_free(w);
     gpu_image_doom(&w->gimg);
     w->gimg_px = 0;
@@ -4032,11 +4428,12 @@ void compositor_reap_pid(int pid) {
  * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
  * which is almost always. */
 static void anim_frame(void) {
-    if (!g_nghosts && !g_ov && !tp_moving()) return;   /* cheap unlocked pre-check */
+    if (!g_nghosts && !g_ov && !tp_moving() && !g_layers_moving) return;   /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
     g_src = EMBK_COMP_SRC_ANIM;
     uint64_t now = time_get_ns();
     tp_frame(now);
+    if (g_layers_moving) layers_step(now);
     int held = 0;                            /* windows held still: in the overview, under the fingers */
     if (g_ov) {
         /* the dimming, on its spring: all the screen, while it moves */
@@ -4514,7 +4911,9 @@ static void pointer_frame(void) {
             if (h) {
                 int lx = x - h->x;
                 int ly = y - (h->y + win_titlebar_h(h));
-                if (lx >= 0 && lx < (int)h->cw && ly >= 0 && ly < (int)h->ch) {
+                /* past the content only on a layer of it: there the window has it,
+                 * at coordinates that may be negative or past its size */
+                if ((lx >= 0 && lx < (int)h->cw && ly >= 0 && ly < (int)h->ch) || layer_hit(h, x, y)) {
                     g_ptr_pid = h->pid; g_ptr_win = h->id;
                     g_ptr_lx = lx; g_ptr_ly = ly; g_ptr_buttons = b;
                     if ((b & MOUSE_BTN_LEFT) && !(g_prev_buttons & MOUSE_BTN_LEFT)) {
@@ -4895,6 +5294,7 @@ static int comp_continuous(void) {
      * motion: an app drawing in one kicks a frame like any present, and so
      * does a finger moving) */
     return g_nghosts > g_ghosts_still || (g_ov && (g_ov_leaving || g_ov_dim.moving)) || tp_moving() ||
+           g_layers_moving ||
            time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
 }
 
@@ -5046,6 +5446,23 @@ void compositor_print_windows(void) {
                 spring_px(&(struct spring){ .x = g->r[2].target }), spring_px(&(struct spring){ .x = g->r[3].target }),
                 g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover);
     }
+    /* and every layer: whose, where it is now, how opaque and large, where it
+     * is going, whether it is still moving; parked ones as how many */
+    int parked = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used) continue;
+        if (L->parked) { parked++; continue; }
+        const struct comp_window *w = win_by_id(L->win_id);
+        if (!w) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        kprintf("perf: layer app=%s id=%u x=%d y=%d w=%d h=%d alpha=%d scale=%d to=%d,%d,%d,%d moving=%d shown=%d\n",
+                w->app[0] ? w->app : "-", L->id, r[0], r[1], r[2], r[3], a, spring_px(&L->scale),
+                spring_px(&(struct spring){ .x = L->x.target }), spring_px(&(struct spring){ .x = L->y.target }),
+                spring_px(&(struct spring){ .x = L->opacity.target }), spring_px(&(struct spring){ .x = L->scale.target }),
+                layer_moving(L), L->presented && layers_shown(w));
+    }
+    if (parked) kprintf("perf: layers parked=%d\n", parked);
     comp_unlock();
     kprintf("perf: end\n");
 }

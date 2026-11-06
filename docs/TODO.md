@@ -155,7 +155,19 @@ the default target). Measured before and after every step
   - [ ] Translucent windows still do not fly (open, close, minimise): the blit that would let
         them is here, but the notification banners and the top bar already move themselves, and
         a compositor zoom over that would be motion twice. Decide per kind of window.
-  - [ ] M3: kernel layers (syscalls 166-169).
+  - [x] M3: kernel layers (syscalls 166-168, `user/lib/embk_layer.h`): created, set on springs
+        (held for a present), presented, parked for reuse, hit by the pointer outside their window,
+        freed with it; reduce motion makes them jump and keeps a short fade. `tools/layer_smoke.py`
+        (arm64, x86, virgl), `user/tests/layerdemo`, gallery 231.
+  - [ ] A layer's material (`EMBK_LM_BLUR`) is accepted and not drawn: blurring what is behind a
+        moving layer needs the damage grown as a glass window's is (`region_grow_material`), and
+        on the GPU path a blur under it. Until then a layer's tint is its own pixels.
+  - [ ] A layer above everything (`z` 1 in the plan) is not offered: layers stand at their
+        window's place in the stack.
+  - [ ] An app that dies takes its layers at once; a closing menu of a crashed app does not
+        fade (the pages would have to outlive the address space, on a doomed list).
+  - [ ] Parked layers keep their client mapping: a window's parked pages count against its
+        8 MB, and the client VA they hold is not returned until the window goes.
   - [ ] M4: menus, popovers, toasts and tooltips on layers; the top bar's dropdowns.
   - [ ] M5: dialogs and sheets that scale in; the close pull moved by the compositor.
   - [ ] M6: the library's glass as a layer over a kept blur.

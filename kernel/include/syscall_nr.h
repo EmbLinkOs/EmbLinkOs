@@ -360,6 +360,9 @@
 #define SYS_win_frame_rate 163 /* (pref_mhz) -> 0: the rate this process's motion wants */
 #define SYS_win_drag_regions 164 /* (id, int32_t (*rects)[4], n) -> 0 | -err: where the compositor drags it */
 #define SYS_dock_targets 165 /* (const struct embk_dock_target *, n) -> 0 | -err: the desktop's dock tiles */
+#define SYS_layer_create 166 /* (win, w, h, uint64_t *va) -> id | -err: a layer of the window (embk_layer.h) */
+#define SYS_layer_set 167    /* (win, const struct embk_layer_op *, n, flags) -> 0 | -err: where it goes */
+#define SYS_layer_present 168 /* (win, id, (x<<32)|y, (w<<32)|h) -> 0 | -err: its pixels there changed */
 
 
 
