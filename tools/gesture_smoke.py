@@ -7,6 +7,8 @@ the second, and asserts:
 
   clicks   the pointer (a tablet on arm64, a mouse on x86) still clicks with
            a touchscreen on the machine, which QEMU hands the clicks to
+  landing  fingers landing one at a time, the first on the dock's Files tile,
+           swipe without clicking it: a lone finger waits to press
   hand     three fingers moving left hold both spaces under the hand: Settings
            (going) and the Terminal (coming) follow the fingers one to one,
            side by side, the space shown unchanged; the fingers, on Settings'
@@ -18,6 +20,8 @@ the second, and asserts:
   edge     toward a space that is not there the hand meets a rubber band
            (never past 120 px), and lets go
   up/down  three fingers up open the overview; down close it
+  one      one finger held past the wait drags Settings by its bar, and a
+           quick tap clicks as it lifts (Files opens from the dock)
 
 and photographs the two spaces under the hand. --arch aarch64 runs it on arm64
 under HVF.
@@ -61,6 +65,17 @@ class Hand:
 
     def down(self, points):
         self.at = list(points); self._frame('begin')
+
+    def land(self, points, gap=0.025):
+        """The fingers one at a time, `gap` s apart, as a hand lands."""
+        self.at = []
+        for i, (x, y) in enumerate(points):
+            self.at.append((x, y))
+            self.d.g.qmp.cmd('input-send-event', events=[
+                mtt('begin', i, 10 + i, 'x', 0),
+                mtt('data', i, 10 + i, 'x', unit(x, W)), mtt('data', i, 10 + i, 'y', unit(y, H))])
+            if i + 1 < len(points):
+                time.sleep(gap)
 
     def move(self, dx, dy=0, steps=None, pause=0.03):
         """The hand dx, dy further, in even steps, as a hand moves. Paced by
@@ -125,6 +140,23 @@ def main():
         ptr = d.ptr
         hand = Hand(d)
         bar = (S[0] + S[2] // 2, S[1] + 18)            # where Settings is dragged by
+
+        # LANDING: one finger at a time, the first on Files in the dock -- a
+        # finger alone must not press before the others come, or swiping clicks
+        _, _, dock = state(d)
+        fx, fy, fw, fh = dock['files.elf']
+        files = (fx + fw // 2, fy + fh // 2)
+        n0 = len(d.g.seen)
+        hand.land([files, (files[0] + 60, files[1]), (files[0] + 120, files[1])])
+        hand.move(-150)
+        d.g.wait(b'compositor: swipe from space 1 toward 2', 20, start=n0)
+        d.g.pump(0.3)
+        hand.up()
+        d.g.wait(b'compositor: swipe let go of space 1', 20, start=n0)
+        settle(d, 0); d.g.pump(3)
+        assert b'Files: first frame presented' not in d.g.seen[n0:], 'the first finger to land clicked Files'
+        print('landing: three fingers 25 ms apart swiped, and the first (on Files) clicked nothing', flush=True)
+        state(d); ptr = d.ptr                          # the first finger put the pointer on Files
 
         # HAND: three fingers on Settings' bar, moving left
         n0 = len(d.g.seen)
@@ -209,6 +241,24 @@ def main():
         _, wins = settle(d, 0)
         assert frame_rect(wins['Settings']) == S, f'Settings did not come home: {wins["Settings"]}'
         print('up/down: three fingers up opened the overview, down closed it', flush=True)
+
+        # ONE: a finger held past the wait drags Settings by its bar...
+        hand.land([bar]); time.sleep(0.2)
+        hand.move(100)
+        time.sleep(0.2)
+        hand.up()
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            wins, ghosts, _ = state(d)
+            if frame_rect(wins['Settings'])[0] == S[0] + 100 and not ghosts:
+                break
+        assert frame_rect(wins['Settings']) == [S[0] + 100] + S[1:], f'one finger did not drag Settings 100 px: {wins["Settings"]} from {S}'
+        # ...and a quick tap clicks, as it lifts
+        n0 = len(d.g.seen)
+        hand.land([files]); time.sleep(0.03)
+        hand.up()
+        d.g.wait(b'Files: first frame presented', 30, start=n0)
+        print('one: a held finger dragged Settings 100 px by its bar; a 30 ms tap opened Files', flush=True)
     finally:
         d.g.close()
     print('PASS: three fingers hold the spaces under the hand, take the next past a third or on a '

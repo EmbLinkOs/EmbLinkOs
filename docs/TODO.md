@@ -223,9 +223,11 @@ the default target). Measured before and after every step
         Precision Touchpad's input mode, so its fingers never reach the recogniser. Needs the
         Input Mode feature report, per-finger collections (parallel and hybrid reporting) and a
         pad-to-screen scale, tested on hardware.
-  - [ ] On a real touchscreen the first finger presses as it lands, before the others: a
-        three-finger swipe can click under the first finger. A short hold-off before a touch
-        presses would fix it, at the cost of that much latency on every tap.
+  - [x] A touchscreen's first finger pressed as it landed, before the others: a three-finger
+        swipe clicked under it. A lone finger now moves the pointer at once and presses only
+        after 60 ms alone, 8 px of travel, or on lifting (a tap clicks as it lifts); a second
+        finger in that time makes it a gesture (`gesture_smoke.py` landing: fails without it).
+        The cost: a press held still starts 60 ms late.
   - [ ] No pinch, no two-finger scrolling from a touchscreen, no four-finger variants.
   - [x] Tiling previews: held against an edge, a window shows the half (or, at the top, all) of
         the work area it will take -- a wash under it, the outline over it -- by the runtime's own

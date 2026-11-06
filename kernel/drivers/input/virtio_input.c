@@ -148,8 +148,33 @@ static uint32_t g_mt_slot;        /* which contact the device is talking about *
 static int32_t g_mt_max_x = 32767, g_mt_max_y = 32767;
 static uint32_t g_mt_buttons;     /* clicks it was handed (mouse_hold_buttons) */
 static bool g_mt_pressing;        /* its first finger is the pointer's left button */
+/* A FINGER ALONE WAITS TO PRESS. Fingers do not land together: the first of
+ * a three-finger swipe is down tens of milliseconds before the others, and
+ * pressing at once clicked whatever it landed on. A lone finger moves the
+ * pointer straight away and presses only once it has been alone MT_WAIT_NS,
+ * has moved MT_SLOP_PX, or lifts (a tap: pressed and let go where it landed).
+ * A second finger in that time makes it a gesture, and nothing is pressed. */
+#define MT_WAIT_NS  60000000ull
+#define MT_SLOP_PX  8
+static bool     g_mt_waiting;
+static uint64_t g_mt_land_ns;
+static int32_t  g_mt_land_x, g_mt_land_y;
 static uint32_t g_mt_events;
 static bool g_mt_present;
+
+/* The waiting finger presses where it landed, then goes where it is. */
+static void mt_press(void) {
+    g_mt_waiting = false;
+    g_mt_pressing = true;
+    mouse_set_absolute(g_mt_land_x, g_mt_land_y, g_mt_max_x, MOUSE_BTN_LEFT, 0);
+    if (g_mt[0].active && (g_mt[0].x != g_mt_land_x || g_mt[0].y != g_mt_land_y))
+        mouse_set_absolute(g_mt[0].x, g_mt[0].y, g_mt_max_x, MOUSE_BTN_LEFT, 0);
+}
+static int32_t mt_px(int32_t units, int32_t max, int horizontal) {
+    const fb_info_t *fi = fb_get_info();
+    int64_t span = fi ? (int64_t)(horizontal ? fi->width : fi->height) : (int64_t)max + 1;
+    return (int32_t)((int64_t)units * span / ((int64_t)max + 1));
+}
 
 uint32_t virtio_input_touch_count(void) {
     uint32_t n = 0;
@@ -362,7 +387,7 @@ static void vi_handle(const struct vi_dev *d, const struct virtio_input_event *e
          *
          * A TOUCHSCREEN DRIVES THE POINTER FROM ITS FIRST CONTACT, and the
          * contact existing IS the button being down -- there is no separate
-         * press. Later contacts are counted and kept but do nothing on their
+         * press (once a lone finger has waited: g_mt_waiting). Later contacts are counted and kept but do nothing on their
          * own: a gesture recogniser is a different piece of software, and
          * inventing one here would put guesses in the input path.
          *
@@ -387,17 +412,32 @@ static void vi_handle(const struct vi_dev *d, const struct virtio_input_event *e
                 gesture_contacts(gx, gy, n, time_get_ns());
                 if (gesture_holds_pointer()) {
                     if (g_mt_pressing) mouse_move_relative(0, 0, 0, 0);   /* where it is, let go */
-                    g_mt_pressing = false;
+                    g_mt_pressing = g_mt_waiting = false;
                     return;
                 }
             }
             /* Only its own press is its to release: a frame of nothing (the
              * sync after a click it was handed) leaves the buttons alone. */
-            if (g_mt[0].active)
-                mouse_set_absolute(g_mt[0].x, g_mt[0].y, g_mt_max_x, MOUSE_BTN_LEFT, 0);
-            else if (g_mt_pressing)
-                mouse_move_relative(0, 0, 0, 0);         /* lifted: released where it is */
-            g_mt_pressing = g_mt[0].active;
+            if (g_mt[0].active) {
+                if (!g_mt_pressing && !g_mt_waiting) {          /* landed: wait */
+                    g_mt_waiting = true;
+                    g_mt_land_ns = time_get_ns();
+                    g_mt_land_x = g_mt[0].x; g_mt_land_y = g_mt[0].y;
+                }
+                if (g_mt_waiting) {
+                    int32_t mx = mt_px(g_mt[0].x - g_mt_land_x, g_mt_max_x, 1);
+                    int32_t my = mt_px(g_mt[0].y - g_mt_land_y, g_mt_max_y, 0);
+                    if (mx * mx + my * my > MT_SLOP_PX * MT_SLOP_PX ||
+                        time_get_ns() - g_mt_land_ns >= MT_WAIT_NS) mt_press();
+                    else mouse_set_absolute(g_mt[0].x, g_mt[0].y, g_mt_max_x, 0, 0);   /* there, not yet down */
+                } else {
+                    mouse_set_absolute(g_mt[0].x, g_mt[0].y, g_mt_max_x, MOUSE_BTN_LEFT, 0);
+                }
+            } else {
+                if (g_mt_waiting) mt_press();                    /* a tap: down where it landed... */
+                if (g_mt_pressing) mouse_move_relative(0, 0, 0, 0);   /* ...and released where it is */
+                g_mt_pressing = false;
+            }
             return;
         }
         mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons, 0);
@@ -430,6 +470,9 @@ void virtio_input_poll(void) {
         }
         virtio_pci_notify(&d->vd, d->notify_off, 0);
     }
+    /* A finger resting alone sends nothing: its wait ends here, on the poll. */
+    if (g_mt_waiting && g_mt[0].active && !gesture_holds_pointer() &&
+        time_get_ns() - g_mt_land_ns >= MT_WAIT_NS) mt_press();
 }
 
 void virtio_input_init(void) {
