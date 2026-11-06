@@ -1053,18 +1053,29 @@ int em_app_run(const EmApp *app) {
         built_motion = em_frame_requested() || em_nav_transitioning() || em_overlay_active() ||
                        em_window_pulling();
 
-        /* grip released with a real delta -> re-back the window at the new
-         * size; the old pixel pointer dies inside embk_win_resize. */
-        int dw = 0, dh = 0;
-        if (em_window_take_resize(&dw, &dh)) {
-            int nw = winw + dw, nh = winh + dh;
+        /* THE GRIP, AS IT IS DRAGGED: the window takes the size the drag says
+         * -- the size it had when grabbed, plus how far the pointer has gone
+         * -- each frame that changes it, and is drawn at it before the next.
+         * The compositor resizes in place while that fits the window's pages,
+         * so the pixel pointer usually comes back the same; when it does not,
+         * the old one died inside the call. */
+        int dw = 0, dh = 0, how;
+        static int rz_base_w, rz_base_h, rz_changed;
+        if ((how = em_window_take_resize(&dw, &dh)) != 0) {
+            if (how & EM_RESIZE_FIRST) { rz_base_w = winw; rz_base_h = winh; rz_changed = 0; }
+            int nw = rz_base_w + dw, nh = rz_base_h + dh;
             if(nw<minw)nw=minw;
             if(nh<minh)nh=minh;
             struct em_out O=out_at(wx_now+winw/2,wy_now+winh/2,sw,sh);   /* no bigger than its monitor */
             if (O.w && nw > O.w) nw = O.w;
             if (O.h && nh > O.h) nh = O.h;
             uint32_t *npx = 0;
-            if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
+            if ((how & EM_RESIZE_DONE) && rz_changed && nw == winw && nh == winh) {
+                char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
+            }
+            if ((nw != winw || nh != winh) &&
+                embk_win_resize_live(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
+                rz_changed = 1;
                 px = npx; winw = nw; winh = nh;
                 if (layout_now == EmWinNormal) { normal_w = nw; normal_h = nh; }   /* the size the person chose */
                 g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
@@ -1087,7 +1098,9 @@ int em_app_run(const EmApp *app) {
                 scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
                 if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
                 embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
-                char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
+                if (how & EM_RESIZE_DONE) {
+                    char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
+                }
             }
         }
         /* THE NEXT FRAME, ON THE COMPOSITOR'S BEAT. Something is moving -- a

@@ -465,12 +465,18 @@ void em_drag_handle_end_(void);
 #define DragHandle(...) EM_SCOPE_(em_drag_handle_((EmProps){__VA_ARGS__}), em_drag_handle_end_())
 
 /* Resizable windows (V5): the runtime enables the grip; Window() then draws a
- * corner handle whose drag, ON RELEASE, records a size delta the runtime
- * collects with em_window_take_resize and applies via embk_win_resize. */
+ * corner handle whose drag records a size delta -- from the size at the grab
+ * -- that the runtime collects with em_window_take_resize and applies via
+ * embk_win_resize_live as it changes, and once more when it is let go.
+ * em_window_take_resize returns 0 when there is nothing new, else
+ * EM_RESIZE_STEP with FIRST on a drag's first take and DONE on release. */
+#define EM_RESIZE_STEP  1
+#define EM_RESIZE_FIRST 2
+#define EM_RESIZE_DONE  4
 void em_window_set_resizable(int on);
 void em_window_set_glass(int on);   /* Window() renders a translucent tint for glass */
 void em_window_set_clear(int on);   /* the window shows through: a clear Window background stays clear */
-int  em_window_take_resize(int *dw, int *dh);   /* 1 if a resize is pending */
+int  em_window_take_resize(int *dw, int *dh);   /* EM_RESIZE_*, or 0 */
 
 /* --- new components ----------------------------------------------------- */
 /* Dropdown / Picker: a field showing labels[*sel]; tap to open a menu, tap an

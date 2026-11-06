@@ -204,8 +204,9 @@ be turned around mid-way from where it is, at the speed it has.
   a window's size at once (filling, a half of the screen, a layout, going
   back) flies: what the window looked like stays where it was until the app
   has drawn at its new size, then it flies to the new frame on a spring,
-  drawn from the new pixels. The corner grip, a step at a time, is drawn as
-  it comes. Dragged against an edge, a window that will tile shows where
+  drawn from the new pixels. The corner grip resizes as it is dragged: the
+  window is the size the hand says, drawn at it, frame by frame, and never
+  flies (`tools/resize_smoke.py`). Dragged against an edge, a window that will tile shows where
   before it is let go: a wash of the accent grows out of it on a spring
   toward the half (or, at the top, all) of the work area it will take, under
   the window, and the target's outline is drawn over it, since a big window

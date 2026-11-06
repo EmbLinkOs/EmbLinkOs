@@ -1817,12 +1817,16 @@ static int64_t sys_proc_alive(const struct sysargs *a) {
     return (int64_t)process_alive(pid);
 }
 
-/* win_resize(id, w, h, &out_va) -> id, with the window's NEW shared-pixel
- * mapping base written to *out_va (the old mapping is gone on return). */
+/* win_resize(id, w, h, &out_va) -> id, with the window's shared-pixel
+ * mapping base written to *out_va (a new one if the pages were replaced; the
+ * old mapping is gone on return). EMBK_WIN_RESIZE_LIVE in w: a grip step. */
+#define EMBK_WIN_RESIZE_LIVE (1u << 31)          /* user/lib/embk.h's */
 static int64_t sys_win_resize(const struct sysargs *a) {
     uint64_t cva = 0;
+    uint32_t w = (uint32_t)a->arg[1];
+    int live = (w & EMBK_WIN_RESIZE_LIVE) != 0;
     int64_t rc = compositor_win_resize(current_process, (uint32_t)a->arg[0],
-                                       (uint32_t)a->arg[1], (uint32_t)a->arg[2], &cva);
+                                       w & ~EMBK_WIN_RESIZE_LIVE, (uint32_t)a->arg[2], live, &cva);
     if (rc < 0) return rc;
     if (a->arg[3] && copy_to_user((void *)a->arg[3], &cva, sizeof(cva)) != EMBK_OK)
         return -EMBK_EFAULT;

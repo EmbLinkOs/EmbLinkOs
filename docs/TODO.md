@@ -191,8 +191,19 @@ the default target). Measured before and after every step
         has drawn at its new size, then flies to the new frame (a `zoom` ghost;
         `tools/motion_smoke.py` on x86, arm64 and virgl; gallery 221). Every window in the air
         now keeps its rounded corners and shadow, on both paths.
-  - [ ] Live resize by the corner grip: each step is still drawn as the app delivers it; the
-        compositor could scale the last frame until the app catches up.
+  - [x] Live resize by the corner grip: the window takes the size the drag says each frame it
+        changes, drawn at it, both ways (it used to change only when let go). The compositor
+        resizes within a window's pages in place (same pages, same VA) and grows them half again
+        when they run out, so a drag re-allocates a handful of times instead of every step
+        leaking its page tables and VA; new edges repeat the window's own last column and row
+        until the app draws, not black. A grip step (`embk_win_resize_live`) is never a zoom and
+        is not logged; the app says its size once, on release (`tools/resize_smoke.py`: x86 and
+        arm64; gallery 227).
+  - [ ] Resizing is from the bottom-right grip only: no edges, no other corners, no Option-drag
+        from the centre. The window edge moves at the app's frame rate: an app slow to draw
+        trails the pointer (the compositor could stretch the last frame meanwhile).
+  - [ ] VA given up by a replaced backing is still never reused (bump allocation), now only on
+        growth past the pages a window has.
   - [ ] Ghost shadows cost a band per frame on the CPU path; under TCG that slowed the park
         flight enough that the interrupt test needed `perf slowmo`. Not measured on hardware.
 - [ ] P6 Overview, touchpad gestures, tiling previews.

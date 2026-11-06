@@ -84,10 +84,11 @@ int64_t compositor_win_create_translucent(struct process *client, uint32_t cw, u
                                           int32_t x, int32_t y, const char *title,
                                           uint64_t *out_client_va);
 
-/* Resize a shared window's content: fresh page backing, new client VA out.
- * The caller must switch to the new pointer immediately. */
+/* Resize a shared window's content: in place when it fits its pages, else a
+ * fresh backing at a new client VA (out). The caller must switch to the
+ * pointer given back immediately. `live`: a step of a grip drag -- no zoom. */
 int64_t compositor_win_resize(struct process *client, uint32_t id,
-                              uint32_t nw, uint32_t nh, uint64_t *out_client_va);
+                              uint32_t nw, uint32_t nh, int live, uint64_t *out_client_va);
 
 /* Non-zero if (pid,id) is a shared (zero-copy) window -- present skips the copy. */
 int compositor_win_is_shared(int pid, uint32_t id);

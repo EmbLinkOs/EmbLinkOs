@@ -1310,13 +1310,15 @@ void em_window_move_to(int32_t x, int32_t y) {
 }
 void em_window_pos(int32_t *x, int32_t *y) { if (x) *x = g_win_x; if (y) *y = g_win_y; }
 
-/* resizable-window plumbing (V5): the grip accumulates a drag delta and, on
- * RELEASE, parks it here for the runtime to apply (live re-backing every frame
- * would thrash the page allocator; commit-on-release keeps it one realloc). */
+/* resizable-window plumbing (V5): the grip's drag, measured from where it was
+ * grabbed, is parked here for the runtime every time it changes and once more
+ * on release -- the window resizes as it is dragged (the compositor resizes in
+ * place while the size fits the window's pages, so a step a frame is cheap). */
 static int g_win_resizable;
 static int g_win_glass;
-static int g_rz_active, g_rz_pend;
+static int g_rz_active, g_rz_pend, g_rz_first, g_rz_done;
 static float g_rz_grab_x, g_rz_grab_y, g_rz_dx, g_rz_dy;
+static int g_rz_taken_x, g_rz_taken_y;          /* the delta the runtime last took */
 void em_window_set_resizable(int on) { g_win_resizable = on; }
 void em_window_set_glass(int on) { g_win_glass = on; }
 /* A window that shows through (em_window_material): a Window background it
@@ -1327,10 +1329,12 @@ static int g_win_clear;
 void em_window_set_clear(int on) { g_win_clear = on; }
 int em_window_take_resize(int *dw, int *dh) {
     if (!g_rz_pend) return 0;
-    g_rz_pend = 0;
-    if (dw) *dw = (int)g_rz_dx;
-    if (dh) *dh = (int)g_rz_dy;
-    return 1;
+    int how = EM_RESIZE_STEP | (g_rz_first ? EM_RESIZE_FIRST : 0) | (g_rz_done ? EM_RESIZE_DONE : 0);
+    g_rz_pend = g_rz_first = g_rz_done = 0;
+    g_rz_taken_x = (int)g_rz_dx; g_rz_taken_y = (int)g_rz_dy;
+    if (dw) *dw = g_rz_taken_x;
+    if (dh) *dh = g_rz_taken_y;
+    return how;
 }
 
 /* ---- drag-to-dismiss close (EmbLink's own close gesture) ----------------- *
@@ -1449,14 +1453,20 @@ void em_window_end_(void) {
               ui_text("%s", g); }
             ui_end_stack();
             if (active) {
+                /* the pointer is content-local, and the window grows from its
+                 * top-left corner: the grab point stays put as it resizes */
                 float px, py; ui_pointer_pos(&px, &py);
-                if (!g_rz_active) { g_rz_active = 1; g_rz_grab_x = px; g_rz_grab_y = py; g_rz_dx = 0; g_rz_dy = 0; }
-                else { g_rz_dx = px - g_rz_grab_x; g_rz_dy = py - g_rz_grab_y; }
+                if (!g_rz_active) {
+                    g_rz_active = 1; g_rz_grab_x = px; g_rz_grab_y = py; g_rz_dx = 0; g_rz_dy = 0;
+                    g_rz_taken_x = g_rz_taken_y = 0; g_rz_first = 1;
+                } else {
+                    g_rz_dx = px - g_rz_grab_x; g_rz_dy = py - g_rz_grab_y;
+                    if ((int)g_rz_dx != g_rz_taken_x || (int)g_rz_dy != g_rz_taken_y) g_rz_pend = 1;
+                }
                 em_request_frame();               /* keep tracking while held */
             } else if (g_rz_active) {
                 g_rz_active = 0;
-                if (g_rz_dx > 4.0f || g_rz_dx < -4.0f || g_rz_dy > 4.0f || g_rz_dy < -4.0f)
-                    g_rz_pend = 1;                /* commit on release */
+                g_rz_pend = g_rz_done = 1;        /* let go: the size it was left at */
             }
         }
         ui_end_stack();

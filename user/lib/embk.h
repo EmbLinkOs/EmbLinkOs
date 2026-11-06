@@ -1137,14 +1137,21 @@ static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, in
                                              * against an edge it will take half the
                                              * screen, and the compositor shows where */
 
-/* Resize a shared window's content to w x h. The window's pixel pages are
- * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is
- * dead the moment this returns. Returns the window id, or -EMBK_*. */
+/* Resize a shared window's content to w x h. *out_pixels receives the
+ * window's mapping base -- the same one when the size fits the pages it has,
+ * else NEW ones, and then the old pointer is dead the moment this returns:
+ * always switch to what comes back. Returns the window id, or -EMBK_*. */
 static inline int embk_win_resize(int id, uint32_t w, uint32_t h, void **out_pixels) {
     uint64_t va = 0;
     int rc = (int)embk_syscall4(EMBK_SYS_win_resize, id, w, h, (int64_t)(intptr_t)&va);
     if (rc >= 0 && out_pixels) *out_pixels = (void *)(intptr_t)va;
     return rc;
+}
+/* In w: this resize is a step of a live one (a corner grip being dragged):
+ * never a zoom however far it went since the last, and not logged. */
+#define EMBK_WIN_RESIZE_LIVE (1u << 31)
+static inline int embk_win_resize_live(int id, uint32_t w, uint32_t h, void **out_pixels) {
+    return embk_win_resize(id, w | EMBK_WIN_RESIZE_LIVE, h, out_pixels);
 }
 
 /* Zero-copy window with style flags. Same as embk_win_create_shared plus

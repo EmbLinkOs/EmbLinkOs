@@ -1366,8 +1366,8 @@ static void gesture_frame_locked(void) {
  * has, what the window looked like is held where it was (a copy: the old
  * pixels go with the old backing); then it flies to the new frame on a
  * spring, drawn from the new pixels. The window takes clicks and keys at
- * its new place throughout. A small change -- the corner grip, a step at a
- * time -- is drawn as it comes. */
+ * its new place throughout. A small change is drawn as it comes, and so is
+ * every step of the corner grip, however far (a live resize). */
 #define ZOOM_MIN_CHANGE 8          /* an eighth of either side, */
 #define ZOOM_MIN_PX     96         /* or this much of it */
 #define ZOOM_WAIT_MS    1000       /* an app that never redraws is not waited for */
@@ -3067,13 +3067,52 @@ int64_t compositor_win_create_chromeless(struct process *client, uint32_t cw, ui
     return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 0, 0, out_client_va);
 }
 
-/* Resize a SHARED window's content to (nw,nh): allocate a fresh page backing,
- * map it into the client at a new VA (returned via out_client_va), swap it in,
- * and repaint the union of the old+new footprints. The OLD backing is unmapped
- * and freed after the swap; the client must stop using its old pointer as soon
- * as this returns (the EmApp runtime does the swap synchronously). */
+/* What the window showed, ow x oh, laid out again as nw x nh: the rows kept,
+ * and what is new repeating the last column and row -- the window's own edge,
+ * not black, until the app has drawn at its size. `dst` may be `src` (a
+ * resize within the pages it has): rows move toward the end when the window
+ * widens, so walk them backwards then. */
+static void content_relayout(uint32_t *dst, const uint32_t *src, uint32_t ow, uint32_t oh,
+                             uint32_t nw, uint32_t nh) {
+    uint32_t cw = nw < ow ? nw : ow, rows = nh < oh ? nh : oh;
+    if (dst == src && nw > ow)
+        for (uint32_t r = rows; r-- > 0;) memmove(dst + (uint64_t)r * nw, src + (uint64_t)r * ow, (size_t)cw * 4);
+    else
+        for (uint32_t r = 0; r < rows; r++) memmove(dst + (uint64_t)r * nw, src + (uint64_t)r * ow, (size_t)cw * 4);
+    for (uint32_t r = 0; r < rows && cw < nw; r++) {
+        uint32_t *row = dst + (uint64_t)r * nw, edge = row[cw - 1];
+        for (uint32_t x = cw; x < nw; x++) row[x] = edge;
+    }
+    for (uint32_t r = rows; r < nh; r++) memcpy(dst + (uint64_t)r * nw, dst + (uint64_t)(rows - 1) * nw, (size_t)nw * 4);
+}
+/* The window's content is now nw x nh. Caller holds g_comp_lock. */
+static void win_take_size(struct comp_window *w, uint32_t nw, uint32_t nh) {
+    w->cw = nw; w->ch = nh;
+    /* full screen means covering the output it is on, not the whole desktop */
+    const fb_info_t *fi = fb_get_info();
+    if (fi) outputs_whole(fi);
+    int32_t cx = w->x + (int32_t)nw / 2, cy = w->y + (int32_t)nh / 2;
+    layout_clamp_point(g_outs, g_nouts, &cx, &cy);
+    int oi = layout_rect_at(g_outs, g_nouts, cx, cy);
+    const struct layout_rect *o = &g_outs[oi < 0 ? 0 : oi];
+    w->fullscreen = (nw >= o->w && nh >= o->h);
+}
+
+/* Resize a SHARED window's content to (nw,nh). Within the pages it has, in
+ * place: same pages, same client VA. Beyond them, a fresh backing with room
+ * to spare (half as much again, up to the screen) is mapped at a new VA
+ * (returned via out_client_va) and swapped in, and the OLD one unmapped and
+ * freed after; the client must stop using its old pointer as soon as this
+ * returns (the EmApp runtime does the swap synchronously). Either way the
+ * union of the old and new footprints is repainted.
+ *
+ * A LIVE resize -- the corner grip, a step a frame -- is never a zoom (a
+ * fast drag can move a long way between two frames) and is not logged. Its
+ * steps mostly fit: a window dragged smaller always does, one dragged larger
+ * re-allocates a handful of times, where every step used to cost a backing,
+ * page tables that were never given back and VA that never is. */
 int64_t compositor_win_resize(struct process *client, uint32_t id,
-                              uint32_t nw, uint32_t nh, uint64_t *out_client_va) {
+                              uint32_t nw, uint32_t nh, int live, uint64_t *out_client_va) {
     const fb_info_t *fi = fb_get_info();
     if (!fi || !client) return -EMBK_EINVAL;
     /* Translucent system bars are legitimately shorter than app content.
@@ -3083,12 +3122,43 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     struct comp_window *owner=win_find((int)client->pid,id);
     if (!owner || !owner->shared) {comp_unlock();return -EMBK_ENOENT;}
     uint32_t min_h=owner->translucent ? 24u : 90u;
+    uint64_t have = (uint64_t)owner->npages * PAGE_SIZE;
     comp_unlock();
     if (nw < 120 || nh < min_h || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
 
-    /* new backing first (outside the lock: pmm/vmm work) */
     uint64_t bytes = (uint64_t)nw * nh * 4;
-    uint32_t npages = (uint32_t)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (bytes <= have) {                          /* within its pages: in place */
+        int ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1;
+        spin_lock(&g_comp_lock);
+        struct comp_window *w = win_find((int)client->pid, id);
+        if (!w || !w->shared || (uint64_t)w->npages * PAGE_SIZE < bytes) { comp_unlock(); return -EMBK_EINVAL; }
+        win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
+        int zfrom[4], zw = (int)w->cw, zh = (int)w->ch;
+        uint32_t *zold = 0;
+        if (!live && zoom_eligible(w, nw, nh) && (zold = (uint32_t *)kmalloc((size_t)zw * zh * 4)) != 0) {
+            memcpy(zold, w->content, (size_t)zw * zh * 4);
+            win_frame_rect(w, &zfrom[0], &zfrom[1], &zfrom[2], &zfrom[3]);
+            zfrom[2] -= zfrom[0]; zfrom[3] -= zfrom[1];
+        }
+        content_relayout(w->content, w->content, w->cw, w->ch, nw, nh);
+        win_take_size(w, nw, nh);
+        gpu_image_doom(&w->gimg);                 /* its size changed */
+        if (zold) zoom_hold(w, zfrom, zold, zw, zh);
+        win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
+        g_src = EMBK_COMP_SRC_MOVE;
+        paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
+        if (out_client_va) *out_client_va = w->client_va;
+        comp_unlock();
+        if (!live) kprintf("compositor: win %u resized to %ux%u for pid %d\n",
+                           (unsigned)id, (unsigned)nw, (unsigned)nh, (int)client->pid);
+        return (int64_t)id;
+    }
+
+    /* new backing first (outside the lock: pmm/vmm work), with room to grow */
+    uint64_t room = bytes + bytes / 2, screen = (uint64_t)fi->width * fi->height * 4;
+    if (room > screen) room = screen;
+    if (room < bytes) room = bytes;
+    uint32_t npages = (uint32_t)((room + PAGE_SIZE - 1) / PAGE_SIZE);
     uint64_t *phys = (uint64_t *)kmalloc((size_t)npages * sizeof(uint64_t));
     if (!phys) return -EMBK_ENOMEM;
     uint32_t got = 0;
@@ -3115,7 +3185,6 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
         kfree(phys); return -EMBK_ENOMEM;
     }
     client->shared_next_va = cva + (uint64_t)npages * PAGE_SIZE;
-    for (size_t i = 0; i < (size_t)nw * nh; i++) ((uint32_t *)kview)[i] = 0xFF000000u;
 
     /* swap under the lock; remember the old backing to free after */
     uint64_t *ophys = 0; uint32_t onpages = 0; uint64_t okview = 0, ocva = 0, opml4 = 0;
@@ -3133,24 +3202,14 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     /* a big change is a motion (zoom_hold): keep what it looked like */
     int zfrom[4], zw = (int)w->cw, zh = (int)w->ch;
     uint32_t *zold = 0;
-    if (zoom_eligible(w, nw, nh) && (zold = (uint32_t *)kmalloc((size_t)zw * zh * 4)) != 0) {
+    if (!live && zoom_eligible(w, nw, nh) && (zold = (uint32_t *)kmalloc((size_t)zw * zh * 4)) != 0) {
         memcpy(zold, w->content, (size_t)zw * zh * 4);
         win_frame_rect(w, &zfrom[0], &zfrom[1], &zfrom[2], &zfrom[3]);
         zfrom[2] -= zfrom[0]; zfrom[3] -= zfrom[1];
     }
     ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
-    uint32_t copyw=nw<w->cw?nw:w->cw,copyh=nh<w->ch?nh:w->ch;
-    for(uint32_t row=0;row<copyh;row++)
-        memcpy((uint32_t *)kview+(uint64_t)row*nw,w->content+(uint64_t)row*w->cw,(size_t)copyw*4);
-    w->cw = nw; w->ch = nh;
-    {   /* full screen means covering the output it is on, not the whole desktop */
-        outputs_whole(fi);
-        int32_t cx = w->x + (int32_t)nw / 2, cy = w->y + (int32_t)nh / 2;
-        layout_clamp_point(g_outs, g_nouts, &cx, &cy);
-        int oi = layout_rect_at(g_outs, g_nouts, cx, cy);
-        const struct layout_rect *o = &g_outs[oi < 0 ? 0 : oi];
-        w->fullscreen = (nw >= o->w && nh >= o->h);
-    }
+    content_relayout((uint32_t *)kview, w->content, w->cw, w->ch, nw, nh);
+    win_take_size(w, nw, nh);
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
@@ -3169,8 +3228,8 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
         kfree(ophys);
     }
     if (out_client_va) *out_client_va = cva;
-    kprintf("compositor: win %u resized to %ux%u for pid %d\n",
-            (unsigned)id, (unsigned)nw, (unsigned)nh, (int)client->pid);
+    if (!live) kprintf("compositor: win %u resized to %ux%u for pid %d\n",
+                       (unsigned)id, (unsigned)nw, (unsigned)nh, (int)client->pid);
     return (int64_t)id;
 }
 
