@@ -984,6 +984,10 @@ int  em_overlay_active(void);
  * subtrees for the window -- menus, tooltips -- painted once (ui_set_promoted). */
 void em_set_layers(int on);
 int  em_layers_on(void);
+/* For a program running its own loop: the layer host for its window (hand it
+ * to scene_render_set_layer_host, then em_set_layers(1)), or NULL. */
+struct scene_layer_host;
+const struct scene_layer_host *em_layers_attach(int win, int shows_through);
 void em_dialog_(EmProps p);
 void em_dialog_end_(void);
 #define NavigationStack(root) em_nav(root)

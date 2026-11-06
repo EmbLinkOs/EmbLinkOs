@@ -192,7 +192,17 @@ the default target). Measured before and after every step
         to land should be a wait for the condition, not a fixed pause.
   - [ ] The close pull moved by the compositor (`embk_win_props`, syscall 169 in the plan) is not
         done: nothing uses `em_close_grip` yet, so there is no motion to move.
-  - [ ] M6: the library's glass as a layer over a kept blur.
+  - [x] M6: the library and its dimming are layers of the desktop (`em_layers_attach`; a
+        window's layers stack in the order they were made); `tools/layer_library_smoke.py`,
+        gallery 233. Full repaints 23 -> 4, paint 5.12 -> 1.01 ms a frame.
+  - [ ] The library's tiles no longer stagger in on layers (one layer for the sheet). A stagger
+        would want a layer a row, or a compositor-side offset per sub-rectangle of a layer.
+  - [ ] Four full repaints of the desktop remain in a library's open and close on layers; not
+        traced yet.
+  - [ ] The dimming is a screen-sized layer of one colour: a fill layer (a colour, no pixels)
+        would cost the compositor a fill, not a 4 MB picture blended over the screen.
+  - [ ] A blinking caret in a promoted subtree (the library's search field) repaints the whole
+        layer each blink.
   - [ ] Nothing uses `em_toast` or the close grip (`em_close_grip`) yet: both are toolkit
         features without an application, so their motion is untested in the guest.
 - [ ] P4 Type and tokens.

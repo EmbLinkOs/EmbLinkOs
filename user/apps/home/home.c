@@ -453,7 +453,9 @@ static void apps_apply_open(int open);
  * open again while it leaves turns it round where it is. Reduced motion
  * closes at once, as it did. */
 static void apps_set_open(int open) {
-    if (!open && g_apps_open && !ui_theme()->reduced_motion) {
+    /* on layers it is gone from the tree at once and the compositor plays its
+     * leaving (apps_grid) */
+    if (!open && g_apps_open && !ui_theme()->reduced_motion && !em_layers_on()) {
         if (!g_apps_closing) {
             g_apps_closing = 1; em_request_frame();
             embk_win_desktop_front(0);        /* the layer back down now (above) */
@@ -489,9 +491,14 @@ static void apps_apply_open(int open) {
      * mutation, and not one pixel of it was painted. The layer came to the
      * front (hiding the menu bar, which is how it looked like a crash) over a
      * desktop that had simply not drawn its launcher. */
-    em_structure_changed();
-    g_invalidate = 2; /* Home owns its loop; it must consume structural invalidation. */
-    g_full_present = 3;
+    /* (On layers the library is not in the desktop's window at all -- it is
+     * the compositor's -- so the window has nothing to repaint for it.) */
+    if (em_layers_on()) em_request_frame();
+    else {
+        em_structure_changed();
+        g_invalidate = 2; /* Home owns its loop; it must consume structural invalidation. */
+        g_full_present = 3;
+    }
     g_dock_dirty = 1;
     /* Say so on the serial console. The launcher is reachable only from the
      * menu bar once an app covers the screen, and a synthesized click cannot
@@ -1178,19 +1185,38 @@ static void apps_grid(void) {
     char sheet[24];snprintf(sheet,sizeof sheet,"apps%u",g_apps_gen);
     /* how far in it is: 0 gone, 1 settled (a touch under critical going in) */
     char sid[24];snprintf(sid,sizeof sid,"apps-in%u",g_apps_gen);
-    float k=g_apps_closing?em_spring(sid,0.f,0.f,200,1000):em_spring(sid,0.f,1.f,320,900);
+    /* ON LAYERS the compositor plays all of it -- the dimming in, the sheet
+     * rising and growing in over it, both out again -- and the library is
+     * built here at rest, as one piece (its tiles do not stagger: each would
+     * be a layer of its own). */
+    int lay=em_layers_on();
+    float k=lay?1.f:g_apps_closing?em_spring(sid,0.f,0.f,200,1000):em_spring(sid,0.f,1.f,320,900);
     if(g_apps_closing && k<=0.02f){g_apps_closing=0;apps_apply_open(0);return;}
     float kk=k<0?0:k>1?1:k;
+    uint16_t in_ms=ui_theme()->motion_ms>0?320:0,out_ms=ui_theme()->motion_ms>0?200:0;
     Overlay() {
-        { Color sc = ui_theme()->scrim; sc.a *= kk;
+        { Color sc = ui_theme()->scrim; sc.a *= lay ? 0.f : kk;
           ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=sc}); }   /* the dimming comes and goes with it */
         ui_set_hit_passthrough(g_apps_closing);   /* leaving: clicks reach what is behind */
+        if (lay) {                                /* the dimming, a layer under the sheet's */
+            ui_box_begin(0xD1A5C12Bull);
+            ui_set_overlay(true);
+            ui_set_hit_passthrough(true);
+            ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_sw },
+                        (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_sh });
+            ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=ui_theme()->scrim});
+            struct scene_layer_motion in={0,1000,500,500,0,0,in_ms,1000},out={0,1000,500,500,0,0,out_ms,1000};
+            ui_set_promoted(true,&in,&out);
+            ui_box_end();
+        }
         at_begin(0xA995EE7ull, g_px, g_py);
         VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {
             Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
                 ui_set_opacity(kk);                       /* the glass fades as glass (scene_render: backdrop) */
                 ui_set_scale(0.94f+0.06f*kk,0.5f,0.5f);   /* and zooms in from a little smaller */
                 ui_set_offset(0,(1.f-k)*12.f);
+                { struct scene_layer_motion in={0,940,500,500,0,12,in_ms,900},out={0,960,500,500,0,8,out_ms,1000};
+                  ui_set_promoted(lay!=0,&in,&out); }
                 HStack(.spacing=12,.align=Center) {
                     Icon(IconGrid).color(T.accent);
                     Text("Applications").title();Spacer();
@@ -2010,6 +2036,10 @@ int main(int argc, char **argv, char **envp) {
 
     struct render_target rt = { (uint32_t *)pixels, sw, sh, sw * 4, EMBK_PIXFMT_BGRA8888_PRE };
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    /* THE DESKTOP'S LAYERS: its menus, tooltips and the library come and go
+     * on the compositor's springs, painted once (em_layers_attach) */
+    { const struct scene_layer_host *lh = em_layers_attach(win, 0);
+      if (lh) { scene_render_set_layer_host(&r, lh); em_set_layers(1); } }
 
     em_set_clock(embk_uptime_ms);
     ui_kit_motion(em_request_frame, embk_uptime_ms);   /* the launcher's scroll glides */
@@ -2052,7 +2082,7 @@ int main(int argc, char **argv, char **envp) {
                     restore_presented=0;pixels=next;sw=nw;sh=nh;g_sw=nw;g_sh=nh;em_set_viewport(nw,nh);
                     outputs_poll();
                     rt=(struct render_target){(uint32_t *)pixels,nw,nh,nw*4,EMBK_PIXFMT_BGRA8888_PRE};
-                    scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());
+                    scene_render_invalidate(&r);   /* everything painted again; its layers kept */
                     for(int i=0;i<g_desk_n;i++)desk_clamp(&g_desk[i]);
                     g_invalidate=2;g_full_present=2;em_structure_changed();
                 }

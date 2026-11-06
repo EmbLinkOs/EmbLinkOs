@@ -497,6 +497,13 @@ static int layers_probe(int win, int shows_through) {
     return 1;
 }
 
+/* The same for a program with its own loop (the desktop): the layer host for
+ * `win`, or NULL when the window cannot have layers. One window a process. */
+const struct scene_layer_host *em_layers_attach(int win, int shows_through) {
+    g_lh_win = win;
+    return layers_probe(win, shows_through) ? &g_layer_host : 0;
+}
+
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;

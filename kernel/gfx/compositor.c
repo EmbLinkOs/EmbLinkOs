@@ -576,10 +576,27 @@ struct comp_layer {
     int       last[4], have_last;         /* the rect it stained last frame */
     uint32_t  gimg;                       /* its GPU image */
     struct embk_layer_op pend[4]; int npend;   /* held for the next present */
+    uint32_t  seq;                        /* when it was made: a window's layers stack in this order */
 };
+static uint32_t g_layer_seq;
+
 static struct comp_layer g_layers[LAYERS_MAX];
 static uint32_t g_layer_next_id = 1;
 static int g_layers_moving;               /* layers whose springs are still going */
+
+/* this window's live layers, oldest first -- the order they stack in (slots
+ * are reused, so their order in g_layers says nothing) */
+static int layers_of(uint32_t win_id, int *idx) {
+    int n = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || L->win_id != win_id) continue;
+        int j = n++;
+        while (j > 0 && g_layers[idx[j - 1]].seq > L->seq) { idx[j] = idx[j - 1]; j--; }
+        idx[j] = i;
+    }
+    return n;
+}
 
 /* Where a layer stands on screen now, for window `w` (its content origin as
  * w->x, w->y say -- a slide's offset included while one is drawn), and how
@@ -2245,9 +2262,10 @@ static int layers_shown(const struct comp_window *w) {
 
 static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
     if (!layers_shown(w)) return;
-    for (int i = 0; i < LAYERS_MAX; i++) {
-        const struct comp_layer *L = &g_layers[i];
-        if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px) continue;
+    int idx[LAYERS_MAX], n = layers_of(w->id, idx);
+    for (int k = 0; k < n; k++) {
+        const struct comp_layer *L = &g_layers[idx[k]];
+        if (!L->presented || !L->px) continue;
         int r[4], a; layer_geom(L, w, r, &a);
         if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
         int x0, y0, x1, y1; layer_extent(L, w, &x0, &y0, &x1, &y1);
@@ -2263,9 +2281,10 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
 
 static int layers_draw_gpu(const struct comp_window *w, const struct gpu_compose *gc) {
     if (!layers_shown(w)) return 0;
-    for (int i = 0; i < LAYERS_MAX; i++) {
-        struct comp_layer *L = &g_layers[i];
-        if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px) continue;
+    int idx[LAYERS_MAX], n = layers_of(w->id, idx);
+    for (int k = 0; k < n; k++) {
+        struct comp_layer *L = &g_layers[idx[k]];
+        if (!L->presented || !L->px) continue;
         int r[4], a; layer_geom(L, w, r, &a);
         if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
         if (!L->gimg && gc->image_create(L->px, L->w, L->h, L->w * 4, &L->gimg)) { L->gimg = 0; return -1; }
@@ -2335,7 +2354,7 @@ int64_t compositor_layer_create(struct process *client, uint32_t win, uint32_t w
             (!fit || L->npages < fit->npages)) fit = L;
     }
     if (fit) {
-        fit->parked = 0; fit->id = g_layer_next_id++; fit->w = w; fit->h = h;
+        fit->parked = 0; fit->id = g_layer_next_id++; fit->w = w; fit->h = h; fit->seq = ++g_layer_seq;
         spring_init(&fit->x, 0, now); spring_init(&fit->y, 0, now);
         spring_init(&fit->scale, SPRING_PX(1000), now); spring_init(&fit->opacity, SPRING_PX(255), now);
         fit->ax = fit->ay = 500; fit->radius = fit->material = fit->flags = 0;
@@ -2383,7 +2402,7 @@ int64_t compositor_layer_create(struct process *client, uint32_t win, uint32_t w
         return L ? -EMBK_EINVAL : -EMBK_ENOSPC;
     }
     memset(L, 0, sizeof *L);
-    L->used = 1; L->id = g_layer_next_id++; L->win_id = win; L->pid = pid; L->w = w; L->h = h;
+    L->used = 1; L->id = g_layer_next_id++; L->win_id = win; L->pid = pid; L->w = w; L->h = h; L->seq = ++g_layer_seq;
     L->phys = phys; L->npages = npages; L->kview = kview; L->client_va = cva; L->client_pml4 = client->pml4_phys;
     L->px = (uint32_t *)(uintptr_t)kview;
     spring_init(&L->x, 0, now); spring_init(&L->y, 0, now);

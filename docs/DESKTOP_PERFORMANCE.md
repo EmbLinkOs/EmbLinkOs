@@ -625,3 +625,34 @@ it, which needs a layer material in the compositor (M3's open item).
 Files' context menu on arm64 under HVF, opened and dismissed in an open
 window: 0 full repaints (M0: 19) and 0.79 M pixels presented (M0: 11.6 M), the
 rest being the hover the pointer crossing its rows draws.
+
+### M6: the library on layers
+
+The desktop (`home.c`, which runs its own loop) takes the same layer host as
+every EmUI app (`em_layers_attach`), so its menus and tooltips are layers too,
+and the library is two: the dimming, a screen-sized layer that fades, and the
+glass sheet over it, which rises from 0.94 of its size and 12 px low as it
+fades in. Both are painted once and leave on the compositor's springs; the
+library is built at rest, as one piece -- its tiles no longer stagger in (each
+would be a layer of its own) -- and closes in the toolkit at once. The
+compositor stacks a window's layers in the order they were made, whatever
+slot they took. On layers opening the library is no longer a structural repaint
+of the desktop's window either.
+
+`tools/layer_library_smoke.py`: both layers there and at rest, the sheet
+caught arriving, a name typed and Return still launches the application, Esc
+and both leave. arm64 under HVF:
+
+| The library, in and out | M0 | M6 |
+|---|---|---|
+| Desktop frames | 58 | 39 |
+| Full repaints | 23 | 4 |
+| Paint, average | 5.12 ms | 1.01 ms |
+| Pixels presented | 23.6 M | 4.1 M |
+
+What remains: the library's first frame paints the sheet's glass and the
+screen-sized dimming into their layers (its worst frame, 13.7 ms), and the
+search field's blinking caret repaints the whole sheet layer each blink. The
+compositor now composites a screen-sized translucent layer each frame of the
+fade -- on the GPU nothing, on the CPU about a millisecond a megapixel on an
+M5 core.
