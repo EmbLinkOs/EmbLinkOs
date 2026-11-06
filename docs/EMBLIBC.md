@@ -30,6 +30,13 @@ newlib stays the default. Nothing changes unless a build asks for it.
     make clean
     make LIBC=emblibc                # the whole userland on them
 
+`EMBCC_ROOT` must be an EmbCC tree that has the whole library: main from
+`7e4bb5b0` on (PRs #166-#168 brought POSIX, threads and TLS). A tree on a
+branch from before them has no `<fcntl.h>` and no `libcxx-emblinkos` target,
+and the build stops at the first program that includes it. `make clean` also
+removes binaries staged into `build/` from elsewhere (`STAGED_APPS`, such as
+`embcc.elf` and `embld.elf`); build without naming them, or stage them again.
+
 `make emblibc` runs EmbCC's own `make libc-emblinkos libcxx-emblinkos`
 against this tree's `user/lib` headers. It leaves, in the EmbCC tree,
 `build/libc/emblinkos/` with `libc.a`, an empty `libm.a` (the math is in
@@ -117,6 +124,21 @@ this library; the rest are freestanding). On QEMU, through
 | On-OS toolchain | `test tcc`, `test tcc compile`, `test embbuild`, `test embbuild self` (fresh boot: it wants a clean build) |
 | C++ | `test cxx`, `test cxxlib` |
 | Threads | `test pthreads`: EmbCC's `tests/exec/posix-threads.c` (POSIX and C11 threads, mutexes, condition variables, read-write locks, barriers, semaphores, keys), the program glibc and the library both pass on Linux |
+
+The desktop, 2026-11-06, both machines built `LIBC=emblibc` from EmbCC main
+`7e4bb5b0` (every app's ELF carries `__emblibc_tls`):
+
+| Machine | Passes |
+|---|---|
+| x86_64 under TCG | `contour`, `contour_shell`, `contour_controls`, `contour_keyboard`, `contour_modal`, `contour_windows`, `terminal`, `terminal_tabs`, `dock_motion`, `banner_motion`, `motion`, `overview`, `gesture`, `tile` and `workspace` smokes |
+| arm64 under HVF | `gesture`, `motion`, `overview`, `tile` and `dock_motion` smokes |
+
+`files_document_smoke` fails on its stale New Document click, as it does
+under newlib (TODO.md). `workspace_smoke` failed until its symbol lookup
+learnt that a static may share its name with one in the library (EmbCC's
+`exit.c` has a `g_status`, as the Editor does): it read the library's. The
+harness now takes the lowest address, the app's own objects being linked
+first.
 
 Not the library's, and the same under newlib:
 

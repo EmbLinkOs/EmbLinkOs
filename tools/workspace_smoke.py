@@ -71,7 +71,14 @@ print('RESULT '+json.dumps({'windows':rows,'mouse':[x,y]}))''')
         if app not in self.symbols:
             p=subprocess.run([os.environ.get('EMBLINK_NM','x86_64-elf-nm'),'-S','--defined-only',str(ROOT/f'build/{app}.elf')],capture_output=True,text=True,check=True)
             # nm has address, size, type, name; retain local app symbols too.
-            self.symbols[app]={line.split()[3]:int(line.split()[0],16) for line in p.stdout.splitlines() if len(line.split())==4}
+            # A static can share its name with one in the C library (EmbCC's
+            # exit.c has a g_status, as the Editor does): the app's objects
+            # link before the library's, so the lowest address is the app's.
+            table={}
+            for line in p.stdout.splitlines():
+                f=line.split()
+                if len(f)==4:table[f[3]]=min(table.get(f[3],1<<64),int(f[0],16))
+            self.symbols[app]=table
         address=self.symbols[app][symbol]+offset
         return bytes.fromhex(self.debug(f'''import gdb,json
 ps=gdb.parse_and_eval("'kernel/process/process.c'::process_table")
