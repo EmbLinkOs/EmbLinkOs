@@ -81,6 +81,27 @@ int main(void) {
             CHECK(contrast(t->on_accent,t->accent)>=4.5f);
             CHECK(contrast(t->accent,t->accent_soft)>=4.5f);
             CHECK(contrast(t->text_tertiary,t->bg)>=4.5f);
+            /* THE AUDIT: every ground text is set on, with every text tone
+             * (WCAG AA, 4.5:1 for body text), the accent and the status
+             * colours as text, selected text, and the edges a control is
+             * found by (3:1, non-text) */
+            {
+                const struct color grounds[]={t->bg,t->surface,t->surface_alt,t->sidebar,t->chrome};
+                const char *gname[]={"bg","surface","surface_alt","sidebar","chrome"};
+                const struct color tones[]={t->text,t->text_secondary,t->text_tertiary,t->accent,t->success,t->warning,t->danger};
+                const char *tname[]={"text","text_secondary","text_tertiary","accent","success","warning","danger"};
+                for(int gi=0;gi<5;gi++)for(int ti=0;ti<7;ti++){
+                    float r=contrast(tones[ti],grounds[gi]);checks++;
+                    if(r<4.5f){failures++;printf("FAIL audit: %s on %s %.2f (dark %d surface %d contrast %d accent %d)\n",
+                        tname[ti],gname[gi],r,dark,surface,high,i);}
+                }
+                CHECK(contrast(t->text,t->selection)>=4.5f);
+                CHECK(contrast(t->text,t->accent_soft)>=4.5f);
+                CHECK(contrast(t->border_strong,t->bg)>=3.f);
+                CHECK(contrast(t->border_strong,t->surface)>=3.f);
+                CHECK(contrast(t->border_strong,t->surface_alt)>=3.f);
+                CHECK(contrast(t->accent,t->bg)>=3.f);   /* a focus ring */
+            }
             CHECK(t->font_regular==11&&t->font_bold==22);
             CHECK(t->material_alpha==1&&t->blur==0&&t->motion_ms==0);
         }

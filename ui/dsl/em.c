@@ -488,8 +488,8 @@ void em_tooltip_host(void) {
     ui_set_overlay(true);ui_set_layer(3);ui_set_hit_passthrough(true);
     ui_set_size(sz_fixed(0),sz_fixed(0));ui_set_clip_children(false);
     ui_begin_vstack(1);ui_set_offset(x,y);ui_set_size(sz_fixed(width),sz_intrinsic());
-    ui_set_paint(solid(TH->surface));ui_set_border(1,TH->border_strong);ui_set_corner_radius(4);
-    ui_set_padding(5,8,5,8);ui_set_font(TH->font_regular);ui_set_text_size(TH->text_caption);ui_set_text_color(TH->text);
+    ui_set_paint(solid(TH->surface));ui_set_border(1,TH->border_strong);ui_set_corner_radius(TH->radius_sm);
+    ui_set_padding(TH->control_py,TH->sp2,TH->control_py,TH->sp2);ui_set_font(TH->font_regular);ui_set_text_size(TH->text_caption);ui_set_text_color(TH->text);
     ui_text("%s",g_tip_label);ui_end_stack();ui_end_stack();
 }
 
@@ -2463,7 +2463,7 @@ void em_dock(int *ids, int *n, void (*render)(int id), EmProps p) {
         ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
         ui_set_align(ALIGN_CENTER);
         if (dragged) {
-            ui_set_shadow(true, 0, 4, 12, t->shadow_md.color);      /* lift */
+            ui_set_shadow(true, t->shadow_lift.dx, t->shadow_lift.dy, t->shadow_lift.blur, t->shadow_lift.color);
             if (g_dock_out) ui_set_offset(0, g_dock_ptr_y - g_dock_grab_y);  /* follow out */
         }
         render(id);
@@ -2614,7 +2614,7 @@ void em_toast_host(void) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
-    ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar (a lift past it, then back) */
+    ui_set_offset(0, -t->toast_inset + (1.0f - op) * t->sp4);   /* rise above the tab bar (a lift past it, then back) */
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {
         ui_begin_hstack(1);

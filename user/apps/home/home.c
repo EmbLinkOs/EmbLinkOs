@@ -1179,7 +1179,8 @@ static void apps_grid(void) {
     if(g_apps_closing && k<=0.02f){g_apps_closing=0;apps_apply_open(0);return;}
     float kk=k<0?0:k>1?1:k;
     Overlay() {
-        ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=(Color){0,0,0,0.55f*kk}});   /* the dimming comes and goes with it */
+        { Color sc = ui_theme()->scrim; sc.a *= kk;
+          ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=sc}); }   /* the dimming comes and goes with it */
         ui_set_hit_passthrough(g_apps_closing);   /* leaving: clicks reach what is behind */
         at_begin(0xA995EE7ull, g_px, g_py);
         VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {

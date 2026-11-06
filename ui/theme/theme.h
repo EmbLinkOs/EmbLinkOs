@@ -52,6 +52,12 @@ struct ui_theme {
 
     /* --- elevation --- */
     struct ui_shadow_spec shadow_sm, shadow_md, shadow_lg;
+    struct ui_shadow_spec shadow_lift;   /* something held and dragged, above the rest */
+    struct color scrim;                  /* behind a modal: what dims the window */
+
+    /* --- placement and motion --- */
+    float toast_inset;   /* how far above the window's bottom a toast rests */
+    float scroll_step;   /* px a wheel notch moves a view, turned slowly */
 
     /* --- fonts (set by the app after loading its .ttf files) --- */
     uint32_t font_regular, font_bold;

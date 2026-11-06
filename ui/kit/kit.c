@@ -1339,7 +1339,7 @@ static unsigned g_scroll_depth;
  * Each view's motion is keyed by the caller's offset pointer, which is the
  * view's identity across frames. Whatever moves that offset from outside --
  * the thumb, a focus reveal, the app itself -- is taken as where the view is. */
-#define UI_SCROLL_STEP     40.0f   /* px a notch, turned slowly */
+#define UI_SCROLL_STEP     (ui_theme()->scroll_step)   /* px a notch, turned slowly */
 #define UI_SCROLL_VIEWS    16
 #define UI_SCROLL_IDLE_MS  120     /* the wheel still this long: an overscroll springs back */
 #define UI_SCROLL_SPRING   180u, 1000u
@@ -1542,7 +1542,7 @@ void ui_overlay_begin(uint64_t key) {
     struct instance_handle h=ui_open();
     if(g_overlay_depth<16)g_overlay_h[g_overlay_depth]=h;
     g_overlay_depth++;
-    struct color scrim = { 0.0f, 0.0f, 0.0f, 0.55f };   /* dim the content behind */
+    struct color scrim = ui_theme()->scrim;              /* dim the content behind */
     ui_focus_scope_begin(h,INSTANCE_HANDLE_NULL,0);
     ui_set_overlay(true);                 /* fill the screen, out of flow (paints on top) */
     ui_set_layer(1);                      /* elevated: paints above + hits above the flow */

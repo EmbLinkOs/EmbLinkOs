@@ -145,7 +145,24 @@ the default target). Measured before and after every step
   - [ ] `contour_modal_smoke` failed once with "scaled serif paragraph lost its wrapped height" while
         seven emulators ran at once, and passed twice alone: a read before the Serif/115% change had
         settled, most likely. Watch it.
-  - [ ] The token pass and a light/dark audit.
+  - [x] A light/dark audit: every text tone (primary, secondary, tertiary, the accent, success,
+        warning, danger) on every ground it is set on (window, card, input well, sidebar, chrome)
+        at 4.5:1, selected text on its tint at 4.5:1, and a control's edge (`border_strong`:
+        buttons, fields, a switch that is off) at 3:1 -- across light and dark, every surface,
+        every contrast level and every accent (`make contour-test`, 9333 checks). It found
+        control edges at 1.9:1 in light and dark, light captions unreadable in input wells, and,
+        on custom surfaces, tertiary text and danger red below 4.5. Each tone is now designed as
+        before and then moved toward the text colour only as far as it must (`legible` in
+        theme.c), so a tone that read is unchanged. Gallery 229.
+  - [x] Tokens for what was hard-coded: the modal scrim (`scrim`: 55% black in dark, 38% in light,
+        where 55% read as switched off), a dragged chip's shadow (`shadow_lift`), where a toast
+        rests (`toast_inset`), the wheel's step (`scroll_step`, scaling with the interface), and
+        the tooltip's radius and padding (the shared `radius_sm`, `control_py`, `sp2`).
+  - [ ] Small spacings (2, 3, 5 and 6 px) inside kit and EmUI controls are still literals off the
+        4 px grid; text over translucent materials is not part of the audit.
+  - [ ] `contour_controls_smoke` failed once at "dock auto-hide preference" with four emulators
+        running at once, and passed alone straight after (2026-11-06): the press held across a
+        desktop publication, under load. Watch it.
 - [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
   - [x] Apps have springs of their own: `em_spring(id, from, to, response, damping)` and the
         EmSnappy/EmSmooth/EmBouncy tokens (`make em-test`).
