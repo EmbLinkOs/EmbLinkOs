@@ -4497,6 +4497,26 @@
       "featured": false,
       "milestone": "Fluid desktop P6: advanced",
       "historical": false
+    },
+    {
+      "id": "229-light-audited",
+      "phase": "Fluid desktop",
+      "title": "Light, audited",
+      "caption": "Settings in the light theme after the contrast audit: every control's edge -- the preset buttons, the hex field, the segmented controls -- now at 3:1 against what it stands on (it was 1.9:1, and read as hardly there), and every text tone readable at 4.5:1 on every ground it is set on, captions in input wells included. Tones that already read were left as they were designed. arm64 under HVF, on EmbCC's C library.",
+      "alt": "The EmbLinkOS Settings window, Appearance page, in the light theme with clearly outlined controls",
+      "file": "229-light-audited.png",
+      "capture_date": "2026-11-06",
+      "environment": "QEMU aarch64 (HVF), virt, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "b44e8a6febe6ed95de08b2312d6716d47aedb17fa4c6b0ea1e8f153dc1f14bbf",
+      "source_capture": "emblink-theme-tmupubbz/light.ppm",
+      "source_sha256": "f8dda4bf5f1a552edb6deba0e01bfe817e795975ce9a1e1adb950a3f6ade73a3",
+      "source_commit": "f40ad0c",
+      "featured": false,
+      "milestone": "Fluid desktop P4: type and tokens",
+      "historical": false
     }
   ]
 }
