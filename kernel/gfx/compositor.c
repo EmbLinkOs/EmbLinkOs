@@ -4906,13 +4906,20 @@ static void pointer_frame(void) {
         }
     }
 
-    /* the right button's press edge, latched on the window under it */
-    if ((b & MOUSE_BTN_RIGHT) && !(g_prev_buttons & MOUSE_BTN_RIGHT)) {
+    /* a right press, latched on the window under it -- counted by the driver
+     * as it arrived, so one made and let go between two ticks is not lost */
+    uint32_t rtime = 0;
+    int rpress = mouse_take_right_press(&rtime);
+    if (suppressed) rpress = 0;
+    if (!rpress && (b & MOUSE_BTN_RIGHT) && !(g_prev_buttons & MOUSE_BTN_RIGHT)) {
+        rpress = 1; rtime = (uint32_t)timer_uptime_ms();   /* a device that only sets the level */
+    }
+    if (rpress) {
         struct comp_window *wp = topmost_at(x, y);
         if (wp) {
             int clx = x - wp->x, cly = y - (wp->y + win_titlebar_h(wp));
             if (clx >= 0 && clx < (int)wp->cw && cly >= 0 && cly < (int)wp->ch) {
-                wp->pr.x = (int16_t)clx; wp->pr.y = (int16_t)cly; wp->pr.t = (uint32_t)timer_uptime_ms();
+                wp->pr.x = (int16_t)clx; wp->pr.y = (int16_t)cly; wp->pr.t = rtime;
                 wp->pr_pending = 1; wp->pr_phase = 0; g_post_ui = 1;
             }
         }

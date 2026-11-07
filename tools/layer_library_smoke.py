@@ -60,8 +60,10 @@ def main():
         # at different alphas -- and then the sheet's pixels again
         rows = stagger = None
         end = time.monotonic() + 3 * slow
+        seen = []
         while time.monotonic() < end and not stagger:
             rs = [l for l in desktop_layers(d) if l['w'] < P.W - 2 and l['h'] < 200]
+            if rs: seen.append([(l['alpha'], l['y'], l['moving']) for l in rs])
             if len(rs) >= 2:
                 rows = rows or rs
                 al = sorted(l['alpha'] for l in rs)
@@ -101,8 +103,10 @@ def main():
             print(f"looks: half way in at alpha {half['alpha']} scale {half['scale']} ({slowshot})", flush=True)
         # slowed, the rows are seen a beat apart
         end = time.monotonic() + 3 * slow
+        seen = []
         while time.monotonic() < end and not stagger:
             rs = [l for l in desktop_layers(d) if l['w'] < P.W - 2 and l['h'] < 200]
+            if rs: seen.append([(l['alpha'], l['y'], l['moving']) for l in rs])
             if len(rs) >= 2 and max(l['alpha'] for l in rs) - min(l['alpha'] for l in rs) >= 40:
                 stagger = rs
                 rowshot = d.g.capture(out / 'library-rows.ppm')
@@ -110,7 +114,7 @@ def main():
                       + f' -- a layer a row, a beat apart ({rowshot})', flush=True)
             d.g.pump(0.02)
         if args.graphics != 'virgl':
-            assert stagger, 'the rows did not arrive a beat apart'
+            assert stagger, f'the rows did not arrive a beat apart (row layers seen: {seen[:6]} ... {seen[-3:]})'
         d.g.command('perf slowmo 1', b'perf: slowmo', 60)
         until(d, 'the library at rest', lambda: [l for l in desktop_layers(d) if not l['moving']], 10 * slow)
         d.key('esc')

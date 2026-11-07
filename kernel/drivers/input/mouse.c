@@ -130,6 +130,11 @@ static volatile uint8_t  g_press_head, g_press_n;
  * report, so a press lands where the pointer is and a drag survives the
  * mouse's own reports (which never saw the press). */
 static uint32_t g_reported, g_held;
+/* RIGHT PRESSES, counted as they arrive like the left ones: a context click
+ * held for less than the compositor's input tick (a slow tick, slow motion)
+ * left no trace in the level at all */
+static volatile uint32_t g_rpress_t;
+static volatile uint8_t  g_rpress_n;
 
 /* Apply a new button mask, recording the DOWN transition of the left button.
  * Both device paths go through here so neither can forget to. */
@@ -137,6 +142,10 @@ static void buttons_set(uint32_t reported) {
     g_reported = reported;
     uint32_t nb = reported | g_held;
     uint32_t ob = g_buttons;
+    if ((nb & MOUSE_BTN_RIGHT) && !(ob & MOUSE_BTN_RIGHT)) {
+        g_rpress_t = (uint32_t)timer_uptime_ms();
+        if (g_rpress_n < 255) g_rpress_n++;
+    }
     if ((nb & MOUSE_BTN_LEFT) && !(ob & MOUSE_BTN_LEFT)) {
         if (g_press_n < MOUSE_PRESS_Q) {
             uint8_t slot = (uint8_t)((g_press_head + g_press_n) % MOUSE_PRESS_Q);
@@ -162,10 +171,21 @@ int mouse_take_press(uint32_t *when_ms) {
     spin_unlock(&pointer_state_lock);return result;
 }
 
-int mouse_presses_pending(void) { return g_press_n != 0; }
+int mouse_presses_pending(void) { return g_press_n != 0 || g_rpress_n != 0; }
+
+/* a right press since the last call (how many, folded: one is all a context
+ * menu needs), and when the last one was made */
+int mouse_take_right_press(uint32_t *when_ms) {
+    spin_lock(&pointer_state_lock);
+    int n = g_rpress_n;
+    if (n && when_ms) *when_ms = g_rpress_t;
+    g_rpress_n = 0;
+    spin_unlock(&pointer_state_lock);
+    return n;
+}
 
 void mouse_discard_presses(void) {
-    spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;spin_unlock(&pointer_state_lock);
+    spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;g_rpress_n=0;spin_unlock(&pointer_state_lock);
 }
 
 static int32_t  g_w = 1024, g_h = 768;
