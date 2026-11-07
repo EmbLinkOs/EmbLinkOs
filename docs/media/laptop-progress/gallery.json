@@ -4597,6 +4597,26 @@
       "featured": false,
       "milestone": "P7 Layers: a render server",
       "historical": false
+    },
+    {
+      "id": "234-glass-the-compositor-frosts",
+      "phase": "Layers",
+      "title": "Glass the compositor frosts",
+      "caption": "The top bar's EmbLink menu, now a layer. The bar is a window that shows through, so the menu's glass has nothing of its own to frost; the compositor does it, blurring what is really on the screen under the panel -- here Files' sidebar, faintly through the tint -- inside the panel's rounded rectangle and nowhere else, while its shadow and everything round it stay sharp. Opening and closing the menu now costs the bar 0.4 M pixels where it cost 24 M. x86 under TCG, on EmbCC's C library.",
+      "alt": "The EmbLinkOS top bar's EmbLink menu open over a Files window, the sidebar labels faintly blurred through the menu panel",
+      "file": "234-glass-the-compositor-frosts.png",
+      "capture_date": "2026-11-07",
+      "environment": "QEMU x86_64 (TCG), q35, virtio-gpu 1280 × 800; CPU composition; LIBC=emblibc; driven over QMP",
+      "synthetic_acpi_fixture": false,
+      "width": 1280,
+      "height": 800,
+      "sha256": "1c9629e3552a2cba80808e12a66abc305e8d2ce57af75968897464758b687217",
+      "source_capture": "cap/topbar-menu.ppm",
+      "source_sha256": "968135dba64d227563726573c861518df3d0a7caf93830bde92023462dae5afc",
+      "source_commit": "f54fea3",
+      "featured": false,
+      "milestone": "P7 Layers: a render server",
+      "historical": false
     }
   ]
 }

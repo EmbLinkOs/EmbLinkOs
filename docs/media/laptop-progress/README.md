@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-233 actual EmbLinkOS captures document the original laptop work, its
+234 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, windows resized as they are dragged, an overview the keys can walk, both themes audited for contrast, pages that scroll by moving their pixels, layers the compositor moves while their app sleeps, menus that come and go on them, and a library that rises on them over the desktop. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, windows resized as they are dragged, an overview the keys can walk, both themes audited for contrast, pages that scroll by moving their pixels, layers the compositor moves while their app sleeps, menus that come and go on them, a library that rises on them over the desktop, and glass on them that the compositor frosts. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -173,6 +173,12 @@ Files' context menu, half way in. The toolkit painted it once -- its frosted tin
 The library half way in. The desktop painted its dimming and its glass sheet once each, into two layers of its window, and the compositor brings them in: the dimming fading over the desktop, the sheet rising and growing into place over it. The desktop paints a millisecond a frame of it where it painted five, and repaints its whole surface four times where it did twenty-three. Slowed sixteen times to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.
 
 ![The EmbLinkOS desktop with the Applications library half faded in over a partly dimmed wallpaper, its grid of app icons slightly smaller than full size](233-the-library-on-layers.png)
+
+### Glass the compositor frosts
+
+The top bar's EmbLink menu, now a layer. The bar is a window that shows through, so the menu's glass has nothing of its own to frost; the compositor does it, blurring what is really on the screen under the panel -- here Files' sidebar, faintly through the tint -- inside the panel's rounded rectangle and nowhere else, while its shadow and everything round it stay sharp. Opening and closing the menu now costs the bar 0.4 M pixels where it cost 24 M. x86 under TCG, on EmbCC's C library.
+
+![The EmbLinkOS top bar's EmbLink menu open over a Files window, the sidebar labels faintly blurred through the menu panel](234-glass-the-compositor-frosts.png)
 
 ## The prompt, Powerlevel10k-style
 
