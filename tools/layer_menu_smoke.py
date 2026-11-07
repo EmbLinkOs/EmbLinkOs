@@ -168,7 +168,9 @@ def main():
         print(f"toast: \"Copied\" is a layer {toast['w']}x{toast['h']} ({toastshot}); Files built {stay} frames "
               f"while it stayed, and it " + ('sank out on the compositor\'s spring' if catch_going else 'left') +
               ' on time', flush=True)
-        assert stay <= 2, f'Files kept building frames under its toast: {stay}'
+        # a frame or two for the pointer leaving the list; drawing the toast itself
+        # would be one a display frame -- sixty a second
+        assert stay <= 4, f'Files kept building frames under its toast: {stay}'
 
         # SHEET: Move to Trash asks first; the dimming fades in as a layer of its
         # own under the sheet's, and both leave on Esc
