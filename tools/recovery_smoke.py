@@ -32,7 +32,7 @@ class Guest:
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
         shutil.copyfile(firmware/'OVMF_VARS_4M.fd',out/'vars.fd')
-        cmd=['qemu-system-x86_64','-cpu','max','-m','1024','-smp','2','-accel',os.environ.get('EMBLINK_ACCEL','tcg,thread=multi'),
+        cmd=['qemu-system-x86_64','-cpu',os.environ.get('EMBLINK_CPU','max'),'-m','1024','-smp','2','-accel',os.environ.get('EMBLINK_ACCEL','tcg,thread=multi'),
              '-display','none','-vga','none','-device',f'virtio-vga,xres={resolution[0]},yres={resolution[1]}','-nic','none',
              '-drive',f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE_4M.fd"}',
              '-drive',f'if=pflash,format=raw,file={out / "vars.fd"}',

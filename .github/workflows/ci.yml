@@ -108,10 +108,16 @@ jobs:
       - name: Tests that need the image
         working-directory: EmbLinkOs
         run: make LIBC=emblibc EMBCC_ROOT="$GITHUB_WORKSPACE/EmbCC" terminal-test process-compat-test
-      - name: Desktop smokes (QEMU, KVM)
+      - name: Boot probe (which QEMU the kernel runs on here)
         working-directory: EmbLinkOs
         env:
-          EMBLINK_ACCEL: kvm
+          EMBLINK_OVMF_DIR: /usr/share/OVMF
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          python3 tools/ci_boot_probe.py kvm:max kvm:host kvm:qemu64 "tcg,thread=multi:max"
+      - name: Desktop smokes (QEMU)
+        working-directory: EmbLinkOs
+        env:
           EMBLINK_GDB: gdb
           EMBLINK_NM: nm
           EMBLINK_OVMF_DIR: /usr/share/OVMF
@@ -121,7 +127,7 @@ jobs:
                    contour_keyboard_smoke contour_modal_smoke contour_controls_smoke contour_windows_smoke \
                    contour_shell_smoke workspace_smoke motion_smoke scroll_smoke; do
             echo "::group::$t"
-            if ! timeout 900 python3 "tools/$t.py"; then failed="$failed $t"; fi
+            if ! timeout 600 python3 "tools/$t.py"; then failed="$failed $t"; fi
             echo "::endgroup::"
           done
           if [ -n "$failed" ]; then echo "::error::failed:$failed"; exit 1; fi
@@ -132,6 +138,7 @@ jobs:
           name: smokes
           path: |
             /tmp/emblink-*
-            !/tmp/emblink-*/**/*.img
+            /tmp/contour-*
+            !/tmp/**/*.img
           if-no-files-found: ignore
           retention-days: 7
