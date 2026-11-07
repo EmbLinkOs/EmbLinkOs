@@ -9,6 +9,7 @@
  *
  *   pix_test           the checks (built with ASan/UBSan by `make pix-test`)
  *   pix_test --bench   old loops against new on a 1280 x 800 screen (`make pix-bench`) */
+#define _POSIX_C_SOURCE 199309L   /* clock_gettime under -std=c11 on glibc */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +41,9 @@ static uint32_t ref_over(uint32_t s, uint32_t dn, int rgb) {     /* fb_blit_over
     uint32_t r = ((s >> 16) & 0xFF) + (((d >> 16) & 0xFF) * inv) / 255;
     uint32_t g = ((s >> 8) & 0xFF) + (((d >> 8) & 0xFF) * inv) / 255;
     uint32_t b = (s & 0xFF) + ((d & 0xFF) * inv) / 255;
-    if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
     return pack(RGB(r, g, b), rgb);
 }
 static uint32_t ref_mix(uint32_t s, uint32_t dn, uint32_t alpha, int rgb) {   /* fb_blit_uniform */

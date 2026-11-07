@@ -1,4 +1,6 @@
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE   /* DIR, readdir on the host */
+#endif
 /* Host-build stand-ins for the OS-backed pieces (builtins_os.c and
  * eval_extern.c are target-only: embk syscalls). The pure pipeline is fully
  * testable without them; OS command names simply don't resolve here and

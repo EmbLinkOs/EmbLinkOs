@@ -749,7 +749,8 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         int32_t sfy = basey + (iy - y0) * stepy;
-        if (sfy < 0) sfy = 0; if (sfy > maxfy) sfy = maxfy;
+        if (sfy < 0) sfy = 0;
+        if (sfy > maxfy) sfy = maxfy;
         uint32_t sy = (uint32_t)(sfy >> 16);
         uint32_t syn = (sy + 1 < src_h) ? sy + 1 : sy;
         uint32_t wy = (uint32_t)((sfy >> 8) & 0xFF);

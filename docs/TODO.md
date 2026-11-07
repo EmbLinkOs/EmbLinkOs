@@ -139,6 +139,11 @@ the default target). Measured before and after every step
         linear light); text, the kernel compositor and the virgl shaders keep their own.
   - [ ] Layer caching (a group that only fades or scales could reuse its last flattened pixels;
         the library's tiles animate inside it, so it would not help there).
+- [ ] CI (`.github/workflows/ci.yml`): the host suites, tests/drivers (virgl's compose checks when
+      the runner has a render node), the x86 image on EmbCC's library and its desktop smokes under
+      KVM. arm64 stays local (HVF). Open: the shell's completion paths build with
+      `-Wno-format-truncation` on GCC (candidates are cut at 512 bytes on purpose; a cut should be
+      said, not silent); the Homebrew cross toolchain floats with Homebrew (pin it if it drifts).
 - [ ] P7 Layers: a render server ([plan](DESKTOP_PERFORMANCE.md#what-the-applications-pay-for-motion-p7-m0)).
   Apps paint a piece of UI once into a layer and give the compositor targets on a spring; the
   compositor animates it on its own clock.

@@ -480,7 +480,7 @@ static void osc_dynamic(struct vt *v,int which,char *args,bool bel) {
         char *next=strchr(spec,';');
         if (next) *next++=0;
         uint32_t current=which==10?vt_rgb(v,VT_COLOR_DEFAULT,true):which==11?vt_rgb(v,VT_COLOR_DEFAULT,false):vt_cursor_rgb(v);
-        if (!strcmp(spec,"?")) {char head[8];snprintf(head,sizeof head,"%d;",which);color_reply(v,head,current,bel);}
+        if (!strcmp(spec,"?")) {char head[16];snprintf(head,sizeof head,"%d;",which);color_reply(v,head,current,bel);}
         else {
             uint32_t rgb;
             if (parse_color(spec,&rgb)) {

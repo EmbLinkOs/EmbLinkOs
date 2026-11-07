@@ -111,9 +111,9 @@ static bool is_gitdir(const char *dir) {
 static bool gitfile(const char *file, const char *dir, char *out, size_t cap) {
     char line[GS_PATH];
     if (!gs_read_line(file, line, sizeof line) || strncmp(line, "gitdir: ", 8)) return false;
-    if (line[8] == '/') snprintf(out, cap, "%s", line + 8);
-    else snprintf(out, cap, "%s/%s", dir, line + 8);
-    return true;
+    /* a path too long to hold is no path: not a repository, not a wrong one */
+    int n = line[8] == '/' ? snprintf(out, cap, "%s", line + 8) : snprintf(out, cap, "%s/%s", dir, line + 8);
+    return n >= 0 && (size_t)n < cap;
 }
 
 static void read_configs(struct gs_repo *r) {
@@ -138,7 +138,10 @@ struct gs_repo *gs_repo_open(const char *dir) {
         struct stat st;
         bool found = false;
         if (lstat(dotgit, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) { snprintf(gitdir, sizeof gitdir, "%s", dotgit); found = is_gitdir(gitdir); }
+            if (S_ISDIR(st.st_mode)) {
+                int n = snprintf(gitdir, sizeof gitdir, "%s", dotgit);
+                found = n >= 0 && (size_t)n < sizeof gitdir && is_gitdir(gitdir);
+            }
             else if (S_ISREG(st.st_mode)) found = gitfile(dotgit, strcmp(cur, "/") ? cur : "", gitdir, sizeof gitdir) && is_gitdir(gitdir);
         }
         if (found) break;
@@ -155,7 +158,8 @@ struct gs_repo *gs_repo_open(const char *dir) {
     snprintf(cpath, sizeof cpath, "%s/commondir", gitdir);
     if (gs_read_line(cpath, common, sizeof common) && common[0]) {
         if (common[0] == '/') snprintf(r->commondir, sizeof r->commondir, "%s", common);
-        else snprintf(r->commondir, sizeof r->commondir, "%s/%s", gitdir, common);
+        else if (snprintf(r->commondir, sizeof r->commondir, "%s/%s", gitdir, common) >= (int)sizeof r->commondir)
+            snprintf(r->commondir, sizeof r->commondir, "%s", gitdir);   /* too long: its own */
     } else snprintf(r->commondir, sizeof r->commondir, "%s", gitdir);
     read_configs(r);
     char objects[GS_PATH];
@@ -719,11 +723,11 @@ static void action(struct gs_repo *r, char *out, size_t cap) {
     #define LINE(name, buf) (snprintf(p, sizeof p, "%s/%s", r->gitdir, name), gs_read_line(p, buf, sizeof buf))
     if (AT("rebase-merge")) {
         const char *kind = AT("rebase-merge/interactive") ? "rebase-i" : "rebase-m";
-        if (LINE("rebase-merge/msgnum", a) && LINE("rebase-merge/end", b)) snprintf(out, cap, "%s %s/%s", kind, a, b);
+        if (LINE("rebase-merge/msgnum", a) && LINE("rebase-merge/end", b)) { if (snprintf(out, cap, "%s %s/%s", kind, a, b) < 0) out[0] = 0; }   /* shown cut if long */
         else snprintf(out, cap, "%s", kind);
     } else if (AT("rebase-apply")) {
         const char *kind = AT("rebase-apply/rebasing") ? "rebase" : AT("rebase-apply/applying") ? "am" : "am/rebase";
-        if (LINE("rebase-apply/next", a) && LINE("rebase-apply/last", b)) snprintf(out, cap, "%s %s/%s", kind, a, b);
+        if (LINE("rebase-apply/next", a) && LINE("rebase-apply/last", b)) { if (snprintf(out, cap, "%s %s/%s", kind, a, b) < 0) out[0] = 0; }   /* shown cut if long */
         else snprintf(out, cap, "%s", kind);
     } else if (AT("MERGE_HEAD")) snprintf(out, cap, "merge");
     else if (AT("REVERT_HEAD")) snprintf(out, cap, AT("sequencer/todo") ? "revert-seq" : "revert");
@@ -792,7 +796,7 @@ bool gs_repo_status(struct gs_repo *r, const struct gs_options *o, bool no_diff,
     struct gs_oid head;
     bool born = gs_ref_resolve(r, "HEAD", &head, sym, sizeof sym);
     if (born) gs_oid_hex(&head, s->commit);
-    if (!strncmp(sym, "refs/heads/", 11)) snprintf(s->branch, sizeof s->branch, "%s", sym + 11);
+    if (!strncmp(sym, "refs/heads/", 11)) { if (snprintf(s->branch, sizeof s->branch, "%s", sym + 11) < 0) s->branch[0] = 0; }   /* shown cut if long */
     /* upstream and push remote */
     if (s->branch[0]) {
         char key[512];

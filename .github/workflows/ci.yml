@@ -1,0 +1,137 @@
+# CI: everything that does not need this project's arm64 host.
+#
+#   host     the host-built test suites (toolkit, terminal, shell, pixels, ...)
+#   drivers  tests/drivers -- the protocol and compose checks, and virgl's
+#            compose checks on a real virglrenderer (Mesa's llvmpipe)
+#   x86      the x86 image on EmbCC's C library, the tests that need it, and
+#            the desktop smokes under QEMU with KVM
+#
+# arm64 stays a local run (HVF on Apple Silicon is faster than anything here).
+name: CI
+
+on:
+  push:
+    branches: [master, Teo]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The C library the userland builds on: EmbCC at the commit it is tested with.
+  EMBCC_REF: 7e4bb5b0800b00ec8627b765e3c70393b65bed16
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev python3 python3-pil
+      - name: Host suites
+        run: |
+          mkdir -p build
+          failed=""
+          for t in scene-test font-test layout-test reactive-test backend-test declare-test em-test kit-test \
+                   pix-test spring-test backdrop-test frameclock-test pointer-accel-test \
+                   terminal-screen-test terminal-render-test terminal-screentext-test terminal-profile-test \
+                   terminal-golden-test prompt-test gitstatus-test shell-test html-test ico-test edit-test \
+                   syntax-test iconv-test document-test service-test doc-model-test display-arrange-test \
+                   contour-test fd-sharing-test update-test; do
+            echo "::group::$t"
+            if ! make "$t"; then failed="$failed $t"; fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "::error::failed:$failed"; exit 1; fi
+
+  drivers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libvirglrenderer-dev libepoxy-dev libegl1 libgl1-mesa-dri \
+                                  libgbm1 mesa-utils
+      - name: Driver tests
+        run: sh tests/drivers/run.sh
+      - name: virgl compose checks
+        run: |
+          # a DRM render node for virglrenderer: vgem is enough for llvmpipe
+          if [ ! -e /dev/dri/renderD128 ]; then
+            sudo modprobe vgem 2>/dev/null || {
+              sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe vgem; } || true
+          fi
+          if [ ! -e /dev/dri/renderD128 ]; then
+            echo "::warning::no DRM render node on this runner: virgl compose checks not run"; exit 0
+          fi
+          sudo chmod 666 /dev/dri/*
+          cc -std=c11 -D_GNU_SOURCE -D_TYPES_H -include stdint.h -include stdbool.h -include stddef.h \
+             -Ikernel tests/drivers/virgl_compose_test.c kernel/drivers/video/virgl.c \
+             kernel/drivers/video/virgl_compose.c -lvirglrenderer -o virgl_compose_test
+          ./virgl_compose_test
+
+  x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: EmbLinkOs }
+      - uses: actions/checkout@v4
+        with: { repository: EmbLinkOs/EmbCC, ref: '${{ env.EMBCC_REF }}', path: EmbCC }
+      - name: KVM for QEMU
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential nasm python3 python3-pil zlib1g-dev qemu-system-x86 ovmf gdb \
+                                  binutils mtools
+      - name: Cross toolchain (x86_64-elf, from Homebrew)
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install x86_64-elf-binutils x86_64-elf-gcc
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      - name: EmbCC's C library
+        working-directory: EmbLinkOs
+        run: make emblibc EMBCC_ROOT="$GITHUB_WORKSPACE/EmbCC"
+      - name: Image
+        working-directory: EmbLinkOs
+        run: make LIBC=emblibc EMBCC_ROOT="$GITHUB_WORKSPACE/EmbCC" FB_W=1280 FB_H=800 -j"$(nproc)" uefi-usb.img
+      - name: Tests that need the image
+        working-directory: EmbLinkOs
+        run: make LIBC=emblibc EMBCC_ROOT="$GITHUB_WORKSPACE/EmbCC" terminal-test process-compat-test
+      - name: Desktop smokes (QEMU, KVM)
+        working-directory: EmbLinkOs
+        env:
+          EMBLINK_ACCEL: kvm
+          EMBLINK_GDB: gdb
+          EMBLINK_NM: nm
+          EMBLINK_OVMF_DIR: /usr/share/OVMF
+        run: |
+          failed=""
+          for t in layer_smoke layer_menu_smoke layer_library_smoke layer_pull_smoke contour_smoke \
+                   contour_keyboard_smoke contour_modal_smoke contour_controls_smoke contour_windows_smoke \
+                   contour_shell_smoke workspace_smoke motion_smoke scroll_smoke; do
+            echo "::group::$t"
+            if ! timeout 900 python3 "tools/$t.py"; then failed="$failed $t"; fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "::error::failed:$failed"; exit 1; fi
+      - name: Logs and captures of the smokes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smokes
+          path: |
+            /tmp/emblink-*
+            !/tmp/emblink-*/**/*.img
+          if-no-files-found: ignore
+          retention-days: 7

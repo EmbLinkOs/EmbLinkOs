@@ -8,7 +8,9 @@
  *
  * Build: make shell-test. Exit code = number of failures.
  * ========================================================================== */
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE   /* mkdtemp */
+#endif
 #include "complete/complete.h"
 #include "complete/highlight.h"
 #include "eval/eval.h"

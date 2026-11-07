@@ -3076,25 +3076,30 @@ gitstatus-test: | $(BUILD)
 	python3 tools/gitclone_index_test.py
 .PHONY: gitstatus-test
 
+# strdup, mkstemp, setenv under -std=c11: glibc hides them without this (macOS
+# does not), and an undeclared strdup is an int -- a pointer cut in half. And
+# GCC's format-truncation: completion candidates are cut at 512 bytes on
+# purpose (docs/TODO.md), which clang does not flag and GCC does.
+SHELL_HOST_CFLAGS = -D_DEFAULT_SOURCE -Wno-format-truncation
 shell-test:
-	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
 	    shell/builtins/builtins.c $(PROMPT_SRC) shell/edit/wcwidth.c shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/test/host_test.c -o $(BUILD)/shell_test
 	$(BUILD)/shell_test
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
 	    shell/edit/edit.c shell/edit/wcwidth.c shell/hist/hist.c $(VT_SRC) \
 	    shell/test/edit_test.c -o $(BUILD)/edit_test
 	$(BUILD)/edit_test
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Ishell \
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -Werror -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
 	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c shell/complete/highlight.c \
 	    shell/test/complete_test.c -o $(BUILD)/complete_test
 	$(BUILD)/complete_test
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell -Iuser/terminal \
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell -Iuser/terminal \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
 	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
