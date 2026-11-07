@@ -1994,7 +1994,7 @@ static int64_t sys_layer_create(const struct sysargs *a) {
 /* arg 0 = win, 1 = const struct embk_layer_op *, 2 = how many, 3 = flags (EMBK_LS_*).
  * The ops are copied in before the compositor's lock is taken. */
 static int64_t sys_layer_set(const struct sysargs *a) {
-    _Static_assert(sizeof(struct embk_layer_op) == 44, "the layer op's layout is the ABI");
+    _Static_assert(sizeof(struct embk_layer_op) == 52, "the layer op's layout is the ABI");
     struct embk_layer_op ops[EMBK_LAYER_OPS_MAX];
     unsigned n = (unsigned)a->arg[2];
     if (n == 0 || n > EMBK_LAYER_OPS_MAX) return -EMBK_EINVAL;

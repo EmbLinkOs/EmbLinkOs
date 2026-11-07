@@ -747,7 +747,7 @@ static void fl_go(void *ctx, uint32_t id, const struct scene_layer_state *from, 
     struct fake_layer *l = &g_fl[id - 1];
     l->gos++; l->froms += from != 0; l->destroys += destroy; l->at = *to;
 }
-static const struct scene_layer_host g_fake_host = { 0, fl_create, fl_present, fl_go };
+static const struct scene_layer_host g_fake_host = { 0, fl_create, fl_present, fl_go, 0 };
 
 /* the ground and a card -- a menu, its shadow, a row in it -- promoted or not */
 static struct node_handle t20_scene(struct scene_arena *ap, struct node_handle *card_out, struct node_handle *row_out,
@@ -874,6 +874,48 @@ static void t21_invisible(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- T22: a promoted GLASS root: the compositor frosts it, the layer holds
+ * only its tint (a host that says how a layer looks) ---------------------- */
+static int g_look_n, g_look_glass, g_look_radius;
+static int g_look_box[4];
+static void fl_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h) {
+    (void)ctx; (void)id; g_look_n++; g_look_glass = glass; g_look_radius = radius;
+    g_look_box[0] = x; g_look_box[1] = y; g_look_box[2] = w; g_look_box[3] = h;
+}
+static const struct scene_layer_host g_fake_host_look = { 0, fl_create, fl_present, fl_go, fl_look };
+static void t22_glass_layer(void) {
+    printf("T22 a promoted glass root leaves its frost to the compositor:\n");
+    g_fl_n = 0; g_look_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host_look);
+    struct render_target rt = make_target(200, 160);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 200, 160);
+    struct paint gp = solidp(1, 0, 0, 1); scene_set_paint(&a, ground, &gp);   /* red behind */
+    struct node_handle card = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, card, 100, 60); scene_set_transform(&a, card, 40, 30, 0, 0,0,0,1, 1,1,1);
+    scene_set_corner_radius(&a, card, 10);
+    struct paint cp = solidp(0, 0, 1, 0.5f); scene_set_paint(&a, card, &cp);   /* a blue tint, half */
+    scene_set_backdrop_blur(&a, card, 1, 12.0f);
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000 };
+    scene_set_promoted(&a, card, true, &m, &m);
+    scene_render_frame(&r, &a, root, &rt);
+    scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && g_look_n == 1 && g_look_glass && g_look_radius == 10,
+          "its look is said once: glass, its own radius");
+    CHECK(g_look_box[2] == 100 && g_look_box[3] == 60 && g_look_box[0] == 40 - l->at.x && g_look_box[1] == 30 - l->at.y,
+          "and where the glass is in the layer: the card's own box, not its footprint");
+    uint32_t mid = l->px[(30) * l->w + 50];
+    int b, g, rr, al; unbgra(mid, &b, &g, &rr, &al);
+    CHECK(rr == 0 && al >= 126 && al <= 129 && b >= 126 && b <= 129,
+          "and the layer holds the tint alone -- none of the red behind it baked in");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -897,6 +939,7 @@ int main(void) {
     t19_group_dirty();
     t20_promoted();
     t21_invisible();
+    t22_glass_layer();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

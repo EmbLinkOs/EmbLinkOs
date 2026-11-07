@@ -311,7 +311,10 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
                                 n->shadow_dx, n->shadow_dy, n->shadow_blur_radius, n->shadow_color);
             {
                 struct paint fill = n->data.rect.fill;
-                if (n->backdrop_blur_enabled && g_effects_reduced) {
+                if (n->backdrop_blur_enabled && n == r->glass_root) {
+                    /* a layer's glass: the compositor frosts what is behind
+                     * it; here only the tint, as it is */
+                } else if (n->backdrop_blur_enabled && g_effects_reduced) {
                     /* the reduced tier: no blur to compute -- the glass's own tint, whole */
                     if (fill.kind == PAINT_SOLID) fill.solid.a = 1.0f;
                 } else if (n->backdrop_blur_enabled) {
@@ -721,6 +724,9 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
         p->id = id; p->px = px; p->w = (uint32_t)bw; p->h = (uint32_t)bh;
         p->index = h.index; p->generation = h.generation;
         fresh = 1;
+        if (host->look)              /* the glass is the node's own box, not the shadow round it */
+            host->look(host->ctx, id, (uint8_t)fminf(255.0f, n->corner_radius), n->backdrop_blur_enabled,
+                       (int)floorf(nb.x) - bx, (int)floorf(nb.y) - by, (int)ceilf(nb.w), (int)ceilf(nb.h));
     }
     p->seen = 1;
 
@@ -743,9 +749,11 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
         struct render_target *was_bd = r->backdrop; float wox = r->bd_ox, woy = r->bd_oy;
         r->backdrop = target; r->bd_ox = 0; r->bd_oy = 0;   /* glass in it frosts the window behind it */
         int was = r->no_cull; r->no_cull = 1;
+        if (host->look) r->glass_root = n;              /* its own glass is the compositor's */
         cpu_clip_save_and_clear(&sv);
         render_subtree_opaque(r, a, h, wparent, &lt, (float)bx, (float)by);
         cpu_clip_restore(&sv);
+        r->glass_root = 0;
         r->no_cull = was; r->backdrop = was_bd; r->bd_ox = wox; r->bd_oy = woy;
         p->sig = sig; p->fx = fx; p->fy = fy; p->reduced = g_effects_reduced;
         r->layer_paints++;

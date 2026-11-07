@@ -42,6 +42,7 @@ def main():
     ap.add_argument('--accel', choices=('hvf', 'tcg'), default='hvf', help='aarch64 only')
     ap.add_argument('--graphics', choices=('virtio', 'virgl'), default='virtio', help='x86_64 only')
     args = ap.parse_args()
+    slow = 5 if args.graphics == 'virgl' else 1   # x86 emulated in a VM: everything is slower
     out = Path(tempfile.mkdtemp(prefix='emblink-layerlib-'))
     print(f'Logs and captures: {out}', flush=True)
     d = P.boot(args, out)
@@ -52,10 +53,10 @@ def main():
 
         # IN
         d.key('meta_l-spc')
-        sheet = catch(d, lambda l: l['w'] < P.W and l['moving'] and 0 < l['alpha'] < 255, 6)
+        sheet = catch(d, lambda l: l['w'] < P.W and l['moving'] and 0 < l['alpha'] < 255, 6 * slow)
         both = until(d, 'the dimming and the sheet at rest',
                      lambda: (lambda ls: ls if len(ls) >= 2 and all(not l['moving'] and l['alpha'] == 255
-                                                                   for l in ls) else None)(desktop_layers(d)), 8)
+                                                                   for l in ls) else None)(desktop_layers(d)), 8 * slow)
         dim = [l for l in both if l['w'] >= P.W - 2]
         sh = [l for l in both if l['w'] < P.W - 2]
         assert dim and sh, f'expected the dimming and the sheet: {both}'
@@ -68,21 +69,21 @@ def main():
         mark = len(d.g.seen)
         d.type('settings\n')
         d.g.wait(b'Settings: first frame presented', start=mark)
-        until(d, 'the layers gone with the library', lambda: not desktop_layers(d), 6)
+        until(d, 'the layers gone with the library', lambda: not desktop_layers(d), 6 * slow)
         print(f'works: "settings" and Return launched Settings, and the library left ({rest})', flush=True)
 
         # LOOKS: slowed, half way in; then OUT
         d.g.command('perf slowmo 16', b'perf: slowmo', 60)
         d.key('meta_l-spc')
-        half = catch(d, lambda l: l['w'] < P.W and l['moving'] and 90 < l['alpha'] < 170, 10)
+        half = catch(d, lambda l: l['w'] < P.W and l['moving'] and 90 < l['alpha'] < 170, 10 * slow)
         if half:
-            slow = d.g.capture(out / 'library-slow.ppm')
-            print(f"looks: half way in at alpha {half['alpha']} scale {half['scale']} ({slow})", flush=True)
+            slowshot = d.g.capture(out / 'library-slow.ppm')
+            print(f"looks: half way in at alpha {half['alpha']} scale {half['scale']} ({slowshot})", flush=True)
         d.g.command('perf slowmo 1', b'perf: slowmo', 60)
-        until(d, 'the library at rest', lambda: [l for l in desktop_layers(d) if not l['moving']], 10)
+        until(d, 'the library at rest', lambda: [l for l in desktop_layers(d) if not l['moving']], 10 * slow)
         d.key('esc')
-        going = catch(d, lambda l: l['to'][2] == 0, 3)
-        until(d, 'the layers gone', lambda: not desktop_layers(d), 6)
+        going = catch(d, lambda l: l['to'][2] == 0, 3 * slow)
+        until(d, 'the layers gone', lambda: not desktop_layers(d), 6 * slow)
         print('out: Esc, and the library ' + ('leaves on the compositor\'s springs' if going else 'leaves') +
               ', and is gone', flush=True)
         print('PASS: the library and its dimming are layers of the desktop: in, out, and it still launches')

@@ -571,6 +571,7 @@ struct comp_layer {
     struct spring x, y, scale, opacity;
     uint16_t  ax, ay;                     /* the anchor, thousandths of the size */
     uint8_t   radius, material, flags;
+    int16_t   mat_x, mat_y; uint16_t mat_w, mat_h;   /* its material's box in it (0 w: all) */
     int8_t    sh_dy; uint8_t sh_blur, sh_alpha;
     int       destroy_at_rest;
     int       last[4], have_last;         /* the rect it stained last frame */
@@ -612,6 +613,15 @@ static void layer_geom(const struct comp_layer *L, const struct comp_window *w, 
     r[2] = sw; r[3] = sh;
     int a = spring_px(&L->opacity);
     *alpha = a < 0 ? 0 : a > 255 ? 255 : a;
+}
+/* Where its material is on screen: its box (the glass panel within the
+ * picture), scaled with it. */
+static void layer_mat_rect(const struct comp_layer *L, const int r[4], int m[4]) {
+    if (!L->mat_w || !L->mat_h || !L->w || !L->h) { m[0] = r[0]; m[1] = r[1]; m[2] = r[2]; m[3] = r[3]; return; }
+    m[0] = r[0] + (int)((int64_t)L->mat_x * r[2] / (int64_t)L->w);
+    m[1] = r[1] + (int)((int64_t)L->mat_y * r[3] / (int64_t)L->h);
+    m[2] = (int)((int64_t)L->mat_w * r[2] / (int64_t)L->w);
+    m[3] = (int)((int64_t)L->mat_h * r[3] / (int64_t)L->h);
 }
 /* ...and all it stains there: its shadow too */
 static void layer_extent(const struct comp_layer *L, const struct comp_window *w,
@@ -816,9 +826,13 @@ static int g_corner_n;
 
 
 /* The four corner boxes of a frame, and their arc centres. */
+/* A radius other than the windows' for the next save and carve (a layer's);
+ * 0: the windows'. At most WIN_R_MAX, as the saved boxes are. */
+static int g_corner_r_override;
+#define CORNER_R (g_corner_r_override ? g_corner_r_override : WIN_RADIUS)
 static int corner_boxes_at(int fx0, int fy0, int fx1, int fy1, int bx[4], int by[4],
                            int cx[4], int cy[4]) {
-    const int r = WIN_RADIUS;
+    const int r = CORNER_R;
     if (fx1 - fx0 < 2 * r || fy1 - fy0 < 2 * r) return 0;  /* too small to round */
     bx[0] = fx0;     by[0] = fy0;     bx[1] = fx1 - r; by[1] = fy0;
     bx[2] = fx0;     by[2] = fy1 - r; bx[3] = fx1 - r; by[3] = fy1 - r;
@@ -845,7 +859,7 @@ static void region_grow_corners(int *rx0, int *ry0, int *rx1, int *ry1);
 static void corners_save_at(int fx0, int fy0, int fx1, int fy1,
                             int rx0, int ry0, int rx1, int ry1) {
     g_corner_n = 0;
-    const int r = WIN_RADIUS;
+    const int r = CORNER_R;
     int ox[4], oy[4], cx[4], cy[4];
     if (!corner_boxes_at(fx0, fy0, fx1, fy1, ox, oy, cx, cy)) return;
 
@@ -873,7 +887,7 @@ static void corners_save(const struct comp_window *w,
 /* Blend the saved backdrop back over what was painted, by arc coverage --
  * tracing a border ring of `bcol` along the arc when `has_border`. */
 static void corners_carve_ring(int has_border, fb_color_t bcol) {
-    const int r = WIN_RADIUS;
+    const int r = CORNER_R;
     const int rr8 = (r * 8) * (r * 8);          /* radius^2 in eighth-pixels  */
 
     for (int i = 0; i < g_corner_n; i++) {
@@ -2059,6 +2073,31 @@ static void mat_more(int x0, int y0, int x1, int y1) {
  * moved on or off the screen -- or (on the GPU, which keeps no copy) any
  * window that blurs, covers all of that window: the blur reads all of what
  * is behind it, and only a repaint of all of it has that in hand. */
+static int layers_shown(const struct comp_window *w);   /* fwd */
+/* A layer that blurs what is behind it reads all of what is behind it: a
+ * repaint that touches it covers it whole. */
+static void region_grow_layers(int *rx0, int *ry0, int *rx1, int *ry1) {
+    for (int pass = 0; pass < 2; pass++) {
+        int grew = 0;
+        for (int i = 0; i < LAYERS_MAX; i++) {
+            const struct comp_layer *L = &g_layers[i];
+            if (!L->used || L->parked || !L->presented || L->material != EMBK_LM_BLUR) continue;
+            const struct comp_window *w = win_by_id(L->win_id);
+            if (!w || !layers_shown(w)) continue;
+            int r[4], m[4], a; layer_geom(L, w, r, &a);
+            if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
+            layer_mat_rect(L, r, m);
+            int x0 = m[0], y0 = m[1], x1 = m[0] + m[2], y1 = m[1] + m[3];
+            if (x1 <= *rx0 || x0 >= *rx1 || y1 <= *ry0 || y0 >= *ry1) continue;
+            if (x0 < *rx0) { *rx0 = x0; grew = 1; }
+            if (y0 < *ry0) { *ry0 = y0; grew = 1; }
+            if (x1 > *rx1) { *rx1 = x1; grew = 1; }
+            if (y1 > *ry1) { *ry1 = y1; grew = 1; }
+        }
+        if (!grew) break;
+    }
+}
+
 static void region_grow_material(int *rx0, int *ry0, int *rx1, int *ry1, int gpu) {
     for (int pass = 0; pass < 2; pass++) {
         int grew = 0;
@@ -2235,6 +2274,7 @@ static void layer_apply(struct comp_layer *L, const struct embk_layer_op *op, ui
     }
     if (op->set & EMBK_LP_LOOK) {
         L->radius = op->radius; L->material = op->material; L->flags = op->flags;
+        L->mat_x = op->mat_x; L->mat_y = op->mat_y; L->mat_w = op->mat_w; L->mat_h = op->mat_h;
         L->sh_dy = op->shadow_dy; L->sh_blur = op->shadow_blur; L->sh_alpha = op->shadow_alpha;
     }
     if (op->op == EMBK_LOP_DESTROY) L->destroy_at_rest = 1;
@@ -2274,8 +2314,37 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
             struct fb_shadow_layer sl = { L->sh_dy, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u };
             fb_shadow_layers(r[0], r[1], r[0] + r[2], r[1] + r[3], L->radius, &sl, 1, rx0, ry0, rx1, ry1);
         }
+        /* MATERIAL: what is behind it, blurred, under its own pixels -- the
+         * screen as composed so far, which the repaint covers whole
+         * (region_grow_layers). Its corners keep the sharp backdrop outside
+         * the arc. Faded with the layer: a layer half in frosts half. */
+        int carved = 0;
+        if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0) {
+            int m[4]; layer_mat_rect(L, r, m);
+            int bx0 = imax(m[0], rx0), by0 = imax(m[1], ry0), bx1 = imin(m[0] + m[2], rx1), by1 = imin(m[1] + m[3], ry1);
+            if (bx1 > bx0 && by1 > by0) {
+                int rad = L->radius * spring_px(&L->scale) / 1000;
+                g_corner_r_override = rad < 1 ? 0 : rad > WIN_R_MAX ? WIN_R_MAX : rad;
+                if (g_corner_r_override) { corners_save_at(m[0], m[1], m[0] + m[2], m[1] + m[3], rx0, ry0, rx1, ry1); carved = 1; }
+                if (a >= 250) fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                else {
+                    /* part way in: the frost at the layer's own opacity, over the sharp */
+                    {
+                        uint32_t *keep = kmalloc((size_t)(bx1 - bx0) * (size_t)(by1 - by0) * 4);
+                        if (keep) {
+                            fb_read_rect(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0));
+                            fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                            fb_blit_uniform(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0), 255u - (uint32_t)a);
+                            kfree(keep);
+                        }
+                    }
+                }
+            }
+        }
         fb_blit_scaled_over(r[0], r[1], r[2], r[3], L->px, (int32_t)L->w, (int32_t)L->h, L->w,
                             (uint32_t)a, g_ghost_smooth, rx0, ry0, rx1, ry1);
+        if (carved) corners_carve_ring(0, 0);
+        g_corner_r_override = 0;
     }
 }
 
@@ -2292,6 +2361,11 @@ static int layers_draw_gpu(const struct comp_window *w, const struct gpu_compose
         if (L->sh_alpha && L->sh_blur && !fx_reduced()) {
             struct gpu_rect cast = { r[0], r[1] + L->sh_dy, r[2], r[3] };
             gc->shadow(&cast, &fr, L->radius, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u);
+        }
+        if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0) {
+            int m[4]; layer_mat_rect(L, r, m);
+            struct gpu_rect mr = { m[0], m[1], m[2], m[3] };
+            gc->blur(&mr, GLASS_BLUR, &mr, (uint32_t)(L->radius * spring_px(&L->scale) / 1000));
         }
         struct gpu_draw d = { .image = L->gimg, .src = { 0, 0, (int32_t)L->w, (int32_t)L->h }, .dst = fr,
                               .opaque = 0, .opacity = (uint8_t)a };
@@ -3226,6 +3300,7 @@ static void paint_region_now(int rx0, int ry0, int rx1, int ry1) {
     if (!fi) return;
     int W = (int)fi->width, H = (int)fi->height;
     int gpu = gpu_compose_now() != 0;
+    region_grow_layers(&rx0, &ry0, &rx1, &ry1);
     region_grow_material(&rx0, &ry0, &rx1, &ry1, gpu);
     region_grow_corners(&rx0, &ry0, &rx1, &ry1);
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;

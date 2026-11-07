@@ -656,3 +656,23 @@ search field's blinking caret repaints the whole sheet layer each blink. The
 compositor now composites a screen-sized translucent layer each frame of the
 fade -- on the GPU nothing, on the CPU about a millisecond a megapixel on an
 M5 core.
+
+### Glass on layers: the compositor frosts what is really behind
+
+A layer can now have a MATERIAL (`EMBK_LM_BLUR`, with the box of the layer it
+covers -- the glass panel, not the shadow painted round it -- and the radius
+that rounds it). Drawing the layer, the compositor blurs the screen as composed
+so far under that box, keeps the sharp backdrop outside its rounded corners,
+fades the frost with the layer, then lays the layer's pixels over it; on the
+GPU, its blur primitive with the radius. A repaint that touches a material
+layer covers its box whole (`region_grow_layers`). The toolkit paints a
+promoted glass root's tint alone and asks for the material (the host's
+`look`), so a menu frosts what is behind it on the screen -- another window
+too -- not only its own window's pixels, and a window that shows through can
+have layers at last: the top bar's menus are layers now.
+
+| Top-bar menu, open and Esc (arm64 under HVF) | M0 | Now |
+|---|---|---|
+| TopBar frames | 41 | 22 |
+| Full repaints | 25 | 0 |
+| Pixels presented | 24.0 M | 0.4 M |

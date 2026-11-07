@@ -482,12 +482,21 @@ static void lh_go(void *ctx, uint32_t id, const struct scene_layer_state *from, 
     n++;
     embk_layer_set(g_lh_win, op, n, at_present ? EMBK_LS_AT_PRESENT : 0);
 }
-static const struct scene_layer_host g_layer_host = { 0, lh_create, lh_present, lh_go };
+static void lh_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h) {
+    (void)ctx;
+    struct embk_layer_op op; memset(&op, 0, sizeof op);
+    op.id = id; op.set = EMBK_LP_LOOK;
+    op.radius = radius; op.material = glass ? EMBK_LM_BLUR : EMBK_LM_NONE;
+    op.mat_x = (int16_t)x; op.mat_y = (int16_t)y; op.mat_w = (uint16_t)w; op.mat_h = (uint16_t)h;
+    op.flags = EMBK_LF_HIT;                    /* a menu past the window's edge takes the pointer */
+    embk_layer_set(g_lh_win, &op, 1, 0);
+}
+static const struct scene_layer_host g_layer_host = { 0, lh_create, lh_present, lh_go, lh_look };
 /* Can this window have layers? The kernel says by giving one (a pixel, let go
- * at once). Not for a window that shows through: glass in a menu frosts what
- * is behind it in this window's pixels, and there that is nothing. */
+ * at once). A window that shows through can too: a layer's glass is frosted by
+ * the compositor, from what is really behind it (lh_look). */
 static int layers_probe(int win, int shows_through) {
-    if (shows_through) return 0;
+    (void)shows_through;
     uint64_t va = 0;
     int64_t id = embk_layer_create(win, 1, 1, &va);
     if (id <= 0) return 0;
@@ -953,13 +962,6 @@ int em_app_run(const EmApp *app) {
             if (embk_win_set_material(win, g_mat_alpha, g_mat_blur) == 0 || !g_mat_alpha)
                 g_mat_told = g_mat_alpha << 8 | g_mat_blur;
             else g_mat_alpha = g_mat_blur = 0, g_mat_told = 0, g_mat_full = 1, em_window_set_clear(0);   /* refused: opaque, as it is */
-            /* layers while the window is opaque: a window that shows through
-             * has nothing behind a menu for its glass to frost */
-            if (!translucent && (g_mat_alpha != 0) == em_layers_on()) {
-                int on = !g_mat_alpha && layers_probe(win, 0);
-                scene_render_set_layer_host(&r, on ? &g_layer_host : 0);
-                em_set_layers(on);
-            }
         }
         int had_key = 0;
         for (int64_t input; (input = embk_key_poll_key()) > 0; ) {

@@ -159,9 +159,15 @@ the default target). Measured before and after every step
         (held for a present), presented, parked for reuse, hit by the pointer outside their window,
         freed with it; reduce motion makes them jump and keeps a short fade. `tools/layer_smoke.py`
         (arm64, x86, virgl), `user/tests/layerdemo`, gallery 231.
-  - [ ] A layer's material (`EMBK_LM_BLUR`) is accepted and not drawn: blurring what is behind a
-        moving layer needs the damage grown as a glass window's is (`region_grow_material`), and
-        on the GPU path a blur under it. Until then a layer's tint is its own pixels.
+  - [x] A layer's material (`EMBK_LM_BLUR`): the compositor frosts the screen under the layer's
+        glass box, rounded, faded with it (`region_grow_layers`; GPU blur primitive). Promoted
+        glass roots use it (backend-test T22), and the top bar's menus are layers now.
+  - [ ] `tools/layer_menu_smoke.py --graphics virgl` (Lima VM): Files' context menu never opens --
+        the right-click does not seem to arrive in that configuration (left clicks and keys do;
+        `layer_library_smoke.py --graphics virgl` passes, glass layers drawn by the GPU). The same
+        smoke passes on x86 under TCG and arm64 under HVF.
+  - [ ] A layer's frost is a box blur of what is under it, made every frame it is drawn -- not
+        kept, as a window's material blur is (backdrop.c), and with no vibrancy (saturation).
   - [ ] A layer above everything (`z` 1 in the plan) is not offered: layers stand at their
         window's place in the stack.
   - [ ] An app that dies takes its layers at once; a closing menu of a crashed app does not
@@ -174,8 +180,7 @@ the default target). Measured before and after every step
         11.6 M px presented -> 1.2 M.
   - [x] A menu opening is an ordinary frame on layers (no epoch), and a node that paints nothing
         marks nothing (T21): Files' context menu presents 0.79 M px (M0 11.6 M), 0 full repaints.
-  - [ ] The top bar's menus are not promoted: the bar shows through, and their glass has to frost
-        the desktop, which needs the layer material (`EMBK_LM_BLUR`) above.
+  - [x] The top bar's menus are promoted: its menu frames 41 -> 22, pixels 24 M -> 0.4 M.
   - [ ] Toasts are not promoted: `em_toast_host` asks for a frame every frame of its 2.5 s to know
         when to leave, which on a layer would still wake the app throughout; a timed wake is the
         missing piece. (No application raises toasts yet.)

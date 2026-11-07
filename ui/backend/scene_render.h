@@ -55,6 +55,11 @@ struct scene_layer_host {
      * `at_present` it takes effect at the layer's next present. */
     void (*go)(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
                uint16_t response_ms, uint16_t damping_milli, int destroy, int at_present);
+    /* how it looks beyond its pixels, said once when it is made (may be NULL):
+     * its corner radius, and glass -- the compositor blurs what is really
+     * behind it, other windows too, under its pixels; the renderer paints the
+     * glass's tint alone */
+    void (*look)(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h);
 };
 #define SCENE_LAYERS 8
 struct scene_promoted {
@@ -100,6 +105,7 @@ struct scene_renderer {
     struct scene_promoted  promoted[SCENE_LAYERS];
     uint32_t               layer_paints;   /* promoted subtrees painted (tests) */
     int                    wants_frame;    /* a promoted subtree is settling: build the next */
+    const struct scene_node *glass_root;   /* painting it into its layer: its blur is the compositor's */
 };
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be);

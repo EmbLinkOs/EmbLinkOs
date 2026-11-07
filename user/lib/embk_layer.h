@@ -63,8 +63,13 @@ struct embk_layer_op {
     uint8_t  shadow_blur;        /* 0: no shadow */
     uint8_t  shadow_alpha;
     uint8_t  flags;              /* EMBK_LF_* */
-    uint8_t  reserved[2];
+    /* with EMBK_LP_LOOK: where in the layer its material is -- the glass
+     * panel, not the shadow painted round it -- layer pixels at full size;
+     * mat_w 0: all of it. The radius rounds this box. */
+    int16_t  mat_x, mat_y;
+    uint16_t mat_w, mat_h;
     struct embk_spring move, fade, grow;
+    uint16_t reserved;           /* 0: the size, a multiple of four, said outright */
 };
 
 /* embk_layer_set flags */
