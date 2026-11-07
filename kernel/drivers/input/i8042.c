@@ -13,6 +13,8 @@
 
 #include "include/io.h"
 #include "include/kprintf.h"
+#include "include/arch_irq.h"
+#include "process/process.h"   /* the watch: a kernel thread */
 #include "acpi/acpi.h"
 
 #define PS2_DATA    0x60
@@ -67,6 +69,41 @@ int i8042_read(uint32_t spins) {
     for (uint32_t i = 0; i < spins; i++)
         if (inb(PS2_STATUS) & ST_OBF) return (int)inb(PS2_DATA);
     return -1;
+}
+
+/* THE WATCH. Both devices interrupt on an edge, and each handler reads the
+ * one byte it was raised for. An edge lost -- the byte arrived while its line
+ * was masked, or two came close on a real machine -- leaves that byte in the
+ * output buffer, and a controller with a full buffer raises nothing more: the
+ * device is dead from then on. KVM on an AMD host lost the mouse that way four
+ * moves into a drag (CI, 2026-11-07); emulation's timing never did. So a
+ * kernel thread looks ten times a second, and a byte that has waited through
+ * a whole look -- which no live interrupt allows -- is read and handed to its
+ * device by the status register's port bit. One port read a look when idle. */
+void keyboard_ps2_byte(uint8_t sc);
+void mouse_ps2_byte(uint8_t b);
+static void i8042_watch_main(void) {
+    int waited = 0;
+    for (;;) {
+        sched_sleep_ms(100);
+        uint64_t f = arch_irq_save();
+        uint8_t st = inb(PS2_STATUS);
+        if (!(st & ST_OBF) || st == 0xFF) { waited = 0; arch_irq_restore(f); continue; }
+        if (!waited) { waited = 1; arch_irq_restore(f); continue; }   /* once more: an IRQ may be on its way */
+        uint32_t n = 0;
+        while ((st & ST_OBF) && n < 64u) {
+            uint8_t b = inb(PS2_DATA);
+            if (st & ST_AUX) { if (g_have_aux) mouse_ps2_byte(b); }
+            else if (g_have_kbd) keyboard_ps2_byte(b);
+            st = inb(PS2_STATUS); n++;
+        }
+        arch_irq_restore(f);
+        waited = 0;
+        if (n) kprintf("i8042: %u byte(s) left by a lost interrupt, delivered\n", n);
+    }
+}
+void i8042_watch_start(void) {
+    if (g_have_kbd || g_have_aux) process_create_kthread(i8042_watch_main, NULL);
 }
 
 uint32_t i8042_flush(void) {
@@ -268,6 +305,7 @@ bool i8042_init(void) {
 #else  /* !__x86_64__ -- no 8042 on this architecture at all. */
 
 bool i8042_init(void) { return false; }
+void i8042_watch_start(void) {}
 bool i8042_have_kbd(void) { return false; }
 bool i8042_have_aux(void) { return false; }
 int  i8042_read(uint32_t spins) { (void)spins; return -1; }

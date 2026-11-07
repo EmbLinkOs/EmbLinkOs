@@ -18,6 +18,7 @@
 #include "drivers/input/keyboard.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
+#include "drivers/input/i8042.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick() -- cursor/focus/drag */
 #include "gfx/comp_stats.h"   /* the serial `perf` command */
 #include "drivers/timer/timer.h"
@@ -2244,6 +2245,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
      * this point a write() lands in memory and this thread is what bounds how
      * long it stays there. See mm/vm_object.h. */
     vmo_writeback_init();
+    i8042_watch_start();      /* a PS/2 byte a lost interrupt left behind is delivered, not a dead device */
 
     /* Power: idle residency starts being counted the moment the idle threads
      * exist, and shutdown/reboot become available. After the page cache

@@ -299,10 +299,14 @@ void mouse_hold_buttons(uint32_t mask) {
 
 
 #if defined(__x86_64__)
+static uint8_t g_given;          /* a byte handed over by mouse_ps2_byte */
+static int g_have_given;
+#endif
+#if defined(__x86_64__)
 static void mouse_handler_inner(void) {
     /* On IRQ12 the pending byte is mouse data; read it directly. (Some 8042
      * emulations don't set the AUX status bit reliably, so we don't gate on it.) */
-    uint8_t b = inb(PS2_DATA);
+    uint8_t b = g_have_given ? g_given : inb(PS2_DATA);
 
     switch (g_cycle) {
         case 0:
@@ -332,6 +336,16 @@ static void mouse_handler_inner(void) {
 static void mouse_handler(void) {
     spin_lock(&pointer_state_lock);
     mouse_handler_inner();
+    spin_unlock(&pointer_state_lock);
+    notify();
+}
+/* one byte the controller had for the aux port, read by someone else (the
+ * i8042 watch, recovering a lost interrupt) */
+void mouse_ps2_byte(uint8_t b) {
+    spin_lock(&pointer_state_lock);
+    g_given = b; g_have_given = 1;
+    mouse_handler_inner();
+    g_have_given = 0;
     spin_unlock(&pointer_state_lock);
     notify();
 }
