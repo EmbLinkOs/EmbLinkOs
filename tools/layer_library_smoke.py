@@ -97,21 +97,30 @@ def main():
         # LOOKS: slowed, half way in; then OUT
         d.g.command('perf slowmo 4', b'perf: slowmo', 60)
         d.key('meta_l-spc')
-        half = catch(d, lambda l: l['w'] < P.W and l['h'] >= 200 and l['moving'] and 90 < l['alpha'] < 200, 10 * slow)
-        if half:
-            slowshot = d.g.capture(out / 'library-slow.ppm')
-            print(f"looks: half way in at alpha {half['alpha']} scale {half['scale']} ({slowshot})", flush=True)
-        # slowed, the rows are seen a beat apart
-        end = time.monotonic() + 3 * slow
+        # ONE LOOK at a time for both -- the sheet half way in, and its rows a
+        # beat apart -- from the moment it opens: the rows are layers only for
+        # the entrance (home's two seconds), which waiting for one before the
+        # other can miss on a fast machine
+        half = None
         seen = []
-        while time.monotonic() < end and not stagger:
-            rs = [l for l in desktop_layers(d) if l['w'] < P.W - 2 and l['h'] < 200]
+        end = time.monotonic() + 10 * slow
+        while time.monotonic() < end and not (half and stagger):
+            ls = desktop_layers(d)
+            if not half:
+                h = [l for l in ls if l['w'] < P.W and l['h'] >= 200 and l['moving'] and 90 < l['alpha'] < 200]
+                if h:
+                    half = h[0]
+                    slowshot = d.g.capture(out / 'library-slow.ppm')
+                    print(f"looks: half way in at alpha {half['alpha']} scale {half['scale']} ({slowshot})", flush=True)
+            rs = [l for l in ls if l['w'] < P.W - 2 and l['h'] < 200]
             if rs: seen.append([(l['alpha'], l['y'], l['moving']) for l in rs])
-            if len(rs) >= 2 and max(l['alpha'] for l in rs) - min(l['alpha'] for l in rs) >= 40:
+            if not stagger and len(rs) >= 2 and max(l['alpha'] for l in rs) - min(l['alpha'] for l in rs) >= 40:
                 stagger = rs
                 rowshot = d.g.capture(out / 'library-rows.ppm')
                 print('rows: ' + ', '.join(f"alpha {l['alpha']} at y {l['y']}" for l in sorted(rs, key=lambda l: l['y']))
                       + f' -- a layer a row, a beat apart ({rowshot})', flush=True)
+            if seen and not rs and not stagger:
+                break                                   # they were, and are the sheet's again
             d.g.pump(0.02)
         if args.graphics != 'virgl':
             assert stagger, f'the rows did not arrive a beat apart (row layers seen: {seen[:6]} ... {seen[-3:]})'
