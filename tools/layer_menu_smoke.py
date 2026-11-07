@@ -146,8 +146,10 @@ def main():
         until(d, "the file's menu", lambda: [l for l in layers(d) if l['app'] == 'files.elf'
                                              and not l['moving']], 6 * slow)
         P.click(d, item[0] + 70, item[1] + 19 + 33)      # its second row, Copy
+        # the toast: a short pill (the file's menu, still there a moment, is taller)
         toast = until(d, 'the toast at rest', lambda: [l for l in layers(d) if l['app'] == 'files.elf'
-                                                        and l['to'][2] == 255 and not l['moving']], 6 * slow)[0]
+                                                        and l['to'][2] == 255 and not l['moving']
+                                                        and l['h'] < 120], 6 * slow)[0]
         toastshot = d.g.capture(out / 'toast.ppm')
         P.move(d, item[0] + 200, item[1] + 200); d.g.pump(0.3)   # off the list: no hover to repaint
         mark = len(d.g.seen)
