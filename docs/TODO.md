@@ -143,6 +143,14 @@ the default target). Measured before and after every step
       forces RPL 3 on CS only, so every program ran with SS 0x18 and the first exception's iretq
       back to ring 3 raised #GP(0x18) -- every boot under KVM on GitHub's AMD EPYC runners. QEMU's
       emulator, like Intel, forces it on both, which is why it was never seen here.
+- [x] PS/2: one reader for both ports under one lock, each byte routed by the status register's
+      aux bit (`i8042_service`); under KVM the keyboard's and mouse's handlers ran on two cores at
+      once and took each other's bytes (a menu that would not close, a scroll that came back
+      wrong). A watch thread delivers a byte a lost interrupt left in the buffer.
+- [ ] ...the watch still delivers: in a green CI run on KVM, 7 times (mostly 4 bytes, one mouse
+      packet). Interrupts are still lost there -- the IOAPIC's edge trigger against the 8042's
+      level line, or a re-raise inside the handler's window. Nothing breaks now, but a packet
+      that waits 100-200 ms for the watch is a stutter a real touchpad would show.
 - [ ] CI (`.github/workflows/ci.yml`): the host suites, tests/drivers (virgl's compose checks when
       the runner has a render node), the x86 image on EmbCC's library and its desktop smokes under
       KVM. arm64 stays local (HVF). Open: the shell's completion paths build with
