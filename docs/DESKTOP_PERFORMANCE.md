@@ -676,3 +676,28 @@ have layers at last: the top bar's menus are layers now.
 | TopBar frames | 41 | 22 |
 | Full repaints | 25 | 0 |
 | Pixels presented | 24.0 M | 0.4 M |
+
+### A change inside a layer repaints only what it changed
+
+A promoted subtree used to be painted whole into its layer whenever anything in
+it changed -- a hover moving down a menu repainted the menu, the library's
+blinking caret repainted the whole sheet. The renderer now keeps where each of
+its nodes painted last; with the same nodes in it, the old and new places of
+those that changed are cleared and painted again (clipped to them, up to 16
+rects merged) and presented alone. A new shape, a group inside changing how it
+composites, or baked glass under a changed window repaint it whole as before.
+`make backend-test` T23: a hover and a move inside a 24-row menu are partial
+repaints, and the layer then equals painting it whole. arm64 under HVF, paint
+a frame: the top bar's menu 0.37 -> 0.17 ms, Files' context menu 0.41 -> 0.20,
+the library 1.01 -> 0.74.
+
+### A dimming is a fill
+
+A layer can be a FILL (`EMBK_LF_FILL`): one pixel, its colour, standing as
+large as it says. The compositor draws it as a uniform blend of that colour
+over its rect (on the GPU a one-pixel image stretched), so the library's
+dimming is no longer a 4 MB picture of one colour, painted in the desktop's
+first frame of it and presented. The renderer makes a fill of any promoted box
+of one colour with nothing in it (backend-test T24). The library on arm64
+under HVF: paint 0.74 -> 0.15 ms a frame, the dearest frame 10.5 -> 5.2 ms,
+the desktop's full repaints 4 -> 0 and the pixels it presents 4.1 M -> 0.

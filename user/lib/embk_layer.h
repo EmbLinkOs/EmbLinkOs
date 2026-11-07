@@ -47,6 +47,8 @@ struct embk_spring { uint16_t response_ms, damping_milli; };
 
 /* flags */
 #define EMBK_LF_HIT      0x01u   /* the pointer over its opaque pixels goes to the window */
+#define EMBK_LF_FILL     0x02u   /* ONE COLOUR: its first pixel, drawn over mat_w x mat_h --
+                                  * a dimming the size of the screen from a 1 x 1 layer */
 
 /* material */
 #define EMBK_LM_NONE     0u

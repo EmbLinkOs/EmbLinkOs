@@ -184,8 +184,8 @@ the default target). Measured before and after every step
   - [ ] Toasts are not promoted: `em_toast_host` asks for a frame every frame of its 2.5 s to know
         when to leave, which on a layer would still wake the app throughout; a timed wake is the
         missing piece. (No application raises toasts yet.)
-  - [ ] A promoted subtree is repainted whole when anything in it changes -- a hover moving down
-        an open menu repaints the menu's layer each time.
+  - [x] A change inside a promoted subtree repaints only the nodes it changed, old and new places
+        (backend-test T23).
   - [x] M5: EmUI's dialogs and sheets arrive on layers (scale and fade in, sink out).
   - [ ] The scrim behind a sheet still dims at once: promoting it would take the sheet into its
         window-sized layer (a promoted subtree's descendants are its pixels); a second layer
@@ -202,12 +202,11 @@ the default target). Measured before and after every step
         gallery 233. Full repaints 23 -> 4, paint 5.12 -> 1.01 ms a frame.
   - [ ] The library's tiles no longer stagger in on layers (one layer for the sheet). A stagger
         would want a layer a row, or a compositor-side offset per sub-rectangle of a layer.
-  - [ ] Four full repaints of the desktop remain in a library's open and close on layers; not
-        traced yet.
-  - [ ] The dimming is a screen-sized layer of one colour: a fill layer (a colour, no pixels)
-        would cost the compositor a fill, not a 4 MB picture blended over the screen.
-  - [ ] A blinking caret in a promoted subtree (the library's search field) repaints the whole
-        layer each blink.
+  - [x] The library's last four full repaints went with the dimming's layer (it was painted and
+        presented whole into a screen-sized layer).
+  - [x] The dimming is a fill layer (`EMBK_LF_FILL`, backend-test T24): the library's paint
+        0.74 -> 0.15 ms a frame, its pixels presented 4.1 M -> 0.
+  - [x] A blinking caret in a promoted subtree repaints its own rect, not the layer.
   - [ ] Nothing uses `em_toast` or the close grip (`em_close_grip`) yet: both are toolkit
         features without an application, so their motion is untested in the guest.
 - [ ] P4 Type and tokens.

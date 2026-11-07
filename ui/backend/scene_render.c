@@ -666,6 +666,56 @@ static struct scene_layer_state promoted_end(const struct scene_layer_state *at,
     return e;
 }
 
+/* ---- a promoted subtree's own damage: what changed inside it ---------- */
+
+/* each node's footprint in the layer's pixels, walk order (as group_changed's) */
+static int g_pr_depth;
+static void promoted_feet(struct scene_arena *a, struct node_handle h, const float wparent[16], float ox, float oy,
+                          struct scene_promoted_node *out, uint32_t cap, uint32_t *n, int *dirty_comp,
+                          int *dirty_idx, int *n_dirty, int ndmax) {
+    struct scene_node *nd = scene_resolve(a, h);
+    if (!nd || g_pr_depth > 1024) return;
+    float local[16], world[16];
+    scene_trs_to_matrix(nd, local);
+    scene_mat4_mul(wparent, local, world);
+    struct frect f = node_footprint(nd, node_world_aabb(nd, world));
+    if (*n < cap) {
+        out[*n].x = f.x - ox; out[*n].y = f.y - oy; out[*n].w = f.w; out[*n].h = f.h;
+        if (nd->dirty && *n_dirty < ndmax) dirty_idx[(*n_dirty)++] = (int)*n;
+        else if (nd->dirty) *n_dirty = ndmax + 1;        /* too many: paint it all */
+    }
+    (*n)++;
+    if (nd->dirty_comp && *n > 1) *dirty_comp = 1;        /* a group inside changed how it composites */
+    g_pr_depth++;
+    struct node_handle c = nd->first_child;
+    uint32_t guard = 512;
+    while (!node_handle_is_null(c) && guard-- != 0) {
+        struct scene_node *cn = scene_resolve(a, c);
+        struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
+        promoted_feet(a, c, world, ox, oy, out, cap, n, dirty_comp, dirty_idx, n_dirty, ndmax);
+        c = next;
+    }
+    g_pr_depth--;
+}
+/* a rect into a short list, merged into the one that grows least when full */
+static void rect_merge_add(struct clip_rect *r, int *n, int max, struct scene_promoted_node f) {
+    float x0 = floorf(f.x), y0 = floorf(f.y), x1 = ceilf(f.x + f.w), y1 = ceilf(f.y + f.h);
+    if (x1 <= x0 || y1 <= y0) return;
+    for (int i = 0; i < *n; i++)                       /* already covered */
+        if (x0 >= r[i].x && y0 >= r[i].y && x1 <= r[i].x + r[i].w && y1 <= r[i].y + r[i].h) return;
+    if (*n < max) { r[*n] = (struct clip_rect){ x0, y0, x1 - x0, y1 - y0, 0 }; (*n)++; return; }
+    int best = 0; float grow = 0;
+    for (int i = 0; i < *n; i++) {
+        float ux0 = fminf(r[i].x, x0), uy0 = fminf(r[i].y, y0);
+        float ux1 = fmaxf(r[i].x + r[i].w, x1), uy1 = fmaxf(r[i].y + r[i].h, y1);
+        float g = (ux1 - ux0) * (uy1 - uy0) - r[i].w * r[i].h;
+        if (i == 0 || g < grow) { grow = g; best = i; }
+    }
+    float ux0 = fminf(r[best].x, x0), uy0 = fminf(r[best].y, y0);
+    float ux1 = fmaxf(r[best].x + r[best].w, x1), uy1 = fmaxf(r[best].y + r[best].h, y1);
+    r[best] = (struct clip_rect){ ux0, uy0, ux1 - ux0, uy1 - uy0, 0 };
+}
+
 static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
                            struct scene_node *n, const float wparent[16], struct render_target *target) {
     const struct scene_layer_host *host = r->host;
@@ -689,6 +739,7 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
     if (p && (p->w != (uint32_t)bw || p->h != (uint32_t)bh)) {
         /* another size: another layer, standing where the old one stood */
         host->go(host->ctx, p->id, 0, &p->at, 0, 0, 1, 0);
+        free(p->nodes);
         memset(p, 0, sizeof *p); p = 0; resized = 1;
     }
     if (!p) {
@@ -718,15 +769,22 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
             return;
         }
         p = w; p->waiting = 0;
+        /* ONE COLOUR, a box and nothing else -- a dimming -- is a fill: a
+         * 1 x 1 layer that stands as large as the box, not its pixels */
+        int fill = host->look && n->kind == SCENE_NODE_RECT && node_handle_is_null(n->first_child) &&
+                   n->data.rect.fill.kind == PAINT_SOLID && n->corner_radius <= 0 && !n->shadow_enabled &&
+                   n->border_width <= 0 && !n->backdrop_blur_enabled;
         uint32_t *px = 0;
-        uint32_t id = host->create(host->ctx, (uint32_t)bw, (uint32_t)bh, &px);
+        uint32_t id = host->create(host->ctx, fill ? 1u : (uint32_t)bw, fill ? 1u : (uint32_t)bh, &px);
         if (!id || !px) { memset(p, 0, sizeof *p); return; }
-        p->id = id; p->px = px; p->w = (uint32_t)bw; p->h = (uint32_t)bh;
+        p->id = id; p->px = px; p->w = (uint32_t)bw; p->h = (uint32_t)bh; p->fill = fill;
         p->index = h.index; p->generation = h.generation;
         fresh = 1;
-        if (host->look)              /* the glass is the node's own box, not the shadow round it */
-            host->look(host->ctx, id, (uint8_t)fminf(255.0f, n->corner_radius), n->backdrop_blur_enabled,
-                       (int)floorf(nb.x) - bx, (int)floorf(nb.y) - by, (int)ceilf(nb.w), (int)ceilf(nb.h));
+        if (host->look) {            /* the glass is the node's own box, not the shadow round it */
+            if (fill) host->look(host->ctx, id, 0, 0, 0, 0, bw, bh, 1);
+            else host->look(host->ctx, id, (uint8_t)fminf(255.0f, n->corner_radius), n->backdrop_blur_enabled,
+                            (int)floorf(nb.x) - bx, (int)floorf(nb.y) - by, (int)ceilf(nb.w), (int)ceilf(nb.h), 0);
+        }
     }
     p->seen = 1;
 
@@ -740,8 +798,39 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
      * what is behind it in the window did */
     int repaint = fresh || changed || p->sig != sig || fabsf(p->fx - fx) > 1e-3f || fabsf(p->fy - fy) > 1e-3f ||
                   p->reduced != g_effects_reduced || (blur && (r->full || dirty_hits(r, b)));
-    if (repaint) {
-        memset(p->px, 0, (size_t)p->w * p->h * 4);
+    /* WHAT CHANGED, inside: with the same nodes in it (the same shape), the
+     * old and new places of each node that changed -- a hover moving down a
+     * menu, a caret -- are all that is painted again. */
+    struct clip_rect part[16]; int npart = -1;
+    struct scene_promoted_node feet[512]; uint32_t nfeet = 0;
+    int dirty_idx[32], n_dirty = 0, dcomp = 0;
+    promoted_feet(a, h, wparent, (float)bx, (float)by, feet, 512, &nfeet, &dcomp, dirty_idx, &n_dirty, 32);
+    if (p->fill && repaint) {
+        /* a fill's one pixel: the colour, premultiplied */
+        struct color c = n->data.rect.fill.solid;
+        uint32_t A = (uint32_t)clamp255(c.a);
+        p->px[0] = A << 24 | (uint32_t)clamp255(c.r * c.a) << 16 | (uint32_t)clamp255(c.g * c.a) << 8 |
+                   (uint32_t)clamp255(c.b * c.a);
+        p->sig = sig; p->fx = fx; p->fy = fy; p->reduced = g_effects_reduced;
+        r->layer_paints++;
+        npart = -2;                                     /* painted: no render */
+    }
+    if (repaint && npart != -2 && !fresh && p->nodes && p->n_nodes == nfeet && nfeet <= 512 && p->sig == sig &&
+        fabsf(p->fx - fx) <= 1e-3f && fabsf(p->fy - fy) <= 1e-3f && p->reduced == g_effects_reduced &&
+        !dcomp && n_dirty <= 32 && !(blur && !host->look && (r->full || dirty_hits(r, b)))) {
+        npart = 0;
+        for (uint32_t k = 0; k < nfeet; k++)
+            if (feet[k].x != p->nodes[k].x || feet[k].y != p->nodes[k].y ||
+                feet[k].w != p->nodes[k].w || feet[k].h != p->nodes[k].h) {
+                rect_merge_add(part, &npart, 16, feet[k]); rect_merge_add(part, &npart, 16, p->nodes[k]);
+            }
+        for (int k = 0; k < n_dirty; k++) {
+            rect_merge_add(part, &npart, 16, feet[dirty_idx[k]]);
+            rect_merge_add(part, &npart, 16, p->nodes[dirty_idx[k]]);
+        }
+    }
+    if (repaint && npart == 0) repaint = 0;            /* it changed nothing it shows */
+    if (repaint && npart != -2) {
         struct render_target lt; memset(&lt, 0, sizeof lt);
         lt.pixels = p->px; lt.width = p->w; lt.height = p->h; lt.stride = p->w * 4;
         lt.format = EMBK_PIXFMT_BGRA8888_PRE;
@@ -751,13 +840,29 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
         int was = r->no_cull; r->no_cull = 1;
         if (host->look) r->glass_root = n;              /* its own glass is the compositor's */
         cpu_clip_save_and_clear(&sv);
+        if (npart > 0) {
+            /* only those rects: cleared, and painted again -- clipped to them */
+            lt.clear_dirty = 1;
+            r->be->begin_frame(&lt, part, (uint32_t)npart);
+        } else {
+            memset(p->px, 0, (size_t)p->w * p->h * 4);
+        }
         render_subtree_opaque(r, a, h, wparent, &lt, (float)bx, (float)by);
+        if (npart > 0) r->be->end_frame(&lt);
         cpu_clip_restore(&sv);
         r->glass_root = 0;
         r->no_cull = was; r->backdrop = was_bd; r->bd_ox = wox; r->bd_oy = woy;
         p->sig = sig; p->fx = fx; p->fy = fy; p->reduced = g_effects_reduced;
-        r->layer_paints++;
+        if (npart > 0) r->layer_partials++; else r->layer_paints++;
     }
+    /* where its nodes are now, for the next change */
+    if (nfeet <= 512) {
+        if (p->cap_nodes < nfeet) {
+            struct scene_promoted_node *nn = (struct scene_promoted_node *)realloc(p->nodes, sizeof *nn * (nfeet ? nfeet : 1));
+            if (nn) { p->nodes = nn; p->cap_nodes = nfeet; }
+        }
+        if (p->cap_nodes >= nfeet) { memcpy(p->nodes, feet, sizeof *feet * nfeet); p->n_nodes = nfeet; }
+    } else p->n_nodes = 0;
 #ifdef PROMOTE_TRACE
     fprintf(stderr, "promote: id %u fresh=%d resized=%d repaint=%d at %d,%d op=%d appear op=%d resp=%d\n", p->id, fresh, resized, repaint, at.x, at.y, at.opacity, n->appear.opacity, n->appear.response_ms);
 #endif
@@ -770,7 +875,10 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
         if (memcmp(&at, &p->at, sizeof at))
             host->go(host->ctx, p->id, 0, &at, 0, 0, 0, repaint);   /* the app moved it: it is there */
     }
-    if (repaint) host->present(host->ctx, p->id, 0, 0, bw, bh);
+    if (repaint && npart > 0) {
+        for (int k = 0; k < npart; k++)
+            host->present(host->ctx, p->id, (int)part[k].x, (int)part[k].y, (int)part[k].w, (int)part[k].h);
+    } else if (repaint) host->present(host->ctx, p->id, 0, 0, p->fill ? 1 : bw, p->fill ? 1 : bh);
     p->at = at;
     p->disappear = n->disappear;        /* where it goes when it is gone... */
     p->nx = nb.x; p->ny = nb.y; p->nw = nb.w; p->nh = nb.h;   /* ...about the node as it is now */
@@ -805,6 +913,7 @@ static void promoted_leave(struct scene_renderer *r, struct scene_promoted *p) {
     struct frect nb = { p->nx, p->ny, p->nw, p->nh };
     struct scene_layer_state to = promoted_end(&p->at, &p->disappear, nb, p->at.x, p->at.y, (int)p->w, (int)p->h);
     if (host) host->go(host->ctx, p->id, 0, &to, p->disappear.response_ms, p->disappear.damping_milli, 1, 0);
+    free(p->nodes);
     memset(p, 0, sizeof *p);
 }
 

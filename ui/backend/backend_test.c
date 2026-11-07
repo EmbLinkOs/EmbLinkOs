@@ -878,8 +878,9 @@ static void t21_invisible(void) {
  * only its tint (a host that says how a layer looks) ---------------------- */
 static int g_look_n, g_look_glass, g_look_radius;
 static int g_look_box[4];
-static void fl_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h) {
-    (void)ctx; (void)id; g_look_n++; g_look_glass = glass; g_look_radius = radius;
+static int g_look_fill;
+static void fl_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h, int fill) {
+    (void)ctx; (void)id; g_look_n++; g_look_fill = fill; g_look_glass = glass; g_look_radius = radius;
     g_look_box[0] = x; g_look_box[1] = y; g_look_box[2] = w; g_look_box[3] = h;
 }
 static const struct scene_layer_host g_fake_host_look = { 0, fl_create, fl_present, fl_go, fl_look };
@@ -916,6 +917,67 @@ static void t22_glass_layer(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* ---- T23: a change inside a layer repaints only what it changed ---------- */
+static void t23_partial_layer(void) {
+    printf("T23 a hover inside a promoted menu repaints only the rows it changed:\n");
+    g_fl_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host);
+    struct render_target rt = make_target(200, 200);
+    struct card c; card_build(&a, &c, 24);                /* a card of 24 boxes: a menu's rows */
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 0, 1000 };
+    scene_set_promoted(&a, c.grp, true, &m, &m);
+    scene_render_frame(&r, &a, c.root, &rt);
+    scene_render_frame(&r, &a, c.root, &rt);              /* settled: the layer made */
+    uint32_t whole = r.layer_paints;
+    struct paint hp = solidp(0.9f, 0.6f, 0.1f, 1); scene_set_paint(&a, c.box[9], &hp);   /* the hover */
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(r.layer_paints == whole && r.layer_partials == 1, "one row's paint: a partial repaint, not the whole");
+    scene_set_transform(&a, c.box[3], 6.0f, 9.0f, 0, 0,0,0,1, 1,1,1);   /* a row moved inside */
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(r.layer_paints == whole && r.layer_partials == 2, "one row moved inside it: partial too");
+    /* the layer as kept, against the same subtree painted whole */
+    struct fake_layer *l = &g_fl[0];
+    uint32_t *kept = malloc((size_t)l->w * l->h * 4); memcpy(kept, l->px, (size_t)l->w * l->h * 4);
+    uint32_t kw = l->w, kh = l->h;
+    scene_render_invalidate(&r);                          /* everything painted again */
+    scene_render_frame(&r, &a, c.root, &rt);
+    int diff = 0;
+    for (uint32_t i = 0; i < kw * kh; i++) diff += kept[i] != g_fl[0].px[i];
+    CHECK(l->w == kw && diff == 0, "and what it kept is what painting it whole gives");
+    free(kept);
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T24: a promoted box of one colour is a fill: a 1 x 1 layer ---------- */
+static void t24_fill_layer(void) {
+    printf("T24 a dimming is a fill layer -- one pixel standing the size of the screen:\n");
+    g_fl_n = 0; g_look_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host_look);
+    struct render_target rt = make_target(160, 100);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle dim = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, dim, 160, 100);
+    struct paint dp = solidp(0, 0, 0, 0.4f); scene_set_paint(&a, dim, &dp);
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000 };
+    scene_set_promoted(&a, dim, true, &m, &m);
+    scene_render_frame(&r, &a, root, &rt);
+    scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && l->w == 1 && l->h == 1, "its layer is one pixel");
+    CHECK(g_look_fill && g_look_box[2] == 160 && g_look_box[3] == 100, "said to be a fill, as large as the box");
+    CHECK(l->px[0] == (102u << 24), "its pixel the colour, premultiplied (black at 0.4)");
+    struct paint dp2 = solidp(0, 0, 0, 0.6f); scene_set_paint(&a, dim, &dp2);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->px[0] == (153u << 24) && l->presents == 2, "a new colour is a new pixel, presented");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -940,6 +1002,8 @@ int main(void) {
     t20_promoted();
     t21_invisible();
     t22_glass_layer();
+    t23_partial_layer();
+    t24_fill_layer();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

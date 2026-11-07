@@ -59,7 +59,8 @@ struct scene_layer_host {
      * its corner radius, and glass -- the compositor blurs what is really
      * behind it, other windows too, under its pixels; the renderer paints the
      * glass's tint alone */
-    void (*look)(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h);
+    void (*look)(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h, int fill);
+    /* fill: the layer is one colour -- its single pixel -- standing w x h */
 };
 #define SCENE_LAYERS 8
 struct scene_promoted {
@@ -73,6 +74,11 @@ struct scene_promoted {
     uint32_t  sig;
     int       reduced, seen;
     int       waiting;             /* seen, not yet settled: no layer yet (frames waited) */
+    /* where each node of it painted last, layer pixels, in walk order -- so a
+     * change inside repaints only what it changed (a hover, a caret) */
+    struct scene_promoted_node { float x, y, w, h; } *nodes;
+    uint32_t  n_nodes, cap_nodes;
+    int       fill;                /* one colour: a 1 x 1 layer standing w x h */
 };
 
 struct scene_renderer {
@@ -103,7 +109,8 @@ struct scene_renderer {
     /* the layer host, and the promoted subtrees it holds for us */
     const struct scene_layer_host *host;
     struct scene_promoted  promoted[SCENE_LAYERS];
-    uint32_t               layer_paints;   /* promoted subtrees painted (tests) */
+    uint32_t               layer_paints;   /* promoted subtrees painted whole (tests) */
+    uint32_t               layer_partials; /* ...and painted only where they changed */
     int                    wants_frame;    /* a promoted subtree is settling: build the next */
     const struct scene_node *glass_root;   /* painting it into its layer: its blur is the compositor's */
 };

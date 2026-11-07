@@ -482,13 +482,13 @@ static void lh_go(void *ctx, uint32_t id, const struct scene_layer_state *from, 
     n++;
     embk_layer_set(g_lh_win, op, n, at_present ? EMBK_LS_AT_PRESENT : 0);
 }
-static void lh_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h) {
+static void lh_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h, int fill) {
     (void)ctx;
     struct embk_layer_op op; memset(&op, 0, sizeof op);
     op.id = id; op.set = EMBK_LP_LOOK;
     op.radius = radius; op.material = glass ? EMBK_LM_BLUR : EMBK_LM_NONE;
     op.mat_x = (int16_t)x; op.mat_y = (int16_t)y; op.mat_w = (uint16_t)w; op.mat_h = (uint16_t)h;
-    op.flags = EMBK_LF_HIT;                    /* a menu past the window's edge takes the pointer */
+    op.flags = EMBK_LF_HIT | (fill ? EMBK_LF_FILL : 0);   /* a menu past the window's edge takes the pointer */
     embk_layer_set(g_lh_win, &op, 1, 0);
 }
 static const struct scene_layer_host g_layer_host = { 0, lh_create, lh_present, lh_go, lh_look };

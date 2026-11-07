@@ -606,10 +606,13 @@ static void layer_geom(const struct comp_layer *L, const struct comp_window *w, 
     int s = spring_px(&L->scale);
     if (s < 10) s = 10;
     if (s > 1000) s = 1000;
-    int sw = (int)((int64_t)L->w * s / 1000), sh = (int)((int64_t)L->h * s / 1000);
+    /* a fill stands as large as it says, from its one pixel */
+    int64_t lw = (L->flags & EMBK_LF_FILL) && L->mat_w ? L->mat_w : L->w;
+    int64_t lh = (L->flags & EMBK_LF_FILL) && L->mat_h ? L->mat_h : L->h;
+    int sw = (int)(lw * s / 1000), sh = (int)(lh * s / 1000);
     int ox = w->x, oy = w->y + win_titlebar_h(w);
-    r[0] = ox + spring_px(&L->x) + (int)(((int64_t)L->w - sw) * L->ax / 1000);
-    r[1] = oy + spring_px(&L->y) + (int)(((int64_t)L->h - sh) * L->ay / 1000);
+    r[0] = ox + spring_px(&L->x) + (int)((lw - sw) * L->ax / 1000);
+    r[1] = oy + spring_px(&L->y) + (int)((lh - sh) * L->ay / 1000);
     r[2] = sw; r[3] = sh;
     int a = spring_px(&L->opacity);
     *alpha = a < 0 ? 0 : a > 255 ? 255 : a;
@@ -617,7 +620,7 @@ static void layer_geom(const struct comp_layer *L, const struct comp_window *w, 
 /* Where its material is on screen: its box (the glass panel within the
  * picture), scaled with it. */
 static void layer_mat_rect(const struct comp_layer *L, const int r[4], int m[4]) {
-    if (!L->mat_w || !L->mat_h || !L->w || !L->h) { m[0] = r[0]; m[1] = r[1]; m[2] = r[2]; m[3] = r[3]; return; }
+    if (!L->mat_w || !L->mat_h || !L->w || !L->h || (L->flags & EMBK_LF_FILL)) { m[0] = r[0]; m[1] = r[1]; m[2] = r[2]; m[3] = r[3]; return; }
     m[0] = r[0] + (int)((int64_t)L->mat_x * r[2] / (int64_t)L->w);
     m[1] = r[1] + (int)((int64_t)L->mat_y * r[3] / (int64_t)L->h);
     m[2] = (int)((int64_t)L->mat_w * r[2] / (int64_t)L->w);
@@ -2341,6 +2344,18 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
                 }
             }
         }
+        if (L->flags & EMBK_LF_FILL) {
+            /* one colour over its rect: a uniform blend of a row of it */
+            static uint32_t fill_row[4096];
+            uint32_t c = L->px[0], ca = c >> 24;
+            int fx0 = imax(r[0], rx0), fy0 = imax(r[1], ry0), fx1 = imin(r[0] + r[2], rx1), fy1 = imin(r[1] + r[3], ry1);
+            if (ca && fx1 > fx0 && fy1 > fy0 && fx1 - fx0 <= 4096) {
+                uint32_t cr = ((c >> 16) & 255u) * 255u / ca, cg = ((c >> 8) & 255u) * 255u / ca, cb = (c & 255u) * 255u / ca;
+                uint32_t straight = 0xff000000u | (cr > 255 ? 255 : cr) << 16 | (cg > 255 ? 255 : cg) << 8 | (cb > 255 ? 255 : cb);
+                for (int x = 0; x < fx1 - fx0; x++) fill_row[x] = straight;
+                fb_blit_uniform(fx0, fy0, fx1 - fx0, fy1 - fy0, fill_row, 0, ca * (uint32_t)a / 255u);
+            }
+        } else
         fb_blit_scaled_over(r[0], r[1], r[2], r[3], L->px, (int32_t)L->w, (int32_t)L->h, L->w,
                             (uint32_t)a, g_ghost_smooth, rx0, ry0, rx1, ry1);
         if (carved) corners_carve_ring(0, 0);
@@ -2362,7 +2377,7 @@ static int layers_draw_gpu(const struct comp_window *w, const struct gpu_compose
             struct gpu_rect cast = { r[0], r[1] + L->sh_dy, r[2], r[3] };
             gc->shadow(&cast, &fr, L->radius, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u);
         }
-        if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0) {
+        if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0 && !(L->flags & EMBK_LF_FILL)) {
             int m[4]; layer_mat_rect(L, r, m);
             struct gpu_rect mr = { m[0], m[1], m[2], m[3] };
             gc->blur(&mr, GLASS_BLUR, &mr, (uint32_t)(L->radius * spring_px(&L->scale) / 1000));
@@ -2383,6 +2398,7 @@ static int layer_hit(const struct comp_window *w, int x, int y) {
         if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px || !(L->flags & EMBK_LF_HIT)) continue;
         int r[4], a; layer_geom(L, w, r, &a);
         if (a <= 0 || r[2] <= 0 || r[3] <= 0 || x < r[0] || y < r[1] || x >= r[0] + r[2] || y >= r[1] + r[3]) continue;
+        if (L->flags & EMBK_LF_FILL) { if (L->px[0] >> 24) return 1; continue; }
         uint32_t lx = (uint32_t)((int64_t)(x - r[0]) * L->w / (uint32_t)r[2]);
         uint32_t ly = (uint32_t)((int64_t)(y - r[1]) * L->h / (uint32_t)r[3]);
         if (lx < L->w && ly < L->h && (L->px[(size_t)ly * L->w + lx] >> 24)) return 1;
