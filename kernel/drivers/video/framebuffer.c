@@ -670,6 +670,21 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
     fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
 }
 
+// VIBRANCY over a drawn region: each colour moved away from its grey by `s`
+// (pix_saturate_row; PIX_VIBRANCY is the materials'), what frosted glass does
+// to what shows through it. 32-bit scanouts only; elsewhere nothing.
+void fb_saturate_region(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t s) {
+    if (!fb_fast()) return;
+    int32_t x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int32_t x1 = x + w > (int32_t)fb.width ? (int32_t)fb.width : x + w;
+    int32_t y1 = y + h > (int32_t)fb.height ? (int32_t)fb.height : y + h;
+    if (x1 <= x0 || y1 <= y0) return;
+    int swap = fb_swap();
+    uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
+    for (int32_t yy = y0; yy < y1; yy++, row += fb.pitch) pix_saturate_row((uint32_t *)row, x1 - x0, s, swap);
+    fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+}
+
 // A LAYER: a picture with its own alpha (premultiplied 0xAARRGGBB, as the
 // toolkit paints it) scaled into a destination rect and composited OVER what
 // is there at `opacity`, clipped as fb_blit_scaled_uniform is. Where that one

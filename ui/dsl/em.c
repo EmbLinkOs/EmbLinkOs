@@ -656,6 +656,11 @@ void em_overlay_end_(void)  {
 }
 int  em_overlay_dismissed(void) { return g_ov_dismissed; }
 int  em_overlay_active(void)    { return g_ov_now || g_ov_prev; }
+/* ...in its first frames, while a scrim click is still debounced: frames must
+ * come for the count to reach it. Once it has, the modal is like any other
+ * screen -- built for input, not for every frame the display shows. */
+int  em_overlay_settling(void)  { return em_overlay_active() && (g_ov_frames < 4 || !g_ov_now); }
+/* (and the frame after it went, when focus goes back to what it covered) */
 int em_overlay_escape(void) {
     if(!em_overlay_active() || !ui_focus_scope_active())return 0;
     g_ov_escape=1;g_em_epoch++;em_request_frame();return 1;

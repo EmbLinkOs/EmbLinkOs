@@ -1000,14 +1000,13 @@ int em_app_run(const EmApp *app) {
         prev_in = in;
 
         /* --- retained updates: skip ALL ui work on untouched frames --------- *
-         * em_overlay_active() MUST be a build trigger: a modal's scrim-dismiss
+         * em_overlay_settling() MUST be a build trigger: a modal's scrim-dismiss
          * is debounced for a few consecutive shown frames (em.c's g_ov_frames
          * >= 3, to swallow the click that opened it). Without this, a retained
          * loop only builds on input, so the debounce counter never advances and
-         * the scrim-dismiss never fires (it'd take repeated clicks). Keeping
-         * frames coming while a modal is up costs nothing -- modals are
-         * transient -- and matches the always-build loop the modal was designed
-         * against. */
+         * the scrim-dismiss never fires (it'd take repeated clicks). Only until
+         * it has: a modal left up -- a sheet asking a question -- used to build
+         * every frame the display showed for as long as it was there. */
         int win_moved = em_window_moved();
         if(win_moved && (in.buttons&EMBK_MOUSE_LEFT))drag_pending=1;   /* read-and-clear (drag/snap last frame) */
         /* refresh_ms was honoured for WIDGETS only, so an application whose
@@ -1026,7 +1025,7 @@ int em_app_run(const EmApp *app) {
         if (app_tick) last_app_tick = em_now_ms();
         int build = first || input_edge || em_take_frame_request() || app_tick ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
-                    em_overlay_active() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
+                    em_overlay_settling() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
         if (!build) {
             em_prof_flush(&g_prof, title);          /* a run of frames ends at the wait */
             cad_idle_tick(&cad);
@@ -1142,7 +1141,10 @@ int em_app_run(const EmApp *app) {
             char b[96]; snprintf(b, sizeof b, "%s: first frame presented (+%lums)\n", title,
                                  (unsigned long)(embk_uptime_ms() - t0)); embk_puts(1, b);
         }
-        built_motion = em_frame_requested() || em_nav_transitioning() || em_overlay_active() ||
+        /* Input while a modal is up: a frame after it, where what it did -- a
+         * button that dismissed it -- takes shape, and focus goes back. */
+        if (input_edge && em_overlay_active()) em_request_frame();
+        built_motion = em_frame_requested() || em_nav_transitioning() || em_overlay_settling() ||
                        em_window_pulling();
 
         /* THE GRIP, AS IT IS DRAGGED: the window takes the size the drag says

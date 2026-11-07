@@ -166,8 +166,10 @@ the default target). Measured before and after every step
         the right-click does not seem to arrive in that configuration (left clicks and keys do;
         `layer_library_smoke.py --graphics virgl` passes, glass layers drawn by the GPU). The same
         smoke passes on x86 under TCG and arm64 under HVF.
-  - [ ] A layer's frost is a box blur of what is under it, made every frame it is drawn -- not
-        kept, as a window's material blur is (backdrop.c), and with no vibrancy (saturation).
+  - [x] A layer's frost is saturated as the windows' materials are (`fb_saturate_region`,
+        `PIX_VIBRANCY`) on the CPU path; the GPU's blur primitive has no saturation yet (above).
+  - [ ] A layer's frost is a box blur of what is under it made every frame it is drawn, not kept
+        as a window's material blur is (backdrop.c).
   - [ ] A layer above everything (`z` 1 in the plan) is not offered: layers stand at their
         window's place in the stack.
   - [ ] An app that dies takes its layers at once; a closing menu of a crashed app does not
@@ -190,8 +192,8 @@ the default target). Measured before and after every step
   - [ ] The scrim behind a sheet still dims at once: promoting it would take the sheet into its
         window-sized layer (a promoted subtree's descendants are its pixels); a second layer
         under the sheet's own would fade it.
-  - [ ] While a sheet is up the runtime still builds a frame every frame (`em_overlay_active`,
-        the scrim-click debounce), painting nothing; it could wait for input like any other.
+  - [x] While a sheet is up the runtime builds frames only in its first four (the scrim-click
+        debounce, `em_overlay_settling`), then waits for input like any other screen.
   - [ ] `overview_smoke.py` failed once on x86 under TCG at its turn-back step (the windows were
         still in flight when sampled) and passed alone on x86 and arm64; its wait for the windows
         to land should be a wait for the condition, not a fixed pause.

@@ -980,6 +980,7 @@ void em_overlay_(void);
 void em_overlay_end_(void);
 int  em_overlay_dismissed(void);
 int  em_overlay_active(void);
+int  em_overlay_settling(void);   /* active, and still in the frames its scrim-dismiss waits out */
 /* LAYERS: the runtime turns them on when the compositor will move promoted
  * subtrees for the window -- menus, tooltips -- painted once (ui_set_promoted). */
 void em_set_layers(int on);

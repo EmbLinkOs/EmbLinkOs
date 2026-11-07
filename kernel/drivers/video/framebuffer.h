@@ -90,6 +90,8 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 /* A picture with its own (premultiplied) alpha, scaled and composited over at
  * `opacity` -- a compositor layer; see framebuffer.c. */
+/* Each colour of a drawn region moved away from its grey (pix_saturate_row). */
+void fb_saturate_region(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t s);
 void fb_blit_scaled_over(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                          const uint32_t *argb, int32_t sw, int32_t sh,
                          uint32_t stride, uint32_t opacity, int smooth,

@@ -2329,7 +2329,10 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
                 int rad = L->radius * spring_px(&L->scale) / 1000;
                 g_corner_r_override = rad < 1 ? 0 : rad > WIN_R_MAX ? WIN_R_MAX : rad;
                 if (g_corner_r_override) { corners_save_at(m[0], m[1], m[0] + m[2], m[1] + m[3], rx0, ry0, rx1, ry1); carved = 1; }
-                if (a >= 250) fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                if (a >= 250) {
+                    fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                    fb_saturate_region(bx0, by0, bx1 - bx0, by1 - by0, PIX_VIBRANCY);   /* frosted, not muddy */
+                }
                 else {
                     /* part way in: the frost at the layer's own opacity, over the sharp */
                     {
@@ -2337,6 +2340,7 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
                         if (keep) {
                             fb_read_rect(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0));
                             fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                            fb_saturate_region(bx0, by0, bx1 - bx0, by1 - by0, PIX_VIBRANCY);
                             fb_blit_uniform(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0), 255u - (uint32_t)a);
                             kfree(keep);
                         }
