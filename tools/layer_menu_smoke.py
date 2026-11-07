@@ -36,10 +36,13 @@ PROF = re.compile(rb'prof: Files frames=(\d+) full=(\d+)')
 
 
 def right_click(d, x, y):
+    # held 0.2 s, as the left click is (shell_shot.click): through QEMU 8.2's
+    # PS/2 mouse a 50 ms press never reached the guest -- the menu did not open
+    # on Ubuntu's QEMU (CI, the virgl VM) and always did on Homebrew's 11
     P.move(d, x, y)
     for down in (True, False):
         d.g.qmp.cmd('input-send-event', events=[{'type': 'btn', 'data': {'down': down, 'button': 'right'}}])
-        time.sleep(0.05)
+        time.sleep(0.2)
 
 
 def catch_layer(d, cond, seconds):
