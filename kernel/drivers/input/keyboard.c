@@ -610,10 +610,7 @@ void kbd_translate(uint8_t make, int pressed) {
 
 #if defined(__x86_64__)
 static int g_kbd_prefix;
-static void keyboard_handler(void) {
-    uint8_t sc=inb(KBD_DATA_PORT);
-    spin_lock(&input_state_lock);keyboard_scancode(sc,&g_kbd_prefix,1);spin_unlock(&input_state_lock);
-}
+static void keyboard_handler(void) { (void)i8042_service(1); }   /* reads, routes, drains */
 /* a byte for port 1 that the i8042 watch read, recovering a lost interrupt */
 void keyboard_ps2_byte(uint8_t sc) {
     spin_lock(&input_state_lock);keyboard_scancode(sc,&g_kbd_prefix,1);spin_unlock(&input_state_lock);

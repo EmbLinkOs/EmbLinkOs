@@ -333,12 +333,7 @@ static void mouse_handler_inner(void) {
         }
     }
 }
-static void mouse_handler(void) {
-    spin_lock(&pointer_state_lock);
-    mouse_handler_inner();
-    spin_unlock(&pointer_state_lock);
-    notify();
-}
+static void mouse_handler(void) { (void)i8042_service(12); }    /* reads, routes, drains */
 /* one byte the controller had for the aux port, read by someone else (the
  * i8042 watch, recovering a lost interrupt) */
 void mouse_ps2_byte(uint8_t b) {

@@ -14,6 +14,7 @@
 #include "include/io.h"
 #include "include/kprintf.h"
 #include "include/arch_irq.h"
+#include "include/spinlock.h"
 #include "process/process.h"   /* the watch: a kernel thread */
 #include "acpi/acpi.h"
 
@@ -82,23 +83,43 @@ int i8042_read(uint32_t spins) {
  * device by the status register's port bit. One port read a look when idle. */
 void keyboard_ps2_byte(uint8_t sc);
 void mouse_ps2_byte(uint8_t b);
+
+/* ONE READER FOR BOTH PORTS, under one lock, the way Linux's i8042 does it.
+ * The keyboard's handler (IRQ1) and the mouse's (IRQ12) each used to read the
+ * data port blind: on two cores at once -- which KVM makes real -- either could
+ * take the other's byte, and a mouse packet lost a byte to the keyboard (wheel
+ * garbage, a menu that would not close). Now every byte is read with the
+ * status that says whose it is, and all that is waiting is drained.
+ * `source`: 1 or 12 (the interrupt that fired), 0 (the watch). An 8042 that
+ * never sets the aux bit (some emulations) is routed by the line, as before. */
+static spinlock_t g_svc_lock = SPINLOCK_INIT;
+static int g_aux_bit_seen;
+uint32_t i8042_service(int source) {
+    spin_lock(&g_svc_lock);
+    uint32_t n = 0;
+    for (; n < 32u; n++) {
+        uint8_t st = inb(PS2_STATUS);
+        if (!(st & ST_OBF) || st == 0xFF) break;
+        uint8_t b = inb(PS2_DATA);
+        int aux;
+        if (st & ST_AUX) { aux = 1; g_aux_bit_seen = 1; }
+        else aux = !g_aux_bit_seen && source == 12;
+        if (aux) { if (g_have_aux) mouse_ps2_byte(b); }
+        else if (g_have_kbd) keyboard_ps2_byte(b);
+    }
+    spin_unlock(&g_svc_lock);
+    return n;
+}
+
 static void i8042_watch_main(void) {
     int waited = 0;
     for (;;) {
         sched_sleep_ms(100);
-        uint64_t f = arch_irq_save();
         uint8_t st = inb(PS2_STATUS);
-        if (!(st & ST_OBF) || st == 0xFF) { waited = 0; arch_irq_restore(f); continue; }
-        if (!waited) { waited = 1; arch_irq_restore(f); continue; }   /* once more: an IRQ may be on its way */
-        uint32_t n = 0;
-        while ((st & ST_OBF) && n < 64u) {
-            uint8_t b = inb(PS2_DATA);
-            if (st & ST_AUX) { if (g_have_aux) mouse_ps2_byte(b); }
-            else if (g_have_kbd) keyboard_ps2_byte(b);
-            st = inb(PS2_STATUS); n++;
-        }
-        arch_irq_restore(f);
+        if (!(st & ST_OBF) || st == 0xFF) { waited = 0; continue; }
+        if (!waited) { waited = 1; continue; }   /* once more: an interrupt may be on its way */
         waited = 0;
+        uint32_t n = i8042_service(0);
         if (n) kprintf("i8042: %u byte(s) left by a lost interrupt, delivered\n", n);
     }
 }
