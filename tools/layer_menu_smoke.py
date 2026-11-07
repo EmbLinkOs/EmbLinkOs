@@ -58,7 +58,7 @@ def main():
     ap.add_argument('--accel', choices=('hvf', 'tcg'), default='hvf', help='aarch64 only')
     ap.add_argument('--graphics', choices=('virtio', 'virgl'), default='virtio', help='x86_64 only')
     args = ap.parse_args()
-    slow = 5 if args.graphics == 'virgl' else 3 if os.environ.get('CI') else 1   # CI: a shared, slower emulator   # x86 emulated in a VM: everything is slower
+    slow = 5 if args.graphics == 'virgl' else 3 if os.environ.get('CI') else 1   # virgl: emulated in a VM; CI: a shared, slower emulator
     out = Path(tempfile.mkdtemp(prefix='emblink-layermenu-'))
     print(f'Logs and captures: {out}', flush=True)
     d = P.boot(args, out)
