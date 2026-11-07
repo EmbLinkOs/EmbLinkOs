@@ -446,6 +446,17 @@ static int g_frame_req = 1;   /* first frame always builds */
 void em_request_frame(void) { g_frame_req = 1; }
 int  em_take_frame_request(void) { int r = g_frame_req; g_frame_req = 0; return r; }
 int  em_frame_requested(void) { return g_frame_req; }
+static uint64_t g_wake_at;
+void em_wake_at(uint64_t ms) { if (ms && (!g_wake_at || ms < g_wake_at)) g_wake_at = ms; }
+int  em_take_wake(uint64_t now) {
+    if (!g_wake_at || now < g_wake_at) return 0;
+    g_wake_at = 0; return 1;
+}
+int  em_wake_wait(uint64_t now, int wait) {
+    if (!g_wake_at) return wait;
+    int64_t left = g_wake_at > now ? (int64_t)(g_wake_at - now) : 0;
+    return left < wait ? (int)left : wait;
+}
 
 static uint64_t (*g_clock)(void);
 static uint64_t g_now_ms, g_prev_ms;
@@ -476,7 +487,7 @@ void em_tooltip(const char *label) {
     if(strcmp(g_tip_label,label)){snprintf(g_tip_label,sizeof g_tip_label,"%s",label);g_tip_since=em_now_ms();}
     if(!g_tip_since)g_tip_since=em_now_ms();
     g_tip_seen=1;g_tip_rect[0]=x;g_tip_rect[1]=y;g_tip_rect[2]=w;g_tip_rect[3]=h;
-    if(em_now_ms()-g_tip_since<600)em_request_frame();
+    if(em_now_ms()-g_tip_since<600)em_wake_at(g_tip_since+600);   /* shown then, not polled for */
 }
 int em_tooltip_visible(void){return g_tip_visible;}
 void em_tooltip_host(void) {
@@ -497,7 +508,7 @@ void em_tooltip_host(void) {
     ui_begin_vstack(1);ui_set_offset(x,y);ui_set_size(sz_fixed(width),sz_intrinsic());
     /* on layers it fades in and out (the compositor's), with no repaint of the window */
     { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms:0);
-      struct scene_layer_motion in={0,1000,500,500,0,0,r,1000},out={0,1000,500,500,0,0,r,1000};
+      struct scene_layer_motion in={0,1000,500,500,0,0,r,1000,0},out={0,1000,500,500,0,0,r,1000,0};
       ui_set_promoted(g_em_layers!=0,&in,&out); }
     ui_set_paint(solid(TH->surface));ui_set_border(1,TH->border_strong);ui_set_corner_radius(TH->radius_sm);
     ui_set_padding(TH->control_py,TH->sp2,TH->control_py,TH->sp2);ui_set_font(TH->font_regular);ui_set_text_size(TH->text_caption);ui_set_text_color(TH->text);
@@ -643,7 +654,14 @@ int  em_nav_depth(void){ return g_nav_top + 1; }
  * structural change the dirty-rect renderer won't fully erase, so the host loop
  * force-repaints while em_overlay_active(). em_overlay_end_ records whether the
  * bare scrim (not the dialog) was clicked -> OverlayDismissed(). */
-void em_overlay_(void)      { em_flush(); g_ov_now = 1; ui_overlay_begin(0); }
+void em_overlay_(void)      {
+    em_flush(); g_ov_now = 1; ui_overlay_begin(0);
+    /* ON LAYERS THE DIMMING FADES, in and out, a layer of its own under the
+     * sheet's (a fill: one colour, the window's size) */
+    { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms*2.0f:0);
+      struct scene_layer_motion in={0,1000,500,500,0,0,r,1000,0},out={0,1000,500,500,0,0,(uint16_t)(r*2/3),1000,0};
+      ui_set_promoted(g_em_layers!=0,&in,&out); }
+}
 void em_overlay_end_(void)  {
     em_flush();
     /* Debounce scrim-dismiss for the first few frames after the modal opens: the
@@ -673,10 +691,10 @@ void em_dialog_(EmProps p)  {
     em_apply_box(p);
     /* ON LAYERS A SHEET ARRIVES: up from 0.95 of its size about its middle and
      * 8 px low, as it fades in, on a snappy spring -- and sinks back out when
-     * it is dismissed. The scrim behind it dims at once, as before. Without
+     * it is dismissed, over a dimming that fades (em_overlay_). Without
      * layers it appears where it stands. */
     { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms*2.4f:0);
-      struct scene_layer_motion in={0,950,500,500,0,8,r,900},out={0,970,500,500,0,4,(uint16_t)(r*2/3),1000};
+      struct scene_layer_motion in={0,950,500,500,0,8,r,900,0},out={0,970,500,500,0,4,(uint16_t)(r*2/3),1000,0};
       ui_set_promoted(g_em_layers!=0,&in,&out); }
 }
 void em_dialog_end_(void)   { em_flush(); ui_dialog_end(); }
@@ -1372,8 +1390,26 @@ static float g_cl_grab_x, g_cl_grab_y, g_cl_dx, g_cl_dy, g_cl_progress;
 /* the spring back after a pull let go short: 1 at release, 0 home */
 static struct em_spring g_cl_back;
 static float g_cl_rel_dx, g_cl_rel_dy, g_cl_rel_progress;
+/* ON LAYERS the window's content is a layer while it is pulled, and for as
+ * long after as its spring home takes the compositor (g_cl_home): the drag
+ * moves it, the release sends it home, and the app builds no frame of it */
+static uint64_t g_cl_home;
+static int g_cl_layer;
 
-int em_window_take_close(void) { if (!g_cl_pend) return 0; g_cl_pend = 0; return 1; }
+static int g_cl_back_frames;     /* frames presented with the content back in the window */
+int em_window_take_close(void) {
+    if (!g_cl_pend) return 0;
+    /* ON LAYERS, NOT YET: the content goes back into the window first, and
+     * that frame is presented -- the window then closes with its picture in
+     * it, as it flies away, rather than an empty frame */
+    if (g_em_layers && (g_cl_layer || g_cl_back_frames < 1)) {
+        if (!g_cl_layer) g_cl_back_frames++;
+        em_request_frame();
+        return 0;
+    }
+    g_cl_pend = 0; g_cl_back_frames = 0;
+    return 1;
+}
 
 bool em_close_grip(void) {
     const struct ui_theme *t = TH;
@@ -1408,6 +1444,12 @@ bool em_close_grip(void) {
         g_cl_active = 0;                               /* released before the threshold */
         g_cl_rel_dx = g_cl_dx; g_cl_rel_dy = g_cl_dy; g_cl_rel_progress = g_cl_progress;
         em_spring_set(&g_cl_back, 1.0f);
+        if (g_em_layers && em_now_ms()) {
+            /* home on the compositor's spring: the app's picture is there now */
+            g_cl_progress = 0; g_cl_dx = g_cl_dy = 0;
+            g_cl_home = em_now_ms() + (TH->motion_ms > 0 ? 600 : 0);
+            em_wake_at(g_cl_home);                     /* the frame that takes it back */
+        }
     }
     /* spring back when released below the threshold -- on the clock, not by
      * a fraction a frame, which sprang back twice as fast at 120 Hz */
@@ -1422,7 +1464,7 @@ bool em_close_grip(void) {
 
 /* True while a close pull is in progress (or springing back) -- the app runtime
  * force-repaints so the fade/slide don't ghost under the dirty-rect present. */
-int em_window_pulling(void) { return g_cl_active || g_cl_progress > 0.001f; }
+int em_window_pulling(void) { return !g_em_layers && (g_cl_active || g_cl_progress > 0.001f); }
 
 /* Window: the full-bleed top-level surface of a chromeless app window. Fills
  * the whole pixel buffer with the theme background (rectangular -- the OS
@@ -1445,10 +1487,26 @@ void em_window_(const char *title, EmProps p) {
     ui_set_spacing(0);
     em_apply_box(p);
     /* drag-to-dismiss preview: fade + slide the whole window toward the pull as
-     * the close grip is dragged (springs back if released early). */
-    if (g_cl_progress > 0.001f) {
+     * the close grip is dragged (springs back if released early). ON LAYERS
+     * the content is a layer for it: the drag moves it, the compositor springs
+     * it home, and it is the window's pixels again once there -- or the frame
+     * the pull commits, so the window closes with its picture in it. Going in
+     * and coming back are structural (what it vacates is cleared). */
+    int layer = g_em_layers && !g_cl_pend && (g_cl_active || (g_cl_home && em_now_ms() < g_cl_home));
+    if (!layer) g_cl_home = 0;
+    if (layer != g_cl_layer) { g_cl_layer = layer; g_em_epoch++; }
+    if (g_em_layers) {
+        static const struct scene_layer_motion there = { 255, 1000, 500, 500, 0, 0, 0, 0, 0 };
+        ui_set_promoted(layer, &there, &there);
+        ui_set_layer_spring(g_cl_active ? 0 : 250, 900);   /* follows the hand; let go, springs home */
+    }
+    if (g_cl_progress > 0.001f || g_em_layers) {
         ui_set_opacity(1.0f - g_cl_progress * 0.88f);
-        ui_set_offset(g_cl_dx * 0.30f, g_cl_dy * 0.30f);
+        /* whole pixels on layers: a layer a pixel wider is another layer, made
+         * again -- the drag moves this one */
+        float ox = g_cl_dx * 0.30f, oy = g_cl_dy * 0.30f;
+        if (g_em_layers) ui_set_offset((float)(int)(ox + (ox < 0 ? -0.5f : 0.5f)), (float)(int)(oy + (oy < 0 ? -0.5f : 0.5f)));
+        else ui_set_offset(g_cl_dx * 0.30f, g_cl_dy * 0.30f);
     }
 }
 void em_window_end_(void) {
@@ -2604,11 +2662,11 @@ static struct { const char *msg; EmTone tone; uint64_t raised; int active; struc
 void em_toast(const char *msg, EmTone tone) {
     if (!g_toast.active) em_spring_set(&g_toast.m, 0.0f);   /* a fresh one rises from below */
     g_toast.msg = msg; g_toast.tone = tone; g_toast.raised = em_now_ms(); g_toast.active = 1;
-    g_em_epoch++;
+    if (g_em_layers) em_request_frame();   /* on a layer it is not in the window: an ordinary frame */
+    else g_em_epoch++;
 }
 void em_toast_host(void) {
     if (!g_toast.active) return;
-    em_request_frame();                    /* fading/expiring: keep frames coming */
     const struct ui_theme *t = TH;
     uint64_t now = em_now_ms();
     /* with a real clock, auto-expire; on host (clock 0) stay visible for render */
@@ -2618,9 +2676,20 @@ void em_toast_host(void) {
      * damping, so the rise settles with a lift rather than a stop. */
     float leave = t->motion_ms > 0 ? t->motion_ms * 2.5f : 300.0f;
     int staying = !now || age < TOAST_MS - leave;
-    float op = em_spring_to(&g_toast.m, staying ? 1.0f : 0.0f, SPRING_SNAPPY);
-    if (!staying && op < 0.01f) { g_toast.active = 0; g_em_epoch++; return; }
-    if (op < 0) op = 0;
+    float op;
+    if (g_em_layers) {
+        /* ON A LAYER the compositor raises it and sinks it; the app builds it
+         * at rest, once, and wakes again only when its time is up -- to stop
+         * building it, which is what sends the layer down. */
+        if (!staying) { g_toast.active = 0; em_request_frame(); return; }
+        if (now) em_wake_at(g_toast.raised + (uint64_t)(TOAST_MS - leave));
+        op = 1.0f;
+    } else {
+        em_request_frame();                /* fading/expiring: keep frames coming */
+        op = em_spring_to(&g_toast.m, staying ? 1.0f : 0.0f, SPRING_SNAPPY);
+        if (!staying && op < 0.01f) { g_toast.active = 0; g_em_epoch++; return; }
+        if (op < 0) op = 0;
+    }
     Color accent = t->accent;
     int cp = IconInfo;
     switch (g_toast.tone) {
@@ -2641,6 +2710,11 @@ void em_toast_host(void) {
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {
         ui_begin_hstack(1);
+        { uint16_t r = (uint16_t)(t->motion_ms > 0 ? leave : 0);
+          int16_t dy = (int16_t)t->sp4;               /* from just below, up; and back down */
+          struct scene_layer_motion in = { 0, 1000, 500, 1000, 0, dy, r, 850, 0 };
+          struct scene_layer_motion out = { 0, 1000, 500, 1000, 0, dy, (uint16_t)(r * 2 / 3), 1000, 0 };
+          ui_set_promoted(g_em_layers != 0, &in, &out); }
         ui_set_paint(solid(t->text));                 /* dark pill, light text (modern toast) */
         ui_set_corner_radius(t->radius_pill);
         ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
@@ -3360,8 +3434,8 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal) {
     if (mt > 1.0f) mt = 1.0f;
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
     { uint16_t r = (uint16_t)(t->motion_ms > 0 ? drop_ms : 0), up = ay < 0 ? 1000 : 0;
-      struct scene_layer_motion in = { 0, 940, 0, up, 0, -5, r, 1000 };
-      struct scene_layer_motion out = { 0, 970, 0, up, 0, -3, (uint16_t)(r * 2 / 3), 1000 };
+      struct scene_layer_motion in = { 0, 940, 0, up, 0, -5, r, 1000, 0 };
+      struct scene_layer_motion out = { 0, 970, 0, up, 0, -3, (uint16_t)(r * 2 / 3), 1000, 0 };
       ui_set_promoted(g_em_layers != 0, &in, &out); }
     ui_set_opacity(mt);
     /* ...and it grows out of the corner it opens from, as a popover does:

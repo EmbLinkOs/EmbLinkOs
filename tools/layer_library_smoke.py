@@ -6,7 +6,8 @@ Boots a disposable desktop and opens the library (GUI+Space). With layers
 layer of its window, and the compositor brings them in. Asserts:
 
   in        two layers of the desktop: one the size of the screen (the
-            dimming), one the sheet; the sheet caught arriving, then both at rest
+            dimming), one the sheet; the sheet caught arriving, its rows
+            rising in a beat apart, a layer each, then both at rest
   looks     photographed at rest, and slowed half way in (perf slowmo)
   works     typing an application's name and Return launches it
   out       the layers leave as the library closes, and are gone
@@ -54,8 +55,21 @@ def main():
         # IN
         d.key('meta_l-spc')
         sheet = catch(d, lambda l: l['w'] < P.W and l['moving'] and 0 < l['alpha'] < 255, 6 * slow)
-        both = until(d, 'the dimming and the sheet at rest',
-                     lambda: (lambda ls: ls if len(ls) >= 2 and all(not l['moving'] and l['alpha'] == 255
+        # ROWS: a layer each while they arrive, a beat apart -- caught at once
+        # at different alphas -- and then the sheet's pixels again
+        rows = stagger = None
+        end = time.monotonic() + 3 * slow
+        while time.monotonic() < end and not stagger:
+            rs = [l for l in desktop_layers(d) if l['w'] < P.W - 2 and l['h'] < 200]
+            if len(rs) >= 2:
+                rows = rows or rs
+                al = sorted(l['alpha'] for l in rs)
+                if al[-1] - al[0] >= 40:
+                    stagger = rs
+            if not stagger:
+                d.g.pump(0.01)
+        both = until(d, 'the dimming and the sheet at rest, the rows back in the sheet',
+                     lambda: (lambda ls: ls if len(ls) == 2 and all(not l['moving'] and l['alpha'] == 255
                                                                    for l in ls) else None)(desktop_layers(d)), 8 * slow)
         dim = [l for l in both if l['w'] >= P.W - 2]
         sh = [l for l in both if l['w'] < P.W - 2]
@@ -63,6 +77,11 @@ def main():
         print(f"in: the dimming {dim[0]['w']}x{dim[0]['h']} and the sheet {sh[0]['w']}x{sh[0]['h']} are layers"
               + (f"; the sheet caught arriving at alpha {sheet['alpha']} scale {sheet['scale']}" if sheet else ''),
               flush=True)
+        print(f"rows: {len(rows) if rows else 0} row layers while it arrived, then the sheet's pixels again",
+              flush=True)
+        stagger = None
+        if args.graphics != 'virgl':
+            assert rows, 'the rows did not arrive as layers'
         rest = d.g.capture(out / 'library.ppm')
 
         # WORKS: find Settings, Return
@@ -73,12 +92,24 @@ def main():
         print(f'works: "settings" and Return launched Settings, and the library left ({rest})', flush=True)
 
         # LOOKS: slowed, half way in; then OUT
-        d.g.command('perf slowmo 16', b'perf: slowmo', 60)
+        d.g.command('perf slowmo 4', b'perf: slowmo', 60)
         d.key('meta_l-spc')
-        half = catch(d, lambda l: l['w'] < P.W and l['moving'] and 90 < l['alpha'] < 170, 10 * slow)
+        half = catch(d, lambda l: l['w'] < P.W and l['h'] >= 200 and l['moving'] and 90 < l['alpha'] < 200, 10 * slow)
         if half:
             slowshot = d.g.capture(out / 'library-slow.ppm')
             print(f"looks: half way in at alpha {half['alpha']} scale {half['scale']} ({slowshot})", flush=True)
+        # slowed, the rows are seen a beat apart
+        end = time.monotonic() + 3 * slow
+        while time.monotonic() < end and not stagger:
+            rs = [l for l in desktop_layers(d) if l['w'] < P.W - 2 and l['h'] < 200]
+            if len(rs) >= 2 and max(l['alpha'] for l in rs) - min(l['alpha'] for l in rs) >= 40:
+                stagger = rs
+                rowshot = d.g.capture(out / 'library-rows.ppm')
+                print('rows: ' + ', '.join(f"alpha {l['alpha']} at y {l['y']}" for l in sorted(rs, key=lambda l: l['y']))
+                      + f' -- a layer a row, a beat apart ({rowshot})', flush=True)
+            d.g.pump(0.02)
+        if args.graphics != 'virgl':
+            assert stagger, 'the rows did not arrive a beat apart'
         d.g.command('perf slowmo 1', b'perf: slowmo', 60)
         until(d, 'the library at rest', lambda: [l for l in desktop_layers(d) if not l['moving']], 10 * slow)
         d.key('esc')

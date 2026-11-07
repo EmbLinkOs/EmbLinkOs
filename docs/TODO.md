@@ -110,7 +110,10 @@ the default target). Measured before and after every step
   - [ ] Corner masks precomputed per radius (the carve supersamples 4 x 4 per corner pixel).
   - [x] Vibrancy: every glass surface saturates what shows through it, compositor and toolkit;
         translucent (35%) with a 12 px blur by default (gallery 215).
-  - [ ] Vibrancy on the GPU path (virgl, Intel): its blur primitive has no saturation yet.
+  - [x] Vibrancy on the GPU path (virgl, Intel): the blur primitive saturates its last pass
+        (`sat`, PIX_VIBRANCY; virgl in the blur shader, Intel in `sc_blur`) -- windows' glass and
+        materials, translucent bars and layers alike. Compose check 7c against pix_saturate_row's
+        arithmetic, on virglrenderer and the Intel engine model.
   - [x] An effects governor with an Effects setting (Automatic / Full / Reduced): reduced draws
         a tint instead of a blur behind what shows through and only the ambient shadow layer;
         judged against a 60 Hz frame, down on a sustained run of dear frames, up after a hold that
@@ -166,10 +169,13 @@ the default target). Measured before and after every step
         the right-click does not seem to arrive in that configuration (left clicks and keys do;
         `layer_library_smoke.py --graphics virgl` passes, glass layers drawn by the GPU). The same
         smoke passes on x86 under TCG and arm64 under HVF.
-  - [x] A layer's frost is saturated as the windows' materials are (`fb_saturate_region`,
-        `PIX_VIBRANCY`) on the CPU path; the GPU's blur primitive has no saturation yet (above).
-  - [ ] A layer's frost is a box blur of what is under it made every frame it is drawn, not kept
-        as a window's material blur is (backdrop.c).
+  - [x] A layer's frost is saturated as the windows' materials are, on both paths. (It was
+        saturated twice on the CPU from 6a3ddb3: `fb_blur_region` already saturates; the extra
+        `fb_saturate_region` is gone.)
+  - [x] A layer's frost is kept at rest on the CPU (`fr_sharp`/`fr_blur`): laid back when what is
+        behind it did not change (a hover down the top bar's menu: 0 blurs, 13 kept).
+  - [ ] ...the GPU path re-blurs a glass layer each time it draws it (cheap there, but not free),
+        and a moving or fading layer is blurred every frame on both.
   - [ ] A layer above everything (`z` 1 in the plan) is not offered: layers stand at their
         window's place in the stack.
   - [ ] An app that dies takes its layers at once; a closing menu of a crashed app does not
@@ -183,34 +189,38 @@ the default target). Measured before and after every step
   - [x] A menu opening is an ordinary frame on layers (no epoch), and a node that paints nothing
         marks nothing (T21): Files' context menu presents 0.79 M px (M0 11.6 M), 0 full repaints.
   - [x] The top bar's menus are promoted: its menu frames 41 -> 22, pixels 24 M -> 0.4 M.
-  - [ ] Toasts are not promoted: `em_toast_host` asks for a frame every frame of its 2.5 s to know
-        when to leave, which on a layer would still wake the app throughout; a timed wake is the
-        missing piece. (No application raises toasts yet.)
+  - [x] Toasts are promoted, and wake their app once, to leave (`em_wake_at`): Files toasts Copy
+        and Move to Trash; `tools/layer_menu_smoke.py` sees 2 frames while one stays. The tooltip's
+        600 ms delay is a wake too (Settings' tooltip 46 frames -> 12).
   - [x] A change inside a promoted subtree repaints only the nodes it changed, old and new places
         (backend-test T23).
   - [x] M5: EmUI's dialogs and sheets arrive on layers (scale and fade in, sink out).
-  - [ ] The scrim behind a sheet still dims at once: promoting it would take the sheet into its
-        window-sized layer (a promoted subtree's descendants are its pixels); a second layer
-        under the sheet's own would fade it.
+  - [x] The scrim behind a sheet fades in and out: a promoted node inside another is a layer of
+        its own, above it (backend-test T25, `tools/layer_menu_smoke.py` sheet step). A promotion
+        lasts only the frames that declare it (declare-test T10).
   - [x] While a sheet is up the runtime builds frames only in its first four (the scrim-click
         debounce, `em_overlay_settling`), then waits for input like any other screen.
   - [ ] `overview_smoke.py` failed once on x86 under TCG at its turn-back step (the windows were
         still in flight when sampled) and passed alone on x86 and arm64; its wait for the windows
         to land should be a wait for the condition, not a fixed pause.
-  - [ ] The close pull moved by the compositor (`embk_win_props`, syscall 169 in the plan) is not
-        done: nothing uses `em_close_grip` yet, so there is no motion to move.
+  - [x] The close pull is moved by the compositor: the window's content is a layer while pulled,
+        springs home on the compositor's clock (`ui_set_layer_spring`), and is back in the window
+        before it closes (`tools/layer_pull_smoke.py`, v7demo). No syscall was needed.
+  - [ ] The pulled content may slide past its window's edge (a layer is not clipped by its
+        window); the frame stays behind it, which reads as peeling, but is not what it did.
   - [x] M6: the library and its dimming are layers of the desktop (`em_layers_attach`; a
         window's layers stack in the order they were made); `tools/layer_library_smoke.py`,
         gallery 233. Full repaints 23 -> 4, paint 5.12 -> 1.01 ms a frame.
-  - [ ] The library's tiles no longer stagger in on layers (one layer for the sheet). A stagger
-        would want a layer a row, or a compositor-side offset per sub-rectangle of a layer.
+  - [x] The library's rows stagger in on layers: a layer a row over the sheet while it arrives,
+        each on a delay the compositor keeps (`delay_ms`), then the sheet's pixels again.
+  - [ ] Rows beyond the first five, or not wholly in view, arrive with the sheet (a layer is not
+        clipped by the scroller); a layer clipped to a parent's rect would lift both limits.
   - [x] The library's last four full repaints went with the dimming's layer (it was painted and
         presented whole into a screen-sized layer).
   - [x] The dimming is a fill layer (`EMBK_LF_FILL`, backend-test T24): the library's paint
         0.74 -> 0.15 ms a frame, its pixels presented 4.1 M -> 0.
   - [x] A blinking caret in a promoted subtree repaints its own rect, not the layer.
-  - [ ] Nothing uses `em_toast` or the close grip (`em_close_grip`) yet: both are toolkit
-        features without an application, so their motion is untested in the guest.
+  - [ ] Only the v4/v6/v7 demos use the close grip (`em_close_grip`); no shipped application does.
 - [ ] P4 Type and tokens.
   - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
         stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its

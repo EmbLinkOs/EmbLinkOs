@@ -497,6 +497,38 @@ static void t9_text_highlight(void) {
     done();
 }
 
+/* ---- T10: a layer is declared every frame -------------------------------
+ * An unkeyed promoted box (an overlay) goes; the box after it takes its
+ * place, reusing its instance -- and must not be a layer for that. */
+static int g_t10_promote;
+static void app_t10(void) {
+    ui_begin_vstack(0);
+      ui_begin_hstack(0);
+        if (g_t10_promote) { struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 100, 1000, 0 };
+                             ui_set_promoted(true, &m, &m); }
+        ui_text("row");
+      ui_end_stack();
+    ui_end_stack();
+}
+static void t10_promoted_per_frame(void) {
+    printf("T10 a layer is declared every frame:\n");
+    fresh();
+    g_t10_promote = 1;
+    ui_frame_begin(); app_t10(); ui_frame_end();
+    struct instance_handle row = ui_first_child(ui_first_child(ui_root()));
+    struct scene_node *n = scene_resolve(&SA, ui_scene_of(row));
+    CHECK(n && n->promoted, "a box promoted this frame is a layer");
+    ui_frame_begin(); app_t10(); ui_frame_end();
+    n = scene_resolve(&SA, ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+    CHECK(n && n->promoted, "and stays one while it is declared so");
+    g_t10_promote = 0;
+    ui_frame_begin(); app_t10(); ui_frame_end();
+    struct instance_handle row2 = ui_first_child(ui_first_child(ui_root()));
+    n = scene_resolve(&SA, ui_scene_of(row2));
+    CHECK(heq(row, row2) && n && !n->promoted, "the same instance declared without it is the window's again");
+    done();
+}
+
 int main(void) {
     t8_magnifier_press();
     printf("=== EmbLink UI Piece 7: declarative-API selftests ===\n");
@@ -511,6 +543,7 @@ int main(void) {
     t6_hit_clip();
     t6b_hit_layers();
     t7_button_pulse();
+    t10_promoted_per_frame();
     printf("=== declare-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

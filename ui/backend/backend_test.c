@@ -725,7 +725,8 @@ static void t19_group_dirty(void) {
 /* ---- T20: a PROMOTED subtree is a layer's, not the window's --------------
  * A fake layer host keeps the layers as the application runtime would hand
  * them to the compositor, and counts what it was asked. */
-struct fake_layer { uint32_t *px; uint32_t w, h; int presents, gos, froms, destroys; struct scene_layer_state at; };
+struct fake_layer { uint32_t *px; uint32_t w, h; int presents, gos, froms, destroys; struct scene_layer_state at;
+                    uint16_t resp, delay; };
 static struct fake_layer g_fl[8];
 static int g_fl_n;
 static uint32_t fl_create(void *ctx, uint32_t w, uint32_t h, uint32_t **px) {
@@ -742,10 +743,10 @@ static void fl_present(void *ctx, uint32_t id, int x, int y, int w, int h) {
     g_fl[id - 1].presents++;
 }
 static void fl_go(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
-                  uint16_t resp, uint16_t damp, int destroy, int at_present) {
-    (void)ctx; (void)resp; (void)damp; (void)at_present;
+                  uint16_t resp, uint16_t damp, uint16_t delay, int destroy, int at_present) {
+    (void)ctx; (void)damp; (void)at_present;
     struct fake_layer *l = &g_fl[id - 1];
-    l->gos++; l->froms += from != 0; l->destroys += destroy; l->at = *to;
+    l->gos++; l->froms += from != 0; l->destroys += destroy; l->at = *to; l->resp = resp; l->delay = delay;
 }
 static const struct scene_layer_host g_fake_host = { 0, fl_create, fl_present, fl_go, 0 };
 
@@ -766,7 +767,7 @@ static struct node_handle t20_scene(struct scene_arena *ap, struct node_handle *
     struct node_handle row = scene_create_node(&a, SCENE_NODE_RECT, card);
     scene_set_size(&a, row, 80, 12); scene_set_transform(&a, row, 10, 10, 0, 0,0,0,1, 1,1,1);
     struct paint rp = solidp(0.2f, 0.6f, 0.3f, 1); scene_set_paint(&a, row, &rp);
-    struct scene_layer_motion in = { 0, 940, 0, 0, 0, -5, 240, 1000 }, out = { 0, 960, 0, 0, 0, 0, 200, 1000 };
+    struct scene_layer_motion in = { 0, 940, 0, 0, 0, -5, 240, 1000, 0 }, out = { 0, 960, 0, 0, 0, 0, 200, 1000, 0 };
     if (promote) scene_set_promoted(&a, card, true, &in, &out);
     *card_out = card; *row_out = row;
     return root;
@@ -900,7 +901,7 @@ static void t22_glass_layer(void) {
     scene_set_corner_radius(&a, card, 10);
     struct paint cp = solidp(0, 0, 1, 0.5f); scene_set_paint(&a, card, &cp);   /* a blue tint, half */
     scene_set_backdrop_blur(&a, card, 1, 12.0f);
-    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000 };
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000, 0 };
     scene_set_promoted(&a, card, true, &m, &m);
     scene_render_frame(&r, &a, root, &rt);
     scene_render_frame(&r, &a, root, &rt);
@@ -926,7 +927,7 @@ static void t23_partial_layer(void) {
     scene_render_set_layer_host(&r, &g_fake_host);
     struct render_target rt = make_target(200, 200);
     struct card c; card_build(&a, &c, 24);                /* a card of 24 boxes: a menu's rows */
-    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 0, 1000 };
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 0, 1000, 0 };
     scene_set_promoted(&a, c.grp, true, &m, &m);
     scene_render_frame(&r, &a, c.root, &rt);
     scene_render_frame(&r, &a, c.root, &rt);              /* settled: the layer made */
@@ -963,7 +964,7 @@ static void t24_fill_layer(void) {
     struct node_handle dim = scene_create_node(&a, SCENE_NODE_RECT, root);
     scene_set_size(&a, dim, 160, 100);
     struct paint dp = solidp(0, 0, 0, 0.4f); scene_set_paint(&a, dim, &dp);
-    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000 };
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000, 0 };
     scene_set_promoted(&a, dim, true, &m, &m);
     scene_render_frame(&r, &a, root, &rt);
     scene_render_frame(&r, &a, root, &rt);
@@ -974,6 +975,93 @@ static void t24_fill_layer(void) {
     struct paint dp2 = solidp(0, 0, 0, 0.6f); scene_set_paint(&a, dim, &dp2);
     scene_render_frame(&r, &a, root, &rt);
     CHECK(l->px[0] == (153u << 24) && l->presents == 2, "a new colour is a new pixel, presented");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T25: a promoted node inside another is a layer of its own ---------- */
+static void t25_nested_layers(void) {
+    printf("T25 a sheet over its dimming: two layers, each on its own motion:\n");
+    g_fl_n = 0; g_look_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host_look);
+    struct render_target rt = make_target(160, 100);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 160, 100);
+    struct paint gp = solidp(0.1f, 0.2f, 0.6f, 1); scene_set_paint(&a, ground, &gp);
+    struct node_handle dim = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, dim, 160, 100);
+    struct paint dp = solidp(0, 0, 0, 0.4f); scene_set_paint(&a, dim, &dp);
+    struct node_handle card = scene_create_node(&a, SCENE_NODE_RECT, dim);
+    scene_set_size(&a, card, 60, 40); scene_set_transform(&a, card, 50, 30, 0, 0,0,0,1, 1,1,1);
+    struct paint cp = solidp(0.9f, 0.9f, 0.9f, 1); scene_set_paint(&a, card, &cp);
+    struct node_handle row = scene_create_node(&a, SCENE_NODE_RECT, card);
+    scene_set_size(&a, row, 40, 10); scene_set_transform(&a, row, 10, 10, 0, 0,0,0,1, 1,1,1);
+    struct paint rp = solidp(0.2f, 0.6f, 0.3f, 1); scene_set_paint(&a, row, &rp);
+    struct scene_layer_motion fade = { 0, 1000, 500, 500, 0, 0, 200, 1000, 0 };
+    struct scene_layer_motion rise = { 0, 950, 500, 500, 0, 8, 240, 900, 0 };
+    scene_set_promoted(&a, dim, true, &fade, &fade);
+    scene_set_promoted(&a, card, true, &rise, &rise);
+    for (int f = 0; f < 3; f++) scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == 2 && g_fl[0].w == 1 && g_fl[0].h == 1 && g_fl[1].w == 60 && g_fl[1].h == 40,
+          "two layers: the dimming first (a fill, though the card is inside it), then the card above it");
+    CHECK(g_fl[0].froms == 1 && g_fl[1].froms == 1, "each sent in from its own appear end");
+    CHECK(px_at(&rt, 80, 50) == px_at(&rt, 2, 2), "the window under them is the ground: neither is in it");
+    { uint32_t c = g_fl[1].px[30 * 60 + 30], w = g_fl[1].px[15 * 60 + 30];
+      CHECK(c >> 24 == 255 && ((c >> 8) & 255) > 200 && ((w >> 16) & 255) < 100 && ((w >> 8) & 255) > 130,
+            "the card's layer holds the card and its row"); }
+    int dim_presents = g_fl[0].presents, card_presents = g_fl[1].presents;
+    struct paint rp2 = solidp(0.8f, 0.3f, 0.3f, 1); scene_set_paint(&a, row, &rp2);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl[1].presents == card_presents + 1 && g_fl[0].presents == dim_presents,
+          "a change in the card is the card's: the dimming is not painted again");
+    scene_set_size(&a, dim, 150, 100);                      /* the window, resized */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == 4 && g_fl[0].destroys == 1 && g_fl[1].destroys == 1,
+          "a dimming of another size is another layer, and the card is made again above it");
+    CHECK(g_fl[2].froms == 0 && g_fl[3].froms == 0 && g_fl[3].w == 60, "both where they stood, with no second arrival");
+    scene_destroy_node(&a, dim);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl[2].destroys == 1 && g_fl[3].destroys == 1 && g_fl[3].at.scale_milli == 950 && g_fl[2].at.scale_milli == 1000,
+          "gone, each leaves on its own motion -- the card sinking, the dimming fading");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T26: a stagger's delay, a pull let go, a layer taken back ------------ */
+static void t26_layer_springs(void) {
+    printf("T26 a layer waits its turn, springs home when the app moves it, and is taken back at once:\n");
+    g_fl_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host);
+    struct render_target rt = make_target(200, 160);
+    struct node_handle card, row, root = t20_scene(&a, &card, &row, 1);
+    struct scene_layer_motion in = { 0, 1000, 500, 500, 0, 16, 300, 900, 135 };
+    scene_set_promoted(&a, card, true, &in, &in);
+    for (int f = 0; f < 3; f++) scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && l->delay == 135 && l->resp == 300, "it arrives on its spring, 135 ms after it is sent");
+    scene_set_layer_spring(&a, card, 250, 900);
+    scene_set_transform(&a, card, 60, 30, 0, 0,0,0,1, 1,1,1);   /* the app moved it */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->at.x > 40 && l->resp == 250 && l->delay == 0 && !l->destroys,
+          "moved by the app, it travels there on the spring it was given, at once");
+    int gos = l->gos;
+    scene_set_promoted(&a, card, false, 0, 0);                  /* back in the window */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->gos == gos && !l->destroys, "taken back while still there, it stays until the window has its pixels");
+    scene_render_after_present(&r);
+    CHECK(l->gos == gos + 1 && l->destroys == 1 && l->resp == 0, "and then goes at once");
+    CHECK(px_at(&rt, 100, 50) != px_at(&rt, 5, 5), "and the window paints it again");
+    struct scene_layer_motion there = { 255, 1000, 500, 500, 0, 0, 0, 0, 0 };
+    scene_set_promoted(&a, card, true, &there, &there);         /* on screen already: a pull */
+    int before = g_fl_n;
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == before + 1 && g_fl[g_fl_n - 1].froms == 0 && g_fl[g_fl_n - 1].presents == 1,
+          "promoted where it already is, it is a layer the same frame -- no settling, no arrival");
     for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
@@ -1004,6 +1092,8 @@ int main(void) {
     t22_glass_layer();
     t23_partial_layer();
     t24_fill_layer();
+    t25_nested_layers();
+    t26_layer_springs();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

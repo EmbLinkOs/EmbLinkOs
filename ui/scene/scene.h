@@ -100,6 +100,7 @@ struct scene_layer_motion {
     uint16_t anchor_x_milli, anchor_y_milli;
     int16_t  dx, dy;
     uint16_t response_ms, damping_milli;   /* 0 response: it jumps */
+    uint16_t delay_ms;             /* its springs start this much later: a stagger */
 };
 
 struct scene_node {
@@ -166,6 +167,10 @@ struct scene_node {
      * where it stands, like any other. */
     bool promoted;
     struct scene_layer_motion appear, disappear;
+    /* ...and when the APP moves it, changes its opacity or scale while it is
+     * up, the spring that takes it there (0: it is there at once) -- a pulled
+     * window let go short, springing home on the compositor's clock */
+    uint16_t layer_move_ms, layer_move_damping;
 
     /* --- kind-specific payload --- */
     union {
@@ -292,6 +297,7 @@ void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float sc
 void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float radius);
 /* Promote a subtree to a layer the compositor moves (scene_node.promoted), or
  * not (on = 0). The motions are copied. */
+void scene_set_layer_spring(struct scene_arena *a, struct node_handle h, uint16_t response_ms, uint16_t damping_milli);
 void scene_set_promoted(struct scene_arena *a, struct node_handle h, bool on,
                         const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);

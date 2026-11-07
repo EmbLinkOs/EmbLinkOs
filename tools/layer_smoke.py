@@ -44,6 +44,16 @@ def layers(d):
     return out
 
 
+def frost(d):
+    """(made, kept): the compositor's layer frosts blurred, and laid back unblurred"""
+    text = d.g.command('perf windows', b'perf: end', 60)
+    for line in text.splitlines():
+        if line.startswith('perf: frost '):
+            pairs = dict(kv.split('=', 1) for kv in line[12:].split() if '=' in kv)
+            return int(pairs['made']), int(pairs['kept'])
+    return None
+
+
 def until(d, what, cond, seconds=20.0):
     end = time.monotonic() + seconds
     while time.monotonic() < end:

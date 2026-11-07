@@ -507,6 +507,12 @@ void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float 
     DMARK(n); n->corner_radius = radius; n->dirty = true; n->dirty_content = true; n->dirty_look = true;
 }
 
+void scene_set_layer_spring(struct scene_arena *a, struct node_handle h, uint16_t response_ms, uint16_t damping_milli) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n) return;
+    n->layer_move_ms = response_ms; n->layer_move_damping = damping_milli;   /* how, not what: no pixel */
+}
+
 void scene_set_promoted(struct scene_arena *a, struct node_handle h, bool on,
                         const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear) {
     struct scene_node *n = scene_resolve(a, h);

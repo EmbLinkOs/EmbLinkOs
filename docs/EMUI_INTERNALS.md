@@ -498,9 +498,37 @@ toolkit reaches them through PROMOTION:
   menus and tooltips at rest, leaving their motion to the compositor.
 
 A promoted subtree must be built every frame it is meant to stay; the frame it
-is not, it leaves. Hit-testing is unchanged: the toolkit tests its own scene,
-which holds where the subtree rests -- not where the compositor has it on the
-way there.
+is not, it leaves (and the declare layer unpromotes a box that closes without
+having said so that frame: a retained instance met again as another box must
+not inherit the promotion). Hit-testing is unchanged: the toolkit tests its own
+scene, which holds where the subtree rests -- not where the compositor has it
+on the way there.
+
+What else a promoted subtree can say:
+
+- **A layer inside a layer.** A promoted node inside another is a layer of its
+  own, made after the one round it (a window's layers stack in the order they
+  were made) and left out of its pixels, footprint, signature and damage: a
+  sheet over its dimming, the library's rows over its sheet. It is not made
+  before the one round it is (`hold`), and made again above it when that one
+  is (`reborn`).
+- **A delay** (`scene_layer_motion.delay_ms`, the op's `delay_ms`): its springs
+  start that much later -- a stagger, kept by the compositor.
+- **A spring for the app's own moves** (`ui_set_layer_spring`): a change of
+  place, opacity or scale the app makes while the subtree is up travels on it
+  instead of jumping -- a pulled window let go short, springing home.
+- **Already there.** An appear motion that changes nothing (opacity 255, scale
+  1, no offset) is content already on screen -- a window's, promoted for the
+  close pull: it is a layer the same frame, with no settling to wait for.
+- **Taken back.** A subtree still in the tree but no longer promoted is its
+  parent's pixels again: its layer goes at once, with no exit, but only once
+  the runtime has presented those pixels (`scene_render_after_present`), so no
+  frame shows neither.
+
+And the runtime's clock: `em_wake_at(ms)` asks for ONE frame at a time,
+where asking for every frame until then would wake the app sixty times a
+second to learn nothing -- a tooltip's delay, a toast's time on screen, the
+library's rows going back into its sheet, a pulled window home.
 
 ## Adding a new component
 

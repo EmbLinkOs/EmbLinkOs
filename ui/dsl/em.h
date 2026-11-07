@@ -865,6 +865,14 @@ void em_app_set_refresh(int ms);
 void em_request_frame(void);
 int  em_take_frame_request(void);   /* runtime-internal: read-and-clear */
 int  em_frame_requested(void);      /* runtime-internal: a peek -- is motion still wanted? */
+/* A FRAME AT A TIME, not every frame until then: the view runs again at
+ * uptime `ms` (the soonest of every call), and the runtime sleeps until it.
+ * For something that changes on a clock but not between -- a tooltip's
+ * delay, a toast's time on screen -- that asking for every frame until it
+ * would wake the app sixty times a second to learn nothing. */
+void em_wake_at(uint64_t ms);
+int  em_take_wake(uint64_t now);     /* runtime-internal: due? (and clears it) */
+int  em_wake_wait(uint64_t now, int wait);   /* runtime-internal: `wait`, no later than the wake */
 /* The waits between frames, for a host loop of its own (the desktop's):
  * em_wait_input until a UI event or `ms`; em_wait_frame until the compositor's
  * next frame, or `pace` ms on a kernel without a frame clock. */

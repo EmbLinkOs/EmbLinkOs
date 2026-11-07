@@ -701,3 +701,108 @@ first frame of it and presented. The renderer makes a fill of any promoted box
 of one colour with nothing in it (backend-test T24). The library on arm64
 under HVF: paint 0.74 -> 0.15 ms a frame, the dearest frame 10.5 -> 5.2 ms,
 the desktop's full repaints 4 -> 0 and the pixels it presents 4.1 M -> 0.
+
+### A wake at a time: toasts on layers, and a tooltip's delay
+
+Something that changes on a clock but not between -- a tooltip due 600 ms
+after the pointer stops, a toast due to leave 2.5 s after it rose -- asked
+for a frame every frame until then, so the app built sixty frames a second to
+learn nothing. `em_wake_at(ms)` asks instead for one frame at that time: the
+runtime's idle wait (em_app, the widget runtime and the desktop's loop) sleeps
+no later than the soonest wake. A toast on layers is promoted, built once at
+rest, and woken when its time is up -- the frame that stops building it, so
+the compositor sinks it out (em-test). Files raises one for Copy and Move to
+Trash; `tools/layer_menu_smoke.py` copies a file: Files builds 2 frames while
+"Copied" stays, where it built one a frame. The close button's tooltip in
+Settings (arm64 under HVF, `tools/app_prof_smoke.py`): 46 frames -> 12.
+
+### A layer inside a layer: the sheet's dimming fades
+
+A sheet arrived on its spring over a dimming that was simply there: the scrim
+was the window's pixels, and promoting it would have taken the sheet into its
+window-sized layer, since a promoted subtree's descendants were its pixels. A
+promoted node inside another is now a layer of its own, made after the one
+round it (a window's layers stack in the order they were made) and left out of
+its pixels, footprint, signature and damage. So the dimming is a fill layer --
+one colour, the window's size, though the sheet is inside it -- that fades in
+and out on its own motion while the sheet rises and sinks on its own, and a
+change in the sheet does not touch it. A layer round others made again (the
+window resized) makes them again above it, where they stood, with no second
+arrival. `make backend-test` T25; `tools/layer_menu_smoke.py` opens Move to
+Trash's sheet in Files on arm64: the dimming a 1000 x 600 layer under the
+sheet's 436 x 242, caught fading in and out.
+
+That smoke found a bug the menus had worked around by hand: a promotion
+outlived its declaration. An unkeyed overlay's instance, met again as the row
+after it once the overlay had gone, stayed promoted, and Files' status line
+became two layers nobody asked for. A box is a layer now only in a frame that
+says so (`make declare-test` T10).
+
+### The library's rows, a beat apart, on the compositor's clock
+
+The library's tiles used to rise in one after another, each offset by the
+desktop on every frame of the entrance; on layers the sheet was one picture
+and they came in together. A layer's springs can wait now (`delay_ms` in the
+op, the reserved field it replaces: old clients say 0), and the library is
+built as rows, each a layer of its own over the sheet's (a layer inside a
+layer, above) while it arrives: the first 40 ms after the sheet, each next one
+45 ms after that, 16 px up as it fades in. A layer is not clipped by the
+scroller, so only rows wholly in view, and only for the entrance: two seconds,
+or until the list scrolls -- then a wake, and they are the sheet's pixels
+again. The columns are said outright (each row's grid would size its own).
+`tools/layer_library_smoke.py` slowed by four on arm64 under HVF: two rows
+caught at once at alpha 155 and 73, and the library still launches what is
+typed. The desktop now honours the renderer's request for a settling frame
+(`wants_frame`), which it had never read.
+
+### Vibrancy on the GPU, and once on the CPU
+
+The GPU's blur primitive saturates its last pass (`sat`, in 256ths:
+PIX_VIBRANCY) -- in the blur shader on virgl, in `sc_blur` on Intel -- so the
+windows' glass and materials, the translucent bars and the layers' frost are
+saturated on the GPU as they are on the CPU. Compose check 7c (a block of one
+colour blurred, against pix_saturate_row's arithmetic, within 3) passes on
+virglrenderer and on the Intel engine model. On the CPU a layer's frost had
+been saturated TWICE since its vibrancy went in: `fb_blur_region` already
+saturates, and the extra pass (1.7 x 1.7, nearly 2.9) is gone.
+
+### A layer's frost, kept
+
+A glass layer at rest blurred what was under it on every repaint that touched
+it -- a hover moving down the top bar's menu, its caret -- though what it
+stands on had not changed. Its frost is kept now as a window material's is: a
+repaint reads what is behind the material box, compares it with what was there
+(`fr_sharp`), and lays the kept blur back when nothing changed; when something
+did, it is blurred again whole (the same box blur and saturation, so it looks
+as it did) and the rest of the box is shown in the same frame. A repaint no
+longer has to cover the whole box while the frost is kept. CPU only (the GPU
+blurs as it draws); not while the layer moves or fades. `perf windows` counts
+them (`perf: frost made= kept=`); `tools/layer_menu_smoke.py` on arm64: a
+hover down five rows of the top bar's menu blurred 0 times and laid the frost
+back 13.
+
+### The close pull, moved by the compositor
+
+Pulling a window's close grip repainted the whole window on every frame of
+the drag and of the spring back (em_app forced full repaints while
+`em_window_pulling`). On layers the content is a layer while it is pulled:
+promoted where it already stands (an appear motion that changes nothing is a
+layer the same frame, with no settling), moved and faded by the drag, and let
+go short, sent home on a spring the compositor plays (`ui_set_layer_spring`);
+a wake then takes it back into the window -- whose pixels are presented first,
+the layer let go after (`scene_render_after_present`), so no frame shows
+neither. Pulled past the threshold, the content goes back into the window and
+is presented before it closes, so the window flies away with its picture.
+`tools/layer_pull_smoke.py` (v7demo, arm64 under HVF): the content a 560 x
+460 layer 12 px toward the hand at alpha 161; let go, caught at 371 on its way
+home to 360, the app presenting twice for all of it; pulled on, it closes.
+(No syscall 169: a window's content is a layer like any other.)
+
+### A bar's window grown for its menus, cleared
+
+Opening the top bar's menu grows its window to the screen (its dismiss surface
+catches a click anywhere). That grown window was cleared by the structural
+frame a menu opening used to be; on layers it is an ordinary frame, and the
+new rows kept what `realloc` gave them -- an old frame, grey, over the whole
+screen below the bar while a menu was open (gallery 234 shows it). A resize of
+that window is a full, cleared repaint again.

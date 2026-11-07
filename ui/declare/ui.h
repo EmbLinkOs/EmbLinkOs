@@ -41,6 +41,9 @@ void ui_set_scale(float scale, float anchor_x, float anchor_y);
  * painted once, where the runtime has layers. Say it every frame the box is
  * built; off (false) to paint it in the window again. */
 void ui_set_promoted(bool on, const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear);
+/* ...and the spring a promoted box travels on when the APP changes where it
+ * is, how opaque or how large (0: at once). Say it every frame; unset, 0. */
+void ui_set_layer_spring(uint16_t response_ms, uint16_t damping_milli);
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);

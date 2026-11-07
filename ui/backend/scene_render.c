@@ -208,6 +208,11 @@ static int node_paints_nothing(const struct scene_node *n) {
 /* A layer host keeps promoted subtrees this frame: the window leaves them out
  * (scene_render_set_layer_host). */
 static int g_promote_live;
+/* A PROMOTED NODE INSIDE ANOTHER is a layer of its own, made after (so above)
+ * the one round it: not the outer one's pixels, footprint, signature or
+ * damage. A sheet's dimming and the sheet are two layers, each on its own
+ * motion. */
+static int nested_layer(const struct scene_node *n) { return n && n->promoted && g_promote_live; }
 
 static void gather(struct scene_arena *a, struct node_handle h, const float wparent[16],
                    int has_group, struct frect gbounds,
@@ -374,7 +379,7 @@ static int group_changed_walk(struct scene_arena *a, struct node_handle h, int i
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        changed |= group_changed_walk(a, c, 0, sig, blur);
+        if (!nested_layer(cn)) changed |= group_changed_walk(a, c, 0, sig, blur);
         c = next;
     }
     g_gc_depth--;
@@ -621,7 +626,7 @@ static struct frect subtree_footprint(struct scene_arena *a, struct node_handle 
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        b = frect_union(b, subtree_footprint(a, c, world));
+        if (!nested_layer(cn)) b = frect_union(b, subtree_footprint(a, c, world));
         c = next;
     }
     g_sb_depth--;
@@ -638,7 +643,7 @@ static void subtree_clean(struct scene_arena *a, struct node_handle h, int depth
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        subtree_clean(a, c, depth + 1);
+        if (!nested_layer(cn)) subtree_clean(a, c, depth + 1);   /* its own pass cleans it */
         c = next;
     }
 }
@@ -692,7 +697,7 @@ static void promoted_feet(struct scene_arena *a, struct node_handle h, const flo
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        promoted_feet(a, c, world, ox, oy, out, cap, n, dirty_comp, dirty_idx, n_dirty, ndmax);
+        if (!nested_layer(cn)) promoted_feet(a, c, world, ox, oy, out, cap, n, dirty_comp, dirty_idx, n_dirty, ndmax);
         c = next;
     }
     g_pr_depth--;
@@ -716,13 +721,32 @@ static void rect_merge_add(struct clip_rect *r, int *n, int max, struct scene_pr
     r[best] = (struct clip_rect){ ux0, uy0, ux1 - ux0, uy1 - uy0, 0 };
 }
 
-static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
-                           struct scene_node *n, const float wparent[16], struct render_target *target) {
+/* does anything inside it paint into its pixels? (a nested layer does not) */
+static int paints_children(struct scene_arena *a, const struct scene_node *n) {
+    struct node_handle c = n->first_child;
+    uint32_t guard = 512;
+    while (!node_handle_is_null(c) && guard-- != 0) {
+        struct scene_node *cn = scene_resolve(a, c);
+        if (!cn) return 1;
+        if (!nested_layer(cn)) return 1;
+        c = cn->next_sibling;
+    }
+    return 0;
+}
+
+/* 0: no layer yet; -1: none (it shows nothing); 1: its layer; 2: its layer,
+ * made this frame. `hold`: the
+ * layer round it is not made yet, and this one may not be made before it (a
+ * window's layers stack in the order they were made). `reborn`: the one round
+ * it was made again, so this one is too, above it, where it stood. */
+static int promoted_layer(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
+                          struct scene_node *n, const float wparent[16], struct render_target *target,
+                          int hold, int reborn) {
     const struct scene_layer_host *host = r->host;
     struct frect b = subtree_footprint(a, h, wparent);
     int bx = (int)floorf(b.x), by = (int)floorf(b.y);
     int bw = (int)ceilf(b.x + b.w) - bx, bh = (int)ceilf(b.y + b.h) - by;
-    if (bw <= 0 || bh <= 0) return;
+    if (bw <= 0 || bh <= 0) return -1;                 /* nothing to wait for: those inside go on */
     float local[16], world[16];
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);
@@ -732,51 +756,67 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
     float fx = b.x - (float)bx, fy = b.y - (float)by;
 
     struct scene_promoted *p = promoted_find(r, h);
-    int fresh = 0, resized = 0;
+    int fresh = 0, quiet = 0;
 #ifdef PROMOTE_TRACE
     fprintf(stderr, "promote: node %u seen p=%d %dx%d changed=%d\n", h.index, p != 0, bw, bh, changed);
 #endif
-    if (p && (p->w != (uint32_t)bw || p->h != (uint32_t)bh)) {
-        /* another size: another layer, standing where the old one stood */
-        host->go(host->ctx, p->id, 0, &p->at, 0, 0, 1, 0);
+    if (p && (reborn || p->w != (uint32_t)bw || p->h != (uint32_t)bh)) {
+        /* another size, or above a layer made again: another layer, standing
+         * where the old one stood -- made now, with no arrival */
+        host->go(host->ctx, p->id, 0, &p->at, 0, 0, 0, 1, 0);
         free(p->nodes);
-        memset(p, 0, sizeof *p); p = 0; resized = 1;
+        memset(p, 0, sizeof *p); p = 0; quiet = 1;
+        for (int i = 0; i < SCENE_LAYERS && !p; i++) if (!r->promoted[i].id && !r->promoted[i].waiting) p = &r->promoted[i];
+        if (!p) return 0;
     }
-    if (!p) {
+    if (!p || quiet) {
         /* SETTLED FIRST. A subtree's place can lag its first frame by one --
          * a menu measures where it opens against the frame before -- and a
          * layer sent in from the wrong place, then told where it really is,
          * would jump there and lose its arrival. So it waits, unpainted, until
          * it stands in one place two frames running (three at most), and asks
          * for the frame that tells. */
-        struct scene_promoted *w = 0;
+        /* ALREADY ON SCREEN -- the window's content, promoted for a pull --
+         * arrives from where it is: no motion, so no settling to wait for */
+        const struct scene_layer_motion *ap = &n->appear;
+        if (ap->opacity == 255 && (ap->scale_milli == 0 || ap->scale_milli == 1000) && !ap->dx && !ap->dy && !hold) {
+            if (!p) for (int i = 0; i < SCENE_LAYERS && !p; i++)
+                if (r->promoted[i].waiting && r->promoted[i].index == h.index && r->promoted[i].generation == h.generation)
+                    p = &r->promoted[i];
+            if (!p) for (int i = 0; i < SCENE_LAYERS && !p; i++) if (!r->promoted[i].id && !r->promoted[i].waiting) p = &r->promoted[i];
+            if (!p) return 0;
+            memset(p, 0, sizeof *p); quiet = 1;
+        }
+        struct scene_promoted *w = quiet ? p : 0;
         for (int i = 0; i < SCENE_LAYERS && !w; i++)
             if (r->promoted[i].waiting && r->promoted[i].index == h.index && r->promoted[i].generation == h.generation)
                 w = &r->promoted[i];
         if (!w) {
             for (int i = 0; i < SCENE_LAYERS && !w; i++) if (!r->promoted[i].id && !r->promoted[i].waiting) w = &r->promoted[i];
-            if (!w) return;
+            if (!w) return 0;
             memset(w, 0, sizeof *w);
             w->index = h.index; w->generation = h.generation; w->waiting = 1;
             w->at.x = bx; w->at.y = by; w->w = (uint32_t)bw; w->h = (uint32_t)bh;
             w->seen = 1; r->wants_frame = 1;
-            return;
+            return 0;
         }
         w->seen = 1;
-        if ((w->at.x != bx || w->at.y != by || w->w != (uint32_t)bw || w->h != (uint32_t)bh) && w->waiting < 3) {
+        if (!quiet && (((w->at.x != bx || w->at.y != by || w->w != (uint32_t)bw || w->h != (uint32_t)bh) &&
+                        w->waiting < 3) || hold)) {
             w->at.x = bx; w->at.y = by; w->w = (uint32_t)bw; w->h = (uint32_t)bh;
-            w->waiting++; r->wants_frame = 1;
-            return;
+            if (w->waiting < 3) w->waiting++;
+            r->wants_frame = 1;
+            return 0;
         }
         p = w; p->waiting = 0;
         /* ONE COLOUR, a box and nothing else -- a dimming -- is a fill: a
          * 1 x 1 layer that stands as large as the box, not its pixels */
-        int fill = host->look && n->kind == SCENE_NODE_RECT && node_handle_is_null(n->first_child) &&
+        int fill = host->look && n->kind == SCENE_NODE_RECT && !paints_children(a, n) &&
                    n->data.rect.fill.kind == PAINT_SOLID && n->corner_radius <= 0 && !n->shadow_enabled &&
                    n->border_width <= 0 && !n->backdrop_blur_enabled;
         uint32_t *px = 0;
         uint32_t id = host->create(host->ctx, fill ? 1u : (uint32_t)bw, fill ? 1u : (uint32_t)bh, &px);
-        if (!id || !px) { memset(p, 0, sizeof *p); return; }
+        if (!id || !px) { memset(p, 0, sizeof *p); return 0; }
         p->id = id; p->px = px; p->w = (uint32_t)bw; p->h = (uint32_t)bh; p->fill = fill;
         p->index = h.index; p->generation = h.generation;
         fresh = 1;
@@ -864,16 +904,18 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
         if (p->cap_nodes >= nfeet) { memcpy(p->nodes, feet, sizeof *feet * nfeet); p->n_nodes = nfeet; }
     } else p->n_nodes = 0;
 #ifdef PROMOTE_TRACE
-    fprintf(stderr, "promote: id %u fresh=%d resized=%d repaint=%d at %d,%d op=%d appear op=%d resp=%d\n", p->id, fresh, resized, repaint, at.x, at.y, at.opacity, n->appear.opacity, n->appear.response_ms);
+    fprintf(stderr, "promote: id %u fresh=%d quiet=%d repaint=%d at %d,%d op=%d appear op=%d resp=%d\n", p->id, fresh, quiet, repaint, at.x, at.y, at.opacity, n->appear.opacity, n->appear.response_ms);
 #endif
     if (fresh) {
         struct scene_layer_state from = promoted_end(&at, &n->appear, nb, bx, by, bw, bh);
         at.anchor_x_milli = from.anchor_x_milli; at.anchor_y_milli = from.anchor_y_milli;
-        host->go(host->ctx, p->id, resized ? 0 : &from, &at, n->appear.response_ms, n->appear.damping_milli, 0, 1);
+        host->go(host->ctx, p->id, quiet ? 0 : &from, &at, n->appear.response_ms, n->appear.damping_milli,
+                 quiet ? 0 : n->appear.delay_ms, 0, 1);
     } else if (memcmp(&at, &p->at, sizeof at)) {
         if (at.scale_milli == 1000) { at.anchor_x_milli = p->at.anchor_x_milli; at.anchor_y_milli = p->at.anchor_y_milli; }
         if (memcmp(&at, &p->at, sizeof at))
-            host->go(host->ctx, p->id, 0, &at, 0, 0, 0, repaint);   /* the app moved it: it is there */
+            /* the app moved it: it is there -- or on its way, on the spring it said */
+            host->go(host->ctx, p->id, 0, &at, n->layer_move_ms, n->layer_move_damping, 0, 0, repaint);
     }
     if (repaint && npart > 0) {
         for (int k = 0; k < npart; k++)
@@ -883,13 +925,18 @@ static void promoted_layer(struct scene_renderer *r, struct scene_arena *a, stru
     p->disappear = n->disappear;        /* where it goes when it is gone... */
     p->nx = nb.x; p->ny = nb.y; p->nw = nb.w; p->nh = nb.h;   /* ...about the node as it is now */
     subtree_clean(a, h, 0);
+    return fresh ? 2 : 1;
 }
 
 static void promoted_walk(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
-                          const float wparent[16], struct render_target *target, int depth) {
+                          const float wparent[16], struct render_target *target, int depth,
+                          int hold, int reborn) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n || depth > 1024) return;
-    if (n->promoted) { promoted_layer(r, a, h, n, wparent, target); return; }
+    if (n->promoted) {                                  /* ...and then the layers inside it */
+        int st = promoted_layer(r, a, h, n, wparent, target, hold, reborn);
+        hold = hold || st == 0; reborn = st == 2;
+    }
     float local[16], world[16];
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);
@@ -898,7 +945,7 @@ static void promoted_walk(struct scene_renderer *r, struct scene_arena *a, struc
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        promoted_walk(r, a, c, world, target, depth + 1);
+        promoted_walk(r, a, c, world, target, depth + 1, hold, reborn);
         c = next;
     }
 }
@@ -912,12 +959,20 @@ static void promoted_leave(struct scene_renderer *r, struct scene_promoted *p) {
 #endif
     struct frect nb = { p->nx, p->ny, p->nw, p->nh };
     struct scene_layer_state to = promoted_end(&p->at, &p->disappear, nb, p->at.x, p->at.y, (int)p->w, (int)p->h);
-    if (host) host->go(host->ctx, p->id, 0, &to, p->disappear.response_ms, p->disappear.damping_milli, 1, 0);
+    if (host) host->go(host->ctx, p->id, 0, &to, p->disappear.response_ms, p->disappear.damping_milli,
+                       p->disappear.delay_ms, 1, 0);
     free(p->nodes);
     memset(p, 0, sizeof *p);
 }
 
+void scene_render_after_present(struct scene_renderer *r) {
+    for (int i = 0; i < r->n_doomed; i++)
+        if (r->host) r->host->go(r->host->ctx, r->doomed[i].id, 0, &r->doomed[i].at, 0, 0, 0, 1, 0);
+    r->n_doomed = 0;
+}
+
 void scene_render_set_layer_host(struct scene_renderer *r, const struct scene_layer_host *host) {
+    scene_render_after_present(r);
     if (r->host == host) return;
     for (int i = 0; i < SCENE_LAYERS; i++) if (r->promoted[i].id) promoted_leave(r, &r->promoted[i]);
     r->host = host;
@@ -929,8 +984,10 @@ void scene_render_init(struct scene_renderer *r, struct render_backend *be) {
     r->no_cull = 0; r->group_hits = r->group_paints = 0;
     memset(r->groups, 0, sizeof r->groups);
     r->host = 0; memset(r->promoted, 0, sizeof r->promoted); r->layer_paints = 0; r->wants_frame = 0;
+    r->n_doomed = 0;
 }
 void scene_render_destroy(struct scene_renderer *r) {
+    scene_render_after_present(r);
     for (int i = 0; i < SCENE_LAYERS; i++) if (r->promoted[i].id) promoted_leave(r, &r->promoted[i]);
     free(r->cache); r->cache = 0; r->cache_cap = 0;
     for (int i = 0; i < SCENE_GROUP_CACHE; i++) group_drop(&r->groups[i]);
@@ -1396,11 +1453,21 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
      * changed, moved when its place did, sent away when it is gone. Every
      * frame, after the window's own pixels, which its glass is frosted from. */
     if (r->host) {
+        scene_render_after_present(r);                  /* last frame's, if the runtime did not */
         r->wants_frame = 0;
         for (int i = 0; i < SCENE_LAYERS; i++) r->promoted[i].seen = 0;
-        promoted_walk(r, a, root, ident, target, 0);
+        promoted_walk(r, a, root, ident, target, 0, 0, 0);
         for (int i = 0; i < SCENE_LAYERS; i++) {
-            if (r->promoted[i].id && !r->promoted[i].seen) promoted_leave(r, &r->promoted[i]);
+            struct scene_promoted *p = &r->promoted[i];
+            if (p->id && !p->seen && scene_resolve(a, (struct node_handle){ p->index, p->generation })) {
+                /* STILL THERE, no longer a layer: its pixels are its parent's
+                 * again -- painted and presented above -- so it goes at once,
+                 * with no exit to play over itself */
+                if (r->n_doomed < SCENE_LAYERS) {
+                    r->doomed[r->n_doomed].id = p->id; r->doomed[r->n_doomed].at = p->at; r->n_doomed++;
+                } else r->host->go(r->host->ctx, p->id, 0, &p->at, 0, 0, 0, 1, 0);
+                free(p->nodes); memset(p, 0, sizeof *p);
+            } else if (r->promoted[i].id && !r->promoted[i].seen) promoted_leave(r, &r->promoted[i]);
             else if (r->promoted[i].waiting && !r->promoted[i].seen) memset(&r->promoted[i], 0, sizeof r->promoted[i]);
         }
     }

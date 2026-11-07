@@ -397,11 +397,31 @@ static struct instance_handle enter_container(enum instance_kind kind, uint8_t a
     else { g_cursor_over++; g_depth_overflowed = 1; }   /* clamp, and stay balanced */
     return inst;
 }
+/* A LAYER IS DECLARED EVERY FRAME, like the rest of a box. A retained
+ * instance can be met again as another box -- an unkeyed overlay's place
+ * taken by the row after it once the overlay is gone -- and a promotion it
+ * kept would make that row a layer nobody asked for. So the boxes promoted
+ * this frame are noted, and one that closes promoted without being among them
+ * is the window's again. */
+#define PROMOTED_PER_FRAME 64
+static struct instance_handle g_promoted_now[PROMOTED_PER_FRAME];
+static int g_promoted_n;
+static uint64_t g_promoted_serial;
+static int promoted_now(struct instance_handle h) {
+    if (g_promoted_serial != g_frame_serial) return 0;
+    for (int i = 0; i < g_promoted_n; i++)
+        if (g_promoted_now[i].index == h.index && g_promoted_now[i].generation == h.generation) return 1;
+    return 0;
+}
+
 static void exit_container(void) {
     if (g_cursor_over > 0) { g_cursor_over--; return; }
     if (g_cursor_top < 0) return;
     struct instance_handle parent = g_cursor[g_cursor_top].parent;
     sweep_unvisited_children(parent);
+    struct instance *b = instance_resolve(parent);
+    struct scene_node *sn = b ? scene_resolve(g_sa, b->scene_node) : 0;
+    if (sn && sn->promoted && !promoted_now(parent)) scene_set_promoted(g_sa, b->scene_node, false, 0, 0);
     g_cursor_top--;
 }
 
@@ -566,6 +586,12 @@ void ui_set_scale(float scale, float anchor_x, float anchor_y) {
 void ui_set_promoted(bool on, const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear) {
     struct instance *b = cur_box(); if (!b) return;
     scene_set_promoted(g_sa, b->scene_node, on, appear, disappear);   /* guarded */
+    if (g_promoted_serial != g_frame_serial) { g_promoted_serial = g_frame_serial; g_promoted_n = 0; }
+    if (on && g_promoted_n < PROMOTED_PER_FRAME) g_promoted_now[g_promoted_n++] = b->self;
+}
+void ui_set_layer_spring(uint16_t response_ms, uint16_t damping_milli) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_layer_spring(g_sa, b->scene_node, response_ms, damping_milli);
 }
 void ui_set_offset(float x, float y) {
     struct instance *b = cur_box(); if (!b) return;

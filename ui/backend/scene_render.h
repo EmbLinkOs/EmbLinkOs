@@ -51,10 +51,11 @@ struct scene_layer_host {
     /* its pixels in (x, y, w, h) changed */
     void (*present)(void *ctx, uint32_t id, int x, int y, int w, int h);
     /* go to `to` on the spring (response ms, damping permille; 0: jump), from
-     * `from` if given (jumped to first); then gone when `destroy`. With
-     * `at_present` it takes effect at the layer's next present. */
+     * `from` if given (jumped to first), starting `delay_ms` later; then gone
+     * when `destroy`. With `at_present` it takes effect at the layer's next
+     * present. */
     void (*go)(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
-               uint16_t response_ms, uint16_t damping_milli, int destroy, int at_present);
+               uint16_t response_ms, uint16_t damping_milli, uint16_t delay_ms, int destroy, int at_present);
     /* how it looks beyond its pixels, said once when it is made (may be NULL):
      * its corner radius, and glass -- the compositor blurs what is really
      * behind it, other windows too, under its pixels; the renderer paints the
@@ -109,6 +110,11 @@ struct scene_renderer {
     /* the layer host, and the promoted subtrees it holds for us */
     const struct scene_layer_host *host;
     struct scene_promoted  promoted[SCENE_LAYERS];
+    /* layers taken back into the window's pixels this frame: let go once the
+     * window has presented them (scene_render_after_present), not before --
+     * else a frame between shows neither */
+    struct { uint32_t id; struct scene_layer_state at; } doomed[SCENE_LAYERS];
+    int                    n_doomed;
     uint32_t               layer_paints;   /* promoted subtrees painted whole (tests) */
     uint32_t               layer_partials; /* ...and painted only where they changed */
     int                    wants_frame;    /* a promoted subtree is settling: build the next */
@@ -140,5 +146,8 @@ int  scene_render_set_reduced(int on);
 /* Hand promoted subtrees to `host` (NULL: paint them in the window, as any
  * other subtree). Layers it holds are let go when it is changed. */
 void scene_render_set_layer_host(struct scene_renderer *r, const struct scene_layer_host *host);
+/* the window's pixels for this frame are presented: the layers taken back
+ * into them may go now (else they go at the next frame) */
+void scene_render_after_present(struct scene_renderer *r);
 
 #endif /* __EMBLINK_UI_SCENE_RENDER_H__ */

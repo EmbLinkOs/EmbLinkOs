@@ -203,6 +203,7 @@ static float g_apps_scroll = 0;   /* launcher grid scroll offset */
 static char  g_apps_q[40];        /* the launcher's search text */
 /* Bumped every time the launcher opens; the sheet is keyed by it. See below. */
 static unsigned g_apps_gen = 0;
+static uint64_t g_apps_open_ms;   /* when it opened: its rows arrive a beat apart after it */
 
 /* Enumerate /data/apps/<name>/, keeping those that hold a <name>.elf, and read
  * each one's presentation manifest. home's namespace grants `ro /data/apps`. */
@@ -474,7 +475,8 @@ static void apps_set_open(int open) {
 }
 static void apps_apply_open(int open) {
     if (open == g_apps_open) return;
-    if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
+    if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++;
+                g_apps_open_ms = embk_uptime_ms(); }
     g_apps_open = open;
     /* Render the new state BEFORE moving the layer when closing, and move it
      * before rendering when opening -- either way the compositor's recompose
@@ -1195,27 +1197,20 @@ static void apps_grid(void) {
     float kk=k<0?0:k>1?1:k;
     uint16_t in_ms=ui_theme()->motion_ms>0?320:0,out_ms=ui_theme()->motion_ms>0?200:0;
     Overlay() {
-        { Color sc = ui_theme()->scrim; sc.a *= lay ? 0.f : kk;
-          ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=sc}); }   /* the dimming comes and goes with it */
+        /* the dimming comes and goes with it -- on layers the overlay's own,
+         * a layer under the sheet's that fades on the compositor's spring */
+        { Color sc = ui_theme()->scrim; sc.a *= lay ? 1.f : kk;
+          ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=sc});
+          if (lay) { struct scene_layer_motion in={0,1000,500,500,0,0,in_ms,1000,0},out={0,1000,500,500,0,0,out_ms,1000,0};
+                     ui_set_promoted(true,&in,&out); } }
         ui_set_hit_passthrough(g_apps_closing);   /* leaving: clicks reach what is behind */
-        if (lay) {                                /* the dimming, a layer under the sheet's */
-            ui_box_begin(0xD1A5C12Bull);
-            ui_set_overlay(true);
-            ui_set_hit_passthrough(true);
-            ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_sw },
-                        (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_sh });
-            ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=ui_theme()->scrim});
-            struct scene_layer_motion in={0,1000,500,500,0,0,in_ms,1000},out={0,1000,500,500,0,0,out_ms,1000};
-            ui_set_promoted(true,&in,&out);
-            ui_box_end();
-        }
         at_begin(0xA995EE7ull, g_px, g_py);
         VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {
             Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
                 ui_set_opacity(kk);                       /* the glass fades as glass (scene_render: backdrop) */
                 ui_set_scale(0.94f+0.06f*kk,0.5f,0.5f);   /* and zooms in from a little smaller */
                 ui_set_offset(0,(1.f-k)*12.f);
-                { struct scene_layer_motion in={0,940,500,500,0,12,in_ms,900},out={0,960,500,500,0,8,out_ms,1000};
+                { struct scene_layer_motion in={0,940,500,500,0,12,in_ms,900,0},out={0,960,500,500,0,8,out_ms,1000,0};
                   ui_set_promoted(lay!=0,&in,&out); }
                 HStack(.spacing=12,.align=Center) {
                     Icon(IconGrid).color(T.accent);
@@ -1231,18 +1226,51 @@ static void apps_grid(void) {
                 Divider();
                 ScrollView(&g_apps_scroll,height-158,.key="appsgrid") {
                     int count=0;
+                    /* ON LAYERS THE ROWS ARRIVE A BEAT APART: for the entrance
+                     * each row in view is a layer of its own over the sheet's,
+                     * rising in on a delay the compositor keeps -- then, landed,
+                     * the sheet's pixels again (a layer is not clipped by the
+                     * scroller, so only rows wholly in view, and not for long).
+                     * Without layers each tile is offset, as it always was. */
+                    uint64_t now=embk_uptime_ms(),staggered=g_apps_open_ms+2000;
+                    int stagger=lay && in_ms && now<staggered && g_apps_scroll==0;   /* scrolled: not clipped, so back */
+                    if(stagger)em_wake_at(staggered);
+                    float vx,vtop,vw,vh;int vknown=ui_open_rect(&vx,&vtop,&vw,&vh);
+                    int matching=0;for(int i=0;i<g_all_n;i++)matching+=app_matches(g_all[i].label,g_apps_q);
+                    int rows=lay?(matching+cols-1)/cols:1,i=0;
+                    VStack(.spacing=8,.align=Fill) {
+                    for(int row=0;row<rows;row++) {
                     Grid(cols,.spacing=8) {
-                        for(int i=0;i<g_all_n;i++) {
+                        if(lay) {
+                            float rx,ry,rw,rh;
+                            int inview=vknown && ui_open_rect(&rx,&ry,&rw,&rh) && rh>0 && ry+rh<=vtop+vh+0.5f;
+                            uint16_t delay=(uint16_t)(40+row*45);
+                            struct scene_layer_motion in={0,1000,500,500,0,16,in_ms,900,delay},
+                                                      out={0,960,500,500,0,8,out_ms,1000,0};
+                            ui_set_promoted(stagger && inview && row<5,&in,&out);
+                        }
+                        int c=0;
+                        for(;i<g_all_n && (!lay || c<cols);i++) {
                             if(!app_matches(g_all[i].label,g_apps_q))continue;
-                            count++;
-                            VStack(.spacing=6,.align=Center,.py=5) {
+                            count++;c++;
+                            /* in rows of their own, the columns are said outright -- each
+                             * row's grid would size its own, and they would not line up */
+                            float tw=lay?((vknown && vw>0?vw:width-40)-8.f*(cols-1))/cols:0;
+                            VStack(.spacing=6,.align=Center,.py=5,.width=tw) {
                                 /* a beat apart: each tile a little behind the one before */
                                 float d=(float)(count<12?count:12)*0.035f,pi=(k-d)/(1.f-d);
-                                ui_set_offset(0,(1.f-(pi<0?0:pi>1?1:pi))*16.f);
+                                ui_set_offset(0,lay?0.f:(1.f-(pi<0?0:pi>1?1:pi))*16.f);
                                 drag_icon(grid_to_item(i),54,3,i);
                                 Text(g_all[i].label).caption();
                             }
                         }
+                        /* a short row keeps its columns: the cells it lacks, empty */
+                        float tw=lay?((vknown && vw>0?vw:width-40)-8.f*(cols-1))/cols:0;
+                        for(;lay && c<cols;c++) { ui_box_begin(0);
+                            ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=tw},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=1});
+                            ui_box_end(); }
+                    }
+                    }
                     }
                     if(!count) {
                         Text("No applications found").body();
@@ -2229,6 +2257,7 @@ int main(int argc, char **argv, char **envp) {
         if (g_invalidate > 0) { g_invalidate--; scene_render_invalidate(&r); }
         uint64_t pf2b = em_prof_now(&g_prof);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        if (r.wants_frame) em_request_frame();   /* a layer settling into place: the frame that tells */
         uint64_t pf3 = em_prof_now(&g_prof), pf_px = 0;
         int pf_full = r.full || g_full_present > 0;
 
@@ -2265,6 +2294,7 @@ int main(int argc, char **argv, char **envp) {
                 pf_px = (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
             }
         }
+        scene_render_after_present(&r);   /* layers taken back into those pixels (the rows): now */
         if (g_prof.on) {
             em_prof_frame(&g_prof, pf1 - pf0, pf2b - pf1, pf3 - pf2b,
                           embk_thread_cpu_ns() - pf3, pf_full, pf_px);
@@ -2289,7 +2319,9 @@ int main(int argc, char **argv, char **envp) {
         else {
             em_prof_flush(&g_prof, "Desktop");      /* a run of frames ends at the wait */
             uint64_t now = embk_uptime_ms();
-            em_wait_input(screen_next > now ? (int)(screen_next - now) : 0);
+            int wait = em_wake_wait(now, screen_next > now ? (int)(screen_next - now) : 0);
+            em_take_wake(now);                      /* due: this loop builds every pass anyway */
+            em_wait_input(wait);
         }
     }
     return 0;

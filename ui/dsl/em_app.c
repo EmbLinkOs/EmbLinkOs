@@ -470,7 +470,7 @@ static void lh_op(struct embk_layer_op *op, uint32_t id, const struct scene_laye
     op->anchor_x_milli = s->anchor_x_milli; op->anchor_y_milli = s->anchor_y_milli;
 }
 static void lh_go(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
-                  uint16_t response_ms, uint16_t damping_milli, int destroy, int at_present) {
+                  uint16_t response_ms, uint16_t damping_milli, uint16_t delay_ms, int destroy, int at_present) {
     (void)ctx;
     struct embk_layer_op op[2]; uint32_t n = 0;
     if (from) { lh_op(&op[n], id, from); op[n].snap = op[n].set; n++; }
@@ -478,6 +478,7 @@ static void lh_go(void *ctx, uint32_t id, const struct scene_layer_state *from, 
     if (!response_ms) op[n].snap = op[n].set;
     op[n].move.response_ms = op[n].fade.response_ms = op[n].grow.response_ms = response_ms;
     op[n].move.damping_milli = op[n].fade.damping_milli = op[n].grow.damping_milli = damping_milli;
+    op[n].delay_ms = delay_ms;
     if (destroy) op[n].op = EMBK_LOP_DESTROY;
     n++;
     embk_layer_set(g_lh_win, op, n, at_present ? EMBK_LS_AT_PRESENT : 0);
@@ -760,7 +761,7 @@ int em_app_run(const EmApp *app) {
                     if(nh>P.h)nh=P.h;
                     uint32_t *npx=NULL;
                     if(embk_win_resize(win,nw,nh,(void **)&npx)>=0 && npx) {
-                        px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);
+                        px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);g_mat_full=1;
                         rt.pixels=back?back:px;rt.width=nw;rt.height=nh;rt.stride=nw*4;
                         g_viewport_w=nw;g_viewport_h=nh;em_set_viewport(nw,nh);
                         int ny=P.y+(g_follow_display_width && g_shell_bottom && !menu_expanded?P.h-nh:0);
@@ -946,6 +947,11 @@ int em_app_run(const EmApp *app) {
                     rt.pixels = back ? back : px;
                     rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
                     scene_render_invalidate(&r);
+                    /* ALL OF IT, cleared: what realloc gave the new rows is an
+                     * old frame's pixels (the screen went grey below the bar
+                     * when a menu on a layer opened -- no structural frame
+                     * clears it any more) */
+                    g_mat_full = 1;
                     em_request_frame();
                     menu_expanded = expanded;
                     em_window_move_to(P.x,P.y+(g_shell_bottom && !want?P.h-nh:0));
@@ -1023,7 +1029,7 @@ int em_app_run(const EmApp *app) {
         int rms = g_refresh_override >= 0 ? g_refresh_override : app->refresh_ms;
         int app_tick = rms > 0 && (em_now_ms() - last_app_tick) >= (uint64_t)rms;
         if (app_tick) last_app_tick = em_now_ms();
-        int build = first || input_edge || em_take_frame_request() || app_tick ||
+        int build = first || input_edge || em_take_frame_request() || app_tick || em_take_wake(em_now_ms()) ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
                     em_overlay_settling() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
         if (!build) {
@@ -1046,6 +1052,7 @@ int em_app_run(const EmApp *app) {
                 int64_t left = due > now ? (int64_t)(due - now) : 0;
                 if (left < wait) wait = left;
             }
+            wait = em_wake_wait(now, (int)wait);     /* a tooltip due, a toast leaving */
             em_wait_input((int)wait);
             continue;
         }
@@ -1125,6 +1132,7 @@ int em_app_run(const EmApp *app) {
         }
 
         uint64_t pf_px = present_changes(win, px, back, winw, winh, &r, force_full);
+        scene_render_after_present(&r);            /* layers taken back into those pixels: now */
         if (g_prof.on) {
             uint64_t pf4 = embk_thread_cpu_ns();
             em_prof_frame(&g_prof, pf1 - pf0, pf2 - pf1, pf3 - pf2, pf4 - pf3, force_full || r.full, pf_px);
@@ -1285,7 +1293,7 @@ int em_widget_run(const EmWidget *wg) {
         if(memcmp(&next,&widget_appearance,sizeof next)) {
             widget_appearance=next;oscfg_apply_appearance(&next);em_structure_changed();em_request_frame();
         }
-        int build = first || input_edge || tick || em_take_frame_request() ||
+        int build = first || input_edge || tick || em_take_frame_request() || em_take_wake(now) ||
                     em_ui_epoch() != prev_epoch;
         if (!build) {
             /* nothing to draw: wait for input, or the next refresh tick (a
@@ -1296,7 +1304,7 @@ int em_widget_run(const EmWidget *wg) {
                 uint64_t due = last_tick + (uint64_t)wg->refresh_ms;
                 wait = due > now ? (int64_t)(due - now) : 0;
             }
-            em_wait_input((int)wait);
+            em_wait_input(em_wake_wait(now, (int)wait));
             continue;
         }
         if (tick) last_tick = now;
