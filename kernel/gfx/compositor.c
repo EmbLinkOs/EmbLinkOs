@@ -135,6 +135,12 @@ struct comp_window {
      * button down. A press replayed to an app that still thinks the button is
      * held is no edge at all, so it gets the release first -- see the replay. */
     uint8_t   sent_left;
+    /* A RIGHT PRESS, latched as the left ones are: the level alone lost a
+     * right-click an app did not poll during (busy, or a slow machine) --
+     * Files' context menu, under emulation and under KVM. One is enough: a
+     * context menu is not double-clicked. */
+    uint8_t   pr_pending, pr_phase, sent_right;
+    struct comp_click pr;
     /* A WINDOW THAT SHOWS THROUGH (compositor_win_set_material): an ordinary
      * app window -- its workspace, shadow and place in the layout -- whose
      * pixels are composited by their own alpha, over what is behind it
@@ -3617,6 +3623,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->glass = 0;
     w->translucent = 0;
     w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
+    w->pr_pending = w->pr_phase = w->sent_right = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->mat_alpha = w->mat_blur = 0;
@@ -3733,6 +3740,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->translucent = translucent && !desktop;
     w->mat_alpha = w->mat_blur = 0;
     w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
+    w->pr_pending = w->pr_phase = w->sent_right = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
@@ -4700,7 +4708,8 @@ static void reset_pointer_capture_locked(void) {
     mouse_discard_presses();(void)mouse_take_wheel();
     g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
     g_drag_on=0;g_drag_pid=0;g_ptr_wheel=0;g_buttons_suppressed=1;
-    for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+    for(int i=0;i<COMP_MAX_WINDOWS;i++){g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+                                        g_wins[i].pr_pending=g_wins[i].pr_phase=0;}
 }
 void compositor_drag_set(int on, uint32_t pid) {
     spin_lock(&g_comp_lock);
@@ -4893,6 +4902,18 @@ static void pointer_frame(void) {
                     wp->pend_q[slot].t = press_ev[k].t;   /* ITS OWN time, from the driver */
                     wp->pend_count++;
                 }
+            }
+        }
+    }
+
+    /* the right button's press edge, latched on the window under it */
+    if ((b & MOUSE_BTN_RIGHT) && !(g_prev_buttons & MOUSE_BTN_RIGHT)) {
+        struct comp_window *wp = topmost_at(x, y);
+        if (wp) {
+            int clx = x - wp->x, cly = y - (wp->y + win_titlebar_h(wp));
+            if (clx >= 0 && clx < (int)wp->cw && cly >= 0 && cly < (int)wp->ch) {
+                wp->pr.x = (int16_t)clx; wp->pr.y = (int16_t)cly; wp->pr.t = (uint32_t)timer_uptime_ms();
+                wp->pr_pending = 1; wp->pr_phase = 0; g_post_ui = 1;
             }
         }
     }
@@ -5215,9 +5236,37 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
         }
         break;
     }
+    /* ...and a right press the app has not seen: down on one poll, up on the
+     * next -- unless this poll is already handing it a left replay, or the app
+     * saw it live (it held the button), or it is still down on that window,
+     * which the live state delivers */
+    int left_replay = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++)
-        if (g_wins[i].used && g_wins[i].pid == pid)
+        if (g_wins[i].used && g_wins[i].pid == pid && g_wins[i].pend_count) left_replay = 1;
+    for (int i = 0; i < COMP_MAX_WINDOWS && !left_replay; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->pid != pid || !w->pr_pending) continue;
+        int live = focused && w->id == g_ptr_win && (g_ptr_buttons & MOUSE_BTN_RIGHT);
+        if (w->pr_phase == 0 && (live || w->sent_right)) { w->pr_pending = 0; break; }
+        if (lx) *lx = w->pr.x;
+        if (ly) *ly = w->pr.y;
+        if (win) *win = w->id;
+        if (when) *when = w->pr.t;
+        focused = 1;
+        if (w->pr_phase == 0) {
+            if (buttons) *buttons = MOUSE_BTN_RIGHT;
+            sent = MOUSE_BTN_RIGHT; w->pr_phase = 1;
+        } else {
+            if (buttons) *buttons = 0;
+            sent = 0; w->pr_pending = 0; w->pr_phase = 0;
+        }
+        break;
+    }
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++)
+        if (g_wins[i].used && g_wins[i].pid == pid) {
             g_wins[i].sent_left = (sent & MOUSE_BTN_LEFT) != 0;
+            g_wins[i].sent_right = (sent & MOUSE_BTN_RIGHT) != 0;
+        }
     /* Window-manager commands share the otherwise ordinary `win` result.
      * The high bit distinguishes them without changing the stable syscall ABI. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {

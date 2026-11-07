@@ -222,6 +222,13 @@ def main():
         d.g.command('perf apps off', b'perf: apps off', 60)
         print('PASS: Files\' context menu is a layer: the compositor brings it in and takes it away, and Files '
               'draws only its first frame')
+    except Exception:
+        # what was on the screen, and the layers, when it failed (CI keeps both)
+        try:
+            print(f"failed: the screen {d.g.capture(out / 'failed.ppm')}, the layers {layers(d)}", flush=True)
+        except Exception:
+            pass
+        raise
     finally:
         d.g.close()
 

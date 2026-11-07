@@ -139,6 +139,10 @@ the default target). Measured before and after every step
         linear light); text, the kernel compositor and the virgl shaders keep their own.
   - [ ] Layer caching (a group that only fades or scales could reuse its last flattened pixels;
         the library's tiles animate inside it, so it would not help there).
+- [x] The x86 kernel runs on AMD: STAR's SYSRET selector carries RPL 3 itself (0x13). AMD's SYSRET
+      forces RPL 3 on CS only, so every program ran with SS 0x18 and the first exception's iretq
+      back to ring 3 raised #GP(0x18) -- every boot under KVM on GitHub's AMD EPYC runners. QEMU's
+      emulator, like Intel, forces it on both, which is why it was never seen here.
 - [ ] CI (`.github/workflows/ci.yml`): the host suites, tests/drivers (virgl's compose checks when
       the runner has a render node), the x86 image on EmbCC's library and its desktop smokes under
       KVM. arm64 stays local (HVF). Open: the shell's completion paths build with
@@ -170,10 +174,14 @@ the default target). Measured before and after every step
   - [x] A layer's material (`EMBK_LM_BLUR`): the compositor frosts the screen under the layer's
         glass box, rounded, faded with it (`region_grow_layers`; GPU blur primitive). Promoted
         glass roots use it (backend-test T22), and the top bar's menus are layers now.
-  - [ ] `tools/layer_menu_smoke.py --graphics virgl` (Lima VM): Files' context menu never opens --
-        the right-click does not seem to arrive in that configuration (left clicks and keys do;
-        `layer_library_smoke.py --graphics virgl` passes, glass layers drawn by the GPU). The same
-        smoke passes on x86 under TCG and arm64 under HVF.
+  - [ ] `tools/layer_menu_smoke.py --graphics virgl` (Lima VM): Files' context menu never opened.
+        The same happened in CI (Ubuntu's QEMU 8.2, as in the VM) and never under Homebrew's QEMU
+        11. The cause was the compositor: it latched every LEFT press and replayed it to an app that
+        had not polled in time, and handed the right button over as its level only -- a right-click
+        made while Files was busy or the machine slow was simply never seen. Right presses are
+        latched and replayed now (down one poll, up the next).
+  - [ ] Esc with nothing open quits an EmUI app (`em_app.c`, `em_app_request_exit`): a stray Esc
+        closed Files in the middle of a smoke. A desktop app should not quit on Esc.
   - [x] A layer's frost is saturated as the windows' materials are, on both paths. (It was
         saturated twice on the CPU from 6a3ddb3: `fb_blur_region` already saturates; the extra
         `fb_saturate_region` is gone.)
