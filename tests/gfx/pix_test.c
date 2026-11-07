@@ -332,8 +332,12 @@ static int layer_rows_match(void) {
             if (dw != sw || dh != sh) { u = (x + 0.5) * sw / dw - 0.5; v = (y + 0.5) * sh / dh - 0.5; }
             int u0 = (int)floor(u), v0 = (int)floor(v); double fu = u - u0, fv = v - v0;
             int xs[2] = { u0, u0 + 1 }, ys[2] = { v0, v0 + 1 };
-            for (int k = 0; k < 2; k++) { if (xs[k] < 0) xs[k] = 0; if (xs[k] >= sw) xs[k] = sw - 1;
-                                          if (ys[k] < 0) ys[k] = 0; if (ys[k] >= sh) ys[k] = sh - 1; }
+            for (int k = 0; k < 2; k++) {
+                if (xs[k] < 0) xs[k] = 0;
+                if (xs[k] >= sw) xs[k] = sw - 1;
+                if (ys[k] < 0) ys[k] = 0;
+                if (ys[k] >= sh) ys[k] = sh - 1;
+            }
             double ch[4];
             for (int c = 0; c < 4; c++) {
                 int sf = c * 8;

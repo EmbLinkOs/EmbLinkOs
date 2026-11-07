@@ -974,7 +974,9 @@ else
 ABI_NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall \
                     $(USER_INC) -isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include
 endif
-ABI_NEWLIB_OBJS = build/abi/crt0.o build/abi/syscalls.o
+# ...only where there IS a newlib to build them against: without one there is no
+# libc.a for /system/abi either (a fresh tree, CI), and mkfs leaves it out
+ABI_NEWLIB_OBJS = $(if $(wildcard $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include/stdio.h),build/abi/crt0.o build/abi/syscalls.o,)
 build/abi/crt0.o: user/lib/crt0.c | $(BUILD)
 	@mkdir -p build/abi
 	$(USER_CC) $(ABI_NEWLIB_CFLAGS) -c $< -o $@
