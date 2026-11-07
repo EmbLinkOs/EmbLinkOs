@@ -145,8 +145,11 @@ struct gpu_compose {
     void (*shadow)(const struct gpu_rect *frame, const struct gpu_rect *cover, uint32_t radius,
                    uint32_t width, uint32_t peak);
     // Box blur of what is drawn in r, edges clamped to r as fb_blur_region's
-    // are, laid back only inside `frame` rounded by `corner` (NULL: all of r).
-    void (*blur)(const struct gpu_rect *r, uint32_t radius, const struct gpu_rect *frame, uint32_t corner);
+    // are, laid back only inside `frame` rounded by `corner` (NULL: all of r),
+    // saturated by `sat` (256ths, pix_saturate_row's; 0: not) -- PIX_VIBRANCY
+    // on a material's last pass, as the CPU's blurs are.
+    void (*blur)(const struct gpu_rect *r, uint32_t radius, const struct gpu_rect *frame, uint32_t corner,
+                 uint32_t sat);
     void (*draw)(const struct gpu_draw *d);
     int  (*end)(void);                              // 0: shown; else the GPU failed
     int  (*read)(const struct gpu_rect *r);         // the screen's pixels back into its backing

@@ -133,8 +133,9 @@ static const char fs_solid_text[] =
  * own texel centres, so its edge repeats as the CPU blur's does; CONST[2].xy
  * then scales the coordinate for the sampler (1 for a rectangle texture, one
  * over the size for a 2D one). CONST[0] = (step x, step y, r, 1 / (2r + 1)).
- * The result is premultiplied by the coverage of a rounded frame, CONST[3] =
- * half of it and CONST[4].x its radius, from the frame-local IN[1]. */
+ * The mean is saturated by CONST[4].y (1: not; pix_saturate_row's weights),
+ * then premultiplied by the coverage of a rounded frame, CONST[3] = half of
+ * it and CONST[4].x its radius, from the frame-local IN[1]. */
 #define FS_BLUR(target)                                                \
     "FRAG\n"                                                           \
     "DCL IN[0], GENERIC[0], LINEAR\n"                                  \
@@ -145,6 +146,7 @@ static const char fs_solid_text[] =
     "DCL CONST[0..4]\n"                                                \
     "DCL TEMP[0..3]\n"                                                 \
     "IMM[0] FLT32 { 0.0000, 1.0000, 0.5000, 0.0000}\n"                 \
+    "IMM[1] FLT32 { 0.30078125, 0.5859375, 0.11328125, 0.0000}\n"      \
     "  MOV TEMP[0], IMM[0].xxxx\n"                                     \
     "  MOV TEMP[1].x, -CONST[0].zzzz\n"                                \
     "  BGNLOOP\n"                                                      \
@@ -161,6 +163,9 @@ static const char fs_solid_text[] =
     "    ADD TEMP[1].x, TEMP[1].xxxx, IMM[0].yyyy\n"                   \
     "  ENDLOOP\n"                                                      \
     "  MUL TEMP[0], TEMP[0], CONST[0].wwww\n"                          \
+    "  DP3 TEMP[1].x, TEMP[0].xyzz, IMM[1].xyzz\n"                     \
+    "  ADD TEMP[3].xyz, TEMP[0].xyzz, -TEMP[1].xxxx\n"                 \
+    "  MAD_SAT TEMP[0].xyz, TEMP[3].xyzz, CONST[4].yyyy, TEMP[1].xxxx\n" \
     SDF("IN[1]", "CONST[3]", "CONST[4].xxxx")                          \
     "  ADD_SAT TEMP[2].x, IMM[0].zzzz, -TEMP[2].xxxx\n"                \
     "  MUL OUT[0], TEMP[0], TEMP[2].xxxx\n"                            \
@@ -413,7 +418,7 @@ static int blur_scratch(void)
  * frame `fw` x `fh` with corners `corner`, at the quad's frame origin. */
 static void blur_pass(uint32_t view, uint32_t shader, int horizontal, uint32_t radius,
                       int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t tw, uint32_t th,
-                      int32_t fw, int32_t fh, uint32_t corner)
+                      int32_t fw, int32_t fh, uint32_t corner, uint32_t sat)
 {
     vg_bind(&S, horizontal ? H_BLEND_COPY : H_BLEND_OVER, VG_OBJ_BLEND);
     vg_bind_shader(&S, shader, VG_SHADER_FRAGMENT);
@@ -426,12 +431,13 @@ static void blur_pass(uint32_t view, uint32_t shader, int horizontal, uint32_t r
         vg_f32_ratio(2 * (int64_t)x1 - 1, 2), vg_f32_ratio(2 * (int64_t)y1 - 1, 2),
         vg_f32_ratio(1, (int64_t)tw), vg_f32_ratio(1, (int64_t)th), 0, 0,
         vg_f32_ratio(fw, 2), vg_f32_ratio(fh, 2), 0, 0,
-        vg_f32((int64_t)corner), 0, 0, 0,
+        vg_f32((int64_t)corner), sat ? vg_f32_ratio((int64_t)sat, 256) : vg_f32(1), 0, 0,
     };
     vg_constants(&S, VG_SHADER_FRAGMENT, c, 20);
 }
 
-static void vc_blur(const struct gpu_rect *r0, uint32_t radius, const struct gpu_rect *frame, uint32_t corner)
+static void vc_blur(const struct gpu_rect *r0, uint32_t radius, const struct gpu_rect *frame, uint32_t corner,
+                    uint32_t sat)
 {
     if (!radius || failed) return;
     struct gpu_rect r = *r0;
@@ -455,11 +461,11 @@ static void vc_blur(const struct gpu_rect *r0, uint32_t radius, const struct gpu
     }
     use_target(H_BLUR_SURF, blur_w, blur_h, 0, 0, 0, (uint32_t)r.w, (uint32_t)r.h);
     blur_pass(H_TARGET_VIEW, H_FS_BLUR_2D, 1, radius, r.x, ty0, r.x + r.w, ty1, target_w, target_h,
-              r.w, r.h, 0);
+              r.w, r.h, 0, 0);
     quad(&at0, &from, 0, 0);
     /* Vertical: scratch -> the screen, where it came from, cut to the frame. */
     use_screen();
-    blur_pass(H_BLUR_VIEW, H_FS_BLUR_RECT, 0, radius, 0, 0, r.w, r.h, 1, 1, f.w, f.h, corner);
+    blur_pass(H_BLUR_VIEW, H_FS_BLUR_RECT, 0, radius, 0, 0, r.w, r.h, 1, 1, f.w, f.h, corner, sat);
     quad(&r, &at0, f.x, f.y);
 }
 
@@ -539,7 +545,7 @@ static int selftest(void)
         struct gpu_rect white = { 24, 2, 3, 4 };
         vc_fill(&white, 0xffffff);
         struct gpu_rect region = { 20, 0, 12, PROBE_H };
-        vc_blur(&region, 1, 0, 0);
+        vc_blur(&region, 1, 0, 0, 0);
         ok = vc_end() == 0 && vc_read(&all) == 0;
     } else {
         ok = 0;

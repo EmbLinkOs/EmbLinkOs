@@ -147,7 +147,7 @@ static void compose_checks(const struct gpu_compose *ops)
     struct gpu_rect wl = { 150, 26, 14, 9 };
     gc->fill(&wl, 0xffffff);
     struct gpu_rect br = { 140, 20, 40, 30 };
-    gc->blur(&br, 3, 0, 0);
+    gc->blur(&br, 3, 0, 0, 0);
     assert(gc->end() == 0);
     readback();
     static int src[30][40], hb[30][40], ref[30][40];
@@ -193,13 +193,39 @@ static void compose_checks(const struct gpu_compose *ops)
     struct gpu_rect stripe = { 220, 20, 20, 40 };
     gc->fill(&stripe, 0x000000);
     struct gpu_rect fr = { 200, 20, 40, 40 };
-    gc->blur(&fr, 3, &fr, 10);
+    gc->blur(&fr, 3, &fr, 10, 0);
     assert(gc->end() == 0);
     readback();
     CHECK(px(200, 20) == 0xffffff && px(239, 59) == 0x000000, "rounded blur touched its corners: %06x %06x",
           px(200, 20), px(239, 59));
     CHECK(chan(px(219, 40), 0) > 80 && chan(px(219, 40), 0) < 200 && chan(px(220, 40), 0) > 50 &&
           chan(px(220, 40), 0) < 180, "rounded blur not frosted inside: %06x %06x", px(219, 40), px(220, 40));
+
+    /* 7c. A material's blur is saturated as the CPU's is (pix_saturate_row,
+     * PIX_VIBRANCY): a block of one colour stays that colour, moved away
+     * from its grey -- and with no saturation asked for, it is left as it is. */
+    frame(&all, 0x000000);
+    struct gpu_rect tint = { 260, 20, 40, 40 }, inner = { 270, 30, 20, 20 }, plain = { 260, 70, 40, 40 },
+                    plain_in = { 270, 80, 20, 20 };
+    gc->fill(&tint, 0x3060c0);
+    gc->fill(&plain, 0x3060c0);
+    gc->blur(&inner, 3, 0, 0, 435);
+    gc->blur(&plain_in, 3, 0, 0, 0);
+    assert(gc->end() == 0);
+    readback();
+    {
+        int r = 0x30, g = 0x60, b = 0xc0, l = (77 * r + 150 * g + 29 * b) >> 8, want[3];
+        int c[3] = { r, g, b };
+        for (int k = 0; k < 3; k++) {
+            int v = l + (((c[k] - l) * 435) >> 8);
+            want[k] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+        uint32_t have = px(280, 40);
+        int dr = (int)chan(have, 16) - want[0], dg = (int)chan(have, 8) - want[1], db = (int)chan(have, 0) - want[2];
+        CHECK(dr <= 3 && dr >= -3 && dg <= 3 && dg >= -3 && db <= 3 && db >= -3,
+              "saturated blur %06x, want %02x%02x%02x", have, want[0], want[1], want[2]);
+        CHECK(px(280, 90) == 0x3060c0, "a blur asked for no saturation changed the colour: %06x", px(280, 90));
+    }
 
     /* 8. Scaled: the 64x40 picture into 32x20, linear: a smooth gradient still. */
     frame(&all, 0x000000);

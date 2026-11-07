@@ -71,7 +71,10 @@ struct embk_layer_op {
     int16_t  mat_x, mat_y;
     uint16_t mat_w, mat_h;
     struct embk_spring move, fade, grow;
-    uint16_t reserved;           /* 0: the size, a multiple of four, said outright */
+    /* how long its springs wait, from when the op takes effect, before they
+     * start: the layer stays where it was (a stagger -- each tile a beat
+     * after the one before). 0: at once. Not under reduce motion. */
+    uint16_t delay_ms;
 };
 
 /* embk_layer_set flags */

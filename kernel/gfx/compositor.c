@@ -578,6 +578,11 @@ struct comp_layer {
     uint32_t  gimg;                       /* its GPU image */
     struct embk_layer_op pend[4]; int npend;   /* held for the next present */
     uint32_t  seq;                        /* when it was made: a window's layers stack in this order */
+    /* ITS FROST, KEPT (CPU, at rest): what was behind its material box and
+     * that blurred, so a frame that changes nothing behind it -- a hover
+     * moving down the menu -- lays the blur back instead of making it */
+    uint32_t *fr_sharp, *fr_blur;
+    int       fr_x, fr_y, fr_w, fr_h, fr_valid;
 };
 static uint32_t g_layer_seq;
 
@@ -2077,9 +2082,25 @@ static void mat_more(int x0, int y0, int x1, int y1) {
  * window that blurs, covers all of that window: the blur reads all of what
  * is behind it, and only a repaint of all of it has that in hand. */
 static int layers_shown(const struct comp_window *w);   /* fwd */
+static int layer_moving(const struct comp_layer *L);   /* fwd */
+/* Its material box on the screen, as its kept frost knows it (clipped to it). */
+static int frost_box(const int m[4], int c[4]) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return 0;
+    c[0] = imax(m[0], 0); c[1] = imax(m[1], 0);
+    c[2] = imin(m[0] + m[2], (int)fi->width) - c[0]; c[3] = imin(m[1] + m[3], (int)fi->height) - c[1];
+    return c[2] > 1 && c[3] > 1;
+}
+static int layer_frost_known(const struct comp_layer *L, const int m[4], int a) {
+    int c[4];
+    return a >= 250 && L->fr_valid && !layer_moving(L) && frost_box(m, c) &&
+           c[0] == L->fr_x && c[1] == L->fr_y && c[2] == L->fr_w && c[3] == L->fr_h;
+}
 /* A layer that blurs what is behind it reads all of what is behind it: a
- * repaint that touches it covers it whole. */
-static void region_grow_layers(int *rx0, int *ry0, int *rx1, int *ry1) {
+ * repaint that touches it covers it whole -- unless its frost is kept (CPU,
+ * at rest, the same box): then what the repaint covers is read and compared,
+ * and the rest is already right (layer_frost_cpu). */
+static void region_grow_layers(int *rx0, int *ry0, int *rx1, int *ry1, int gpu) {
     for (int pass = 0; pass < 2; pass++) {
         int grew = 0;
         for (int i = 0; i < LAYERS_MAX; i++) {
@@ -2092,6 +2113,7 @@ static void region_grow_layers(int *rx0, int *ry0, int *rx1, int *ry1) {
             layer_mat_rect(L, r, m);
             int x0 = m[0], y0 = m[1], x1 = m[0] + m[2], y1 = m[1] + m[3];
             if (x1 <= *rx0 || x0 >= *rx1 || y1 <= *ry0 || y0 >= *ry1) continue;
+            if (!gpu && layer_frost_known(L, m, a)) continue;
             if (x0 < *rx0) { *rx0 = x0; grew = 1; }
             if (y0 < *ry0) { *ry0 = y0; grew = 1; }
             if (x1 > *rx1) { *rx1 = x1; grew = 1; }
@@ -2192,7 +2214,12 @@ static uint64_t layer_bytes(const struct comp_layer *L) { return (uint64_t)L->np
 
 /* Give the pages back: out of the client (while its address space is still
  * alive -- the same rule as a shared window's), out of the kernel's view. */
+static void layer_frost_free(struct comp_layer *L) {
+    kfree(L->fr_sharp); kfree(L->fr_blur);
+    L->fr_sharp = L->fr_blur = 0; L->fr_w = L->fr_h = 0; L->fr_valid = 0;
+}
 static void layer_free(struct comp_layer *L) {
+    layer_frost_free(L);
     gpu_image_doom(&L->gimg);
     if (L->client_pml4 && L->client_va)
         for (uint32_t i = 0; i < L->npages; i++) vmm_unmap_in(L->client_pml4, L->client_va + (uint64_t)i * PAGE_SIZE);
@@ -2228,6 +2255,7 @@ static void layer_park(struct comp_layer *L) {
         parked += g_layers[i].used && g_layers[i].parked && g_layers[i].win_id == L->win_id;
     if (parked >= LAYER_PARKED_PER_WIN) { layer_free(L); return; }
     gpu_image_doom(&L->gimg);
+    layer_frost_free(L);
     L->parked = 1; L->presented = 0; L->npend = 0; L->have_last = 0; L->destroy_at_rest = 0;
     L->id = 0;
 }
@@ -2251,10 +2279,14 @@ static void layers_count_moving(void) {
 }
 
 /* one property toward its target: jumping there, or on its spring */
-static void layer_go(struct spring *sp, int64_t target, int snap, struct embk_spring how, uint64_t now) {
-    if (snap || !how.response_ms) spring_set(sp, target, now);
-    else spring_to(sp, target, spring_params((uint32_t)how.response_ms * g_slowmo,
-                                             how.damping_milli ? how.damping_milli : 1000u), now);
+static void layer_go(struct spring *sp, int64_t target, int snap, struct embk_spring how, uint64_t now,
+                     uint32_t delay_ms) {
+    if (snap || !how.response_ms) { spring_set(sp, target, now); return; }
+    spring_to(sp, target, spring_params((uint32_t)how.response_ms * g_slowmo,
+                                        how.damping_milli ? how.damping_milli : 1000u), now);
+    /* A DELAY: the spring's clock starts later. Until then it holds where it
+     * is, and says it is moving -- so the frames keep coming to start it. */
+    if (delay_ms && sp->moving) { sp->t0_ns = now + (uint64_t)delay_ms * g_slowmo * 1000000ull; sp->steps = 0; }
 }
 
 static void layer_apply(struct comp_layer *L, const struct embk_layer_op *op, uint64_t now) {
@@ -2263,15 +2295,16 @@ static void layer_apply(struct comp_layer *L, const struct embk_layer_op *op, ui
     int still = (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION) != 0;
     struct embk_spring fade = op->fade;
     if (still && fade.response_ms > 150) fade.response_ms = 150;
+    uint32_t delay = still ? 0 : op->delay_ms;
     if (op->set & EMBK_LP_POS) {
-        layer_go(&L->x, SPRING_PX(op->x), still || (op->snap & EMBK_LP_POS), op->move, now);
-        layer_go(&L->y, SPRING_PX(op->y), still || (op->snap & EMBK_LP_POS), op->move, now);
+        layer_go(&L->x, SPRING_PX(op->x), still || (op->snap & EMBK_LP_POS), op->move, now, delay);
+        layer_go(&L->y, SPRING_PX(op->y), still || (op->snap & EMBK_LP_POS), op->move, now, delay);
     }
     if (op->set & EMBK_LP_OPACITY)
-        layer_go(&L->opacity, SPRING_PX(op->opacity), op->snap & EMBK_LP_OPACITY, fade, now);
+        layer_go(&L->opacity, SPRING_PX(op->opacity), op->snap & EMBK_LP_OPACITY, fade, now, delay);
     if (op->set & EMBK_LP_SCALE) {
         uint32_t sc = op->scale_milli < 10 ? 10 : op->scale_milli > 1000 ? 1000 : op->scale_milli;
-        layer_go(&L->scale, SPRING_PX(sc), still || (op->snap & EMBK_LP_SCALE), op->grow, now);
+        layer_go(&L->scale, SPRING_PX(sc), still || (op->snap & EMBK_LP_SCALE), op->grow, now, delay);
         L->ax = op->anchor_x_milli > 1000 ? 1000 : op->anchor_x_milli;
         L->ay = op->anchor_y_milli > 1000 ? 1000 : op->anchor_y_milli;
     }
@@ -2303,6 +2336,54 @@ static int layers_shown(const struct comp_window *w) {
     return w->visible && w->presented && session_ui_allowed(w->pid) && win_shown(w) && !g_ov;
 }
 
+/* THE FROST UNDER A LAYER AT REST, kept: what the repaint covers of its box
+ * is read and compared with what was behind it before; the same -- the
+ * layer's own picture changed, not what it stands on -- and the kept blur is
+ * laid back. Changed: blurred again, whole, as fb_blur_region does it (one
+ * box, saturated), and the rest of the box shown too (mat_more). 0: not kept
+ * (moving, no memory, too wide) -- blur it the plain way. */
+static uint32_t g_frost_made, g_frost_kept;   /* blurs made, and laid back (perf windows) */
+static int layer_frost_cpu(struct comp_layer *L, const int m[4], int bx0, int by0, int bx1, int by1) {
+    int c[4];
+    if (layer_moving(L) || 2 * GLASS_BLUR + 1 > PIX_BOX_MAX_WIN || !frost_box(m, c) ||
+        c[2] > (int)(sizeof g_bd_row / sizeof *g_bd_row)) { layer_frost_free(L); return 0; }
+    if (!L->fr_sharp || L->fr_w != c[2] || L->fr_h != c[3]) {
+        layer_frost_free(L);
+        L->fr_sharp = kmalloc((uint64_t)c[2] * (uint64_t)c[3] * 4);
+        L->fr_blur = L->fr_sharp ? kmalloc((uint64_t)c[2] * (uint64_t)c[3] * 4) : 0;
+        if (!L->fr_sharp || !L->fr_blur) { layer_frost_free(L); return 0; }
+        L->fr_w = c[2]; L->fr_h = c[3]; L->fr_valid = 0;
+    }
+    if (L->fr_x != c[0] || L->fr_y != c[1]) { L->fr_x = c[0]; L->fr_y = c[1]; L->fr_valid = 0; }
+    bx0 = imax(bx0, c[0]); by0 = imax(by0, c[1]); bx1 = imin(bx1, c[0] + c[2]); by1 = imin(by1, c[1] + c[3]);
+    if (bx1 <= bx0 || by1 <= by0) return 1;
+    int whole = bx0 == c[0] && by0 == c[1] && bx1 == c[0] + c[2] && by1 == c[1] + c[3];
+    if (!L->fr_valid && !whole) return 0;            /* region_grow_layers covers it whole then */
+    int n = bx1 - bx0, changed = !L->fr_valid;
+    for (int y = by0; y < by1; y++) {
+        fb_read_rect(bx0, y, n, 1, g_bd_row, (uint32_t)n);
+        uint32_t *kept = L->fr_sharp + (size_t)(y - c[1]) * (size_t)c[2] + (size_t)(bx0 - c[0]);
+        if (!changed && !memcmp(kept, g_bd_row, (size_t)n * 4)) continue;
+        memcpy(kept, g_bd_row, (size_t)n * 4);
+        changed = 1;
+    }
+    if (changed) {
+        size_t px = (size_t)c[2] * (size_t)c[3];
+        /* pix_box_blur's scratch: a picture's worth, and three sums a column */
+        uint32_t *tmp = kmalloc(px * 4), *col = tmp ? kmalloc((size_t)c[2] * 3 * 4) : 0;
+        if (!tmp || !col) { kfree(tmp); kfree(col); L->fr_valid = 0; return 0; }
+        memcpy(L->fr_blur, L->fr_sharp, px * 4);
+        pix_box_blur(L->fr_blur, c[2], c[3], GLASS_BLUR, tmp, col);
+        for (int y = 0; y < c[3]; y++) pix_saturate_row(L->fr_blur + (size_t)y * c[2], c[2], PIX_VIBRANCY, 0);
+        kfree(tmp); kfree(col);
+        L->fr_valid = 1; g_frost_made++;
+        if (!whole) mat_more(c[0], c[1], c[0] + c[2], c[1] + c[3]);   /* the rest of it, blurred anew */
+    } else g_frost_kept++;
+    fb_blit(bx0, by0, n, by1 - by0, L->fr_blur + (size_t)(by0 - c[1]) * (size_t)c[2] + (size_t)(bx0 - c[0]),
+            (uint32_t)c[2]);
+    return 1;
+}
+
 static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
     if (!layers_shown(w)) return;
     int idx[LAYERS_MAX], n = layers_of(w->id, idx);
@@ -2330,8 +2411,8 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
                 g_corner_r_override = rad < 1 ? 0 : rad > WIN_R_MAX ? WIN_R_MAX : rad;
                 if (g_corner_r_override) { corners_save_at(m[0], m[1], m[0] + m[2], m[1] + m[3], rx0, ry0, rx1, ry1); carved = 1; }
                 if (a >= 250) {
-                    fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
-                    fb_saturate_region(bx0, by0, bx1 - bx0, by1 - by0, PIX_VIBRANCY);   /* frosted, not muddy */
+                    if (!layer_frost_cpu((struct comp_layer *)L, m, bx0, by0, bx1, by1))
+                        fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);   /* saturated: frosted, not muddy */
                 }
                 else {
                     /* part way in: the frost at the layer's own opacity, over the sharp */
@@ -2340,7 +2421,6 @@ static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int r
                         if (keep) {
                             fb_read_rect(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0));
                             fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
-                            fb_saturate_region(bx0, by0, bx1 - bx0, by1 - by0, PIX_VIBRANCY);
                             fb_blit_uniform(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0), 255u - (uint32_t)a);
                             kfree(keep);
                         }
@@ -2384,7 +2464,7 @@ static int layers_draw_gpu(const struct comp_window *w, const struct gpu_compose
         if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0 && !(L->flags & EMBK_LF_FILL)) {
             int m[4]; layer_mat_rect(L, r, m);
             struct gpu_rect mr = { m[0], m[1], m[2], m[3] };
-            gc->blur(&mr, GLASS_BLUR, &mr, (uint32_t)(L->radius * spring_px(&L->scale) / 1000));
+            gc->blur(&mr, GLASS_BLUR, &mr, (uint32_t)(L->radius * spring_px(&L->scale) / 1000), PIX_VIBRANCY);
         }
         struct gpu_draw d = { .image = L->gimg, .src = { 0, 0, (int32_t)L->w, (int32_t)L->h }, .dst = fr,
                               .opaque = 0, .opacity = (uint8_t)a };
@@ -2978,7 +3058,7 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
              * a uniform translucency (paint_window's two cases) */
             if (GLASS_BLUR > 0) {
                 if (fx_reduced()) gc->fill(&shown, g_desktop.background);
-                else gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius);
+                else gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius, PIX_VIBRANCY);
             }
             if (w->widget && GLASS_ALPHA == 255) gc->fill(&shown, g_desktop.background);
             if (w->widget) d.opaque = 0;
@@ -2991,8 +3071,8 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
                 gc->fill(&shown, g_desktop.background);
             } else if (w->mat_blur) {
                 uint32_t half = (uint32_t)(w->mat_blur + 1) / 2;
-                gc->blur(&shown, half, 0, 0);
-                gc->blur(&shown, half, round ? &frame : 0, radius);
+                gc->blur(&shown, half, 0, 0, 0);                  /* saturated once, at the end */
+                gc->blur(&shown, half, round ? &frame : 0, radius, PIX_VIBRANCY);
             }
             d.opaque = 0;
         } else if (w->desktop || w->translucent) {
@@ -3002,7 +3082,7 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
                 if (bx1 > bx0 && by1 > by0) {
                     struct gpu_rect b = { bx0, by0, bx1 - bx0, by1 - by0 };
                     if (fx_reduced()) gc->fill(&b, g_desktop.background);
-                    else gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0);
+                    else gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0, PIX_VIBRANCY);
                 }
             }
             d.opaque = 0;
@@ -3320,7 +3400,7 @@ static void paint_region_now(int rx0, int ry0, int rx1, int ry1) {
     if (!fi) return;
     int W = (int)fi->width, H = (int)fi->height;
     int gpu = gpu_compose_now() != 0;
-    region_grow_layers(&rx0, &ry0, &rx1, &ry1);
+    region_grow_layers(&rx0, &ry0, &rx1, &ry1, gpu);
     region_grow_material(&rx0, &ry0, &rx1, &ry1, gpu);
     region_grow_corners(&rx0, &ry0, &rx1, &ry1);
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;
@@ -5577,6 +5657,7 @@ void compositor_print_windows(void) {
                 layer_moving(L), L->presented && layers_shown(w));
     }
     if (parked) kprintf("perf: layers parked=%d\n", parked);
+    kprintf("perf: frost made=%u kept=%u\n", g_frost_made, g_frost_kept);
     comp_unlock();
     kprintf("perf: end\n");
 }
