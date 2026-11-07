@@ -115,6 +115,28 @@ static void dump_fault(struct registers *regs) {
     serial_write_string("RBP: ");
     serial_write_hex(regs->rbp);
     serial_write_string("\n");
+    /* A #GP AT AN IRETQ: what it was asked to return to, and the descriptors
+     * the CPU judged it by -- the frame (RIP CS RFLAGS RSP SS) is at RSP, and
+     * the GDT is wherever this core's GDTR says. (It took a real CPU, under
+     * KVM, to find the first of these: QEMU's emulator never faulted.) */
+    if (regs->vector == 13 && regs->cs == 0x08 && regs->rip >= 0xFFFF800000000000ull &&
+        ((const uint8_t *)regs->rip)[0] == 0x48 && ((const uint8_t *)regs->rip)[1] == 0xCF) {
+        const uint64_t *f = (const uint64_t *)regs->rsp;
+        serial_write_string("iretq frame: RIP "); serial_write_hex(f[0]);
+        serial_write_string(" CS "); serial_write_hex(f[1]);
+        serial_write_string(" RFLAGS "); serial_write_hex(f[2]);
+        serial_write_string(" RSP "); serial_write_hex(f[3]);
+        serial_write_string(" SS "); serial_write_hex(f[4]);
+        serial_write_string("\n");
+        struct __attribute__((packed)) { uint16_t limit; uint64_t base; } gdtr;
+        __asm__ volatile("sgdt %0" : "=m"(gdtr));
+        const uint64_t *g = (const uint64_t *)gdtr.base;
+        serial_write_string("GDTR base "); serial_write_hex(gdtr.base);
+        serial_write_string(" limit "); serial_write_hex(gdtr.limit);
+        serial_write_string("\nGDT[3] "); serial_write_hex(g[3]);
+        serial_write_string(" GDT[4] "); serial_write_hex(g[4]);
+        serial_write_string("\n");
+    }
     // Page Fault (vector 14): CR2 holds the faulting address, and the
     // error code's low bits explain the cause.
     if (regs->vector == 14) {

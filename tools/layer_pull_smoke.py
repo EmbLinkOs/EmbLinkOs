@@ -17,6 +17,7 @@ content is a layer while it is pulled. Asserts, from the compositor's account
 --arch aarch64 runs it on arm64 under HVF.
 """
 import argparse
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -43,7 +44,7 @@ def main():
     ap.add_argument('--accel', choices=('hvf', 'tcg'), default='hvf', help='aarch64 only')
     ap.add_argument('--graphics', choices=('virtio', 'virgl'), default='virtio', help='x86_64 only')
     args = ap.parse_args()
-    slow = 5 if args.graphics == 'virgl' else 1
+    slow = 5 if args.graphics == 'virgl' else 3 if os.environ.get('CI') else 1   # CI: a shared, slower emulator
     out = Path(tempfile.mkdtemp(prefix='emblink-layerpull-'))
     print(f'Logs and captures: {out}', flush=True)
     d = P.boot(args, out)
