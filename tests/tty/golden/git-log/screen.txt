@@ -1,0 +1,40 @@
+[31m|[39m                        
+[31m|[39m  log.txt | 2 [32m+[31m-[39m        
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)  
+[31m|[39m                        
+* [33mcommit bfa1a2615a4ba26f5d7b87975eb7d6c9a634032d[39m 
+[31m|[39m Author: Golden <golden@example.invalid>         
+[31m|[39m Date:   Sun Oct 25 22:17:52 2026 +0100          
+[31m|[39m                        
+[31m|[39m     Revision 28: adjust the log                 
+[31m|[39m                        
+[31m|[39m  log.txt | 2 [32m+[31m-[39m        
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)  
+[31m|[39m                        
+* [33mcommit 4b5aecdb241d33623292ae74042e1fc18911bce1[39m 
+[31m|[39m Author: Golden <golden@example.invalid>         
+[31m|[39m Date:   Sun Oct 25 22:17:52 2026 +0100          
+[31m|[39m                        
+[31m|[39m     Revision 27: adjust the log                 
+[31m|[39m                        
+[31m|[39m  log.txt | 2 [32m+[31m-[39m        
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)  
+[31m|[39m                        
+* [33mcommit c2bbf107b1f02a473d9cb3f97b3a0d6823bb2938[39m 
+[31m|[39m Author: Golden <golden@example.invalid>         
+[31m|[39m Date:   Sun Oct 25 22:17:52 2026 +0100          
+[31m|[39m                        
+[31m|[39m     Revision 26: adjust the log                 
+[31m|[39m                        
+[31m|[39m  log.txt | 2 [32m+[31m-[39m        
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)  
+[31m|[39m                        
+* [33mcommit 44cb297be0f311f9b6e5648044f7a655b656ed2a[39m 
+[31m|[39m Author: Golden <golden@example.invalid>         
+[31m|[39m Date:   Sun Oct 25 22:17:52 2026 +0100          
+[31m|[39m                        
+[31m|[39m     Revision 25: adjust the log                 
+[31m|[39m                        
+[31m|[39m  log.txt | 2 [32m+[31m-[39m        
+[31m|[39m  1 file changed, 1 insertion(+), 1 deletion(-)  
+

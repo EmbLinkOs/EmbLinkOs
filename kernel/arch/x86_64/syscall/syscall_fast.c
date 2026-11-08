@@ -27,14 +27,22 @@
 /* The GDT is already in SYSRET's order, which is not an accident of ours --
  * it is the order SYSRET demands: kernel code, kernel data, USER DATA, user
  * code. SYSCALL loads CS = STAR[47:32] and SS = that + 8; SYSRET loads
- * CS = STAR[63:48] + 16 and SS = that + 8, both forced to RPL 3. With kernel
- * code 0x08, kernel data 0x10, user data 0x18 and user code 0x20:
+ * CS = STAR[63:48] + 16 and SS = that + 8. With kernel code 0x08, kernel data
+ * 0x10, user data 0x18 and user code 0x20:
  *     STAR[47:32] = 0x08  ->  kernel CS 0x08, kernel SS 0x10
- *     STAR[63:48] = 0x10  ->  user   CS 0x23, user   SS 0x1B
+ *     STAR[63:48] = 0x13  ->  user   CS 0x23, user   SS 0x1B
  * which is exactly what the iretq path uses, so a thread cannot tell which
- * way it entered or left. */
+ * way it entered or left.
+ *
+ * THE RPL IS IN STAR, not left to the CPU. Intel's SYSRET forces RPL 3 on
+ * both selectors, and so does QEMU's emulator -- which is how 0x10 worked for
+ * as long as this kernel ran nowhere else. AMD's forces it on CS only: user
+ * code ran with SS 0x18, which nothing checks in long mode until the first
+ * exception's iretq back to ring 3 found SS's RPL (0) unequal to CS's (3)
+ * and raised #GP(0x18) -- every boot, just after init started, on every CPU
+ * model under KVM on an AMD host. 0x13 gives the same selectors on both. */
 #define STAR_SYSCALL_SEL  0x08ull
-#define STAR_SYSRET_SEL   0x10ull
+#define STAR_SYSRET_SEL   0x13ull
 
 /* Flags the CPU clears on entry. IF above all -- a syscall must begin with
  * interrupts off, exactly as the int-0x80 interrupt gate begins -- then the

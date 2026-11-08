@@ -154,7 +154,7 @@ void layout_destroy_node(struct layout_arena *a, struct layout_handle h) {
 /* ------------------------------------------------------------------------- */
 
 static float text_char_advance(struct font *f, uint32_t cp, float size_px) {
-    struct glyph_cache_entry *e = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
+    struct glyph_cache_entry *e = glyph_cache_lookup_or_rasterize(font_global_atlas(), font_for_codepoint(f, cp), cp, size_px);
     return e ? e->advance_px : 0.0f;
 }
 /* One-line, unwrapped pixel width (Phase-1 text intrinsic).
@@ -168,10 +168,13 @@ static float text_char_advance(struct font *f, uint32_t cp, float size_px) {
  * the glyph was not off-centre, the string was measured as the wrong string. */
 static float text_line_width(struct font *f, const char *s, float size_px) {
     float w = 0;
+    uint32_t prev = 0;
     for (const char *p = s; *p; ) {
         uint32_t cp;
         p += font_utf8_decode(p, &cp);
-        w += text_char_advance(f, cp, size_px);
+        if (cp == ' ' || cp == '\t') prev = 0;          /* the renderer kerns words, as here */
+        w += font_pair_px(f, prev, cp, size_px) + text_char_advance(f, cp, size_px);
+        prev = cp == ' ' || cp == '\t' ? 0 : cp;
     }
     return w;
 }

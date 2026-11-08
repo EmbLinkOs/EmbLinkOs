@@ -1,0 +1,7 @@
+# On top of p10k-lean.zsh: a ruler above every prompt, and a dotted gap.
+typeset -g POWERLEVEL9K_SHOW_RULER=true
+typeset -g POWERLEVEL9K_RULER_CHAR='─'
+typeset -g POWERLEVEL9K_RULER_FOREGROUND=240
+typeset -g POWERLEVEL9K_PROMPT_ADD_NEWLINE=false
+typeset -g POWERLEVEL9K_MULTILINE_FIRST_PROMPT_GAP_CHAR='·'
+typeset -g POWERLEVEL9K_MULTILINE_FIRST_PROMPT_GAP_FOREGROUND=240

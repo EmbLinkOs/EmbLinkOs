@@ -27,6 +27,7 @@
 #include "include/types.h"
 
 struct embk_desktop;
+struct embk_dock_target;
 int compositor_request_launcher(void);
 int compositor_workspace_key(int target,int move);
 int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *state);
@@ -83,10 +84,20 @@ int64_t compositor_win_create_translucent(struct process *client, uint32_t cw, u
                                           int32_t x, int32_t y, const char *title,
                                           uint64_t *out_client_va);
 
-/* Resize a shared window's content: fresh page backing, new client VA out.
- * The caller must switch to the new pointer immediately. */
+/* Resize a shared window's content: in place when it fits its pages, else a
+ * fresh backing at a new client VA (out). The caller must switch to the
+ * pointer given back immediately. `live`: a step of a grip drag -- no zoom. */
+/* LAYERS (user/lib/embk_layer.h): pieces of a shared window the compositor
+ * places, fades and scales itself. create -> the id, its pixels mapped at
+ * *out_va in `client`; set: ops (copied in already), now or at the next
+ * present; present: the layer's pixels in that rect changed. */
+struct embk_layer_op;
+int64_t compositor_layer_create(struct process *client, uint32_t win, uint32_t w, uint32_t h, uint64_t *out_va);
+int64_t compositor_layer_set(int pid, uint32_t win, const struct embk_layer_op *ops, uint32_t n, uint32_t flags);
+int64_t compositor_layer_present(int pid, uint32_t win, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h);
+
 int64_t compositor_win_resize(struct process *client, uint32_t id,
-                              uint32_t nw, uint32_t nh, uint64_t *out_client_va);
+                              uint32_t nw, uint32_t nh, int live, uint64_t *out_client_va);
 
 /* Non-zero if (pid,id) is a shared (zero-copy) window -- present skips the copy. */
 int compositor_win_is_shared(int pid, uint32_t id);
@@ -192,14 +203,71 @@ void compositor_repaint_all(void);
 /* What composes the desktop, for Settings: 1 and its name ("host GPU
  * (virgl)") when a GPU does, else 0 and "Software". */
 int compositor_renderer(char *name, unsigned len);
-/* Advance window open/park motion one frame; no-op when nothing is moving. */
+/* Advance window open/park motion one frame; no-op when nothing is moving.
+ * Once the frame thread runs (compositor_start) motion is its work and this
+ * does nothing; before then it is the inline pump. */
 void compositor_anim_tick(void);
+/* Start the frame thread (kcompositor): from then on paints are recorded as
+ * damage and composed once per frame. Call once the scheduler runs. */
+void compositor_start(void);
+/* The pointer changed -- wake the frame thread. Any context, IRQ included. */
+void compositor_input_kick(void);
+/* The pointer on the display's cursor plane (1, where there is one) or drawn
+ * by the compositor (0) -- `perf cursor hw|sw`. */
+void compositor_cursor_plane(int on);
+/* The rects (content-local x, y, w, h; at most 4) of a window the compositor
+ * drags it by, itself, clipped to the content; n 0 clears. Returns how many it
+ * took. A drag that moved the window ends with EMBK_WIN_ACTION_MOVED. */
+int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n);
+/* The app tiles this window when it is dragged against an edge (EMBK_WINF_RESIZABLE). */
+void compositor_win_set_resizable(int pid, uint32_t id);
+/* The desktop's dock tiles (rects in the desktop window), by program
+ * basename: where a minimised window flies. Only the desktop layer's owner;
+ * replaces the last set; n 0 clears. */
+int compositor_dock_targets(int pid, const struct embk_dock_target *t, unsigned n);
+/* `perf slowmo N`: window motion N times slower (1: as designed). */
+void compositor_slowmo(uint32_t n);
+/* THE OVERVIEW: every window on the space at once, side by side (GUI+Up).
+ * Toggled; `pick` a window id to bring in front as it closes (0: none). */
+void compositor_overview_toggle(uint32_t pick);
+/* While it is up: an arrow (1 left, 2 right, 3 up, 4 down) moves the ring;
+ * 0, Return, brings the ringed window in front as they all fly home. */
+void compositor_overview_key(int dir);
+int  compositor_overview_shown(void);
+/* `perf effects`: 0 the desktop's Effects setting, 1 hold full, 2 hold reduced. */
+void compositor_effects_override(int mode);
+/* GUI+M: the front window into the dock. */
+void compositor_minimize_front(void);
+/* `perf beat N`: N seconds of frames on the beat, composing nothing. */
+void compositor_beat_test(uint32_t seconds);
+/* `perf windows` on the serial console: every visible window's geometry. */
+void compositor_print_windows(void);
+/* Wait for the next frame (asking for one); see compositor.c. */
+struct embk_frame_info;
+int compositor_frame_wait(int pid, struct embk_frame_info *out, uint32_t timeout_ms);
+/* The rate `pid`'s motion wants, in millihertz (0: as fast as the display
+ * goes) -- taken while it waits for frames (frameclock.h). */
+int compositor_frame_rate(int pid, uint32_t pref_mhz);
+/* A display that is not there, for the frame clock: a fixed refresh, or a
+ * VRR range; all zero goes back to the real one (`perf display`). */
+void compositor_simulate_display(uint32_t refresh_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz);
+/* The statistics overlay (comp_stats.h): toggle it (returns 1 if it is now
+ * wanted), whether it is on screen, and the kernel loop's refresh of it. */
+int  compositor_hud_toggle(void);
+int  compositor_hud_shown(void);
+void compositor_hud_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
 int compositor_win_menu(int pid,uint32_t id,int active);
 int compositor_win_close_ack(int pid,uint32_t id);
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
+/* A window that shows through: alpha=1 composites its pixels by their own
+ * alpha, over what is behind it blurred by `blur` pixels (0 sharp, at most
+ * COMP_MAT_BLUR_MAX). An ordinary app window otherwise; alpha=0 makes it
+ * opaque again. */
+#define COMP_MAT_BLUR_MAX 32
+int  compositor_win_set_material(int pid, uint32_t id, int alpha, int blur);
 /* `when` is the millisecond the reported button state was MADE, which for a
  * replayed press is when the finger went down and not when this poll happened.
  * Anything timing a double-click needs that: replayed clicks arrive one per

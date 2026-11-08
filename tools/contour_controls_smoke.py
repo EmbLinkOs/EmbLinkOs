@@ -5,13 +5,13 @@ A disposable live UEFI image; NativeUI only observes labels and C geometry.
 The assertions read compositor state, without modifying guest memory.
 """
 from pathlib import Path
-import json,shutil,tempfile,time
+import os,json,shutil,tempfile,time
 from workspace_smoke import Desktop
 from recovery_smoke import Guest,ROOT
 from native_ui import NativeUI
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='contour-controls-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='contour-controls-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     def state():

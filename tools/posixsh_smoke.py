@@ -4,14 +4,14 @@ All actions use serial commands or QMP input; GDB only observes state.
 Keep x86 kernel/application binaries unchanged while this guest is running.
 """
 from pathlib import Path
-import re,shutil,tempfile,time
+import os,re,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_terminal import TerminalState
 from lock_test import keyname
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='posix-shell-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='posix-shell-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     def eventually(check,message,timeout=180):
@@ -35,7 +35,7 @@ print('RESULT '+json.dumps([int(ps[i]['pid']) for i in range(ps.type.range()[1]+
             assert line and re.search(r'\bOK\b',line.group()) and 'FAIL' not in result,result
             print(line.group(),flush=True)
         screen=TerminalState(d);w=d.launch('Terminal','Terminal')
-        prompt=lambda:screen.integer(w,'g_at_prompt',1)==1
+        prompt=lambda:screen.at_prompt(w)
         eventually(prompt,'native prompt')
         type_text('/data/apps/shprobe/shprobe.elf\n')
         eventually(lambda:'shprobe:' in screen.text(w) and prompt(),'graphical shell script checks')

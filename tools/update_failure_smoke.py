@@ -17,7 +17,7 @@ import json
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('fixture',type=Path);p.add_argument('disk',type=Path);args=p.parse_args()
-    fixture=args.fixture;out=Path(tempfile.mkdtemp(prefix='update-failures-',dir='/workspace/.setup'));print(out,flush=True)
+    fixture=args.fixture;out=Path(tempfile.mkdtemp(prefix='update-failures-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';subprocess.run(['cp','--sparse=always',str(args.disk),str(disk)],check=True)
     meta=json.loads((fixture/'base.json').read_text());esp=meta['partitions'][0]['start']*512
     original=(fixture/'current').resolve();private=load_pem_private_key((fixture/'private.pem').read_bytes(),password=None)

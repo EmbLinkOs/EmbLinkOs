@@ -9,6 +9,10 @@
 #define EMBK_DESKTOP_REDUCED_MOTION 1u
 #define EMBK_DESKTOP_SNAP 2u
 #define EMBK_DESKTOP_WRAP 4u
+/* The effects tier, held: full blur and shadows whatever frames cost, or the
+ * reduced tier always. Neither: the compositor chooses by what frames cost. */
+#define EMBK_DESKTOP_EFFECTS_FULL 8u
+#define EMBK_DESKTOP_EFFECTS_REDUCED 16u
 struct embk_desktop {
     uint32_t version, flags;
     uint32_t left,top,right,bottom;
@@ -16,5 +20,12 @@ struct embk_desktop {
     uint32_t radius,shadows,decoration,cursor_style,cursor_size;
     uint32_t workspace_count,workspace;
     uint32_t shortcut_modifier,blur,opacity;
+};
+/* A dock tile, for a minimised window to fly into: the program's basename (as
+ * the window list names it) and the tile's rect in the desktop window. */
+#define EMBK_DOCK_TARGETS_MAX 16u
+struct embk_dock_target {
+    char    app[24];
+    int32_t x, y, w, h;
 };
 #endif

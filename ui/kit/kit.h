@@ -269,6 +269,10 @@ float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nb
  * drag inside it both update it, clamped to the content. Put content between. */
 void ui_scroll_begin(uint64_t key, float viewport_h, float *scroll_y);
 void ui_scroll_end(void);
+/* MOTION: how a scroll view still gliding asks for the next frame, and the
+ * clock it glides by (em_app installs em_request_frame and the uptime). With
+ * none installed the wheel jumps a notch at a time, as it always did. */
+void ui_kit_motion(void (*request_frame)(void), uint64_t (*now_ms)(void));
 
 /* --- overlay / modal --- */
 /* A full-surface scrim that dims everything and centres its content. Declare it

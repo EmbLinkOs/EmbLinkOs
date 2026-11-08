@@ -1,0 +1,12 @@
+ASCII and Latin: café naïve Ωμέγα Привет
+Combining: é ä ñ कि  
+Wide: 漢字かなカナ 한국어 ｆｕｌｌ      
+Emoji: 😀 🚀 ❤️ 👍🏽  
+Box: ┌──┬──┐ ╔══╗ ▁▂▃▄▅▆▇█ ░▒▓          
+Powerline:   branch                
+Braille: ⠁⠃⠉⠙⠑⠋⠛⠓   
+
+
+
+
+

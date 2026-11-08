@@ -211,6 +211,18 @@
 #define EMBK_SYS_monitor 154
 #define EMBK_SYS_win_place 155
 #define EMBK_SYS_win_where 156
+#define EMBK_SYS_key_poll_key 157
+#define EMBK_SYS_win_focused 158
+#define EMBK_SYS_win_set_material 159   /* (win, alpha, blur) -> the window shows through, blurred */
+#define EMBK_SYS_comp_stats 160
+#define EMBK_SYS_ui_wait 161
+#define EMBK_SYS_win_frame 162
+#define EMBK_SYS_win_frame_rate 163
+#define EMBK_SYS_win_drag_regions 164
+#define EMBK_SYS_dock_targets 165
+#define EMBK_SYS_layer_create 166
+#define EMBK_SYS_layer_set 167
+#define EMBK_SYS_layer_present 168
 
 
 

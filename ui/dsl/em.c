@@ -12,6 +12,7 @@
 #include "em.h"
 #include "kit.h"
 #include "font.h"
+#include "../motion/spring.h"   /* every motion here: see em_spring_to */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,15 +166,22 @@ static void em_apply_box(EmProps p) {
      * EmProps cannot distinguish "unset" from "transparent" -- both are alpha 0 --
      * so the fix is that they MEAN THE SAME THING: no fill. Containers that want
      * a default (Card, Sidebar, Window...) now pass it through p.background
-     * above rather than pre-painting behind this function's back. */
-    ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
+     * above rather than pre-painting behind this function's back.
+     *
+     * Except glass: its fill and border are the material's (em_glass_apply,
+     * below), and setting them here first made a glass box DIRTY ON EVERY
+     * FRAME -- the scene keeps a node clean only while each set repeats the
+     * last, and clear-then-tint never repeats tint. The dock re-presented
+     * itself ten times a second with nothing changing
+     * (docs/DESKTOP_PERFORMANCE.md). Every property is now set once a frame. */
+    if (!p.glass) ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
     if (em_set(p.corner))   ui_set_corner_radius(em_z(p.corner));
     /* em_set, not `> 0`, for the reason the paint above spells out at length:
      * a container that DROPS its border must be able to say so, or the reused
      * instance keeps last frame's. Same one-way-highlight bug, one prop over --
      * the dock's sockets light when an app runs and have to go dark when it
      * exits. `.border = EmZero` is how a caller means no border. */
-    if (em_set(p.border))
+    if (em_set(p.border) && !p.glass)
         ui_set_border(em_z(p.border), p.border_color.a > 0 ? p.border_color : TH->border);
     if (p.shadow > 0) {
         const struct ui_theme *t = TH;
@@ -437,6 +445,18 @@ void em_structure_changed(void) { g_em_epoch++; }
 static int g_frame_req = 1;   /* first frame always builds */
 void em_request_frame(void) { g_frame_req = 1; }
 int  em_take_frame_request(void) { int r = g_frame_req; g_frame_req = 0; return r; }
+int  em_frame_requested(void) { return g_frame_req; }
+static uint64_t g_wake_at;
+void em_wake_at(uint64_t ms) { if (ms && (!g_wake_at || ms < g_wake_at)) g_wake_at = ms; }
+int  em_take_wake(uint64_t now) {
+    if (!g_wake_at || now < g_wake_at) return 0;
+    g_wake_at = 0; return 1;
+}
+int  em_wake_wait(uint64_t now, int wait) {
+    if (!g_wake_at) return wait;
+    int64_t left = g_wake_at > now ? (int64_t)(g_wake_at - now) : 0;
+    return left < wait ? (int)left : wait;
+}
 
 static uint64_t (*g_clock)(void);
 static uint64_t g_now_ms, g_prev_ms;
@@ -452,6 +472,13 @@ void em_set_clock(uint64_t (*fn)(void)) { g_clock = fn; }
 uint64_t em_now_ms(void) { return g_clock ? g_clock() : 0; }
 int em_dt_ms(void) { return g_dt_ms; }
 
+/* LAYERS: the runtime says whether the compositor will move promoted
+ * subtrees for this window (em_set_layers); without, they are painted and
+ * moved here, frame by frame, as before. */
+static int g_em_layers;
+void em_set_layers(int on) { g_em_layers = on; }
+int  em_layers_on(void) { return g_em_layers; }
+
 static int g_tip_seen,g_tip_visible;
 static char g_tip_label[128];static float g_tip_rect[4];static uint64_t g_tip_since;
 void em_tooltip(const char *label) {
@@ -460,12 +487,12 @@ void em_tooltip(const char *label) {
     if(strcmp(g_tip_label,label)){snprintf(g_tip_label,sizeof g_tip_label,"%s",label);g_tip_since=em_now_ms();}
     if(!g_tip_since)g_tip_since=em_now_ms();
     g_tip_seen=1;g_tip_rect[0]=x;g_tip_rect[1]=y;g_tip_rect[2]=w;g_tip_rect[3]=h;
-    if(em_now_ms()-g_tip_since<600)em_request_frame();
+    if(em_now_ms()-g_tip_since<600)em_wake_at(g_tip_since+600);   /* shown then, not polled for */
 }
 int em_tooltip_visible(void){return g_tip_visible;}
 void em_tooltip_host(void) {
     int visible=g_tip_seen && em_now_ms() && em_now_ms()-g_tip_since>=600;
-    if(visible!=g_tip_visible){g_tip_visible=visible;em_structure_changed();em_request_frame();}
+    if(visible!=g_tip_visible){g_tip_visible=visible;if(!g_em_layers)em_structure_changed();em_request_frame();}
     if(!g_tip_seen){g_tip_since=0;g_tip_label[0]=0;}
     if(!visible || em_viewport_height()<g_tip_rect[3]+32)return;
     float width=em_text_width(g_tip_label,TH->text_caption)+18;
@@ -479,14 +506,99 @@ void em_tooltip_host(void) {
     ui_set_overlay(true);ui_set_layer(3);ui_set_hit_passthrough(true);
     ui_set_size(sz_fixed(0),sz_fixed(0));ui_set_clip_children(false);
     ui_begin_vstack(1);ui_set_offset(x,y);ui_set_size(sz_fixed(width),sz_intrinsic());
-    ui_set_paint(solid(TH->surface));ui_set_border(1,TH->border_strong);ui_set_corner_radius(4);
-    ui_set_padding(5,8,5,8);ui_set_font(TH->font_regular);ui_set_text_size(TH->text_caption);ui_set_text_color(TH->text);
+    /* on layers it fades in and out (the compositor's), with no repaint of the window */
+    { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms:0);
+      struct scene_layer_motion in={0,1000,500,500,0,0,r,1000,0},out={0,1000,500,500,0,0,r,1000,0};
+      ui_set_promoted(g_em_layers!=0,&in,&out); }
+    ui_set_paint(solid(TH->surface));ui_set_border(1,TH->border_strong);ui_set_corner_radius(TH->radius_sm);
+    ui_set_padding(TH->control_py,TH->sp2,TH->control_py,TH->sp2);ui_set_font(TH->font_regular);ui_set_text_size(TH->text_caption);ui_set_text_color(TH->text);
     ui_text("%s",g_tip_label);ui_end_stack();ui_end_stack();
 }
 
-#define ANIM_MAX 96
-static struct { const char *id; float cur, target; int used; } g_anim[ANIM_MAX];
+/* A FLOAT ON A SPRING, on this toolkit's clock (ui/motion/spring.h). Every
+ * motion here goes through it: an approach with a velocity, so a motion
+ * turned round mid-way turns round smoothly, and one that lands where it
+ * lands at any frame rate -- the per-frame `*= 0.72` and the dt-scaled
+ * exponential it replaces did neither. Values are any unit (an opacity, a
+ * pixel offset), held at 1/1024 in the spring's Q16.16. With no clock (a host
+ * render) or reduced motion it is simply the target. Settled when within
+ * 0.001 and nearly still: a spring's own rest, 1/64 of a unit at this scale,
+ * would keep redrawing a crawl nobody can see. */
+#define EM_SPRING_SCALE 1024.0f
+struct em_spring { struct spring s; int live; };
+static int64_t em_q(float v) { return (int64_t)(v * EM_SPRING_SCALE * (float)SPRING_ONE); }
+static float em_spring_value(const struct em_spring *m) {
+    return (float)m->s.x / ((float)SPRING_ONE * EM_SPRING_SCALE);
+}
+/* Put it at `v`, at rest (a gesture's direct manipulation, a fresh start). */
+static void em_spring_set(struct em_spring *m, float v) {
+    uint64_t now_ns = em_now_ms() * 1000000ull;
+    if (!m->live) { spring_init(&m->s, em_q(v), now_ns); m->live = 1; }
+    else spring_set(&m->s, em_q(v), now_ns);
+}
+/* Toward `target` (response ms, damping permille); the value now. */
+static float em_spring_to(struct em_spring *m, float target, uint32_t resp_ms, uint32_t damp) {
+    uint64_t now_ms = em_now_ms();
+    if (!now_ms || TH->reduced_motion) { em_spring_set(m, target); return target; }
+    uint64_t now_ns = now_ms * 1000000ull;
+    if (!m->live) { spring_init(&m->s, em_q(target), now_ns); m->live = 1; }
+    int64_t tq = em_q(target);
+    if (tq != m->s.target) spring_to(&m->s, tq, spring_params(resp_ms, damp), now_ns);
+    if (spring_step(&m->s, now_ns)) {
+        int64_t dx = m->s.x - m->s.target, rest = em_q(0.001f), still = em_q(0.02f);
+        if (dx < rest && dx > -rest && m->s.v < still && m->s.v > -still) spring_set(&m->s, tq, now_ns);
+        else em_request_frame();
+    }
+    return em_spring_value(m);
+}
 
+/* em_spring's table: ids copied, the least recently used slot reused. */
+#define EM_SPRINGS 64
+static struct { char id[40]; struct em_spring m; uint64_t used; } g_springs[EM_SPRINGS];
+static uint64_t g_spring_tick;
+static int em_spring_slot(const char *id, int create) {
+    int lru = 0;
+    for (int i = 0; i < EM_SPRINGS; i++) {
+        if (g_springs[i].used && !strncmp(g_springs[i].id, id, sizeof g_springs[i].id - 1)) return i;
+        if (g_springs[i].used < g_springs[lru].used) lru = i;
+    }
+    if (!create) return -1;
+    snprintf(g_springs[lru].id, sizeof g_springs[lru].id, "%s", id);
+    g_springs[lru].m.live = 0;
+    g_springs[lru].used = 0;
+    return lru;
+}
+float em_spring(const char *id, float from, float to, int response_ms, int damping_permille) {
+    if (!id) return to;
+    int s = em_spring_slot(id, 0);
+    if (s < 0) { s = em_spring_slot(id, 1); em_spring_set(&g_springs[s].m, from); }
+    g_springs[s].used = ++g_spring_tick;
+    return em_spring_to(&g_springs[s].m, to, (uint32_t)(response_ms > 4 ? response_ms : 4),
+                        (uint32_t)(damping_permille > 0 ? damping_permille : 1000));
+}
+void em_spring_throw(const char *id, float value, float velocity) {
+    if (!id) return;
+    int s = em_spring_slot(id, 0);
+    if (s < 0) s = em_spring_slot(id, 1);
+    g_springs[s].used = ++g_spring_tick;
+    em_spring_set(&g_springs[s].m, value);
+    uint64_t now_ms = em_now_ms();
+    if (velocity != 0 && now_ms && !TH->reduced_motion) {
+        spring_kick(&g_springs[s].m.s, em_q(velocity), now_ms * 1000000ull);
+        em_request_frame();
+    }
+}
+int em_spring_moving(const char *id) {
+    int s = id ? em_spring_slot(id, 0) : -1;
+    return s < 0 || g_springs[s].m.s.moving;
+}
+
+#define ANIM_MAX 96
+static struct { const char *id; struct em_spring m; int used; } g_anim[ANIM_MAX];
+
+/* `rate` (per second) was an exponential approach's: 63% of the way in 1/rate
+ * s. A critically damped spring is there at 2.15/w, so its response
+ * (2 pi / w) is 2.92/rate s -- the same pace, now with a velocity. */
 float em_animate(const char *id, float target, float rate) {
     if(TH->reduced_motion)return target;
     int slot = -1, freei = -1;
@@ -495,20 +607,24 @@ float em_animate(const char *id, float target, float rate) {
             if (g_anim[i].id == id || (g_anim[i].id && id && strcmp(g_anim[i].id, id) == 0)) { slot = i; break; }
         } else if (freei < 0) freei = i;
     }
-    if (slot < 0) { slot = freei >= 0 ? freei : 0; g_anim[slot].used = 1; g_anim[slot].id = id; g_anim[slot].cur = target; }
-    g_anim[slot].target = target;
-    float dt = g_dt_ms / 1000.0f;                 /* exponential approach, frame-rate independent-ish */
-    float step = rate * dt;
-    if (step > 1.0f) step = 1.0f;
-    if (step < 0.0f) step = 0.0f;
-    g_anim[slot].cur += (g_anim[slot].target - g_anim[slot].cur) * step;
-    float d = g_anim[slot].target - g_anim[slot].cur;
-    if (d < 0.0008f && d > -0.0008f) g_anim[slot].cur = g_anim[slot].target;   /* settle */
-    else em_request_frame();               /* still easing -> keep frames coming */
-    return g_anim[slot].cur;
+    if (slot < 0) {
+        slot = freei >= 0 ? freei : 0;
+        g_anim[slot].used = 1; g_anim[slot].id = id; g_anim[slot].m.live = 0;
+        em_spring_set(&g_anim[slot].m, target);
+    }
+    uint32_t resp = rate > 0.1f ? (uint32_t)(2920.0f / rate) : 29200u;
+    return em_spring_to(&g_anim[slot].m, target, resp, 1000u);
 }
 
+/* THE DRAG ZONES this frame built (WindowBar, AppBar, DragHandle), for the
+ * runtime to hand to the compositor (em_window_drag_rects). Once it has taken
+ * them, the compositor drags the window and em_window_drag_ only watches. */
+#define EM_DRAG_ZONES 4
+static struct instance_handle g_drag_zones[EM_DRAG_ZONES];
+static int g_drag_zone_n, g_drag_by_compositor;
+
 void em_new_frame(void) {
+    g_drag_zone_n = 0;
     if(!g_ov_now)g_ov_escape=0;
     g_tip_seen=0;g_menu_button_count=0;
     g_now_ms = em_now_ms();
@@ -527,8 +643,9 @@ static EmPage g_pages[16];
 static int    g_nav_top = -1;
 static float  g_nav_t = 1.0f;   /* transition progress: 1 = settled, <1 = fading in */
 static int    g_nav_dir = 1;    /* +1 push (slide from right), -1 pop (from left) */
-void em_push(EmPage p) { if (p && g_nav_top < 15) { g_pages[++g_nav_top] = p; g_nav_t = 0.0f; g_nav_dir = 1; } }
-void em_pop(void)      { if (g_nav_top > 0) { g_nav_top--; g_nav_t = 0.0f; g_nav_dir = -1; } }
+static struct em_spring g_nav_m; /* the progress, on a spring: it eases itself */
+void em_push(EmPage p) { if (p && g_nav_top < 15) { g_pages[++g_nav_top] = p; g_nav_t = 0.0f; g_nav_dir = 1; em_spring_set(&g_nav_m, 0.0f); } }
+void em_pop(void)      { if (g_nav_top > 0) { g_nav_top--; g_nav_t = 0.0f; g_nav_dir = -1; em_spring_set(&g_nav_m, 0.0f); } }
 int  em_nav_depth(void){ return g_nav_top + 1; }
 
 /* ---- modal overlay (Sheet / Alert) ------------------------------------- *
@@ -537,7 +654,14 @@ int  em_nav_depth(void){ return g_nav_top + 1; }
  * structural change the dirty-rect renderer won't fully erase, so the host loop
  * force-repaints while em_overlay_active(). em_overlay_end_ records whether the
  * bare scrim (not the dialog) was clicked -> OverlayDismissed(). */
-void em_overlay_(void)      { em_flush(); g_ov_now = 1; ui_overlay_begin(0); }
+void em_overlay_(void)      {
+    em_flush(); g_ov_now = 1; ui_overlay_begin(0);
+    /* ON LAYERS THE DIMMING FADES, in and out, a layer of its own under the
+     * sheet's (a fill: one colour, the window's size) */
+    { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms*2.0f:0);
+      struct scene_layer_motion in={0,1000,500,500,0,0,r,1000,0},out={0,1000,500,500,0,0,(uint16_t)(r*2/3),1000,0};
+      ui_set_promoted(g_em_layers!=0,&in,&out); }
+}
 void em_overlay_end_(void)  {
     em_flush();
     /* Debounce scrim-dismiss for the first few frames after the modal opens: the
@@ -550,6 +674,11 @@ void em_overlay_end_(void)  {
 }
 int  em_overlay_dismissed(void) { return g_ov_dismissed; }
 int  em_overlay_active(void)    { return g_ov_now || g_ov_prev; }
+/* ...in its first frames, while a scrim click is still debounced: frames must
+ * come for the count to reach it. Once it has, the modal is like any other
+ * screen -- built for input, not for every frame the display shows. */
+int  em_overlay_settling(void)  { return em_overlay_active() && (g_ov_frames < 4 || !g_ov_now); }
+/* (and the frame after it went, when focus goes back to what it covered) */
 int em_overlay_escape(void) {
     if(!em_overlay_active() || !ui_focus_scope_active())return 0;
     g_ov_escape=1;g_em_epoch++;em_request_frame();return 1;
@@ -560,6 +689,13 @@ void em_dialog_(EmProps p)  {
      * Supply the semantic default through props, as Card and Sidebar do. */
     if(p.background.a<=0)p.background=TH->surface;
     em_apply_box(p);
+    /* ON LAYERS A SHEET ARRIVES: up from 0.95 of its size about its middle and
+     * 8 px low, as it fades in, on a snappy spring -- and sinks back out when
+     * it is dismissed, over a dimming that fades (em_overlay_). Without
+     * layers it appears where it stands. */
+    { uint16_t r=(uint16_t)(TH->motion_ms>0?TH->motion_ms*2.4f:0);
+      struct scene_layer_motion in={0,950,500,500,0,8,r,900,0},out={0,970,500,500,0,4,(uint16_t)(r*2/3),1000,0};
+      ui_set_promoted(g_em_layers!=0,&in,&out); }
 }
 void em_dialog_end_(void)   { em_flush(); ui_dialog_end(); }
 /* True while a page transition is fading in. The host loop should force a full
@@ -576,9 +712,10 @@ void em_nav(EmPage root) {
     if (em_now_ms() == 0 || TH->reduced_motion) {
         g_nav_t = 1.0f;
     } else if (g_nav_t < 1.0f) {
-        g_nav_t += (float)em_dt_ms() / (TH->motion_ms>0?TH->motion_ms*1.5f:NAV_DUR_MS);
-        if (g_nav_t > 1.0f) g_nav_t = 1.0f;
-        em_request_frame();                /* transition in flight */
+        /* critically damped: 98% of the way at its response, the ease-out
+         * the old curve applied by hand; em_spring_to keeps frames coming */
+        g_nav_t = em_spring_to(&g_nav_m, 1.0f, (uint32_t)(TH->motion_ms > 0 ? TH->motion_ms * 1.8f : NAV_DUR_MS), 1000u);
+        if (g_nav_t > 0.999f) g_nav_t = 1.0f;
     }
 
     /* Resolve the transition transform. It is applied to the page's OWN root
@@ -587,7 +724,7 @@ void em_nav(EmPage root) {
      * swaps g_pages[g_nav_top]; the page is called directly as the root here. */
     g_nav_cur_op = 1.0f; g_nav_cur_slide = 0.0f;
     if (g_nav_t < 1.0f) {
-        float e = 1.0f - (1.0f - g_nav_t) * (1.0f - g_nav_t);   /* easeOutQuad */
+        float e = g_nav_t;                  /* the spring is its own ease-out */
         g_nav_cur_op = 0.12f + 0.88f * e;   /* floor avoids a fully-blank first frame */
         g_nav_cur_slide = (1.0f - e) * 44.0f * (float)g_nav_dir; /* right on push, left on pop */
     }
@@ -1193,6 +1330,19 @@ void em_window_bind(int win, int32_t x, int32_t y) {
 /* Read-and-clear: did the bound window move since the last poll? The app runtime
  * force-repaints on a move so a drag/snap can't leave dirty-rect ghost trails. */
 int em_window_moved(void) { int m = g_win_moved; g_win_moved = 0; return m; }
+int em_window_drag_rects(int32_t (*out)[4], int max) {
+    int n = 0;
+    for (int i = 0; i < g_drag_zone_n && n < max; i++) {
+        float x, y, w, h;
+        if (!ui_rect_of(g_drag_zones[i], &x, &y, &w, &h) || w < 1 || h < 1) continue;
+        out[n][0] = (int32_t)x; out[n][1] = (int32_t)y;
+        out[n][2] = (int32_t)(w + 0.5f); out[n][3] = (int32_t)(h + 0.5f);
+        n++;
+    }
+    return n;
+}
+void em_window_set_compositor_drag(int on) { g_drag_by_compositor = on; }
+
 /* Programmatically move the bound window (e.g. a pin/snap-to-anchor control). */
 void em_window_move_to(int32_t x, int32_t y) {
     if (!g_win_bound || !g_win_mover || (x == g_win_x && y == g_win_y)) return;
@@ -1201,21 +1351,31 @@ void em_window_move_to(int32_t x, int32_t y) {
 }
 void em_window_pos(int32_t *x, int32_t *y) { if (x) *x = g_win_x; if (y) *y = g_win_y; }
 
-/* resizable-window plumbing (V5): the grip accumulates a drag delta and, on
- * RELEASE, parks it here for the runtime to apply (live re-backing every frame
- * would thrash the page allocator; commit-on-release keeps it one realloc). */
+/* resizable-window plumbing (V5): the grip's drag, measured from where it was
+ * grabbed, is parked here for the runtime every time it changes and once more
+ * on release -- the window resizes as it is dragged (the compositor resizes in
+ * place while the size fits the window's pages, so a step a frame is cheap). */
 static int g_win_resizable;
 static int g_win_glass;
-static int g_rz_active, g_rz_pend;
+static int g_rz_active, g_rz_pend, g_rz_first, g_rz_done;
 static float g_rz_grab_x, g_rz_grab_y, g_rz_dx, g_rz_dy;
+static int g_rz_taken_x, g_rz_taken_y;          /* the delta the runtime last took */
 void em_window_set_resizable(int on) { g_win_resizable = on; }
 void em_window_set_glass(int on) { g_win_glass = on; }
+/* A window that shows through (em_window_material): a Window background it
+ * gives as clear (alpha 0) is clear -- not "unset", which is the theme's, and
+ * which under a translucent screen made the window as opaque as ever, the
+ * theme's colour where the desktop should have been. */
+static int g_win_clear;
+void em_window_set_clear(int on) { g_win_clear = on; }
 int em_window_take_resize(int *dw, int *dh) {
     if (!g_rz_pend) return 0;
-    g_rz_pend = 0;
-    if (dw) *dw = (int)g_rz_dx;
-    if (dh) *dh = (int)g_rz_dy;
-    return 1;
+    int how = EM_RESIZE_STEP | (g_rz_first ? EM_RESIZE_FIRST : 0) | (g_rz_done ? EM_RESIZE_DONE : 0);
+    g_rz_pend = g_rz_first = g_rz_done = 0;
+    g_rz_taken_x = (int)g_rz_dx; g_rz_taken_y = (int)g_rz_dy;
+    if (dw) *dw = g_rz_taken_x;
+    if (dh) *dh = g_rz_taken_y;
+    return how;
 }
 
 /* ---- drag-to-dismiss close (EmbLink's own close gesture) ----------------- *
@@ -1227,8 +1387,29 @@ int em_window_take_resize(int *dw, int *dh) {
 #define CLOSE_PULL 95.0f           /* px of drag that commits the close */
 static int   g_cl_active, g_cl_pend;
 static float g_cl_grab_x, g_cl_grab_y, g_cl_dx, g_cl_dy, g_cl_progress;
+/* the spring back after a pull let go short: 1 at release, 0 home */
+static struct em_spring g_cl_back;
+static float g_cl_rel_dx, g_cl_rel_dy, g_cl_rel_progress;
+/* ON LAYERS the window's content is a layer while it is pulled, and for as
+ * long after as its spring home takes the compositor (g_cl_home): the drag
+ * moves it, the release sends it home, and the app builds no frame of it */
+static uint64_t g_cl_home;
+static int g_cl_layer;
 
-int em_window_take_close(void) { if (!g_cl_pend) return 0; g_cl_pend = 0; return 1; }
+static int g_cl_back_frames;     /* frames presented with the content back in the window */
+int em_window_take_close(void) {
+    if (!g_cl_pend) return 0;
+    /* ON LAYERS, NOT YET: the content goes back into the window first, and
+     * that frame is presented -- the window then closes with its picture in
+     * it, as it flies away, rather than an empty frame */
+    if (g_em_layers && (g_cl_layer || g_cl_back_frames < 1)) {
+        if (!g_cl_layer) g_cl_back_frames++;
+        em_request_frame();
+        return 0;
+    }
+    g_cl_pend = 0; g_cl_back_frames = 0;
+    return 1;
+}
 
 bool em_close_grip(void) {
     const struct ui_theme *t = TH;
@@ -1261,19 +1442,29 @@ bool em_close_grip(void) {
         em_request_frame();
     } else if (g_cl_active) {
         g_cl_active = 0;                               /* released before the threshold */
+        g_cl_rel_dx = g_cl_dx; g_cl_rel_dy = g_cl_dy; g_cl_rel_progress = g_cl_progress;
+        em_spring_set(&g_cl_back, 1.0f);
+        if (g_em_layers && em_now_ms()) {
+            /* home on the compositor's spring: the app's picture is there now */
+            g_cl_progress = 0; g_cl_dx = g_cl_dy = 0;
+            g_cl_home = em_now_ms() + (TH->motion_ms > 0 ? 600 : 0);
+            em_wake_at(g_cl_home);                     /* the frame that takes it back */
+        }
     }
-    /* spring back when released below the threshold */
+    /* spring back when released below the threshold -- on the clock, not by
+     * a fraction a frame, which sprang back twice as fast at 120 Hz */
     if (!g_cl_active && !g_cl_pend && g_cl_progress > 0.001f) {
-        g_cl_progress *= 0.72f; g_cl_dx *= 0.72f; g_cl_dy *= 0.72f;
-        if (g_cl_progress < 0.02f) { g_cl_progress = 0; g_cl_dx = g_cl_dy = 0; }
-        em_request_frame();
+        float k = em_spring_to(&g_cl_back, 0.0f, SPRING_SNAPPY);
+        if (k < 0.0f) k = 0.0f;
+        g_cl_progress = g_cl_rel_progress * k; g_cl_dx = g_cl_rel_dx * k; g_cl_dy = g_cl_rel_dy * k;
+        if (g_cl_progress < 0.002f) { g_cl_progress = 0; g_cl_dx = g_cl_dy = 0; }
     }
     return g_cl_pend != 0;
 }
 
 /* True while a close pull is in progress (or springing back) -- the app runtime
  * force-repaints so the fade/slide don't ghost under the dirty-rect present. */
-int em_window_pulling(void) { return g_cl_active || g_cl_progress > 0.001f; }
+int em_window_pulling(void) { return !g_em_layers && (g_cl_active || g_cl_progress > 0.001f); }
 
 /* Window: the full-bleed top-level surface of a chromeless app window. Fills
  * the whole pixel buffer with the theme background (rectangular -- the OS
@@ -1286,7 +1477,7 @@ void em_window_(const char *title, EmProps p) {
     /* the app renders opaque (the compositor makes a glass window translucent
      * and frosts the desktop behind it); a glass window just gets a faint accent
      * cast in its bg so the frost reads as EmbLink's, not a neutral gray. */
-    Color bg = p.background.a > 0 ? p.background : t->bg;
+    Color bg = p.background.a > 0 || g_win_clear ? p.background : t->bg;
     if (g_win_glass) { Color a = t->accent;
         bg = (Color){ bg.r * 0.92f + a.r * 0.08f, bg.g * 0.92f + a.g * 0.08f,
                       bg.b * 0.92f + a.b * 0.08f, 1.0f }; }
@@ -1296,10 +1487,26 @@ void em_window_(const char *title, EmProps p) {
     ui_set_spacing(0);
     em_apply_box(p);
     /* drag-to-dismiss preview: fade + slide the whole window toward the pull as
-     * the close grip is dragged (springs back if released early). */
-    if (g_cl_progress > 0.001f) {
+     * the close grip is dragged (springs back if released early). ON LAYERS
+     * the content is a layer for it: the drag moves it, the compositor springs
+     * it home, and it is the window's pixels again once there -- or the frame
+     * the pull commits, so the window closes with its picture in it. Going in
+     * and coming back are structural (what it vacates is cleared). */
+    int layer = g_em_layers && !g_cl_pend && (g_cl_active || (g_cl_home && em_now_ms() < g_cl_home));
+    if (!layer) g_cl_home = 0;
+    if (layer != g_cl_layer) { g_cl_layer = layer; g_em_epoch++; }
+    if (g_em_layers) {
+        static const struct scene_layer_motion there = { 255, 1000, 500, 500, 0, 0, 0, 0, 0 };
+        ui_set_promoted(layer, &there, &there);
+        ui_set_layer_spring(g_cl_active ? 0 : 250, 900);   /* follows the hand; let go, springs home */
+    }
+    if (g_cl_progress > 0.001f || g_em_layers) {
         ui_set_opacity(1.0f - g_cl_progress * 0.88f);
-        ui_set_offset(g_cl_dx * 0.30f, g_cl_dy * 0.30f);
+        /* whole pixels on layers: a layer a pixel wider is another layer, made
+         * again -- the drag moves this one */
+        float ox = g_cl_dx * 0.30f, oy = g_cl_dy * 0.30f;
+        if (g_em_layers) ui_set_offset((float)(int)(ox + (ox < 0 ? -0.5f : 0.5f)), (float)(int)(oy + (oy < 0 ? -0.5f : 0.5f)));
+        else ui_set_offset(g_cl_dx * 0.30f, g_cl_dy * 0.30f);
     }
 }
 void em_window_end_(void) {
@@ -1327,14 +1534,20 @@ void em_window_end_(void) {
               ui_text("%s", g); }
             ui_end_stack();
             if (active) {
+                /* the pointer is content-local, and the window grows from its
+                 * top-left corner: the grab point stays put as it resizes */
                 float px, py; ui_pointer_pos(&px, &py);
-                if (!g_rz_active) { g_rz_active = 1; g_rz_grab_x = px; g_rz_grab_y = py; g_rz_dx = 0; g_rz_dy = 0; }
-                else { g_rz_dx = px - g_rz_grab_x; g_rz_dy = py - g_rz_grab_y; }
+                if (!g_rz_active) {
+                    g_rz_active = 1; g_rz_grab_x = px; g_rz_grab_y = py; g_rz_dx = 0; g_rz_dy = 0;
+                    g_rz_taken_x = g_rz_taken_y = 0; g_rz_first = 1;
+                } else {
+                    g_rz_dx = px - g_rz_grab_x; g_rz_dy = py - g_rz_grab_y;
+                    if ((int)g_rz_dx != g_rz_taken_x || (int)g_rz_dy != g_rz_taken_y) g_rz_pend = 1;
+                }
                 em_request_frame();               /* keep tracking while held */
             } else if (g_rz_active) {
                 g_rz_active = 0;
-                if (g_rz_dx > 4.0f || g_rz_dx < -4.0f || g_rz_dy > 4.0f || g_rz_dy < -4.0f)
-                    g_rz_pend = 1;                /* commit on release */
+                g_rz_pend = g_rz_done = 1;        /* let go: the size it was left at */
             }
         }
         ui_end_stack();
@@ -1347,7 +1560,8 @@ void em_window_end_(void) {
  * one step (after the move the kernel re-references the pointer to the new
  * origin, so the grab point stays put). See the plan's drag derivation. */
 static void em_window_drag_(void) {
-    if (!g_win_bound) return;
+    if (g_drag_zone_n < EM_DRAG_ZONES) g_drag_zones[g_drag_zone_n++] = ui_open();
+    if (!g_win_bound || g_drag_by_compositor) return;
     if (ui_is_active()) {          /* pressed on the drag zone, button still held */
         float px, py; ui_pointer_pos(&px, &py);
         if (!g_win_dragging) { g_win_dragging = 1; g_win_grab_x = px; g_win_grab_y = py; }
@@ -1355,8 +1569,13 @@ static void em_window_drag_(void) {
             int nx = g_win_x + (int)(px - g_win_grab_x);
             int ny = g_win_y + (int)(py - g_win_grab_y);
             if ((nx != g_win_x || ny != g_win_y) && g_win_mover) {
-                g_win_mover(g_win_id, nx, ny);
+                /* the mover may correct this to where the window really went
+                 * (kept out of the bar or the dock): a drag that remembered
+                 * the number it asked for instead would add every refused
+                 * pixel to the next step, and the window would not come back
+                 * when the hand did */
                 g_win_x = nx; g_win_y = ny; g_win_moved = 1;
+                g_win_mover(g_win_id, nx, ny);
             }
         }
     } else {
@@ -2325,7 +2544,7 @@ void em_dock(int *ids, int *n, void (*render)(int id), EmProps p) {
         ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
         ui_set_align(ALIGN_CENTER);
         if (dragged) {
-            ui_set_shadow(true, 0, 4, 12, t->shadow_md.color);      /* lift */
+            ui_set_shadow(true, t->shadow_lift.dx, t->shadow_lift.dy, t->shadow_lift.blur, t->shadow_lift.color);
             if (g_dock_out) ui_set_offset(0, g_dock_ptr_y - g_dock_grab_y);  /* follow out */
         }
         render(id);
@@ -2437,30 +2656,40 @@ void em_divider_label(const char *label) {
 }
 
 /* ---- Toast: transient message; ToastHost() renders the active one ------ */
-static struct { const char *msg; EmTone tone; uint64_t raised; int active; } g_toast;
+static struct { const char *msg; EmTone tone; uint64_t raised; int active; struct em_spring m; } g_toast;
 #define TOAST_MS 2500
 
 void em_toast(const char *msg, EmTone tone) {
+    if (!g_toast.active) em_spring_set(&g_toast.m, 0.0f);   /* a fresh one rises from below */
     g_toast.msg = msg; g_toast.tone = tone; g_toast.raised = em_now_ms(); g_toast.active = 1;
-    g_em_epoch++;
+    if (g_em_layers) em_request_frame();   /* on a layer it is not in the window: an ordinary frame */
+    else g_em_epoch++;
 }
 void em_toast_host(void) {
     if (!g_toast.active) return;
-    em_request_frame();                    /* fading/expiring: keep frames coming */
     const struct ui_theme *t = TH;
     uint64_t now = em_now_ms();
     /* with a real clock, auto-expire; on host (clock 0) stay visible for render */
     float age = (now && g_toast.raised) ? (float)(now - g_toast.raised) : 0.0f;
-    if (now && age > TOAST_MS) { g_toast.active = 0; g_em_epoch++; return; }
-    /* fade+rise in over the first 180ms and out over the last 300ms */
-    float op = 1.0f;
-    if (now && !t->reduced_motion && t->motion_ms>0) {
-        float enter=t->motion_ms*1.5f,leave=t->motion_ms*2.5f;
-        if(age<enter)op=age/enter;
-        else if(age>TOAST_MS-leave)op=(TOAST_MS-age)/leave;
+    /* RISES IN ON A SPRING and sinks out on one: in while it has time left,
+     * out over the last stretch, gone once it is down. A touch under critical
+     * damping, so the rise settles with a lift rather than a stop. */
+    float leave = t->motion_ms > 0 ? t->motion_ms * 2.5f : 300.0f;
+    int staying = !now || age < TOAST_MS - leave;
+    float op;
+    if (g_em_layers) {
+        /* ON A LAYER the compositor raises it and sinks it; the app builds it
+         * at rest, once, and wakes again only when its time is up -- to stop
+         * building it, which is what sends the layer down. */
+        if (!staying) { g_toast.active = 0; em_request_frame(); return; }
+        if (now) em_wake_at(g_toast.raised + (uint64_t)(TOAST_MS - leave));
+        op = 1.0f;
+    } else {
+        em_request_frame();                /* fading/expiring: keep frames coming */
+        op = em_spring_to(&g_toast.m, staying ? 1.0f : 0.0f, SPRING_SNAPPY);
+        if (!staying && op < 0.01f) { g_toast.active = 0; g_em_epoch++; return; }
+        if (op < 0) op = 0;
     }
-    if (op < 0) op = 0;
-    if (op > 1) op = 1;
     Color accent = t->accent;
     int cp = IconInfo;
     switch (g_toast.tone) {
@@ -2477,10 +2706,15 @@ void em_toast_host(void) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
-    ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar */
+    ui_set_offset(0, -t->toast_inset + (1.0f - op) * t->sp4);   /* rise above the tab bar (a lift past it, then back) */
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {
         ui_begin_hstack(1);
+        { uint16_t r = (uint16_t)(t->motion_ms > 0 ? leave : 0);
+          int16_t dy = (int16_t)t->sp4;               /* from just below, up; and back down */
+          struct scene_layer_motion in = { 0, 1000, 500, 1000, 0, dy, r, 850, 0 };
+          struct scene_layer_motion out = { 0, 1000, 500, 1000, 0, dy, (uint16_t)(r * 2 / 3), 1000, 0 };
+          ui_set_promoted(g_em_layers != 0, &in, &out); }
         ui_set_paint(solid(t->text));                 /* dark pill, light text (modern toast) */
         ui_set_corner_radius(t->radius_pill);
         ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
@@ -2757,21 +2991,16 @@ uint32_t em_font(const char *path) {
             snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
             cache[i].used = 1; cache[i].handle = h; break;
         }
+    /* Every face but the fallback itself -- and the monospaced ones, whose
+     * columns a proportional stand-in would break -- borrows what it lacks
+     * from the system's widest face (font.h: THE FALLBACK). */
+    static const char fallback[] = "/system/fonts/fallback.ttf";
+    if (h && strcmp(path, fallback) && !strstr(path, "mono")) font_set_fallback(h, em_font(fallback));
     return h;
 }
 float em_text_width(const char *s, float size_px) {
-    if (!s || !*s) return 0.0f;
-    struct font *f = font_for_handle(TH->font_regular);
-    if (!f) return 0.0f;
-    float w = 0;
-    for (const char *p = s; *p; ) {
-        uint32_t cp;
-        p += font_utf8_decode(p, &cp);
-        struct glyph_cache_entry *e =
-            glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
-        if (e) w += e->advance_px;
-    }
-    return w;
+    /* the kit's measure: the fallback face and the kerning, as drawn */
+    return s && *s ? ui_text_width_n(TH->font_regular, size_px, s, -1) : 0.0f;
 }
 
 
@@ -2929,6 +3158,17 @@ void em_image_view(const char *path, EmProps p) {
     ui_image((uint64_t)(uintptr_t)px, px, w, h, p.height > 0 ? p.height : (float)h);
 }
 
+static bool g_quiet_hover;
+void em_quiet_hover(bool on) { g_quiet_hover = on; }
+/* An image button's plate: shaded while pressed, lit while hovered (unless
+ * the surface around it draws its own hover), clear otherwise -- always set:
+ * a highlight set only on hover is retained and stays lit after the pointer
+ * leaves. */
+static struct paint image_button_paint(bool hov, bool pressed) {
+    if (hov && (pressed || !g_quiet_hover)) return solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f));
+    return solid((Color){0, 0, 0, 0});
+}
+
 bool em_image_button_key(const char *path, float size, uint64_t key) {
     em_flush();
     uint32_t w = 0, h = 0;
@@ -2946,10 +3186,7 @@ bool em_image_button_key(const char *path, float size, uint64_t key) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_corner_radius(12);
-    /* ALWAYS set the paint: a hover highlight set only on hover is retained and
-     * would stay lit after the pointer leaves. Transparent when not hovered. */
-    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
-                     : solid((Color){0, 0, 0, 0}));
+    ui_set_paint(image_button_paint(hov, pressed));
     /* The leaf's key must be STABLE, and the pixel pointer is not: it names
      * the mip level, and an icon that magnifies swaps levels as it swells. A
      * key that changes destroys and recreates the instance -- and a press edge
@@ -2990,8 +3227,7 @@ bool em_image_button_tinted(const char *path, float size, Color tint) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_corner_radius(10);
-    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
-                     : solid((Color){0, 0, 0, 0}));
+    ui_set_paint(image_button_paint(hov, pressed));
     /* The leaf retains its identity across live tint and mip changes. The
      * scene setter already marks changed stencil colour as damaged content. */
     ui_image_sized_tinted(0x1CA7, px, w, h, inner, inner, tint);
@@ -3186,19 +3422,25 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay,int modal) {
     /* drop-in motion: the panel fades in while settling down its last 8px.
      * Keyed on WHICH menu is open, so switching between menus re-plays it;
      * with no clock (host renders) it snaps to settled, like em_nav. */
-    static uint64_t s_anim_key, s_anim_t0;
-    uint64_t mnow = em_now_ms();
-    if (s_anim_key != key) { s_anim_key = key; s_anim_t0 = mnow; }
-    float mt = 1.0f;
-    if (mnow && s_anim_t0 && !t->reduced_motion) {
-        float e = (float)(mnow-s_anim_t0)/(t->motion_ms>0?t->motion_ms:120.0f);
-        mt = e < 0 ? 0 : e > 1.0f ? 1.0f : e;
-        float inv = 1.0f - mt;
-        mt = 1.0f - inv * inv * inv;
-        if (mt < 1.0f) em_request_frame();
-    }
+    static uint64_t s_anim_key;
+    static struct em_spring s_menu_m;
+    if (s_anim_key != key) { s_anim_key = key; em_spring_set(&s_menu_m, 0.0f); }
+    uint32_t drop_ms = (uint32_t)(t->motion_ms > 0 ? t->motion_ms * 2.0f : 240.0f);
+    /* ON LAYERS the compositor does all of it -- from transparent, 0.94 of its
+     * size and 5 px up, to where it rests, and back out when it closes -- and
+     * the panel is built here at rest: no frame of the drop-in is ours. */
+    if (g_em_layers) em_spring_set(&s_menu_m, 1.0f);
+    float mt = g_em_layers ? 1.0f : em_spring_to(&s_menu_m, 1.0f, drop_ms, 1000u);
+    if (mt > 1.0f) mt = 1.0f;
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
+    { uint16_t r = (uint16_t)(t->motion_ms > 0 ? drop_ms : 0), up = ay < 0 ? 1000 : 0;
+      struct scene_layer_motion in = { 0, 940, 0, up, 0, -5, r, 1000, 0 };
+      struct scene_layer_motion out = { 0, 970, 0, up, 0, -3, (uint16_t)(r * 2 / 3), 1000, 0 };
+      ui_set_promoted(g_em_layers != 0, &in, &out); }
     ui_set_opacity(mt);
+    /* ...and it grows out of the corner it opens from, as a popover does:
+     * the top (or, opening upward, the bottom) at its anchor */
+    ui_set_scale(0.94f + 0.06f * mt, 0.0f, ay < 0 ? 1.0f : 0.0f);
     if(ay<0) {
         float x,y,w,h;
         if(!ui_open_rect(&x,&y,&w,&h) || h<1)h=320;
@@ -3240,12 +3482,22 @@ static void em_menu_hidden_open(uint64_t key) {
     ui_set_size(sz_fixed(0), sz_fixed(0));
     ui_set_clip_children(true);
     ui_begin_vstack(1);                   /* mirror the panel level */
+    ui_set_promoted(false, 0, 0);
     ui_set_offset(0, 0);
     ui_set_shadow(false, 0, 0, 0, (Color){0,0,0,0});
     ui_set_backdrop_blur(false, 0);
     ui_set_paint(solid((Color){0,0,0,0}));
     ui_set_clip_children(true);
     ui_set_size(sz_fixed(0), sz_fixed(0));
+}
+
+/* A MENU OPENED OR CLOSED. In the window it is a structural change (the
+ * epoch: a full repaint, the safe answer to a big part of the tree coming and
+ * going). On layers the menu is not in the window at all -- what changes there
+ * is a transparent scrim -- so it is an ordinary frame. */
+static void em_menu_epoch(void) {
+    if (g_em_layers) em_request_frame();
+    else g_em_epoch++;
 }
 
 void em_menu_(const char *label, EmProps p) {
@@ -3256,9 +3508,11 @@ void em_menu_(const char *label, EmProps p) {
     struct instance_handle btn = ui_open();
     if(g_menu_button_count<24){g_menu_buttons[g_menu_button_count].label=label;g_menu_buttons[g_menu_button_count++].button=btn;}
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    /* One paint, decided once: set to the hover colour and then cleared, an
+     * idle button changed twice a frame and was dirty on every one -- the menu
+     * bar re-presented its whole strip twice a second for nothing. */
     ui_set_paint(solid(is_open ? t->accent_soft : pressed ? shade(t->surface_alt, 0.94f)
-                                : hov ? t->surface_alt : t->surface_alt));
-    if (!is_open && !hov && !pressed) ui_set_paint(solid((Color){0,0,0,0}));   /* flat until hovered */
+                       : hov ? t->surface_alt : (Color){0,0,0,0}));   /* flat until hovered */
     ui_set_corner_radius(t->radius_sm);ui_set_border(0,t->border);
     ui_set_padding(p.height>0?1:t->sp1,t->sp3,p.height>0?1:t->sp1,t->sp3);
     if(p.height>0)ui_set_size(sz_intrinsic(),sz_fixed(p.height));
@@ -3287,7 +3541,7 @@ void em_menu_(const char *label, EmProps p) {
                 ui_pointer_pos(&x,&y);g_menu_ax=x;g_menu_ay=y+8.0f;
             }
         }
-        g_em_epoch++;
+        em_menu_epoch();
         is_open = (g_menu_open == (const void *)label);
     }
     g_menu_cur_open = is_open;
@@ -3306,7 +3560,7 @@ void em_menu_(const char *label, EmProps p) {
 void em_menu_end_(void) {
     em_flush();
     if (g_menu_cur_open) {
-        if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; }
+        if (em_menu_panel_close()) { g_menu_open = 0; em_menu_epoch(); }
         else if(g_menu_start_last){ui_focus_edge(true);g_menu_start_last=0;}
     }
     else {
@@ -3329,7 +3583,7 @@ void em_menu_end_(void) {
 int em_menu_any_open(void) { return g_menu_open != 0; }
 int em_menu_dismiss(void) {
     if (!g_menu_open) return 0;
-    g_menu_open=0;g_em_epoch++;return 1;
+    g_menu_open=0;em_menu_epoch();return 1;
 }
 
 bool em_menu_item(const char *label, const char *shortcut) {
@@ -3354,7 +3608,7 @@ bool em_menu_item(const char *label, const char *shortcut) {
     }
     bool activated=g_controls_hidden?ui_consume_click(self):ui_control_interact(self);
     ui_end_stack();
-    if(activated) { g_menu_open = 0; g_menu_item_chosen = 1; g_em_epoch++; return true; }
+    if(activated) { g_menu_open = 0; g_menu_item_chosen = 1; em_menu_epoch(); return true; }
     return false;
 }
 
@@ -3388,7 +3642,7 @@ void em_context_menu_end_(void) {
         int scrim_hit = em_menu_panel_close();
         if ((scrim_hit || g_menu_item_chosen) && g_ctx_open_flag) {
             *g_ctx_open_flag = false;
-            g_em_epoch++;
+            em_menu_epoch();
         }
     } else {
         ui_end_stack(); ui_end_stack();   /* inner mirror + hidden box */
@@ -3400,7 +3654,7 @@ int em_menu_key(int code) {
     int context=g_ctx_cur_open && g_ctx_open_flag && *g_ctx_open_flag;
     if(!g_menu_open && !context)return 0;
     if(code==27) {
-        if(context){*g_ctx_open_flag=false;g_ctx_cur_open=0;g_em_epoch++;}
+        if(context){*g_ctx_open_flag=false;g_ctx_cur_open=0;em_menu_epoch();}
         else em_menu_dismiss();
         return 1;
     }

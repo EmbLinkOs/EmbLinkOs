@@ -8,6 +8,7 @@
 #include "font.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>    /* expf: the tracking curve, once per size */
 
 /* ------------------------------------------------------------------------- */
 /* big-endian sfnt readers (all bounds-checked against data_len by callers)   */
@@ -32,11 +33,10 @@ static float sqrtf_(float v)  { if (v <= 0) return 0; float x = v; for (int i = 
 /* the small font table                                                      */
 /* ------------------------------------------------------------------------- */
 
-#define MAX_FONTS 8
-static struct font g_fonts[MAX_FONTS];
+static struct font g_fonts[FONT_MAX];
 
 struct font *font_for_handle(uint32_t handle) {
-    if (handle == 0 || handle > MAX_FONTS) return 0;
+    if (handle == 0 || handle > FONT_MAX) return 0;
     struct font *f = &g_fonts[handle - 1];
     return f->used ? f : 0;
 }
@@ -61,25 +61,235 @@ static int find_table(const uint8_t *d, size_t len, const char tag[4],
     return 0;
 }
 
-/* Walk cmap's encoding records for a (3,1) Windows/Unicode BMP format-4
- * subtable; store its absolute offset. Returns 0 if none found. */
-static int pick_cmap_format4(const uint8_t *d, size_t len, uint32_t cmap_off, uint32_t *out_sub) {
+/* Walk cmap's encoding records for the Unicode subtable to use: a format-12
+ * one (every plane -- Windows (3,10) first, then Unicode (0,4)/(0,6)) when
+ * the font has it, else format 4 (the BMP; Windows (3,1)/(3,0) first).
+ * Store its absolute offset and format. Returns 0 if none found. */
+static int pick_cmap(const uint8_t *d, size_t len, uint32_t cmap_off, uint32_t *out_sub, uint16_t *out_format) {
     if (cmap_off + 4 > len) return 0;
     uint16_t n = rd_u16(d, cmap_off + 2);
-    uint32_t best = 0;
+    uint32_t best = 0; int best_rank = 0; uint16_t best_format = 0;
     for (uint16_t i = 0; i < n; i++) {
         uint32_t rec = cmap_off + 4 + (uint32_t)i * 8;
         if (rec + 8 > len) return 0;
         uint16_t plat = rd_u16(d, rec), enc = rd_u16(d, rec + 2);
         uint32_t sub = cmap_off + rd_u32(d, rec + 4);
         if (sub + 2 > len) continue;
-        if (rd_u16(d, sub) != 4) continue;          /* format 4 only */
-        if (plat == 3 && (enc == 1 || enc == 0)) { best = sub; break; }  /* prefer Windows BMP */
-        if (best == 0) best = sub;                  /* fall back to any format-4 */
+        uint16_t format = rd_u16(d, sub);
+        int rank = 0;
+        if (format == 12) rank = plat == 3 && enc == 10 ? 6 : plat == 0 ? 5 : 4;
+        else if (format == 4) rank = plat == 3 && (enc == 1 || enc == 0) ? 3 : plat == 0 ? 2 : 1;
+        if (rank > best_rank) { best = sub; best_rank = rank; best_format = format; }
     }
     if (!best) return 0;
     *out_sub = best;
+    *out_format = best_format;
     return 1;
+}
+
+/* ---- GPOS: the 'kern' feature's pair adjustments ------------------------ */
+
+/* Every offset below is checked against the table's end: a face is a file,
+ * and a broken one must kern nothing rather than read past itself. */
+#define GP_OK(f_, o_, n_) ((uint64_t)(o_) + (n_) <= (uint64_t)(f_)->gpos_offset + (f_)->gpos_len)
+
+static void gpos_kern_lookups(struct font *f) {
+    const uint8_t *d = f->data;
+    uint32_t g = f->gpos_offset;
+    if (f->gpos_len < 10 || !GP_OK(f, g, 10)) return;
+    uint32_t fl = g + rd_u16(d, g + 6);
+    if (!GP_OK(f, fl, 2)) return;
+    uint16_t nf = rd_u16(d, fl);
+    for (uint16_t i = 0; i < nf && GP_OK(f, fl + 2 + 6u * i, 6); i++) {
+        uint32_t rec = fl + 2 + 6u * i;
+        if (d[rec] != 'k' || d[rec + 1] != 'e' || d[rec + 2] != 'r' || d[rec + 3] != 'n') continue;
+        uint32_t ft = fl + rd_u16(d, rec + 4);
+        if (!GP_OK(f, ft, 4)) continue;
+        uint16_t n = rd_u16(d, ft + 2);
+        for (uint16_t k = 0; k < n && GP_OK(f, ft + 4 + 2u * k, 2); k++) {
+            uint16_t li = rd_u16(d, ft + 4 + 2u * k);
+            int seen = 0;
+            for (int m = 0; m < f->n_kern_lookups; m++) seen |= f->kern_lookups[m] == li;
+            if (!seen && f->n_kern_lookups < 16) f->kern_lookups[f->n_kern_lookups++] = li;
+        }
+    }
+}
+
+/* Coverage: the glyph's index in the table, or -1. */
+static int gp_coverage(struct font *f, uint32_t off, uint32_t gid) {
+    const uint8_t *d = f->data;
+    if (!GP_OK(f, off, 4)) return -1;
+    uint16_t fmt = rd_u16(d, off), n = rd_u16(d, off + 2);
+    int lo = 0, hi = n;
+    if (fmt == 1) {
+        if (!GP_OK(f, off + 4, 2u * n)) return -1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2; uint16_t gv = rd_u16(d, off + 4 + 2u * mid);
+            if (gv == gid) return mid;
+            if (gv < gid) lo = mid + 1; else hi = mid;
+        }
+    } else if (fmt == 2) {
+        if (!GP_OK(f, off + 4, 6u * n)) return -1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2; uint32_t r = off + 4 + 6u * mid;
+            uint16_t s = rd_u16(d, r), e = rd_u16(d, r + 2);
+            if (gid < s) hi = mid;
+            else if (gid > e) lo = mid + 1;
+            else return rd_u16(d, r + 4) + (int)(gid - s);
+        }
+    }
+    return -1;
+}
+
+/* ClassDef: the glyph's class, 0 when it has none. */
+static int gp_class(struct font *f, uint32_t off, uint32_t gid) {
+    const uint8_t *d = f->data;
+    if (!GP_OK(f, off, 4)) return 0;
+    uint16_t fmt = rd_u16(d, off);
+    if (fmt == 1) {
+        if (!GP_OK(f, off, 6)) return 0;
+        uint16_t start = rd_u16(d, off + 2), n = rd_u16(d, off + 4);
+        if (gid < start || gid >= (uint32_t)start + n || !GP_OK(f, off + 6, 2u * n)) return 0;
+        return rd_u16(d, off + 6 + 2u * (gid - start));
+    }
+    if (fmt == 2) {
+        uint16_t n = rd_u16(d, off + 2);
+        if (!GP_OK(f, off + 4, 6u * n)) return 0;
+        int lo = 0, hi = n;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2; uint32_t r = off + 4 + 6u * mid;
+            uint16_t s = rd_u16(d, r), e = rd_u16(d, r + 2);
+            if (gid < s) hi = mid;
+            else if (gid > e) lo = mid + 1;
+            else return rd_u16(d, r + 4);
+        }
+    }
+    return 0;
+}
+
+/* A ValueRecord's XAdvance (the bits before it say where it is), 0 if absent. */
+static int gp_xadvance(struct font *f, uint32_t vr, uint16_t fmt) {
+    if (!(fmt & 4) || !GP_OK(f, vr, 6)) return 0;
+    return rd_i16(f->data, vr + 2u * ((fmt & 1) + ((fmt >> 1) & 1)));
+}
+static int gp_vr_size(uint16_t fmt) { int n = 0; for (int b = 0; b < 8; b++) n += (fmt >> b) & 1; return 2 * n; }
+
+/* One PairPos subtable's adjustment for (g1, g2); *hit when it applies. */
+static int gp_pairpos(struct font *f, uint32_t st, uint32_t g1, uint32_t g2, int *hit) {
+    const uint8_t *d = f->data;
+    if (!GP_OK(f, st, 10)) return 0;
+    uint16_t fmt = rd_u16(d, st), vf1 = rd_u16(d, st + 4), vf2 = rd_u16(d, st + 6);
+    int ci = gp_coverage(f, st + rd_u16(d, st + 2), g1);
+    if (ci < 0) return 0;
+    int s1 = gp_vr_size(vf1), s2 = gp_vr_size(vf2);
+    if (fmt == 1) {
+        if (ci >= rd_u16(d, st + 8) || !GP_OK(f, st + 10 + 2u * ci, 2)) return 0;
+        uint32_t ps = st + rd_u16(d, st + 10 + 2u * ci);
+        if (!GP_OK(f, ps, 2)) return 0;
+        uint16_t n = rd_u16(d, ps);
+        uint32_t rec = 2 + (uint32_t)s1 + (uint32_t)s2;
+        if (!GP_OK(f, ps + 2, rec * n)) return 0;
+        int lo = 0, hi = n;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2; uint32_t r = ps + 2 + rec * (uint32_t)mid;
+            uint16_t sg = rd_u16(d, r);
+            if (sg == g2) { *hit = 1; return gp_xadvance(f, r + 2, vf1); }
+            if (sg < g2) lo = mid + 1; else hi = mid;
+        }
+        return 0;
+    }
+    if (fmt == 2 && GP_OK(f, st, 16)) {
+        uint16_t c1n = rd_u16(d, st + 12), c2n = rd_u16(d, st + 14);
+        int c1 = gp_class(f, st + rd_u16(d, st + 8), g1), c2 = gp_class(f, st + rd_u16(d, st + 10), g2);
+        if (c1 >= c1n || c2 >= c2n) return 0;
+        *hit = 1;
+        return gp_xadvance(f, st + 16 + (uint32_t)(c1 * c2n + c2) * (uint32_t)(s1 + s2), vf1);
+    }
+    return 0;
+}
+
+/* The pair's kerning in font units: each 'kern' lookup's first subtable that
+ * applies, summed over the lookups (extension subtables followed). */
+static int gp_kern_units(struct font *f, uint32_t g1, uint32_t g2) {
+    const uint8_t *d = f->data;
+    uint32_t g = f->gpos_offset, ll = g + rd_u16(d, g + 8);
+    if (!g1 || !g2 || !GP_OK(f, ll, 2)) return 0;
+    uint16_t nl = rd_u16(d, ll);
+    int total = 0;
+    for (int k = 0; k < f->n_kern_lookups; k++) {
+        uint16_t li = f->kern_lookups[k];
+        if (li >= nl || !GP_OK(f, ll + 2 + 2u * li, 2)) continue;
+        uint32_t lk = ll + rd_u16(d, ll + 2 + 2u * li);
+        if (!GP_OK(f, lk, 6)) continue;
+        uint16_t type = rd_u16(d, lk), ns = rd_u16(d, lk + 4);
+        for (uint16_t s = 0; s < ns && GP_OK(f, lk + 6 + 2u * s, 2); s++) {
+            uint32_t st = lk + rd_u16(d, lk + 6 + 2u * s);
+            uint16_t t = type;
+            if (t == 9 && GP_OK(f, st, 8)) { t = rd_u16(d, st + 2); st += rd_u32(d, st + 4); }
+            if (t != 2) continue;
+            int hit = 0, v = gp_pairpos(f, st, g1, g2, &hit);
+            if (hit) { total += v; break; }
+        }
+    }
+    return total;
+}
+
+float font_kern_px(struct font *f, uint32_t left, uint32_t right, float size_px) {
+    if (!f || !left || !right || !f->n_kern_lookups) return 0.0f;
+    int units;
+    if (left >= 0x20 && left < 0x7F && right >= 0x20 && right < 0x7F) {
+        if (!f->kern_ascii) {
+            /* every printable ASCII pair, once: 9025 lookups, then a load */
+            f->kern_ascii = (int16_t *)malloc(95 * 95 * sizeof(int16_t));
+            if (!f->kern_ascii) return 0.0f;
+            uint32_t gid[95];
+            for (int i = 0; i < 95; i++) gid[i] = font_codepoint_to_glyph(f, (uint32_t)(0x20 + i));
+            for (int a = 0; a < 95; a++)
+                for (int b = 0; b < 95; b++) f->kern_ascii[a * 95 + b] = (int16_t)gp_kern_units(f, gid[a], gid[b]);
+        }
+        units = f->kern_ascii[(left - 0x20) * 95 + (right - 0x20)];
+    } else {
+        if (font_for_codepoint(f, left) != f || font_for_codepoint(f, right) != f) return 0.0f;
+        units = gp_kern_units(f, font_codepoint_to_glyph(f, left), font_codepoint_to_glyph(f, right));
+    }
+    float canonical = (float)(uint16_t)(size_px * 4.0f + .5f) / 4.0f;   /* the cache's size */
+    return (float)units * canonical / (float)f->units_per_em;
+}
+
+/* Inter's dynamic metrics (rsms.me/inter/dynmetrics): tracking in ems as a
+ * function of the size in pixels -- about +0.005 em at 11 px, -0.003 at 13,
+ * -0.02 at 24 and up. */
+static float inter_tracking_em(float size_px) { return -0.0223f + 0.185f * expf(-0.1745f * size_px); }
+
+float font_pair_px(struct font *f, uint32_t left, uint32_t right, float size_px) {
+    if (!f || !left || !right) return 0.0f;
+    float px = font_kern_px(f, left, right, size_px);
+    if (f->dyn_tracking) {
+        float canonical = (float)(uint16_t)(size_px * 4.0f + .5f) / 4.0f;   /* the cache's size */
+        if (canonical != f->trk_size) { f->trk_size = canonical; f->trk_px = inter_tracking_em(canonical) * canonical; }
+        px += f->trk_px;
+    }
+    return px;
+}
+
+/* Is the face's family (name ID 1, Windows UTF-16 or Mac Roman) `family`? */
+static int family_is(const uint8_t *d, size_t len, const char *family) {
+    uint32_t off, tl;
+    if (!find_table(d, len, "name", &off, &tl) || tl < 6) return 0;
+    uint16_t count = rd_u16(d, off + 2), strings = rd_u16(d, off + 4);
+    size_t fl = strlen(family);
+    for (uint16_t i = 0; i < count && 6u + 12u * (i + 1u) <= tl; i++) {
+        uint32_t r = off + 6 + 12u * i;
+        uint16_t platform = rd_u16(d, r), name_id = rd_u16(d, r + 6), slen = rd_u16(d, r + 8), soff = rd_u16(d, r + 10);
+        if (name_id != 1 || (size_t)off + strings + soff + slen > len) continue;
+        const uint8_t *str = d + off + strings + soff;
+        if (platform == 3 && slen >= 2 * fl) {
+            size_t k = 0;
+            while (k < fl && str[2 * k] == 0 && str[2 * k + 1] == (uint8_t)family[k]) k++;
+            if (k == fl) return 1;
+        } else if (platform == 1 && slen >= fl && !memcmp(str, family, fl)) return 1;
+    }
+    return 0;
 }
 
 uint32_t font_load(const uint8_t *ttf_data, size_t len) {
@@ -88,7 +298,7 @@ uint32_t font_load(const uint8_t *ttf_data, size_t len) {
     if (ver != 0x00010000 && ver != 0x74727565 /* 'true' */) return 0;
 
     int slot = -1;
-    for (int i = 0; i < MAX_FONTS; i++) if (!g_fonts[i].used) { slot = i; break; }
+    for (int i = 0; i < FONT_MAX; i++) if (!g_fonts[i].used) { slot = i; break; }
     if (slot < 0) return 0;
     struct font *f = &g_fonts[slot];
     memset(f, 0, sizeof(*f));
@@ -117,18 +327,59 @@ uint32_t font_load(const uint8_t *ttf_data, size_t len) {
 
     uint32_t cmap_off, cmap_len;
     if (!find_table(ttf_data, len, "cmap", &cmap_off, &cmap_len)) return 0;
-    if (!pick_cmap_format4(ttf_data, len, cmap_off, &f->cmap_subtable_offset)) return 0;
+    if (!pick_cmap(ttf_data, len, cmap_off, &f->cmap_subtable_offset, &f->cmap_format)) return 0;
+
+    if (find_table(ttf_data, len, "GPOS", &f->gpos_offset, &f->gpos_len)) gpos_kern_lookups(f);
+    f->dyn_tracking = family_is(ttf_data, len, "Inter");
 
     f->used = true;
     return (uint32_t)(slot + 1);
 }
 
 /* ------------------------------------------------------------------------- */
-/* Section 2: cmap format 4                                                  */
+/* Section 2: cmap formats 12 and 4                                          */
 /* ------------------------------------------------------------------------- */
 
+/* Format 12: groups of (first, last, first glyph), sorted -- a binary search. */
+static uint32_t cmap12_glyph(struct font *f, uint32_t codepoint) {
+    const uint8_t *d = f->data;
+    uint32_t s = f->cmap_subtable_offset;
+    if (s + 16 > f->data_len) return 0;
+    uint32_t groups = rd_u32(d, s + 12);
+    if ((uint64_t)s + 16 + (uint64_t)groups * 12 > f->data_len) return 0;
+    uint32_t lo = 0, hi = groups;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2, g = s + 16 + mid * 12;
+        uint32_t first = rd_u32(d, g), last = rd_u32(d, g + 4);
+        if (codepoint < first) hi = mid;
+        else if (codepoint > last) lo = mid + 1;
+        else {
+            uint32_t glyph = rd_u32(d, g + 8) + (codepoint - first);
+            return glyph < f->num_glyphs ? glyph : 0;
+        }
+    }
+    return 0;
+}
+
+void font_set_fallback(uint32_t font, uint32_t fallback) {
+    struct font *f = font_for_handle(font);
+    if (f && fallback != font) f->fallback = fallback;
+}
+
+struct font *font_for_codepoint(struct font *f, uint32_t codepoint) {
+    if (!f || codepoint < 0x80 || font_codepoint_to_glyph(f, codepoint)) return f;
+    struct font *fb = font_for_handle(f->fallback);
+    return fb && font_codepoint_to_glyph(fb, codepoint) ? fb : f;
+}
+
+bool font_has_glyph(struct font *f, uint32_t codepoint) {
+    return font_codepoint_to_glyph(f, codepoint) != 0;
+}
+
 uint32_t font_codepoint_to_glyph(struct font *f, uint32_t codepoint) {
-    if (!f || codepoint > 0xFFFF) return 0;
+    if (!f) return 0;
+    if (f->cmap_format == 12) return cmap12_glyph(f, codepoint);
+    if (codepoint > 0xFFFF) return 0;
     const uint8_t *d = f->data;
     uint32_t s = f->cmap_subtable_offset;
     if (s + 14 > f->data_len) return 0;
@@ -140,9 +391,14 @@ uint32_t font_codepoint_to_glyph(struct font *f, uint32_t codepoint) {
     uint32_t idRange   = idDelta + segX2;
     if (idRange + segX2 > f->data_len) return 0;
 
-    for (uint16_t i = 0; i < segs; i++) {
-        uint16_t end = rd_u16(d, endCode + i * 2);
-        if (codepoint > end) continue;
+    /* endCode[] is sorted: the segment is the first whose end >= codepoint */
+    uint16_t lo = 0, hi = segs;
+    while (lo < hi) {
+        uint16_t mid = (uint16_t)(lo + (hi - lo) / 2);
+        if (rd_u16(d, endCode + mid * 2) < codepoint) lo = (uint16_t)(mid + 1); else hi = mid;
+    }
+    if (lo < segs) {
+        uint16_t i = lo;
         uint16_t start = rd_u16(d, startCode + i * 2);
         if (codepoint < start) return 0;         /* in a gap */
         int16_t delta = rd_i16(d, idDelta + i * 2);
@@ -380,10 +636,9 @@ void font_free_outline(struct glyph_outline *o) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Section 4: rasterization (supersample scanline fill + box downsample)     */
+/* Section 4: rasterization (exact area coverage)                            */
 /* ------------------------------------------------------------------------- */
 
-#define SS 4   /* linear supersample factor */
 
 static uint32_t g_rasterize_calls;
 uint32_t font_debug_rasterize_count(void) { return g_rasterize_calls; }
@@ -466,9 +721,65 @@ int font_debug_flatten_contour0(struct font *f, uint32_t gi, float scale,
     return np;
 }
 
+/* One edge, (x0,y0)-(x1,y1) in the glyph's own pixel space (y down), into
+ * the accumulation buffer `a` (`aw` floats a row, two more than the glyph is
+ * wide). Per row it crosses: the signed height it covers there, split between
+ * the cells its x span touches by the area to the right of the edge. */
+static void area_line(float *a, int aw, int h, float x0, float y0, float x1, float y1) {
+    if (y0 == y1) return;
+    float dir = 1.0f;
+    if (y0 > y1) { float t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; dir = -1.0f; }
+    float dxdy = (x1 - x0) / (y1 - y0), x = x0;
+    if (y0 < 0) { x -= y0 * dxdy; y0 = 0; }
+    int yend = (int)ceilf_(y1);
+    if (yend > h) yend = h;
+    for (int y = (int)y0; y < yend; y++) {
+        float top = (float)y > y0 ? (float)y : y0;
+        float bot = (float)(y + 1) < y1 ? (float)(y + 1) : y1;
+        float dy = bot - top;
+        if (dy <= 0) continue;
+        float xnext = x + dxdy * dy, d = dy * dir;
+        float xa = x < xnext ? x : xnext, xb = x < xnext ? xnext : x;
+        if (xa < 0) xa = 0;                       /* outside the box is clamped in */
+        if (xb < 0) xb = 0;
+        float *row = a + (size_t)y * aw;
+        float xaf = floorf_(xa);
+        int ia = (int)xaf, ib = (int)ceilf_(xb);
+        if (ia >= aw - 1) ia = aw - 2;
+        if (ib <= ia + 1) {                       /* within one cell */
+            float xm = 0.5f * (xa + xb) - xaf;
+            row[ia] += d - d * xm;
+            row[ia + 1] += d * xm;
+        } else {                                  /* across several */
+            float s = 1.0f / (xb - xa), f0 = xa - xaf;
+            float a0 = 0.5f * s * (1.0f - f0) * (1.0f - f0);
+            float f1 = xb - (float)ib + 1.0f, am = 0.5f * s * f1 * f1;
+            if (ib > aw - 1) ib = aw - 1;
+            row[ia] += d * a0;
+            if (ib == ia + 2) row[ia + 1] += d * (1.0f - a0 - am);
+            else {
+                float a1 = s * (1.5f - f0);
+                row[ia + 1] += d * (a1 - a0);
+                for (int k = ia + 2; k < ib - 1; k++) row[k] += d * s;
+                float a2 = a1 + (float)(ib - ia - 3) * s;
+                row[ib - 1] += d * (1.0f - a2 - am);
+            }
+            row[ib] += d * am;
+        }
+        x = xnext;
+    }
+}
+
 bool font_rasterize_glyph(struct font *f, uint32_t glyph_index, float size_px,
                           uint8_t **out_coverage, int *out_w, int *out_h,
                           int *out_bearing_x, int *out_bearing_y, float *out_advance_px) {
+    return font_rasterize_glyph_at(f, glyph_index, size_px, 0.0f, out_coverage, out_w, out_h,
+                                   out_bearing_x, out_bearing_y, out_advance_px);
+}
+
+bool font_rasterize_glyph_at(struct font *f, uint32_t glyph_index, float size_px, float dx,
+                             uint8_t **out_coverage, int *out_w, int *out_h,
+                             int *out_bearing_x, int *out_bearing_y, float *out_advance_px) {
     g_rasterize_calls++;
     struct glyph_outline o;
     if (!font_get_glyph_outline(f, glyph_index, &o)) return false;
@@ -487,6 +798,7 @@ bool font_rasterize_glyph(struct font *f, uint32_t glyph_index, float size_px,
         span_end[c] = np;   /* this contour's points are [prev_end, np) */
     }
     font_free_outline(&o);
+    if (dx != 0.0f) for (int i = 0; i < np; i++) poly[i].x += dx;   /* the pen's fraction */
 
     if (np == 0) {   /* blank glyph (space): valid, empty bitmap */
         free(poly); free(span_end);
@@ -507,63 +819,39 @@ bool font_rasterize_glyph(struct font *f, uint32_t glyph_index, float size_px,
     if (w <= 0) w = 1;
     if (h <= 0) h = 1;
 
-    int sw = w * SS, sh = h * SS;
-    uint8_t *ss = (uint8_t *)calloc((size_t)sw * sh, 1);
-    if (!ss) { free(poly); free(span_end); return false; }
-
-    /* scanline fill, nonzero winding, at supersample resolution */
-    for (int sy = 0; sy < sh; sy++) {
-        float yc = ((float)sy + 0.5f) / SS + oy;   /* back to pixel space */
-        /* gather edge crossings across ALL contours (joint fill for holes) */
-        float xs[256]; int dir[256]; int nx = 0;
-        int cstart = 0;
-        for (uint32_t c = 0; c < ncont; c++) {
-            int cend = span_end[c];
-            for (int i = cstart; i < cend; i++) {
-                int j = (i + 1 < cend) ? i + 1 : cstart;   /* close the contour */
-                float y0 = poly[i].y, y1 = poly[j].y, x0 = poly[i].x, x1 = poly[j].x;
-                if (y0 == y1) continue;
-                if ((yc >= y0 && yc < y1) || (yc >= y1 && yc < y0)) {
-                    float t = (yc - y0) / (y1 - y0);
-                    float xc = x0 + t * (x1 - x0);
-                    if (nx < 256) { xs[nx] = xc; dir[nx] = (y1 > y0) ? 1 : -1; nx++; }
-                }
-            }
-            cstart = cend;
+    /* EXACT AREA COVERAGE. Each edge adds, to every pixel it crosses, the
+     * signed area it sweeps there; a running sum along the row then is the
+     * winding-weighted area of the outline inside each pixel -- 256 levels,
+     * exact for straight edges, where 4 x 4 supersampling gave 17 and lost
+     * whatever fell between its samples (the font-rs / stb_truetype 2
+     * method). Clamped to 1, which is nonzero winding for outlines that do
+     * not cover a pixel twice and the right answer for those that do. */
+    int aw = w + 2;
+    float *acc = (float *)calloc((size_t)aw * (size_t)h + 1, sizeof(float));
+    if (!acc) { free(poly); free(span_end); return false; }
+    int cstart = 0;
+    for (uint32_t c = 0; c < ncont; c++) {
+        int cend = span_end[c];
+        for (int i = cstart; i < cend; i++) {
+            int j = (i + 1 < cend) ? i + 1 : cstart;   /* close the contour */
+            area_line(acc, aw, h, poly[i].x - (float)ox, poly[i].y - (float)oy,
+                      poly[j].x - (float)ox, poly[j].y - (float)oy);
         }
-        /* sort crossings by x (insertion sort; nx is tiny) */
-        for (int a = 1; a < nx; a++) {
-            float kx = xs[a]; int kd = dir[a]; int b = a - 1;
-            while (b >= 0 && xs[b] > kx) { xs[b+1] = xs[b]; dir[b+1] = dir[b]; b--; }
-            xs[b+1] = kx; dir[b+1] = kd;
-        }
-        int wind = 0;
-        for (int a = 0; a < nx - 1; a++) {
-            wind += dir[a];
-            if (wind != 0) {
-                float xa = (xs[a]   - ox) * SS;
-                float xb = (xs[a+1] - ox) * SS;
-                int ia = (int)(xa + 0.5f), ib = (int)(xb + 0.5f);
-                if (ia < 0) ia = 0;
-                if (ib > sw) ib = sw;
-                for (int px = ia; px < ib; px++) ss[sy * sw + px] = 1;
-            }
-        }
+        cstart = cend;
     }
-
-    /* box-downsample SSxSS -> one coverage byte (this is the AA) */
     uint8_t *cov = (uint8_t *)malloc((size_t)w * h);
+    if (!cov) { free(acc); free(poly); free(span_end); return false; }
     for (int py = 0; py < h; py++) {
+        float sum = 0.0f;
         for (int px = 0; px < w; px++) {
-            int sum = 0;
-            for (int dy = 0; dy < SS; dy++)
-                for (int dx = 0; dx < SS; dx++)
-                    sum += ss[(py*SS+dy)*sw + (px*SS+dx)];
-            cov[py * w + px] = (uint8_t)((sum * 255) / (SS * SS));
+            sum += acc[py * aw + px];
+            float a = sum < 0 ? -sum : sum;
+            cov[py * w + px] = (uint8_t)(a >= 1.0f ? 255 : (int)(a * 255.0f + 0.5f));
         }
     }
+    free(acc);
 
-    free(ss); free(poly); free(span_end);
+    free(poly); free(span_end);
     *out_coverage = cov; *out_w = w; *out_h = h;
     *out_bearing_x = ox;
     *out_bearing_y = -oy;   /* pixels from baseline up to glyph top (oy is negative, y-down) */
@@ -577,62 +865,143 @@ bool font_rasterize_glyph(struct font *f, uint32_t glyph_index, float size_px,
 static struct glyph_atlas g_atlas;
 struct glyph_atlas *font_global_atlas(void) { return &g_atlas; }
 
+const uint8_t *glyph_coverage(const struct glyph_atlas *a, const struct glyph_cache_entry *e) {
+    if (!e || e->page >= GLYPH_ATLAS_PAGES || !e->atlas_w || !a->pages[e->page].coverage) return 0;
+    return a->pages[e->page].coverage + (size_t)e->atlas_y * GLYPH_ATLAS_SIZE + e->atlas_x;
+}
+
+static uint32_t glyph_key_hash(uint32_t fh, uint32_t cp, uint16_t sx4, uint32_t phase) {
+    uint32_t h = cp * 0x9E3779B1u ^ fh * 0x85EBCA77u ^ ((uint32_t)sx4 * FONT_PHASES + phase) * 0xC2B2AE3Du;
+    return (h ^ (h >> 15)) & (GLYPH_HASH_SIZE - 1);
+}
+static void unlink_entry(struct glyph_atlas *a, uint32_t index) {
+    struct glyph_cache_entry *e = &a->entries[index];
+    uint32_t *link = &a->hash[glyph_key_hash(e->font_handle, e->codepoint, e->size_px_x4, e->phase)];
+    while (*link && *link != index + 1) link = &a->entries[*link - 1].next;
+    if (*link) *link = e->next;
+    e->used = false;
+    e->next = a->free_head;
+    a->free_head = index + 1;
+}
+/* Forget everything: entries, hash, every page's packing (the pages' memory stays). */
 static void atlas_reset(struct glyph_atlas *a) {
-    a->shelf_x = a->shelf_y = a->shelf_row_h = 0;
-    a->n_entries = 0;
-    for (uint32_t i = 0; i < GLYPH_CACHE_MAX; i++) a->entries[i].used = false;
+    memset(a->hash, 0, sizeof a->hash);
+    for (uint32_t i = 0; i < a->n_entries; i++) a->entries[i].used = false;
+    a->n_entries = 0; a->free_head = 0; a->current = 0;
+    for (int p = 0; p < GLYPH_ATLAS_PAGES; p++) {
+        a->pages[p].shelf_x = a->pages[p].shelf_y = a->pages[p].shelf_row_h = 0;
+        a->pages[p].last_use = 0;
+    }
+}
+/* Empty page `p`: its glyphs are forgotten and it packs from the top again. */
+static void evict_page(struct glyph_atlas *a, uint32_t p) {
+    for (uint32_t i = 0; i < a->n_entries; i++)
+        if (a->entries[i].used && a->entries[i].page == p) unlink_entry(a, i);
+    a->pages[p].shelf_x = a->pages[p].shelf_y = a->pages[p].shelf_row_h = 0;
+    a->pages[p].last_use = ++a->clock;
+}
+static bool shelf_fits(const struct glyph_page *pg, uint32_t w, uint32_t h, uint32_t *x, uint32_t *y) {
+    uint32_t sx = pg->shelf_x, sy = pg->shelf_y;
+    if (sx + w > GLYPH_ATLAS_SIZE) { sx = 0; sy += pg->shelf_row_h; }
+    if (sy + h > GLYPH_ATLAS_SIZE) return false;
+    *x = sx; *y = sy;
+    return true;
+}
+/* Room for a w x h glyph: the current page, a new page, or the page used
+ * longest ago, emptied. */
+static bool atlas_place(struct glyph_atlas *a, uint32_t w, uint32_t h, uint32_t *page, uint32_t *x, uint32_t *y) {
+    if (w > GLYPH_ATLAS_SIZE || h > GLYPH_ATLAS_SIZE) return false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        struct glyph_page *pg = &a->pages[a->current];
+        if (!pg->coverage) {
+            pg->coverage = (uint8_t *)calloc(GLYPH_ATLAS_SIZE, GLYPH_ATLAS_SIZE);
+            if (!pg->coverage) return false;
+        }
+        if (shelf_fits(pg, w, h, x, y)) { *page = a->current; return true; }
+        uint32_t next = GLYPH_ATLAS_PAGES;
+        for (uint32_t p = 0; p < GLYPH_ATLAS_PAGES; p++) if (!a->pages[p].coverage) { next = p; break; }
+        if (next == GLYPH_ATLAS_PAGES) {
+            uint64_t oldest = UINT64_MAX;
+            for (uint32_t p = 0; p < GLYPH_ATLAS_PAGES; p++)
+                if (a->pages[p].last_use < oldest) { oldest = a->pages[p].last_use; next = p; }
+            evict_page(a, next);
+        }
+        a->current = next;
+    }
+    return false;
+}
+static struct glyph_cache_entry *new_entry(struct glyph_atlas *a) {
+    uint32_t index;
+    if (a->free_head) { index = a->free_head - 1; a->free_head = a->entries[index].next; }
+    else if (a->n_entries < GLYPH_CACHE_MAX) index = a->n_entries++;
+    else {
+        /* every entry in use: give back the oldest page's, or all if they
+         * were blank glyphs (no page to give back) */
+        uint64_t oldest = UINT64_MAX; uint32_t victim = 0;
+        for (uint32_t p = 0; p < GLYPH_ATLAS_PAGES; p++)
+            if (a->pages[p].coverage && a->pages[p].last_use < oldest) { oldest = a->pages[p].last_use; victim = p; }
+        evict_page(a, victim);
+        if (!a->free_head) atlas_reset(a);
+        return new_entry(a);
+    }
+    struct glyph_cache_entry *e = &a->entries[index];
+    memset(e, 0, sizeof *e);
+    return e;
 }
 
 struct glyph_cache_entry *glyph_cache_lookup_or_rasterize(
     struct glyph_atlas *atlas, struct font *f, uint32_t codepoint, float size_px) {
-    if (!atlas || !f) return 0;
-    uint16_t sx4 = (uint16_t)(size_px * 4.0f + 0.5f);
-    /* find this font's handle (for the cache key) */
-    uint32_t fh = 0;
-    for (int i = 0; i < MAX_FONTS; i++) if (&g_fonts[i] == f) { fh = (uint32_t)i + 1; break; }
+    return glyph_cache_lookup_phase(atlas, f, codepoint, size_px, 0);
+}
 
-    for (uint32_t i = 0; i < atlas->n_entries; i++) {
-        struct glyph_cache_entry *e = &atlas->entries[i];
-        if (e->used && e->font_handle == fh && e->codepoint == codepoint && e->size_px_x4 == sx4)
+struct glyph_cache_entry *glyph_cache_lookup_phase(
+    struct glyph_atlas *atlas, struct font *f, uint32_t codepoint, float size_px, uint32_t phase) {
+    if (!atlas || !f) return 0;
+    if (phase >= FONT_PHASES) phase = 0;
+    uint16_t sx4 = (uint16_t)(size_px * 4.0f + 0.5f);
+    uint32_t fh = (uint32_t)(f - g_fonts) + 1;      /* the cache key's font */
+    if (f < g_fonts || fh > FONT_MAX) return 0;
+    uint32_t bucket = glyph_key_hash(fh, codepoint, sx4, phase);
+    for (uint32_t i = atlas->hash[bucket]; i; i = atlas->entries[i - 1].next) {
+        struct glyph_cache_entry *e = &atlas->entries[i - 1];
+        if (e->font_handle == fh && e->codepoint == codepoint && e->size_px_x4 == sx4 && e->phase == phase) {
+            if (e->page < GLYPH_ATLAS_PAGES) atlas->pages[e->page].last_use = ++atlas->clock;
             return e;   /* cache hit -- no rasterize */
+        }
     }
 
     /* miss: rasterize */
     uint32_t gi = font_codepoint_to_glyph(f, codepoint);   /* 0 == .notdef, still rendered */
     uint8_t *cov = 0; int w = 0, h = 0, bx = 0, by = 0; float adv = 0;
-    if (!font_rasterize_glyph(f,gi,(float)sx4/4.0f,&cov,&w,&h,&bx,&by,&adv)) return 0;
+    if (!font_rasterize_glyph_at(f,gi,(float)sx4/4.0f,(float)phase/FONT_PHASES,&cov,&w,&h,&bx,&by,&adv)) return 0;
 
-    /* pack into the shelf; clear-and-restart on exhaustion (Section 5) */
-    if (w > 0 && h > 0) {
-        if (atlas->shelf_x + (uint32_t)w > GLYPH_ATLAS_SIZE) {
-            atlas->shelf_x = 0;
-            atlas->shelf_y += atlas->shelf_row_h;
-            atlas->shelf_row_h = 0;
-        }
-        if (atlas->shelf_y + (uint32_t)h > GLYPH_ATLAS_SIZE || atlas->n_entries >= GLYPH_CACHE_MAX) {
-            atlas_reset(atlas);
-        }
-    } else if (atlas->n_entries >= GLYPH_CACHE_MAX) {
-        atlas_reset(atlas);
+    /* The entry first: making room for it may empty a page, which must not be
+     * the page this glyph is about to be packed into. */
+    struct glyph_cache_entry *e = new_entry(atlas);
+    uint32_t page = GLYPH_NO_PAGE, ax = 0, ay = 0;
+    if (cov && w > 0 && h > 0 && !atlas_place(atlas, (uint32_t)w, (uint32_t)h, &page, &ax, &ay)) {
+        free(cov); cov = 0; w = h = 0;             /* bigger than a page: drawn as nothing */
     }
-
-    struct glyph_cache_entry *e = &atlas->entries[atlas->n_entries++];
-    e->used = true; e->font_handle = fh; e->codepoint = codepoint; e->size_px_x4 = sx4;
+    e->used = true; e->font_handle = fh; e->codepoint = codepoint; e->size_px_x4 = sx4; e->phase = (uint8_t)phase;
     e->bearing_x = (int16_t)bx; e->bearing_y = (int16_t)by; e->advance_px = adv;
+    e->missing = gi == 0;
     e->atlas_w = (uint16_t)(w > 0 ? w : 0); e->atlas_h = (uint16_t)(h > 0 ? h : 0);
-
+    e->page = (uint8_t)page;
     if (cov && w > 0 && h > 0) {
-        e->atlas_x = (uint16_t)atlas->shelf_x;
-        e->atlas_y = (uint16_t)atlas->shelf_y;
+        struct glyph_page *pg = &atlas->pages[page];
+        if (ax == 0 && ay != pg->shelf_y) { pg->shelf_y = ay; pg->shelf_row_h = 0; }   /* a new row */
+        e->atlas_x = (uint16_t)ax; e->atlas_y = (uint16_t)ay;
         for (int yy = 0; yy < h; yy++)
-            for (int xx = 0; xx < w; xx++)
-                atlas->coverage[atlas->shelf_y + yy][atlas->shelf_x + xx] = cov[yy * w + xx];
-        atlas->shelf_x += (uint32_t)w;
-        if ((uint32_t)h > atlas->shelf_row_h) atlas->shelf_row_h = (uint32_t)h;
+            memcpy(pg->coverage + (size_t)(ay + (uint32_t)yy) * GLYPH_ATLAS_SIZE + ax, cov + (size_t)yy * w, (size_t)w);
+        pg->shelf_x = ax + (uint32_t)w;
+        if ((uint32_t)h > pg->shelf_row_h) pg->shelf_row_h = (uint32_t)h;
+        pg->last_use = ++atlas->clock;
     } else {
         e->atlas_x = e->atlas_y = 0;   /* blank glyph (space): no pixels, real advance */
     }
     free(cov);
+    e->next = atlas->hash[bucket];
+    atlas->hash[bucket] = (uint32_t)(e - atlas->entries) + 1;
     return e;
 }
 
@@ -685,7 +1054,7 @@ static void gamma_tables_init(void) {
 
 /* premultiplied-BGRA pixel over-blend, gated by the backend clip/dirty. */
 static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
-                                 struct glyph_atlas *atlas, int ax, int ay, int aw, int ah,
+                                 const uint8_t *coverage, int aw, int ah,
                                  struct color color, float opacity,
                                  float ox, float oy, float box_w, float box_h,
                                  const struct paint *paint) {
@@ -707,7 +1076,7 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
         for (int xx = 0; xx < aw; xx++) {
             int px = dx + xx;
             if (px < 0 || px >= (int)rt->width) continue;
-            float cov = atlas->coverage[ay + yy][ax + xx] / 255.0f;
+            float cov = coverage[(size_t)yy * GLYPH_ATLAS_SIZE + xx] / 255.0f;
             if (grad) {
                 struct color gc = cpu_paint_at(paint, (float)px - ox, (float)py - oy, box_w, box_h);
                 sr2 = gc.r * gc.r; sg2 = gc.g * gc.g; sb2 = gc.b * gc.b; sa = gc.a;
@@ -739,6 +1108,7 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
  * preserves preformatted rows. Explicit line breaks are always honored. */
 static float layout_advance(struct font *f,uint32_t cp,float size) {
     float canonical=(float)(uint16_t)(size*4.0f+.5f)/4.0f;
+    f=font_for_codepoint(f,cp);
     return glyph_advance(f,font_codepoint_to_glyph(f,cp))*canonical/f->units_per_em;
 }
 int font_layout_text(struct font *f,const char *text,float size,float width,
@@ -754,30 +1124,34 @@ int font_layout_text(struct font *f,const char *text,float size,float width,
     }
     float line_height=(f->ascent+f->descent+f->line_gap)*size/f->units_per_em;
     float x=0;int line=0,scanned=0;const char *p=text;
+    uint32_t prev=0;                       /* the glyph before: kerned against it */
     while(*p && scanned<8192) {
         if(*p=='\n' || *p=='\r') {
             char ch=*p++;scanned++;
             if(ch=='\r' && *p=='\n'){p++;scanned++;}
-            line++;x=0;continue;
+            line++;x=0;prev=0;continue;
         }
         if(*p==' ' || *p=='\t') {
-            x+=layout_advance(f,' ',size)*(*p=='\t'?4:1);p++;scanned++;continue;
+            x+=layout_advance(f,' ',size)*(*p=='\t'?4:1);p++;scanned++;prev=0;continue;
         }
-        const char *end=p;float word=0;int bytes=0;
+        const char *end=p;float word=0;int bytes=0;uint32_t wp=prev;
         while(*end && *end!=' ' && *end!='\t' && *end!='\n' && *end!='\r' && scanned+bytes<8192) {
             uint32_t cp;int n=font_utf8_decode(end,&cp);end+=n;bytes+=n;
-            word+=layout_advance(f,cp,size);
+            word+=font_pair_px(f,wp,cp,size)+layout_advance(f,cp,size);wp=cp;
         }
         if(width>0 && x>0 && x+word>width+.01f){line++;x=0;}
         if(!visit && (width<=0 || word<=width)) {
-            x+=word;p=end;scanned+=bytes;continue;
+            x+=word;p=end;scanned+=bytes;prev=wp;continue;
         }
         while(p<end) {
             uint32_t cp;int n=font_utf8_decode(p,&cp);p+=n;scanned+=n;
-            float advance=layout_advance(f,cp,size);
-            if(width>0 && x>0 && x+advance>width+.01f){line++;x=0;}
+            /* the pair's kerning before the fit test: a box measured to the
+             * kerned width must hold its last glyph, not wrap it away */
+            float advance=layout_advance(f,cp,size),kern=font_pair_px(f,prev,cp,size);
+            if(width>0 && x>0 && x+kern+advance>width+.01f){line++;x=0;prev=0;kern=0;}
+            x+=kern;
             if(visit)visit(context,cp,x,line*line_height);
-            x+=advance;
+            x+=advance;prev=cp;
         }
     }
     return line+1;
@@ -790,10 +1164,16 @@ struct text_draw_context {
 static void draw_positioned_glyph(void *opaque,uint32_t cp,float x,float y) {
     struct text_draw_context *c=opaque;
     if(c->height>0 && y>=c->height)return;
-    struct glyph_cache_entry *g=glyph_cache_lookup_or_rasterize(&g_atlas,c->font,cp,c->size);
-    if(g && g->atlas_w>0 && g->atlas_h>0)
-        blit_coverage_tinted(c->rt,(int)(c->x+x+g->bearing_x),(int)(c->y+y+c->ascent-g->bearing_y),
-            &g_atlas,g->atlas_x,g->atlas_y,g->atlas_w,g->atlas_h,c->color,c->opacity,
+    /* the pen to a quarter pixel (FONT_PHASES): its whole pixel, and the
+     * glyph rasterised at the fraction */
+    float pen=c->x+x;int ip=(int)floorf_(pen);
+    int phase=(int)((pen-(float)ip)*FONT_PHASES+.5f);
+    if(phase>=FONT_PHASES){ip++;phase=0;}
+    struct glyph_cache_entry *g=glyph_cache_lookup_phase(&g_atlas,font_for_codepoint(c->font,cp),cp,c->size,(uint32_t)phase);
+    const uint8_t *coverage=glyph_coverage(&g_atlas,g);
+    if(coverage && g->atlas_h>0)
+        blit_coverage_tinted(c->rt,ip+g->bearing_x,(int)(c->y+y+c->ascent-g->bearing_y),
+            coverage,g->atlas_w,g->atlas_h,c->color,c->opacity,
             c->x,c->y,c->width,c->height,c->paint);
 }
 static void backend_draw_text_impl(struct render_target *rt,float x,float y,const char *utf8,

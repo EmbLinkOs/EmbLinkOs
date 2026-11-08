@@ -15,6 +15,19 @@ static struct color mix(struct color a,struct color b,float f) {
 static float linear(float c){return c<=.04045f?c/12.92f:powf((c+.055f)/1.055f,2.4f);}
 static float luma(struct color c){return .2126f*linear(c.r)+.7152f*linear(c.g)+.0722f*linear(c.b);}
 static float ratio(struct color a,struct color b){float x=luma(a),y=luma(b);return x>y?(x+.05f)/(y+.05f):(y+.05f)/(x+.05f);}
+/* LEGIBLE ON EVERY GROUND IT IS SET ON: `c` moved toward `to` (the text
+ * colour: away from the grounds) a step at a time until it reads `need`:1
+ * against each of them -- WCAG's 4.5 for text, 3 for the edge a control is
+ * found by. A tone that already reads is left exactly as designed. */
+static struct color legible(struct color c,struct color to,const struct color *g,int n,float need) {
+    for(int k=0;k<48;k++) {
+        int ok=1;
+        for(int i=0;i<n && ok;i++)ok=ratio(c,g[i])>=need;
+        if(ok)break;
+        c=mix(c,to,.08f);
+    }
+    return c;
+}
 static void rebuild(void) {
     struct ui_theme *t=&g_current;*t=(struct ui_theme){0};
     struct color white=C(255,255,255),black=C(14,20,21);
@@ -45,21 +58,36 @@ static void rebuild(void) {
         t->border=mix(bg,g_dark?white:black,g_appearance.contrast==2?.60f:.32f);
         t->border_strong=t->border;
     }
+    /* every ground text is set on: the window, cards, input wells, the
+     * sidebar, the chrome */
+    const struct color grounds[]={t->bg,t->surface,t->surface_alt,t->sidebar,t->chrome};
+    const int ng=(int)(sizeof grounds/sizeof grounds[0]);
+    struct color away=g_dark?white:black;
+    t->text_secondary=legible(t->text_secondary,t->text,grounds,ng,4.5f);
+    t->text_tertiary=legible(t->text_tertiary,t->text,grounds,ng,4.5f);
+    /* a control's edge (a button, a field, a switch that is off) against
+     * what it stands on and what it holds */
+    t->border_strong=legible(t->border_strong,away,(const struct color[]){t->bg,t->surface,t->surface_alt},3,3.f);
     struct color accent=g_accent;
     for(int i=0;i<24;i++) {
         struct color soft=mix(bg,accent,g_dark?.21f:.13f);
-        if(ratio(accent,t->surface)>=4.5f && ratio(accent,bg)>=4.5f && ratio(accent,soft)>=4.5f)break;
+        int ok=ratio(accent,soft)>=4.5f;
+        for(int k=0;k<ng && ok;k++)ok=ratio(accent,grounds[k])>=4.5f;
+        if(ok)break;
         accent=mix(accent,t->text,.12f);
     }
     t->accent=accent;
     t->accent_hover=mix(accent,g_dark?white:black,.12f);
     t->accent_soft=mix(bg,accent,g_dark?.21f:.13f);
-    t->selection=mix(bg,accent,g_dark?.55f:.36f);
+    /* as strong a tint as still leaves the text on it readable */
+    float sel=g_dark?.55f:.36f;
+    t->selection=mix(bg,accent,sel);
+    while(sel>.12f && ratio(t->text,t->selection)<4.5f){sel-=.03f;t->selection=mix(bg,accent,sel);}
     float l=luma(accent);
     t->on_accent=(l+.05f)/.05f >= 1.05f/(l+.05f)?C(0,0,0):white;
-    t->success=g_dark?C(120,194,149):C(35,117,66);
-    t->warning=g_dark?C(229,183,102):C(145,88,17);
-    t->danger=g_dark?C(238,136,123):C(181,63,53);
+    t->success=legible(g_dark?C(120,194,149):C(35,117,66),t->text,grounds,ng,4.5f);
+    t->warning=legible(g_dark?C(229,183,102):C(145,88,17),t->text,grounds,ng,4.5f);
+    t->danger=legible(g_dark?C(238,136,123):C(181,63,53),t->text,grounds,ng,4.5f);
     float den=g_appearance.density==0?.85f:g_appearance.density==2?1.15f:1.f;
     t->sp1=4*den*g_scale;t->sp2=8*den*g_scale;t->sp3=12*den*g_scale;
     t->sp4=16*den*g_scale;t->sp5=24*den*g_scale;t->sp6=32*den*g_scale;t->sp7=48*den*g_scale;
@@ -79,6 +107,11 @@ static void rebuild(void) {
     t->shadow_sm=(struct ui_shadow_spec){0,1,3,{0,0,0,.08f*shadow}};
     t->shadow_md=(struct ui_shadow_spec){0,5,14,{0,0,0,(g_dark?.30f:.12f)*shadow}};
     t->shadow_lg=(struct ui_shadow_spec){0,10,26,{0,0,0,(g_dark?.40f:.18f)*shadow}};
+    t->shadow_lift=(struct ui_shadow_spec){0,4,12,t->shadow_md.color};
+    /* a light window under 55% black read as switched off: lighter there */
+    t->scrim=(struct color){0,0,0,g_dark?.55f:.38f};
+    t->toast_inset=62*g_scale;
+    t->scroll_step=40*g_scale;
     t->font_regular=g_regular;t->font_bold=g_bold;g_init=true;
 }
 const struct ui_theme *ui_theme(void){if(!g_init)rebuild();return &g_current;}

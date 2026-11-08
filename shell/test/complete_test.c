@@ -1,0 +1,150 @@
+/* ==========================================================================
+ * complete_test.c -- what Tab offers, on the host's own filesystem.
+ *
+ * A scratch directory holds the awkward names (a space, a leading digit, a
+ * hidden file, a directory); the completer is asked about lines a person
+ * would type and must offer exactly what the shell would then read as the
+ * name -- quoted where the lexer would split or misread it.
+ *
+ * Build: make shell-test. Exit code = number of failures.
+ * ========================================================================== */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE   /* mkdtemp */
+#endif
+#include "complete/complete.h"
+#include "complete/highlight.h"
+#include "eval/eval.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+static int g_fail = 0;
+#define CHECK(cond, name) do { \
+    if (cond) printf("  ok   %s\n", name); \
+    else      { printf("  FAIL %s (%s:%d)\n", name, __FILE__, __LINE__); g_fail++; } \
+} while (0)
+
+/* The executor is not in the host build; one defined command stands in. */
+size_t exec_user_command_count(void) { return 1; }
+const char *exec_user_command_name(size_t i) { return i == 0 ? "deploy" : NULL; }
+
+static struct edit_matches m;
+static struct scope top;
+
+static void ask(const char *line) {
+    for (size_t i = 0; i < m.n; i++) { free(m.items[i].insert); free(m.items[i].show); }
+    free(m.items);
+    memset(&m, 0, sizeof m);
+    shell_complete(&top, line, strlen(line), &m);
+}
+static bool offers(const char *insert) {
+    for (size_t i = 0; i < m.n; i++) if (!strcmp(m.items[i].insert, insert)) return true;
+    return false;
+}
+static void touch(const char *name) { FILE *f = fopen(name, "w"); if (f) fclose(f); }
+
+/* How each byte of `line` is drawn, as a letter: . the terminal's own, c a
+ * command (green), u unknown (red, bold), y yellow (reserved words, quoted
+ * text, redirections), e an escape (cyan), m magenta ($( and its )), p a path
+ * (underlined), # a comment. */
+static const char *paint(const char *line, bool done) {
+    static unsigned char style[256];
+    static char out[256];
+    size_t n = strlen(line);
+    memset(style, 0, sizeof style);
+    shell_highlight(&top, line, n, done, style);
+    for (size_t i = 0; i < n; i++)
+        out[i] = style[i] == EDIT_HL_DEFAULT ? '.' : style[i] == EDIT_HL_COMMAND ? 'c' : style[i] == EDIT_HL_UNKNOWN ? 'u'
+               : style[i] == EDIT_HL_QUOTED ? 'y' : style[i] == EDIT_HL_ESCAPE ? 'e' : style[i] == EDIT_HL_SUBSTITUTION ? 'm'
+               : style[i] == EDIT_HL_PATH ? 'p' : style[i] == EDIT_HL_COMMENT ? '#' : '?';
+    out[n] = '\0';
+    return out;
+}
+#define PAINTS(line, want, name) do { const char *got_ = paint(line, false); if (strcmp(got_, want)) printf("       %s\n  got  %s\n  want %s\n", line, got_, want); CHECK(!strcmp(got_, want), name); } while (0)
+
+int main(void) {
+    char dir[] = "/tmp/emblink-complete-XXXXXX";
+    if (!mkdtemp(dir) || chdir(dir) != 0) { puts("no scratch directory"); return 1; }
+    touch("alpha.txt");
+    mkdir("alpine", 0755);
+    touch("alpine/inside.c");
+    touch("my file.txt");
+    touch("2024-report.txt");
+    touch(".hidden");
+    scope_init(&top, NULL);
+    scope_bind(&top, "alpha", value_int(1));
+    scope_bind(&top, "args", value_list());
+
+    printf("files:\n");
+    ask("cat al");
+    CHECK(m.n == 2 && m.start == 4, "two names start with al; the word begins after 'cat '");
+    CHECK(offers("alpha.txt") && offers("alpine/"), "a file, and a directory with its slash");
+    CHECK(!strcmp(m.items[0].show, "alpha.txt") && m.items[1].dir, "sorted, and the directory marked as one");
+    ask("cat my");
+    CHECK(m.n == 1 && offers("\"my file.txt\""), "a name with a space is offered quoted");
+    ask("cat 20");
+    CHECK(offers("\"2024-report.txt\""), "so is a name the lexer would read as a number");
+    ask("cat \"my f");
+    CHECK(m.n == 1 && m.start == 4 && offers("\"my file.txt\""), "inside an open quote the whole quoted word completes");
+    ask("cat alpine/");
+    CHECK(m.n == 1 && offers("alpine/inside.c"), "into a directory");
+    ask("cat a");
+    CHECK(!offers(".hidden"), "hidden names stay hidden");
+    ask("cat .h");
+    CHECK(offers("\".hidden\""), "until the word asks for them");
+
+    printf("commands:\n");
+    ask("ec");
+    CHECK(offers("echo") && m.start == 0, "a builtin, where a command goes");
+    ask("exi");
+    CHECK(offers("exit"), "the REPL's own exit");
+    ask("ls | cou");
+    CHECK(offers("count") && m.start == 5, "after a pipe is a command position too");
+    ask("dep");
+    CHECK(offers("deploy"), "a command defined with def");
+    ask("echo dep");
+    CHECK(!offers("deploy"), "an argument is not a command position");
+    ask("if true { whe");
+    CHECK(offers("where"), "the start of a block is a command position");
+    ask("./al");
+    CHECK(offers("./alpha.txt") && offers("./alpine/"), "a path where a command goes completes as a path");
+
+    printf("variables:\n");
+    ask("echo $a");
+    CHECK(m.n == 2 && offers("$alpha") && offers("$args"), "$ completes the session's names");
+    ask("echo 'al");
+    CHECK(m.n == 0, "nothing inside single quotes");
+
+    printf("highlighting:\n");
+    PAINTS("echo hi | count", "cccc......ccccc", "builtins are commands, after a pipe too");
+    PAINTS("frob x; deploy; exit", "uuuu....cccccc..cccc", "an unknown name, a def, the REPL's exit");
+    PAINTS("if $x > 1 { echo yes } else { frob }", "yy........y.cccc.....y.yyyy.y.uuuu.y",
+           "keywords and braces; a block's first word is a command");
+    PAINTS("let n = $(count)", "yyy.....mmcccccm", "let, and a command in $( )");
+    PAINTS("for f in $files { echo $f }", "yyy.............y.cccc....y", "for (its `in` is plain, as in zsh)");
+    PAINTS("def greet(name) { echo hi }", "yyy.............y.cccc....y", "def");
+    PAINTS("echo hi out> alpha.txt", "cccc....yyyy.ppppppppp", "a redirection, and the file it names");
+    PAINTS("echo alpha.txt nofile alpine/", "cccc.ppppppppp........ppppppp", "files and directories that are there");
+    PAINTS("echo alp", "cccc.ppp", "a word on its way to a file's name, at the end");
+    CHECK(!strcmp(paint("echo alp", true), "cccc...."), "but not once the line is done");
+    PAINTS("echo alp next", "cccc.........", "nor before the end");
+    PAINTS("echo -alpha", "cccc.......", "an option is not a file");
+    PAINTS("echo 'it' \"a\\nb\"", "cccc.yyyy.yyeeyy", "quoted text, a double quote's escapes");
+    PAINTS("echo \"open", "cccc.yyyyy", "a quote not closed yet, to the end");
+    PAINTS("echo hi # note", "cccc....######", "a comment");
+    PAINTS("echo }", "cccc.u", "a brace that closes nothing");
+    PAINTS("./alpha.txt", "ccccccccccc", "a path to a file, where a command goes");
+    PAINTS("./alp", "ppppp", "on its way to one");
+    PAINTS("./nothing", "uuuuuuuuu", "a path to nothing");
+    PAINTS("$x | where size > 1", ".....ccccc.........", "a value, then a command");
+
+    scope_free(&top);
+    remove("alpine/inside.c"); rmdir("alpine");
+    remove("alpha.txt"); remove("my file.txt"); remove("2024-report.txt"); remove(".hidden");
+    if (chdir("/") == 0) rmdir(dir);
+    ask("");
+    printf(g_fail ? "complete: %d FAILED\n" : "complete: all passed\n", g_fail);
+    return g_fail;
+}

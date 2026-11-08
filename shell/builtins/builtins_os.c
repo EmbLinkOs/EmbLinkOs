@@ -104,6 +104,16 @@ void shell_path_resolve(const char *in, char *out, size_t cap) {
     path_resolve(in, out, cap);
 }
 
+int shell_list_dir(const char *path, void (*each)(void *ctx, const char *name, bool dir), void *ctx) {
+    enum { LIST_MAX = 512 };
+    struct embk_dirent *ents = (struct embk_dirent *)malloc(LIST_MAX * sizeof *ents);
+    if (!ents) return -1;
+    int64_t n = embk_readdir(path, ents, LIST_MAX);
+    for (int64_t i = 0; i < n; i++) each(ctx, ents[i].name, ents[i].type == EMBK_DT_DIR);
+    free(ents);
+    return n < 0 ? -1 : (int)n;
+}
+
 /* A whole file, as a string: what `cat`, `source` and `in<` all read. */
 #define READ_FILE_MAX (16u << 20)
 struct value shell_read_file(const char *path, const char *who) {
@@ -1099,11 +1109,13 @@ static struct value bi_sleep(const struct command *cmd, struct value input,
     value_free(&msv);
     if (ms < 0) return value_error("sleep cannot go backwards");
 
-    uint64_t t0 = embk_uptime_ms();
-    int rc = embk_sleep_ms((uint64_t)ms);
-    uint64_t took = embk_uptime_ms() - t0;
-
-    if (rc < 0) return value_error("sleep was interrupted");
+    /* In slices, so ^C ends it: the shell, not a child, is the one sleeping. */
+    uint64_t t0 = embk_uptime_ms(), took = 0;
+    while (took < (uint64_t)ms) {
+        uint64_t left = (uint64_t)ms - took;
+        if (embk_sleep_ms(left < 50 ? left : 50) < 0 || exec_interrupt_poll()) return value_error("sleep was interrupted");
+        took = embk_uptime_ms() - t0;
+    }
 
     struct value out = value_record();
     value_record_set(&out, "ms",   value_int(ms));
@@ -1142,7 +1154,7 @@ static struct value bi_clear(const struct command *cmd, struct value input,
     (void)cmd; (void)env;
     value_free(&input);
     const char *term=getenv("TERM");
-    if (term && !strncmp(term,"emlink",6)) write(1,"\033[2J\033[H\033[3J",11);
+    if (term && term[0] && strcmp(term,"dumb")) write(1,"\033[2J\033[H\033[3J",11);
     else write(1,"\f",1);
     return value_null();
 }
@@ -1150,31 +1162,36 @@ static struct value bi_clear(const struct command *cmd, struct value input,
 /* -------------------------------------------------------------------------
  * The OS registry (builtin_lookup falls through to this).
  * ------------------------------------------------------------------------- */
+static const struct { const char *name; builtin_fn fn; } g_os[] = {
+    { "ls",     bi_ls     }, { "cat",    bi_cat    },
+    { "cd",     bi_cd     }, { "pwd",    bi_pwd    },
+    { "mkdir",  bi_mkdir  }, { "rmdir",  bi_rmdir  },
+    { "touch",  bi_touch  },
+    { "rm",     bi_rm     }, { "cp",     bi_cp     },
+    { "mv",     bi_mv     }, { "save",   bi_save   },
+    { "ps",     bi_ps     }, { "kill",   bi_kill   },
+    { "env",    bi_env    },
+    { "uptime", bi_uptime }, { "date",   bi_date   },
+    { "sleep",  bi_sleep  },
+    { "whoami", bi_whoami }, { "hostname", bi_hostname },
+    { "session", bi_session },
+    { "history", bi_history }, { "which", bi_which },
+    { "source",  bi_source  },
+    { "clip",    bi_clip    },
+    { "clear",  bi_clear  },
+    { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
+    { "bg",     bi_bg     }, { "stop",   bi_stop   },
+    { "glob",   bi_glob   },
+    { "ln",     bi_ln     }, { "readlink", bi_readlink },
+    { "link",   bi_link   },
+};
+
 builtin_fn builtin_lookup_os(const char *name) {
-    static const struct { const char *name; builtin_fn fn; } tab[] = {
-        { "ls",     bi_ls     }, { "cat",    bi_cat    },
-        { "cd",     bi_cd     }, { "pwd",    bi_pwd    },
-        { "mkdir",  bi_mkdir  }, { "rmdir",  bi_rmdir  },
-        { "touch",  bi_touch  },
-        { "rm",     bi_rm     }, { "cp",     bi_cp     },
-        { "mv",     bi_mv     }, { "save",   bi_save   },
-        { "ps",     bi_ps     }, { "kill",   bi_kill   },
-        { "env",    bi_env    },
-        { "uptime", bi_uptime }, { "date",   bi_date   },
-        { "sleep",  bi_sleep  },
-        { "whoami", bi_whoami }, { "hostname", bi_hostname },
-        { "session", bi_session },
-        { "history", bi_history }, { "which", bi_which },
-        { "source",  bi_source  },
-        { "clip",    bi_clip    },
-        { "clear",  bi_clear  },
-        { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
-        { "bg",     bi_bg     }, { "stop",   bi_stop   },
-        { "glob",   bi_glob   },
-        { "ln",     bi_ln     }, { "readlink", bi_readlink },
-        { "link",   bi_link   },
-    };
-    for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
-        if (strcmp(tab[i].name, name) == 0) return tab[i].fn;
+    for (size_t i = 0; i < sizeof g_os / sizeof g_os[0]; i++)
+        if (strcmp(g_os[i].name, name) == 0) return g_os[i].fn;
     return NULL;
+}
+
+const char *builtin_os_name(size_t i) {
+    return i < sizeof g_os / sizeof g_os[0] ? g_os[i].name : NULL;
 }

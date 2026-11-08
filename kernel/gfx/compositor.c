@@ -9,6 +9,7 @@
 #include "display/layout.h"
 #include "drivers/video/console.h"
 #include "drivers/input/mouse.h"
+#include "drivers/input/gesture.h"
 #include "drivers/input/keyboard.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* struct process (shared_next_va, pml4_phys) for zero-copy */
@@ -16,8 +17,19 @@
 #include "mm/vmm.h"            /* vmm_kmap_pages / vmm_map_in for shared windows */
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
+#include "gfx/backdrop.h"      /* the blur behind a window that shows through */
 #include "include/errno.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: the window-motion clock */
+#include "gfx/comp_stats.h"     /* what each compose costs, and why it was asked */
+#include "gfx/ui_events.h"      /* telling waiting applications something changed */
+#include "gfx/frameclock.h"     /* which rate to compose at */
+#include "gfx/pix.h"            /* vibrancy: the kept blur, saturated */
+#include "display/control.h"    /* the display's own refresh */
+#if defined(__x86_64__)
+#include "power/policy.h"       /* the Efficiency profile caps the rate */
+#endif
+#include "../../ui/motion/spring.h"   /* window motion: the toolkit's springs */
+#include "../../user/lib/embk_layer.h" /* layers: pieces of a window the compositor moves */
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -30,8 +42,21 @@ struct comp_window {
     uint32_t  cw, ch;       /* content dimensions in px                       */
     int       z;            /* z-order: larger is nearer the front            */
     int       visible;
+    /* OPENING, or coming back out of the dock: hidden behind its ghost while
+     * it moves (visible 0), but already where a hand aims -- clicks and the
+     * keyboard go to it. A window that took a third of a second to accept the
+     * click that opened it would lose the next one. */
+    int       arriving;
+    /* CHANGING WORKSPACE: drawn as itself, shadow and all, where its ghost is
+     * (an ANIM_SLIDE_*), on the way out of the screen or into it. */
+    int       sliding;
+    /* RESIZED A LOT AT ONCE (zoom_hold): what it looked like is held where it
+     * was, as a ghost, until the app has drawn at the new size. */
+    int       zoom_wait;
+    uint64_t  zoom_since_ms;
     int       menu_keyboard; /* temporary keyboard owner while a bar menu is open */
     int       desktop;      /* 1 = chromeless full-screen back layer (the home) */
+    int       resizable;    /* the app tiles it, dragged against an edge (tile preview) */
     int       chromeless;   /* 1 = floating window with NO kernel chrome: the app
                              * draws its own bar/close (EmUI V4 Window/WindowBar)
                              * and moves itself via win_move. Unlike `desktop` it
@@ -106,13 +131,44 @@ struct comp_window {
     uint8_t   pend_head;          /* ring read index */
     uint8_t   pend_count;         /* how many presses are waiting */
     uint8_t   pend_phase;         /* 0 = the press replays next, 1 = the release */
+    /* WHAT THE APP LAST SAW: whether the last win_input poll handed it the left
+     * button down. A press replayed to an app that still thinks the button is
+     * held is no edge at all, so it gets the release first -- see the replay. */
+    uint8_t   sent_left;
+    /* A RIGHT PRESS, latched as the left ones are: the level alone lost a
+     * right-click an app did not poll during (busy, or a slow machine) --
+     * Files' context menu, under emulation and under KVM. One is enough: a
+     * context menu is not double-clicked. */
+    uint8_t   pr_pending, pr_phase, sent_right;
+    struct comp_click pr;
+    /* A WINDOW THAT SHOWS THROUGH (compositor_win_set_material): an ordinary
+     * app window -- its workspace, shadow and place in the layout -- whose
+     * pixels are composited by their own alpha, over what is behind it
+     * blurred by `mat_blur`. The blur is KEPT: bd_sharp is what was behind
+     * the window when it was last painted and bd_blur that blurred, so a
+     * repaint blurs again only where the backdrop changed, reading past the
+     * change so there is no seam (backdrop.h). bd_v* is the part of the
+     * window that was on the screen, the blur's domain. */
+    uint8_t   mat_alpha, mat_blur;
+    uint32_t *bd_sharp, *bd_blur;
+    uint32_t  bd_w, bd_h;
+    int       bd_vx0, bd_vy0, bd_vx1, bd_vy1;
+    uint8_t   bd_valid;
 
     /* A DROP LANDED HERE. Set when the button comes up over this window while
      * a drag is in flight, and taken once by the owning process. The position
      * is content-local, like every other pointer coordinate an app sees. */
     uint8_t   pend_drop;
     int16_t   drop_lx, drop_ly;
+    /* WHERE THE WINDOW IS DRAGGED BY (compositor_win_drag_regions): content-
+     * local rects -- a title bar's empty middle -- that the compositor drags
+     * the window by itself, in the frame the pointer moves, without asking the
+     * app. A window whose app has hung still moves. */
+#define COMP_DRAG_REGIONS 4
+    uint8_t   drag_n;
+    int16_t   drag_r[COMP_DRAG_REGIONS][4];
     char      title[COMP_TITLE_MAX + 1];
+    char      app[24];      /* the program's basename, for its dock tile */
     uint32_t *content;      /* cw*ch, 0xAARRGGBB premultiplied. For a copy      */
                             /* window this is a kmalloc'd kernel buffer the      */
                             /* client presents INTO; for a shared window it's a  */
@@ -133,6 +189,78 @@ struct comp_window {
 
 static struct comp_window g_wins[COMP_MAX_WINDOWS];
 static spinlock_t g_comp_lock = SPINLOCK_INIT;
+/* WHY the compose in progress was asked for, charged to it in comp_stats.
+ * Set by the entry points that take the lock for a reason (a present, a move,
+ * the pointer, window motion, the overlay) and put back to OTHER by every
+ * unlock, so a cause can never leak into the next caller's composes. */
+static unsigned g_src = EMBK_COMP_SRC_OTHER;
+/* Pixels the compose in progress repainted, counted where the repaint is
+ * finally decided (after the growth for corners and materials). */
+static uint64_t g_paint_px;
+
+/* ---- the frame clock -------------------------------------------------------
+ *
+ * Composition used to happen where it was asked for: a present composed its
+ * rect inside the syscall, a move composed inside win_move, the pointer
+ * composed on every pass of the kernel loop -- which an interrupt wakes, so a
+ * mouse sending a thousand packets a second asked for a thousand composes. Two
+ * windows presenting in the same 16 ms composed twice; nothing anywhere knew
+ * what a frame was.
+ *
+ * Now the asking only RECORDS: paint_region adds the rect to the damage list
+ * (merged with any rect it touches, at most DMG_MAX of them), and the frame
+ * thread (kcompositor, comp_thread_main) composes all of it once per frame --
+ * the pointer, window motion and the damage, at most once per period. A
+ * desktop that has been still composes the moment something changes (on
+ * demand); one in motion composes on the beat.
+ *
+ * Waking it is the one subtle part. The scheduler lock is taken by the reap
+ * path BEFORE this lock (compositor_reap_pid), so nothing may take it while
+ * holding g_comp_lock: comp_unlock wakes the thread after the release, when
+ * the critical section left damage behind. Until the thread runs -- early
+ * boot, or if it could not be made -- paint_region composes inline, as it
+ * always did. */
+#define DMG_MAX 16
+struct dmg_rect { int x0, y0, x1, y1; unsigned src; };
+static struct dmg_rect g_dmg[DMG_MAX];
+static int g_ndmg;
+static int g_need_kick;                     /* this critical section left damage */
+static struct thread *volatile g_comp_thread;   /* the frame clock, once it runs */
+static struct wait_queue g_comp_wq;         /* where it waits for work */
+static volatile int g_kicked;               /* work arrived since it last looked */
+/* This critical section changed what an application would answer -- where the
+ * pointer is over whom, focus, a window asked to close: post a UI event at the
+ * unlock (ui_events.h). Set only under the lock, like g_need_kick, so the reap
+ * path's unlock under the scheduler lock never finds it set. */
+static int g_post_ui;
+/* SYSTEM MOTION -- the pointer, a drag, window motion, the wheel -- until this
+ * uptime (ns): what earns the display's top rate (frameclock.h), held a
+ * moment past the last of it so a rate does not flap between two movements. */
+#define MOTION_HOLD_NS 500000000ull
+static volatile uint64_t g_motion_until_ns;
+static void motion_now(void) { __atomic_store_n(&g_motion_until_ns, time_get_ns() + MOTION_HOLD_NS, __ATOMIC_RELAXED); }
+
+/* Tell the frame thread there is work. Any context but under g_comp_lock --
+ * the mouse interrupt included. A kick is a hint, not a payload: the frame
+ * reads the actual state, so two kicks before it runs are one frame. */
+static void comp_wake(void) {
+    struct thread *t = g_comp_thread;
+    if (!t) return;
+    __atomic_store_n(&g_kicked, 1, __ATOMIC_RELEASE);
+    sched_lock();
+    wait_queue_wake_one(&g_comp_wq);
+    sched_unlock();
+}
+
+static inline void comp_unlock(void) {
+    int kick = g_need_kick, post = g_post_ui;
+    g_need_kick = 0; g_post_ui = 0;
+    g_src = EMBK_COMP_SRC_OTHER;
+    spin_unlock(&g_comp_lock);
+    /* the frame thread composes its own damage in the frame that made it */
+    if (kick && current_thread != g_comp_thread) comp_wake();
+    if (post) ui_event_post();
+}
 static uint32_t   g_next_id = 1;
 /* z bands: desktop = 0; widgets in [1, WIDGET_Z_TOP); app windows above it. */
 #define WIDGET_Z_TOP 1000000
@@ -152,11 +280,13 @@ static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window
 
 static struct embk_desktop g_desktop={.version=1,.flags=EMBK_DESKTOP_SNAP|EMBK_DESKTOP_WRAP,
     .top=34,.bottom=84,.background=0x202524,.text=0xecf0ec,.accent=0x71b5aa,
-    .radius=8,.shadows=1,.workspace_count=4,.blur=6,.opacity=209,.danger=0xee887b,.secondary=0x94a29a};
+    .radius=8,.shadows=1,.workspace_count=4,.blur=12,.opacity=166,.danger=0xee887b,.secondary=0x94a29a};
 static int g_desktop_owner;
 static int on_workspace(const struct comp_window *w) {
     return w->desktop || w->widget || w->translucent || w->workspace==g_desktop.workspace;
 }
+/* On the screen: its space is the one shown, or it is sliding across. */
+static int win_shown(const struct comp_window *w) { return on_workspace(w) || w->sliding; }
 
 /* ---- pointer state (cursor + click-to-focus + title-bar drag) ----------- */
 #define CURSOR_LAYER_W 28
@@ -172,12 +302,39 @@ static int on_workspace(const struct comp_window *w) {
  * before it was removed for looking like a screenshot artefact. Depth is the
  * signal: the front window casts a deeper, wider shadow than the ones behind
  * it, exactly as stacked paper does. */
-#define SHADOW_W_FOCUS  16  /* band width, focused                          */
-#define SHADOW_W_IDLE   11  /* ...and unfocused: shallower, still grounded  */
-#define SHADOW_A_FOCUS  74 /* peak alpha at the window edge (0-255)        */
-#define SHADOW_A_IDLE    38
-#define SHADOW_DY        3  /* cast DOWNWARD: light comes from above        */
-#define SHADOW_PAD (SHADOW_W_FOCUS + SHADOW_DY + 2)   /* repaint growth     */
+/* TWO LAYERS, as a lit object casts them: a KEY shadow, wide, soft and well
+ * below the window (the light is above and in front), and an AMBIENT one,
+ * tight around the edge where the window meets the surface. One band alone is
+ * either a halo or a smudge. Rounded with the window's corners -- the band
+ * this replaces was square-cornered, a rectangle's shadow under a rounded
+ * window. The front window floats higher: a deeper, wider key. */
+static const struct fb_shadow_layer SHADOW_FOCUS[2] = { { 14, 40, 64 }, { 1, 6, 50 } };
+static const struct fb_shadow_layer SHADOW_IDLE[2]  = { {  8, 26, 40 }, { 1, 4, 34 } };
+#define SHADOW_PAD (40 + 14 + 2)   /* repaint growth: the widest key's reach */
+
+/* THE EFFECTS TIER: what the compositor can afford to draw. Full is the
+ * material as designed -- a window that shows through blurs what is behind
+ * it, every window casts both of its shadow layers. Reduced is what keeps
+ * the frame rate when frames run long: what shows through is a flat tint of
+ * the desktop's own colour (no blur to compute again), and a shadow is its
+ * tight ambient layer alone (the wide key is most of a shadow's pixels).
+ * Chosen per frame by comp_frame from what frames cost, unless the person
+ * holds it (Settings > Appearance > Effects; EMBK_DESKTOP_EFFECTS_*). */
+enum { FX_FULL = 0, FX_REDUCED };
+static int g_fx;                                  /* the tier being drawn */
+static int fx_reduced(void) { return g_fx == FX_REDUCED; }
+
+/* this window's layers, at the desktop's shadow strength (0 none, 2 strong) */
+static int shadow_layers(int focused, struct fb_shadow_layer out[2]) {
+    const struct fb_shadow_layer *s = focused ? SHADOW_FOCUS : SHADOW_IDLE;
+    int n = 0;
+    for (int i = fx_reduced() ? 1 : 0; i < 2; i++) {
+        out[n] = s[i];
+        out[n].peak = s[i].peak * (g_desktop.shadows == 2 ? 3u : 2u) / 2u;
+        n++;
+    }
+    return g_desktop.shadows ? n : 0;
+}
 #define WORK_TOP ((int)g_desktop.top)         /* universal system/status bar */
 #define WORK_BOTTOM ((int)g_desktop.bottom)      /* desktop taskbar */
 
@@ -195,12 +352,15 @@ static void outputs_whole(const fb_info_t *fi)
 }
 
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
+static int      g_hw_cursor;       /* the display's cursor plane shows the pointer */
 static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
 static int      g_cursor_under_valid;
 static uint32_t g_prev_buttons;
 static int g_buttons_suppressed; /* ownership/space changes wait for physical release */
 static void reset_pointer_capture_locked(void);
 static int      g_dragging;        /* a title-bar drag is in progress          */
+static int      g_drag_region;     /* ...by a region the app declared: tell it  */
+static int      g_drag_moved;      /*    when it ends (EMBK_WIN_ACTION_MOVED)   */
 static uint32_t g_drag_id;         /* which window is being dragged             */
 static int      g_drag_dx, g_drag_dy;  /* pointer offset within the window frame */
 
@@ -270,7 +430,6 @@ static void *g_canvas_px;
 static uint32_t g_aurora_img;
 static uint32_t g_cursor_img;
 static int g_cursor_img_stale = 1;
-static uint32_t g_snap_img;
 static uint32_t g_gpu_doomed[64];
 static unsigned g_gpu_ndoomed;
 
@@ -388,6 +547,104 @@ static int imin(int a, int b) { return a < b ? a : b; }
 static int win_shadows(const struct comp_window *w) {
     return w->used && !w->desktop && !w->widget && !w->translucent;
 }
+/* ---- LAYERS (user/lib/embk_layer.h) ---------------------------------------
+ *
+ * A layer is a picture an application painted once, attached to one of its
+ * windows, which the compositor places, fades and scales on springs of its
+ * own -- in the frame thread, at the display's rate, with no help from the
+ * application. It stands in its window's place in the stacking order, just
+ * above the window's content, and may reach outside the window's frame.
+ *
+ * Its properties are springs in Q16.16 like a ghost's: x and y in pixels from
+ * the window's content origin, scale in thousandths, opacity 0..255. Its
+ * pixels are the compositor's pages, mapped into the client as a shared
+ * window's are; a layer the application is done with is PARKED with them, and
+ * the window's next layer that fits takes them back -- a menu opened a
+ * hundred times maps its pages once. */
+#define LAYERS_MAX          64
+#define LAYER_PARKED_PER_WIN 4
+#define LAYER_WIN_BYTES     (8u << 20)    /* one window's layers, parked ones too */
+#define LAYER_ALL_BYTES     (32u << 20)   /* everyone's */
+struct comp_layer {
+    int       used, parked;
+    uint32_t  id, win_id;
+    int       pid;
+    uint32_t  w, h;                       /* the picture, w x h, premultiplied */
+    uint64_t *phys; uint32_t npages;
+    uint64_t  kview, client_va, client_pml4;
+    uint32_t *px;
+    int       presented;
+    struct spring x, y, scale, opacity;
+    uint16_t  ax, ay;                     /* the anchor, thousandths of the size */
+    uint8_t   radius, material, flags;
+    int16_t   mat_x, mat_y; uint16_t mat_w, mat_h;   /* its material's box in it (0 w: all) */
+    int8_t    sh_dy; uint8_t sh_blur, sh_alpha;
+    int       destroy_at_rest;
+    int       last[4], have_last;         /* the rect it stained last frame */
+    uint32_t  gimg;                       /* its GPU image */
+    struct embk_layer_op pend[4]; int npend;   /* held for the next present */
+    uint32_t  seq;                        /* when it was made: a window's layers stack in this order */
+    /* ITS FROST, KEPT (CPU, at rest): what was behind its material box and
+     * that blurred, so a frame that changes nothing behind it -- a hover
+     * moving down the menu -- lays the blur back instead of making it */
+    uint32_t *fr_sharp, *fr_blur;
+    int       fr_x, fr_y, fr_w, fr_h, fr_valid;
+};
+static uint32_t g_layer_seq;
+
+static struct comp_layer g_layers[LAYERS_MAX];
+static uint32_t g_layer_next_id = 1;
+static int g_layers_moving;               /* layers whose springs are still going */
+
+/* this window's live layers, oldest first -- the order they stack in (slots
+ * are reused, so their order in g_layers says nothing) */
+static int layers_of(uint32_t win_id, int *idx) {
+    int n = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || L->win_id != win_id) continue;
+        int j = n++;
+        while (j > 0 && g_layers[idx[j - 1]].seq > L->seq) { idx[j] = idx[j - 1]; j--; }
+        idx[j] = i;
+    }
+    return n;
+}
+
+/* Where a layer stands on screen now, for window `w` (its content origin as
+ * w->x, w->y say -- a slide's offset included while one is drawn), and how
+ * opaque. r = x, y, w, h. */
+static void layer_geom(const struct comp_layer *L, const struct comp_window *w, int r[4], int *alpha) {
+    int s = spring_px(&L->scale);
+    if (s < 10) s = 10;
+    if (s > 1000) s = 1000;
+    /* a fill stands as large as it says, from its one pixel */
+    int64_t lw = (L->flags & EMBK_LF_FILL) && L->mat_w ? L->mat_w : L->w;
+    int64_t lh = (L->flags & EMBK_LF_FILL) && L->mat_h ? L->mat_h : L->h;
+    int sw = (int)(lw * s / 1000), sh = (int)(lh * s / 1000);
+    int ox = w->x, oy = w->y + win_titlebar_h(w);
+    r[0] = ox + spring_px(&L->x) + (int)((lw - sw) * L->ax / 1000);
+    r[1] = oy + spring_px(&L->y) + (int)((lh - sh) * L->ay / 1000);
+    r[2] = sw; r[3] = sh;
+    int a = spring_px(&L->opacity);
+    *alpha = a < 0 ? 0 : a > 255 ? 255 : a;
+}
+/* Where its material is on screen: its box (the glass panel within the
+ * picture), scaled with it. */
+static void layer_mat_rect(const struct comp_layer *L, const int r[4], int m[4]) {
+    if (!L->mat_w || !L->mat_h || !L->w || !L->h || (L->flags & EMBK_LF_FILL)) { m[0] = r[0]; m[1] = r[1]; m[2] = r[2]; m[3] = r[3]; return; }
+    m[0] = r[0] + (int)((int64_t)L->mat_x * r[2] / (int64_t)L->w);
+    m[1] = r[1] + (int)((int64_t)L->mat_y * r[3] / (int64_t)L->h);
+    m[2] = (int)((int64_t)L->mat_w * r[2] / (int64_t)L->w);
+    m[3] = (int)((int64_t)L->mat_h * r[3] / (int64_t)L->h);
+}
+/* ...and all it stains there: its shadow too */
+static void layer_extent(const struct comp_layer *L, const struct comp_window *w,
+                         int *x0, int *y0, int *x1, int *y1) {
+    int r[4], a; layer_geom(L, w, r, &a);
+    int pad = L->sh_alpha && L->sh_blur ? L->sh_blur + (L->sh_dy < 0 ? -L->sh_dy : L->sh_dy) + 2 : 1;
+    *x0 = r[0] - pad; *y0 = r[1] - pad; *x1 = r[0] + r[2] + pad; *y1 = r[1] + r[3] + pad;
+}
+
 /* The rect a repaint must cover for a window: its frame, GROWN by the glow band
  * for glow windows so the halo is drawn / erased with the window (else it trails
  * on move/focus-change). */
@@ -399,6 +656,16 @@ static void win_repaint_rect(const struct comp_window *w,
     if (win_shadows(w)) {
         *x0 -= SHADOW_PAD; *y0 -= SHADOW_PAD;
         *x1 += SHADOW_PAD; *y1 += SHADOW_PAD;
+    }
+    /* and its layers, which may reach past it: they move with it */
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented || L->win_id != w->id) continue;
+        int a, b, c, d; layer_extent(L, w, &a, &b, &c, &d);
+        if (a < *x0) *x0 = a;
+        if (b < *y0) *y0 = b;
+        if (c > *x1) *x1 = c;
+        if (d > *y1) *y1 = d;
     }
 }
 
@@ -425,10 +692,13 @@ static int top_z(void) {
     return z;
 }
 
+/* There for input: shown, or arriving (see comp_window). */
+static int win_present(const struct comp_window *w) { return w->visible || w->arriving; }
+
 static struct comp_window *front_window(void) {
     struct comp_window *top = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+        if (!g_wins[i].used || !win_present(&g_wins[i]) || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
         if (!top || g_wins[i].z > top->z) top = &g_wins[i];
     }
     return top;
@@ -438,18 +708,25 @@ static struct comp_window *front_app_window(void) {
     struct comp_window *front=0;
     for(int i=0;i<COMP_MAX_WINDOWS;i++) {
         struct comp_window *w=&g_wins[i];
-        if(!w->used || !w->visible || w->desktop || w->widget || w->translucent ||
+        if(!w->used || !win_present(w) || w->desktop || w->widget || w->translucent ||
            !on_workspace(w) || !session_ui_allowed(w->pid))continue;
         if(!front || w->z>front->z)front=w;
     }
     return front;
 }
 
-/* front-most window whose frame contains screen (x,y), or NULL. */
+static int layer_hit(const struct comp_window *w, int x, int y);   /* fwd */
+
+/* front-most window whose frame contains screen (x,y) -- or one of whose
+ * layers that takes the pointer is opaque there -- or NULL. */
 static struct comp_window *topmost_at(int x, int y) {
     struct comp_window *best = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+        if (!g_wins[i].used || !win_present(&g_wins[i]) || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+        if (layer_hit(&g_wins[i], x, y)) {
+            if (!best || g_wins[i].z > best->z) best = &g_wins[i];
+            continue;
+        }
         int fx0, fy0, fx1, fy1; win_frame_rect(&g_wins[i], &fx0, &fy0, &fx1, &fy1);
         if(x>=fx0 && x<fx1 && y>=fy0 && y<fy1) {
             struct comp_window *w=&g_wins[i];
@@ -474,7 +751,7 @@ uint32_t compositor_focused_pid(void) {
     struct comp_window *best = 0, *desk = 0, *menu = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || !w->visible || (!session_ui_allowed(w->pid) || !on_workspace(w))) continue;
+        if (!w->used || !win_present(w) || (!session_ui_allowed(w->pid) || !on_workspace(w))) continue;
         if (w->desktop) { desk = w; continue; }     /* the fallback owner */
         if (w->translucent && w->menu_keyboard) {
             if (!menu || w->z > menu->z) menu = w;
@@ -494,7 +771,7 @@ uint32_t compositor_focused_pid(void) {
      * input. It must outrank the application it visibly covers. */
     if(desk && (!best || desk->z>best->z))best=desk;
     if (best) pid = (uint32_t)best->pid;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return pid;
 }
 
@@ -561,29 +838,27 @@ struct corner_box {
 static struct corner_box g_corner[4];
 static int g_corner_n;
 
-static uint32_t isqrt32(uint32_t x) {
-    uint32_t r = 0, b = 1u << 30;
-    while (b > x) b >>= 2;
-    while (b) {
-        if (x >= r + b) { x -= r + b; r = (r >> 1) + b; }
-        else r >>= 1;
-        b >>= 2;
-    }
-    return r;
-}
 
-/* The four corner boxes of a window's frame, and their arc centres. */
-static int corner_boxes(const struct comp_window *w, int bx[4], int by[4],
-                        int cx[4], int cy[4]) {
-    int fx0, fy0, fx1, fy1;
-    win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
-    const int r = WIN_RADIUS;
+/* The four corner boxes of a frame, and their arc centres. */
+/* A radius other than the windows' for the next save and carve (a layer's);
+ * 0: the windows'. At most WIN_R_MAX, as the saved boxes are. */
+static int g_corner_r_override;
+#define CORNER_R (g_corner_r_override ? g_corner_r_override : WIN_RADIUS)
+static int corner_boxes_at(int fx0, int fy0, int fx1, int fy1, int bx[4], int by[4],
+                           int cx[4], int cy[4]) {
+    const int r = CORNER_R;
     if (fx1 - fx0 < 2 * r || fy1 - fy0 < 2 * r) return 0;  /* too small to round */
     bx[0] = fx0;     by[0] = fy0;     bx[1] = fx1 - r; by[1] = fy0;
     bx[2] = fx0;     by[2] = fy1 - r; bx[3] = fx1 - r; by[3] = fy1 - r;
     cx[0] = fx0 + r; cy[0] = fy0 + r; cx[1] = fx1 - r; cy[1] = fy0 + r;
     cx[2] = fx0 + r; cy[2] = fy1 - r; cx[3] = fx1 - r; cy[3] = fy1 - r;
     return 1;
+}
+static int corner_boxes(const struct comp_window *w, int bx[4], int by[4],
+                        int cx[4], int cy[4]) {
+    int fx0, fy0, fx1, fy1;
+    win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+    return corner_boxes_at(fx0, fy0, fx1, fy1, bx, by, cx, cy);
 }
 
 /* A corner must never be recomposed from a PARTIAL backdrop, or the carve eats
@@ -595,12 +870,12 @@ static int corner_boxes(const struct comp_window *w, int bx[4], int by[4],
 static void region_grow_corners(int *rx0, int *ry0, int *rx1, int *ry1);
 
 /* Stash the backdrop under the four corner boxes, before the window paints. */
-static void corners_save(const struct comp_window *w,
-                         int rx0, int ry0, int rx1, int ry1) {
+static void corners_save_at(int fx0, int fy0, int fx1, int fy1,
+                            int rx0, int ry0, int rx1, int ry1) {
     g_corner_n = 0;
-    const int r = WIN_RADIUS;
+    const int r = CORNER_R;
     int ox[4], oy[4], cx[4], cy[4];
-    if (!corner_boxes(w, ox, oy, cx, cy)) return;
+    if (!corner_boxes_at(fx0, fy0, fx1, fy1, ox, oy, cx, cy)) return;
 
     for (int i = 0; i < 4; i++) {
         struct corner_box *c = &g_corner[g_corner_n];
@@ -616,14 +891,18 @@ static void corners_save(const struct comp_window *w,
     }
 }
 
-/* Blend the saved backdrop back over the painted window, by arc coverage. */
-static void corners_carve(const struct comp_window *w, int focused) {
-    const int r = WIN_RADIUS;
+static void corners_save(const struct comp_window *w,
+                         int rx0, int ry0, int rx1, int ry1) {
+    int fx0, fy0, fx1, fy1;
+    win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+    corners_save_at(fx0, fy0, fx1, fy1, rx0, ry0, rx1, ry1);
+}
+
+/* Blend the saved backdrop back over what was painted, by arc coverage --
+ * tracing a border ring of `bcol` along the arc when `has_border`. */
+static void corners_carve_ring(int has_border, fb_color_t bcol) {
+    const int r = CORNER_R;
     const int rr8 = (r * 8) * (r * 8);          /* radius^2 in eighth-pixels  */
-    int has_border = (!w->desktop && !w->chromeless);
-    fb_color_t bcol = focused?g_desktop.accent:g_desktop.text;
-    int sw = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-    int sa = g_desktop.shadows?(focused?SHADOW_A_FOCUS:SHADOW_A_IDLE)*(g_desktop.shadows==2?3:2)/2:0;
 
     for (int i = 0; i < g_corner_n; i++) {
         struct corner_box *c = &g_corner[i];
@@ -641,22 +920,13 @@ static void corners_carve(const struct comp_window *w, int focused) {
                 }
                 if (cov == 16) continue;              /* untouched interior */
 
+                /* the backdrop, saved after the shadow was drawn -- which
+                 * reaches under the arc (fb_shadow_layers), so it is carried
+                 * around the curve already */
                 uint32_t bak = c->px[(y - c->y0) * r + (x - c->x0)];
                 uint32_t cur = fb_get_pixel((uint32_t)x, (uint32_t)y);
                 int br = (int)((bak >> 16) & 255), bg = (int)((bak >> 8) & 255),
                     bb = (int)(bak & 255);
-
-                /* carry the drop shadow AROUND the arc: outside the curve this
-                 * pixel is no longer window, so it owes the same darkening its
-                 * neighbours outside the frame already got. */
-                int hx = (x - c->cx) * 2 + 1, hy = (y - c->cy) * 2 + 1;
-                int dout = (int)isqrt32((uint32_t)(hx * hx + hy * hy)) - r * 2;
-                if (dout > 0 && win_shadows(w)) {
-                    int a = sa - sa * dout / (sw * 2);
-                    if (a > 0) { br = br * (255 - a) / 255;
-                                 bg = bg * (255 - a) / 255;
-                                 bb = bb * (255 - a) / 255; }
-                }
 
                 int cr = (int)((cur >> 16) & 255), cg = (int)((cur >> 8) & 255),
                     cb = (int)(cur & 255);
@@ -681,6 +951,9 @@ static void corners_carve(const struct comp_window *w, int focused) {
         }
     }
 }
+static void corners_carve(const struct comp_window *w, int focused) {
+    corners_carve_ring(!w->desktop && !w->chromeless, focused ? g_desktop.accent : g_desktop.text);
+}
 
 /* ---- window motion ------------------------------------------------------ *
  * Windows used to appear and vanish between one frame and the next, which is
@@ -691,50 +964,88 @@ static void corners_carve(const struct comp_window *w, int focused) {
  * ghost of the input row (docs/TODO.md).
  *
  * Doing it in the compositor sidesteps that entirely. The compositor already
- * holds the window's FINISHED pixels, so the animation is a scale+fade of a
+ * holds the window's FINISHED pixels, so the motion is a scale+fade of a
  * buffer: no scene graph, no layout, no scratch surface, and the app never
- * learns it happened. The window is hidden for the duration and a ghost is
- * drawn in its place; paint_region draws that ghost itself, so anything else
- * repainting mid-flight (the cursor, another window) composes correctly. */
-#define ANIM_MS_OPEN   170
-#define ANIM_MS_PARK   200
-#define ANIM_MS_CLOSE  150   /* shorter than open: leaving should feel decisive */
+ * learns it happened. The window is hidden while it moves and a GHOST is
+ * drawn in its place; paint_region draws the ghosts itself, so anything else
+ * repainting mid-flight (the cursor, another window) composes correctly.
+ *
+ * ON SPRINGS (ui/motion/spring.h). The ghost's rectangle is four springs, so a
+ * motion can be turned around from wherever it is: a window minimised and
+ * clicked back in the dock flies back from where it had got to, at the speed
+ * it had, instead of finishing its trip first. Any number of windows move at
+ * once, each its own ghost; a fixed-duration curve allowed one. */
+enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE, ANIM_SLIDE_IN, ANIM_SLIDE_OUT, ANIM_ZOOM,
+                 ANIM_OVERVIEW };
+static const char *const anim_names[] = { "none", "open", "park", "unpark", "close", "slide-in", "slide-out", "zoom",
+                                          "overview" };
+
 #define ANIM_CLOSE_TO   92   /* shrink to 92% while fading -- a collapse, not a fly-off */
 #define ANIM_OPEN_FROM  88   /* open starts at 88% and grows in -- a small move;
                               * a big one reads as a zoom effect, not a window */
+/* (response ms, damping permille) per motion. Closing is the quickest and
+ * never overshoots: leaving should feel decisive. Opening barely overshoots.
+ * Parking is a flight, critically damped all the way into the dock. */
+#define ANIM_SPRING_OPEN   240u, 900u
+#define ANIM_SPRING_CLOSE  200u, 1000u
+#define ANIM_SPRING_PARK   SPRING_SMOOTH
+#define ANIM_SPRING_SLIDE  SPRING_SMOOTH
+#define ANIM_SPRING_ZOOM   300u, 1000u
+#define ANIM_SPRING_OVERVIEW SPRING_SMOOTH
+/* Landed: every edge within half a pixel and nearly still. A spring's own
+ * rest is 1/64 px, and the last pixel of a critically damped approach is a
+ * long crawl nobody can see but every frame of which recomposes the window. */
+#define ANIM_LAND_X        (SPRING_ONE / 2)
+#define ANIM_LAND_V        (30 * SPRING_ONE)
+#define GHOSTS_MAX         16     /* two workspaces' windows sliding at once */
 
-enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE };
-
-static struct {
-    int      kind;
+struct ghost {
+    int      kind;                /* what landing does */
     uint32_t win_id;
-    uint64_t t0, dur;
-    int      from[4], to[4];      /* x, y, w, h */
-    int      last[4];             /* where the ghost was drawn last frame */
-    int      have_last;
+    struct spring r[4];           /* x, y, w, h, Q16.16 px */
+    int      off_x;               /* a slide's target, from the window's frame */
+    /* Drawn as the window would be -- its shadow (the front window's, when
+     * `focus`) and its rounded corners -- when the window has them. */
+    uint8_t  chrome, focus;
+    /* Opacity follows the size: it goes from `a0` to `a1` as the width (or
+     * height) goes from `s0` to its target, so it can never disagree with the
+     * motion, and turning the motion around turns the fade with it. A flight
+     * to or from the dock fades only in the tenth of its travel nearest the
+     * tile -- the window stays a window all the way down, as on the Mac;
+     * fading along the whole way left it invisible before it got there. */
+    int      a0, a1, s0, axis;
+    int      last[4], have_last;  /* where it was drawn last frame */
     /* A CLOSING window's pixels are freed out from under us -- the process is
      * killed and reaped while the ghost is still in the air. So closing (and
-     * only closing) animates a COPY. Every other motion reads the live buffer,
-     * which stays valid because the app is still there. */
+     * only closing) flies a COPY, with its own GPU image. Every other motion
+     * reads the live buffer, which stays valid because the app is still there. */
     uint32_t *snap;
     int      snap_w, snap_h;
-} g_anim;
+    uint32_t snap_img;
+};
+static struct ghost g_ghosts[GHOSTS_MAX];
+static volatile int g_nghosts;                /* in flight: the frame clock's cheap check */
+/* Ghosts are filtered while the frames can afford it: the last frame cost
+ * under half its period (comp_frame decides). Six times nearest-neighbour's
+ * cost is a frame a slow core at 120 Hz cannot spare; a crawl of text in a
+ * motion is the lesser loss than a dropped frame. */
+static int g_ghost_smooth = 1;
 
-static int anim_lerp(int a, int b, int num, int den) {
-    return a + (int)(((int64_t)(b - a) * num) / (den ? den : 1));
-}
+/* WHERE A PARKED WINDOW FLIES TO: its app's tile in the dock. The dock is the
+ * desktop's own drawing, so the desktop says where its tiles are
+ * (compositor_dock_targets), by the binary's basename -- the name the dock
+ * knows its apps by. An app with no tile, or a desktop that never said, gets
+ * the bottom centre of the screen, which is where the dock sits by default. */
+#define DOCK_TARGETS_MAX 16
+static struct { char app[24]; int x, y, w, h; } g_dock_t[DOCK_TARGETS_MAX];
+static int g_dock_tn;
 
-/* ease-out cubic on 0..1000: fast start, soft landing. 1000-(1-t)^3 */
-static int ease_out(int t) {
-    int64_t u = 1000 - t;
-    return (int)(1000 - (u * u * u) / 1000000);
-}
-
-/* Where a parked window flies to. The dock is drawn by the home process and
- * the kernel has no idea where its icons are, so this aims at the bottom
- * centre of the screen -- which is where the dock actually sits. Plumbing the
- * real icon rect through would make it exact; see docs/TODO.md. */
-static void anim_dock_rect(int out[4]) {
+static void anim_dock_rect(const struct comp_window *w, int out[4]) {
+    for (int i = 0; i < g_dock_tn; i++)
+        if (w->app[0] && !strcmp(g_dock_t[i].app, w->app)) {
+            out[0] = g_dock_t[i].x; out[1] = g_dock_t[i].y; out[2] = g_dock_t[i].w; out[3] = g_dock_t[i].h;
+            return;
+        }
     const fb_info_t *fi = fb_get_info();
     int W = fi ? (int)fi->width : 1024, H = fi ? (int)fi->height : 768;
     out[2] = 64; out[3] = 44;
@@ -742,123 +1053,899 @@ static void anim_dock_rect(int out[4]) {
     out[1] = H - 56;
 }
 
-static void anim_progress(int *num, int *den) {
-    uint64_t now = timer_uptime_ms();
-    uint64_t el = now - g_anim.t0;
-    if (el >= g_anim.dur) { *num = 1000; *den = 1000; return; }
-    *num = (int)((el * 1000) / g_anim.dur);
-    *den = 1000;
+static struct ghost *ghost_of(uint32_t win_id) {
+    for (int i = 0; i < GHOSTS_MAX; i++)
+        if (g_ghosts[i].kind != ANIM_NONE && g_ghosts[i].win_id == win_id) return &g_ghosts[i];
+    return 0;
 }
 
-/* the ghost's rect and opacity at the current instant */
-static void anim_frame_rect(int out[4], int *alpha) {
-    int num, den; anim_progress(&num, &den);
-    int t = ease_out(num);
-    for (int i = 0; i < 4; i++) out[i] = anim_lerp(g_anim.from[i], g_anim.to[i], t, den);
-    /* fade with the raw (un-eased) time so opacity and motion don't fight */
-    int a = (g_anim.kind == ANIM_PARK || g_anim.kind == ANIM_CLOSE)
-                ? (255 - num * 255 / 1000)
-                : (num * 255 / 1000);
-    if (a < 0) a = 0; if (a > 255) a = 255;
-    *alpha = a;
+/* the ghost's rect and opacity now */
+static void ghost_rect(const struct ghost *g, int out[4], int *alpha) {
+    for (int i = 0; i < 4; i++) out[i] = spring_px(&g->r[i]);
+    const struct spring *s = &g->r[2 + g->axis];
+    int span = (int)spring_div(s->target, SPRING_ONE) - g->s0;
+    int a = g->a1;
+    if (span) {
+        int64_t done = (int64_t)(out[2 + g->axis] - g->s0) * 1000 / span;
+        done = done < 0 ? 0 : done > 1000 ? 1000 : done;
+        if (g->kind == ANIM_PARK) done = done < 900 ? 0 : (done - 900) * 10;
+        else if (g->kind == ANIM_UNPARK) done = done > 100 ? 1000 : done * 10;
+        a = g->a0 + (int)((g->a1 - g->a0) * done / 1000);
+    }
+    *alpha = a < 0 ? 0 : a > 255 ? 255 : a;
+}
+
+static int ghost_slides(const struct ghost *g) {
+    return g->kind == ANIM_SLIDE_IN || g->kind == ANIM_SLIDE_OUT;
+}
+
+/* How far past its rect a ghost draws: its shadow, when it has one. */
+static int ghost_pad(const struct ghost *g) {
+    return g->chrome ? SHADOW_PAD : 2;
 }
 
 /* Union of the previous and current ghost rects: what a frame must repaint. */
-static void anim_dirty(int *x0, int *y0, int *x1, int *y1) {
-    int r[4], a; anim_frame_rect(r, &a);
+static void ghost_dirty(const struct ghost *g, int *x0, int *y0, int *x1, int *y1) {
+    int r[4], a, pad = ghost_pad(g); ghost_rect(g, r, &a);
     *x0 = r[0]; *y0 = r[1]; *x1 = r[0] + r[2]; *y1 = r[1] + r[3];
-    if (g_anim.have_last) {
-        *x0 = imin(*x0, g_anim.last[0]); *y0 = imin(*y0, g_anim.last[1]);
-        *x1 = imax(*x1, g_anim.last[0] + g_anim.last[2]);
-        *y1 = imax(*y1, g_anim.last[1] + g_anim.last[3]);
+    if (g->have_last) {
+        *x0 = imin(*x0, g->last[0]); *y0 = imin(*y0, g->last[1]);
+        *x1 = imax(*x1, g->last[0] + g->last[2]);
+        *y1 = imax(*y1, g->last[1] + g->last[3]);
     }
-    *x0 -= 2; *y0 -= 2; *x1 += 2; *y1 += 2;
+    *x0 -= pad; *y0 -= pad; *x1 += pad; *y1 += pad;
 }
 
-/* Kick off a motion. The window is HIDDEN for the duration (the ghost stands
- * in for it) and put back -- or not -- when the motion lands. */
+static int ghost_landed(const struct ghost *g) {
+    for (int i = 0; i < 4; i++) {
+        const struct spring *s = &g->r[i];
+        int64_t dx = s->x - s->target;
+        if (s->moving && (dx > ANIM_LAND_X || dx < -ANIM_LAND_X || s->v > ANIM_LAND_V || s->v < -ANIM_LAND_V))
+            return 0;
+    }
+    return 1;
+}
+
+/* `perf slowmo N`: every window motion N times slower, the same shape -- the
+ * Mac's shift-click, for watching (and photographing) a motion. */
+static volatile uint32_t g_slowmo = 1;
+void compositor_slowmo(uint32_t n) { g_slowmo = n ? n : 1; }
+
+/* Send a ghost toward `to` with opacity going to `alpha`, from wherever it is. */
+static void ghost_aim(struct ghost *g, const int to[4], int alpha, uint32_t resp, uint32_t damp, uint64_t now) {
+    int cur[4], a; ghost_rect(g, cur, &a);
+    struct spring_params p = spring_params(resp * g_slowmo, damp);
+    for (int i = 0; i < 4; i++) spring_to(&g->r[i], SPRING_PX(to[i]), p, now);
+    g->a0 = a; g->a1 = alpha;
+    g->axis = cur[2] != to[2] ? 0 : 1;
+    g->s0 = cur[2 + g->axis];
+}
+
+static void ghost_free(struct ghost *g) {
+    if (g->snap) { gpu_image_doom(&g->snap_img); kfree(g->snap); g->snap = 0; g->snap_w = g->snap_h = 0; }
+    if (ghost_slides(g) || g->kind == ANIM_ZOOM) {
+        struct comp_window *w = win_by_id(g->win_id);
+        if (w) { w->sliding = 0; w->zoom_wait = 0; }
+    }
+    if (g->kind != ANIM_NONE) g_nghosts--;
+    g->kind = ANIM_NONE; g->have_last = 0; g->win_id = 0;
+}
+
+/* Kick off a motion, or turn one around. The window is HIDDEN for the
+ * duration (the ghost stands in for it) and put back -- or not -- when the
+ * motion lands. */
 static void paint_region(int rx0, int ry0, int rx1, int ry1);   /* fwd */
 static void enforce_focus(void);
 
 static void anim_start(struct comp_window *w, int kind) {
     if (!w || !w->content) return;
-    if(g_desktop.flags&EMBK_DESKTOP_REDUCED_MOTION) {
-        w->visible=(kind==ANIM_OPEN || kind==ANIM_UNPARK);return;
-    }
+    int show = kind == ANIM_OPEN || kind == ANIM_UNPARK;
+    w->arriving = 0;
+    if(g_desktop.flags&EMBK_DESKTOP_REDUCED_MOTION) { w->visible=show; return; }
     if (w->desktop || w->widget || w->translucent) return;  /* chrome doesn't fly */
 
-    int full[4], dock[4];
+    int full[4], dock[4], from[4], to[4], alpha_from, alpha_to;
     win_frame_rect(w, &full[0], &full[1], &full[2], &full[3]);
     full[2] -= full[0]; full[3] -= full[1];
-    anim_dock_rect(dock);
+    anim_dock_rect(w, dock);
+    uint64_t now = time_get_ns();
 
-    /* if a motion is already running for another window, let it land first */
-    if (g_anim.kind != ANIM_NONE && g_anim.win_id != w->id) return;
+    struct ghost *g = ghost_of(w->id);
+    if (!on_workspace(w)) {
+        /* on a space nobody is looking at (or sliding off the screen): it
+         * closes or parks there, out of sight -- no flight across this one */
+        if (g) {
+            int pad = ghost_pad(g);
+            if (g->have_last) paint_region(g->last[0] - pad, g->last[1] - pad,
+                                           g->last[0] + g->last[2] + pad, g->last[1] + g->last[3] + pad);
+            ghost_free(g);
+        }
+        w->visible = show;
+        return;
+    }
+    if (g && g->kind == ANIM_ZOOM) w->zoom_wait = 0;   /* whatever it held, it moves now */
+    if (g && ghost_slides(g)) {
+        /* a flat ghost from here on: what the window's shadow covered goes too */
+        int pad = ghost_pad(g);
+        if (g->have_last) paint_region(g->last[0] - pad, g->last[1] - pad,
+                                       g->last[0] + g->last[2] + pad, g->last[1] + g->last[3] + pad);
+        w->sliding = 0;
+    }
+    if (!g) {
+        for (int i = 0; i < GHOSTS_MAX && !g; i++) if (g_ghosts[i].kind == ANIM_NONE) g = &g_ghosts[i];
+        if (!g) { w->visible = show; return; }   /* all in the air: no motion, just the result */
+        if (kind == ANIM_OPEN) {
+            int sw_ = full[2] * ANIM_OPEN_FROM / 100, sh_ = full[3] * ANIM_OPEN_FROM / 100;
+            from[0] = full[0] + (full[2] - sw_) / 2; from[1] = full[1] + (full[3] - sh_) / 2;
+            from[2] = sw_; from[3] = sh_; alpha_from = 0;
+        } else if (kind == ANIM_UNPARK) {
+            for (int i = 0; i < 4; i++) from[i] = dock[i];
+            alpha_from = 0;
+        } else {
+            for (int i = 0; i < 4; i++) from[i] = full[i];
+            alpha_from = 255;
+        }
+        g->win_id = w->id; g->have_last = 0; g->chrome = (uint8_t)win_shadows(w);
+        for (int i = 0; i < 4; i++) spring_init(&g->r[i], SPRING_PX(from[i]), now);
+        g->a0 = g->a1 = alpha_from; g->s0 = from[2]; g->axis = 0;
+        g_nghosts++;
+    } else if (g->kind != kind) {
+        /* INTERRUPTED: said once, because it is the case a curve could not do */
+        int r[4], a; ghost_rect(g, r, &a);
+        kprintf("compositor: %s turned around in flight at %d,%d %dx%d (%s -> %s)\n",
+                w->app[0] ? w->app : "a window", r[0], r[1], r[2], r[3], anim_names[g->kind], anim_names[kind]);
+    }
+    g->kind = kind;
+    g->focus = show;                     /* arriving in front, or leaving */
 
-    g_anim.kind = kind;
-    g_anim.win_id = w->id;
-    g_anim.t0 = timer_uptime_ms();
-    g_anim.have_last = 0;
-
-    if (kind == ANIM_OPEN) {
-        g_anim.dur = ANIM_MS_OPEN;
-        int sw_ = full[2] * ANIM_OPEN_FROM / 100, sh_ = full[3] * ANIM_OPEN_FROM / 100;
-        g_anim.from[0] = full[0] + (full[2] - sw_) / 2;
-        g_anim.from[1] = full[1] + (full[3] - sh_) / 2;
-        g_anim.from[2] = sw_; g_anim.from[3] = sh_;
-        for (int i = 0; i < 4; i++) g_anim.to[i] = full[i];
-    } else if (kind == ANIM_PARK) {
-        g_anim.dur = ANIM_MS_PARK;
-        for (int i = 0; i < 4; i++) { g_anim.from[i] = full[i]; g_anim.to[i] = dock[i]; }
-    } else if (kind == ANIM_UNPARK) {
-        g_anim.dur = ANIM_MS_PARK;
-        for (int i = 0; i < 4; i++) { g_anim.from[i] = dock[i]; g_anim.to[i] = full[i]; }
-    } else {  /* ANIM_CLOSE */
-        g_anim.dur = ANIM_MS_CLOSE;
-        int sw_ = full[2] * ANIM_CLOSE_TO / 100, sh_ = full[3] * ANIM_CLOSE_TO / 100;
-        for (int i = 0; i < 4; i++) g_anim.from[i] = full[i];
-        g_anim.to[0] = full[0] + (full[2] - sw_) / 2;
-        g_anim.to[1] = full[1] + (full[3] - sh_) / 2;
-        g_anim.to[2] = sw_; g_anim.to[3] = sh_;
-        /* take the copy now, while the buffer is still ours (a close already
-         * in flight for this window lets go of its own copy first) */
-        if (g_anim.snap) { gpu_image_doom(&g_snap_img); kfree(g_anim.snap); g_anim.snap = 0; }
+    if (kind == ANIM_CLOSE && !g->snap) {
+        /* take the copy now, while the buffer is still ours */
         size_t n = (size_t)w->cw * w->ch;
         uint32_t *cp = (uint32_t *)kmalloc(n * 4);
-        if (cp) {
-            for (size_t i = 0; i < n; i++) cp[i] = w->content[i];
-            g_anim.snap = cp; g_anim.snap_w = (int)w->cw; g_anim.snap_h = (int)w->ch;
-        } else {
-            g_anim.kind = ANIM_NONE;     /* no copy, no animation -- just close */
-            return;
+        if (!cp) {                       /* no copy, no motion -- just close */
+            if (g->have_last) paint_region(g->last[0] - 2, g->last[1] - 2,
+                                           g->last[0] + g->last[2] + 2, g->last[1] + g->last[3] + 2);
+            ghost_free(g); w->visible = 0; return;
         }
+        for (size_t i = 0; i < n; i++) cp[i] = w->content[i];
+        g->snap = cp; g->snap_w = (int)w->cw; g->snap_h = (int)w->ch;
+    }
+
+    if (kind == ANIM_OPEN || kind == ANIM_UNPARK) {
+        for (int i = 0; i < 4; i++) to[i] = full[i];
+        alpha_to = 255;
+        if (kind == ANIM_OPEN) ghost_aim(g, to, alpha_to, ANIM_SPRING_OPEN, now);
+        else ghost_aim(g, to, alpha_to, ANIM_SPRING_PARK, now);
+    } else if (kind == ANIM_PARK) {
+        ghost_aim(g, dock, 0, ANIM_SPRING_PARK, now);
+    } else {
+        int sw_ = full[2] * ANIM_CLOSE_TO / 100, sh_ = full[3] * ANIM_CLOSE_TO / 100;
+        to[0] = full[0] + (full[2] - sw_) / 2; to[1] = full[1] + (full[3] - sh_) / 2;
+        to[2] = sw_; to[3] = sh_;
+        ghost_aim(g, to, 0, ANIM_SPRING_CLOSE, now);
     }
     w->visible = 0;                      /* the ghost is the window for now */
+    w->arriving = show;                  /* ...but an arriving one takes input */
 }
 
-/* Land the motion: the window becomes real again (or stays parked). */
-static void anim_finish(void) {
-    if(g_anim.kind==ANIM_NONE)return;
-    struct comp_window *w = win_by_id(g_anim.win_id);
-    int kind = g_anim.kind;
-    int last[4]; int had = g_anim.have_last;
-    for (int i = 0; i < 4; i++) last[i] = g_anim.last[i];
-    g_anim.kind = ANIM_NONE; g_anim.have_last = 0;
-    if (g_anim.snap) { gpu_image_doom(&g_snap_img); kfree(g_anim.snap); g_anim.snap = 0; g_anim.snap_w = g_anim.snap_h = 0; }
-    if (w) w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK);
+/* Land a motion: the window becomes real again (or stays parked). */
+static void anim_finish(struct ghost *g) {
+    if (g->kind == ANIM_NONE) return;
+    struct comp_window *w = win_by_id(g->win_id);
+    int kind = g->kind, slides = ghost_slides(g), pad = ghost_pad(g);
+    int last[4]; int had = g->have_last;
+    for (int i = 0; i < 4; i++) last[i] = g->last[i];
+    ghost_free(g);
+    /* a slide changes nothing about the window: it was on its space all along */
+    if (w && !slides) {
+        w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK || kind == ANIM_ZOOM || kind == ANIM_OVERVIEW);
+        w->arriving = 0;
+    }
     /* repaint the window's footprint AND wherever the ghost last was */
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    if (w && w->used) win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    if (w && w->used && (!slides || on_workspace(w))) win_repaint_rect(w, &x0, &y0, &x1, &y1);
     else w = 0;
     if (had) {
-        if (!w) { x0 = last[0]; y0 = last[1]; x1 = last[0] + last[2]; y1 = last[1] + last[3]; }
-        else {
-            x0 = imin(x0, last[0]); y0 = imin(y0, last[1]);
-            x1 = imax(x1, last[0] + last[2]); y1 = imax(y1, last[1] + last[3]);
-        }
+        int lx0 = last[0] - pad, ly0 = last[1] - pad, lx1 = last[0] + last[2] + pad, ly1 = last[1] + last[3] + pad;
+        if (!w) { x0 = lx0; y0 = ly0; x1 = lx1; y1 = ly1; }
+        else { x0 = imin(x0, lx0); y0 = imin(y0, ly0); x1 = imax(x1, lx1); y1 = imax(y1, ly1); }
     }
     if (x1 > x0 && y1 > y0) paint_region(x0 - 2, y0 - 2, x1 + 2, y1 + 2);
     if (w && w->visible) enforce_focus();
+}
+
+int compositor_dock_targets(int pid, const struct embk_dock_target *t, unsigned n) {
+    if (n > DOCK_TARGETS_MAX) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    const struct comp_window *d = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++)
+        if (g_wins[i].used && g_wins[i].desktop && g_wins[i].pid == pid) { d = &g_wins[i]; break; }
+    if (!d) { comp_unlock(); return -EMBK_EPERM; }
+    g_dock_tn = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (t[i].w <= 0 || t[i].h <= 0 || t[i].w > 512 || t[i].h > 512) continue;
+        memcpy(g_dock_t[g_dock_tn].app, t[i].app, sizeof g_dock_t[0].app);
+        g_dock_t[g_dock_tn].app[sizeof g_dock_t[0].app - 1] = 0;
+        g_dock_t[g_dock_tn].x = d->x + t[i].x;    /* the desktop is chromeless: */
+        g_dock_t[g_dock_tn].y = d->y + t[i].y;    /* its content is its frame */
+        g_dock_t[g_dock_tn].w = t[i].w; g_dock_t[g_dock_tn].h = t[i].h;
+        g_dock_tn++;
+    }
+    comp_unlock();
+    return 0;
+}
+
+/* Where a sliding window is drawn, from where it is: 0, 0 for any other. */
+static void slide_offset(const struct comp_window *w, int *dx, int *dy) {
+    const struct ghost *g = w->sliding ? ghost_of(w->id) : 0;
+    *dx = g ? spring_px(&g->r[0]) - w->x : 0;
+    *dy = g ? spring_px(&g->r[1]) - w->y : 0;
+}
+
+/* Every motion lands at once: the desktop is being reconfigured under them. */
+/* The overview's state (compositor_overview_toggle, below). */
+static int      g_ov;            /* 1 from GUI+Up until the last window is home */
+static int      g_ov_leaving;    /* on the way home */
+static uint32_t g_ov_hover;      /* the window ringed: under the pointer, or the keys' */
+static int      g_ov_keyed;      /* the keys moved the ring, and the pointer has not since */
+static struct spring g_ov_dim;   /* the desktop's dimming, 0..OV_DIM, Q16.16 */
+static volatile int g_ghosts_still;   /* ghosts held still: the overview's in their places, a swipe's under resting fingers (anim_frame) */
+/* A SWIPE between spaces holds its windows where the fingers put them:
+ * anim_frame neither steps nor lands them until the fingers lift. */
+static int g_swipe_hold;
+/* Its windows landed by someone else (a space change, the display): over. */
+static void ov_reset(void) {
+    g_ov = g_ov_leaving = 0; g_ov_hover = 0; g_ghosts_still = 0;
+    spring_set(&g_ov_dim, 0, time_get_ns());
+}
+static void ghosts_land_all(void) {
+    g_swipe_hold = 0; g_ghosts_still = 0;
+    for (int i = 0; i < GHOSTS_MAX; i++) if (g_ghosts[i].kind != ANIM_NONE) anim_finish(&g_ghosts[i]);
+    if (g_ov) ov_reset();
+}
+
+/* CHANGING WORKSPACE, as a slide: the space being left goes off one side of
+ * the screen while the next comes in from the other -- leftwards going up the
+ * spaces, as on the Mac. Each window is a ghost on four springs, drawn as
+ * itself (shadow, corners, material) where its ghost is, and the windows
+ * coming in take clicks and keys at their real places from the start. A
+ * second switch mid-slide turns them round from where they are, at the speed
+ * they have. The whole desktop surface is one strip: with several monitors a
+ * window crosses its neighbours on the way. Other motions land first; a
+ * window past the ghosts' count changes space at once. Caller holds
+ * g_comp_lock, with g_desktop.workspace already `to`. */
+static void workspace_slide(unsigned from, unsigned to) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || from == to || (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION)) { ghosts_land_all(); return; }
+    for (int i = 0; i < GHOSTS_MAX; i++)
+        if (g_ghosts[i].kind != ANIM_NONE && !ghost_slides(&g_ghosts[i])) anim_finish(&g_ghosts[i]);
+    if (g_ov) ov_reset();
+    int shift = to > from ? (int)fi->width : -(int)fi->width, turned = 0;
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->visible || !w->presented || !w->content) continue;
+        if (w->desktop || w->widget || w->translucent || !session_ui_allowed(w->pid)) continue;
+        int kind = w->workspace == to ? ANIM_SLIDE_IN : w->workspace == from ? ANIM_SLIDE_OUT : ANIM_NONE;
+        if (kind == ANIM_NONE) continue;
+        int full[4];
+        win_frame_rect(w, &full[0], &full[1], &full[2], &full[3]);
+        full[2] -= full[0]; full[3] -= full[1];
+        struct ghost *g = ghost_of(w->id);
+        int64_t was_to = 0;
+        if (g) was_to = g->r[0].target - g->r[0].x;
+        else {
+            for (int k = 0; k < GHOSTS_MAX && !g; k++) if (g_ghosts[k].kind == ANIM_NONE) g = &g_ghosts[k];
+            if (!g) continue;
+            int at = full[0] + (kind == ANIM_SLIDE_IN ? shift : 0);
+            g->win_id = w->id; g->have_last = 0;
+            spring_init(&g->r[0], SPRING_PX(at), now);
+            for (int k = 1; k < 4; k++) spring_init(&g->r[k], SPRING_PX(full[k]), now);
+            g->a0 = g->a1 = 255; g->s0 = full[2]; g->axis = 0;
+            g_nghosts++;
+        }
+        g->kind = kind; g->chrome = (uint8_t)win_shadows(w);
+        g->off_x = kind == ANIM_SLIDE_OUT ? -shift : 0;
+        int dst[4] = { full[0] + g->off_x, full[1], full[2], full[3] };
+        ghost_aim(g, dst, 255, ANIM_SPRING_SLIDE, now);
+        int64_t now_to = g->r[0].target - g->r[0].x;
+        turned += (was_to < 0 && now_to > 0) || (was_to > 0 && now_to < 0);
+        w->sliding = 1;
+    }
+    if (turned) kprintf("compositor: workspace slide turned around in flight (%d windows)\n", turned);
+}
+
+/* THE SPACES UNDER THE HAND (a three-finger swipe sideways; gesture.h). The
+ * space shown and the next one along -- in the direction the fingers go --
+ * are laid side by side and follow the fingers one to one, each window drawn
+ * as itself where the hand puts it (slide ghosts, held: g_swipe_hold).
+ * Toward a space that is not there -- past the first or the last; wrapping
+ * round is the keys' preference, not the hand's -- the hand meets a rubber
+ * band. Lifted far enough, or flicked, the next space is taken and the
+ * windows carry on at the speed the hand had; otherwise they spring back.
+ * Caller holds g_comp_lock. */
+static struct { int on, from, to; int shift, dx; } g_sw;   /* shift: +W toward a later space; dx: the hand's last */
+
+static int sw_rubber(int d) {                            /* Apple's, as the scroll's */
+    int64_t a = d < 0 ? -d : d;
+    int64_t r = a * 120 / (a + 120);                     /* never past 120 px */
+    return (int)(d < 0 ? -r : r);
+}
+/* Each held window where `dx` puts it. */
+static void swipe_place(int dx) {
+    g_sw.dx = dx;
+    int off = g_sw.to < 0 ? sw_rubber(dx) : (g_sw.shift > 0 ? (dx > 0 ? sw_rubber(dx) : dx)
+                                                             : (dx < 0 ? sw_rubber(dx) : dx));
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        struct ghost *g = &g_ghosts[i];
+        if (!ghost_slides(g)) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (!w) continue;
+        int fx0, fy0, fx1, fy1; win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+        int x = fx0 + off + (w->workspace == (unsigned)g_sw.from ? 0 : g_sw.shift);
+        int pad = ghost_pad(g);
+        if (g->have_last) paint_region(g->last[0] - pad, g->last[1] - pad, g->last[0] + g->last[2] + pad, g->last[1] + g->last[3] + pad);
+        spring_set(&g->r[0], SPRING_PX(x), now);
+        int r[4], a; ghost_rect(g, r, &a);
+        for (int k = 0; k < 4; k++) g->last[k] = r[k];
+        g->have_last = 1;
+        paint_region(r[0] - pad, r[1] - pad, r[0] + r[2] + pad, r[1] + r[3] + pad);
+    }
+}
+static void swipe_begin(int dx) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || g_ov || session_input_owner() || (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION)) return;
+    ghosts_land_all();
+    int count = (int)g_desktop.workspace_count, from = (int)g_desktop.workspace;
+    int step = dx < 0 ? 1 : -1;                          /* fingers left: the space after */
+    int to = from + step;                                /* never wraps: wrapping is the keys' preference */
+    if (to < 0 || to >= count) to = -1;
+    g_sw.on = 1; g_sw.from = from; g_sw.to = to; g_sw.shift = step > 0 ? (int)fi->width : -(int)fi->width;
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->visible || !w->presented || !w->content) continue;
+        if (w->desktop || w->widget || w->translucent || !session_ui_allowed(w->pid)) continue;
+        int kind = (int)w->workspace == from ? ANIM_SLIDE_IN : (int)w->workspace == to ? ANIM_SLIDE_OUT : ANIM_NONE;
+        if (kind == ANIM_NONE) continue;
+        struct ghost *g = 0;
+        for (int k = 0; k < GHOSTS_MAX && !g; k++) if (g_ghosts[k].kind == ANIM_NONE) g = &g_ghosts[k];
+        if (!g) break;
+        int f[4]; win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]); f[2] -= f[0]; f[3] -= f[1];
+        g->kind = kind; g->win_id = w->id; g->have_last = 0; g->chrome = (uint8_t)win_shadows(w); g->focus = 0;
+        for (int k = 0; k < 4; k++) spring_init(&g->r[k], SPRING_PX(f[k]), now);
+        g->a0 = g->a1 = 255; g->s0 = f[2]; g->axis = 0; g->off_x = 0;
+        g_nghosts++;
+        w->sliding = 1;
+    }
+    g_swipe_hold = 1;
+    kprintf("compositor: swipe from space %d toward %d\n", from + 1, to + 1);
+    swipe_place(dx);
+}
+static void swipe_end(int dx, int vx) {
+    g_swipe_hold = 0; g_ghosts_still = 0;                /* they move now: frames keep coming */
+    if (!g_sw.on) return;
+    g_sw.on = 0;
+    int dir = g_sw.shift > 0 ? -1 : 1;                   /* the way the fingers go to take it */
+    const fb_info_t *fi = fb_get_info();
+    int W = fi ? (int)fi->width : 1280;
+    int take = g_sw.to >= 0 && (dx * dir > W / 3 || (vx * dir > 400 && dx * dir > 40));
+    if (take) {
+        g_desktop.workspace = (unsigned)g_sw.to;
+        reset_pointer_capture_locked();
+    }
+    uint64_t now = time_get_ns();
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        struct ghost *g = &g_ghosts[i];
+        if (!ghost_slides(g)) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (!w) continue;
+        int f[4]; win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]); f[2] -= f[0]; f[3] -= f[1];
+        int home = on_workspace(w);                     /* on the space shown after this */
+        g->kind = home ? ANIM_SLIDE_IN : ANIM_SLIDE_OUT;
+        g->off_x = home ? 0 : ((int)w->workspace == g_sw.from ? -g_sw.shift : g_sw.shift);
+        int dst[4] = { f[0] + g->off_x, f[1], f[2], f[3] };
+        ghost_aim(g, dst, 255, ANIM_SPRING_SLIDE, now);
+        spring_kick(&g->r[0], SPRING_PX(vx), now);       /* the hand's speed, carried on */
+    }
+    kprintf("compositor: swipe %s space %d (%d px, %d px/s)\n", take ? "took" : "let go of",
+            (take ? g_sw.to : g_sw.from) + 1, dx, vx);
+    enforce_focus();
+    const fb_info_t *f2 = fb_get_info();
+    if (f2) paint_region(0, 0, (int)f2->width, (int)f2->height);
+}
+
+/* THE GESTURES, read on the compositor's frame (pointer_frame). A swipe
+ * decides its axis once it has gone GS_DECIDE px one way more than the
+ * other: sideways it is the spaces under the hand; up opens the overview and
+ * down closes it. A flick can be over before a frame reads it: it is decided
+ * from where it ended, and a sideways one begins and ends in that frame. */
+#define GS_DECIDE 24
+static struct { uint32_t seq; int axis; } g_gs;          /* axis: 0 undecided, 1 sideways, 2 up/down */
+static void ov_enter(void);
+static void ov_leave(uint32_t pick);
+static void gesture_frame_locked(void) {
+    struct gesture g;
+    if (!gesture_take(&g)) return;
+    if (g.seq != g_gs.seq) {
+        if (g_sw.on) swipe_end(g_sw.dx, 0);              /* lifted and down again between two frames */
+        g_gs.seq = g.seq; g_gs.axis = 0;
+    }
+    if (!g_gs.axis) {
+        int ax = g.dx < 0 ? -g.dx : g.dx, ay = g.dy < 0 ? -g.dy : g.dy;
+        if (ax >= GS_DECIDE && ax > ay) { g_gs.axis = 1; swipe_begin(g.dx); }
+        else if (ay >= GS_DECIDE && ay > ax) {
+            g_gs.axis = 2;
+            if (g.dy < 0 && !g_ov && !session_input_owner()) ov_enter();
+            else if (g.dy > 0 && g_ov && !g_ov_leaving) ov_leave(0);
+        }
+    }
+    if (g_gs.axis == 1 && g_sw.on) {
+        if (!g.active) swipe_end(g.dx, g.vx);
+        else if (g.dx != g_sw.dx) swipe_place(g.dx);     /* a hand at rest repaints nothing */
+    }
+}
+
+/* A WINDOW CHANGING SIZE A LOT AT ONCE -- filling the work area and back (a
+ * double click on its bar), a half of the screen, a layout -- is a motion,
+ * not a cut. The app redraws at the new size in its own time, and until it
+ * has, what the window looked like is held where it was (a copy: the old
+ * pixels go with the old backing); then it flies to the new frame on a
+ * spring, drawn from the new pixels. The window takes clicks and keys at
+ * its new place throughout. A small change is drawn as it comes, and so is
+ * every step of the corner grip, however far (a live resize). */
+#define ZOOM_MIN_CHANGE 8          /* an eighth of either side, */
+#define ZOOM_MIN_PX     96         /* or this much of it */
+#define ZOOM_WAIT_MS    1000       /* an app that never redraws is not waited for */
+static int zoom_eligible(const struct comp_window *w, uint32_t nw, uint32_t nh) {
+    if (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION) return 0;
+    if (w->desktop || w->widget || w->translucent || !w->visible || !w->presented || !w->content) return 0;
+    if (!on_workspace(w) || w->sliding || ghost_of(w->id)) return 0;   /* in motion already */
+    int dw = (int)nw - (int)w->cw, dh = (int)nh - (int)w->ch;
+    dw = imax(dw, -dw); dh = imax(dh, -dh);
+    return dw >= ZOOM_MIN_PX || dh >= ZOOM_MIN_PX ||
+           dw * ZOOM_MIN_CHANGE >= (int)w->cw || dh * ZOOM_MIN_CHANGE >= (int)w->ch;
+}
+/* Hold `old` (ow x oh, kmalloc'd; this takes it) at frame `from`. */
+static void zoom_hold(struct comp_window *w, const int from[4], uint32_t *old, int ow, int oh) {
+    struct ghost *g = 0;
+    for (int i = 0; i < GHOSTS_MAX && !g; i++) if (g_ghosts[i].kind == ANIM_NONE) g = &g_ghosts[i];
+    if (!g) { kfree(old); return; }                   /* all in the air: a cut */
+    uint64_t now = time_get_ns();
+    g->kind = ANIM_ZOOM; g->win_id = w->id; g->have_last = 0;
+    g->chrome = (uint8_t)win_shadows(w); g->focus = 1;
+    for (int i = 0; i < 4; i++) spring_init(&g->r[i], SPRING_PX(from[i]), now);
+    g->a0 = g->a1 = 255; g->s0 = from[2]; g->axis = 0;
+    g->snap = old; g->snap_w = ow; g->snap_h = oh; g->snap_img = 0;
+    g_nghosts++;
+    w->zoom_wait = 1; w->zoom_since_ms = timer_uptime_ms();
+    w->visible = 0; w->arriving = 1;
+}
+/* The app has drawn at the new size (or will not): fly there, from its pixels. */
+static void zoom_release(struct comp_window *w, struct ghost *g) {
+    w->zoom_wait = 0;
+    if (g->snap) { gpu_image_doom(&g->snap_img); kfree(g->snap); g->snap = 0; g->snap_w = g->snap_h = 0; }
+    int to[4];
+    win_frame_rect(w, &to[0], &to[1], &to[2], &to[3]);
+    to[2] -= to[0]; to[3] -= to[1];
+    ghost_aim(g, to, 255, ANIM_SPRING_ZOOM, time_get_ns());
+}
+
+/* THE OVERVIEW (GUI+Up; Mission Control on the Mac). Every window on the
+ * space flies, on springs, into a grid of its own over the dimmed desktop --
+ * each the window itself, scaled, live: an app that draws while it is up is
+ * seen drawing. The pointer and Esc belong to the overview while it is up:
+ * a click on a window brings it in front as they all fly home; a click
+ * anywhere else, Esc or GUI+Up again, sends them home as they were. Windows
+ * are hidden behind their ghosts the whole time and real again as each lands.
+ * A grid, each window as large as its cell allows and never larger than
+ * itself, and each in the cell nearest where it stands: the screen shrunk
+ * into the overview's area, every window to the free cell closest to its
+ * place there, the closest pair first -- so a window on the left is found
+ * on the left. The arrows move the ring between them, Return picks the one
+ * ringed. Asked for again while it closes, it turns back: the windows still
+ * in the air are aimed at their places again from where they are.
+ * Caller holds g_comp_lock. */
+#define OV_MAX       GHOSTS_MAX
+#define OV_GAP       28          /* between cells, and the margin */
+#define OV_DIM       140
+int compositor_overview_shown(void) { return g_ov && !g_ov_leaving; }
+
+static int ov_member(const struct comp_window *w) {
+    if (!w->used || !w->presented || !w->content || w->desktop || w->widget || w->translucent ||
+        w->minimized || !on_workspace(w) || !session_ui_allowed(w->pid)) return 0;
+    const struct ghost *g = ghost_of(w->id);
+    return g ? g->kind == ANIM_OVERVIEW : w->visible;   /* on its way home from one: turned back */
+}
+
+/* The thumbnail rect of each member, in screen order. Returns how many. */
+static int ov_layout(struct comp_window *wins[OV_MAX], int rects[OV_MAX][4]) {
+    int n = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS && n < OV_MAX; i++)
+        if (ov_member(&g_wins[i])) wins[n++] = &g_wins[i];
+    if (!n) return 0;
+    /* the work area of the primary, inside a margin */
+    outputs_whole(fb_get_info());
+    const struct layout_rect *o = &g_outs[0];
+    int ax = o->x + (int)g_desktop.left + OV_GAP, ay = o->y + WORK_TOP + OV_GAP;
+    int aw = (int)o->w - (int)g_desktop.left - (int)g_desktop.right - 2 * OV_GAP;
+    int ah = (int)o->h - WORK_TOP - WORK_BOTTOM - 2 * OV_GAP;
+    int cols = 1;
+    while (cols * cols < n) cols++;
+    int rows = (n + cols - 1) / cols;
+    int cw = (aw - (cols - 1) * OV_GAP) / cols, ch = (ah - (rows - 1) * OV_GAP) / rows;
+    /* the cells' top-left corners, row by row, the last row centred */
+    int cell[OV_MAX][2];
+    for (int k = 0; k < n; k++) {
+        int r = k / cols, c = k % cols;
+        int in_row = r == rows - 1 ? n - r * cols : cols;
+        int row_x = ax + (aw - (in_row * cw + (in_row - 1) * OV_GAP)) / 2;
+        cell[k][0] = row_x + c * (cw + OV_GAP); cell[k][1] = ay + r * (ch + OV_GAP);
+    }
+    /* where each window stands, the screen shrunk into the area; then each
+     * to the free cell nearest that, the nearest of all pairs first */
+    int at[OV_MAX][2], cell_of[OV_MAX], taken[OV_MAX] = { 0 };
+    for (int k = 0; k < n; k++) {
+        const struct comp_window *w = wins[k];
+        int wx = w->x + (int)w->cw / 2 - o->x, wy = w->y + (win_titlebar_h(w) + (int)w->ch) / 2 - o->y;
+        at[k][0] = ax + (int)((int64_t)wx * aw / (int64_t)imax((int)o->w, 1));
+        at[k][1] = ay + (int)((int64_t)wy * ah / (int64_t)imax((int)o->h, 1));
+        cell_of[k] = -1;
+    }
+    for (int round = 0; round < n; round++) {
+        int64_t best = -1; int bk = 0, bc = 0;
+        for (int k = 0; k < n; k++) {
+            if (cell_of[k] >= 0) continue;
+            for (int c = 0; c < n; c++) {
+                if (taken[c]) continue;
+                int64_t dx = cell[c][0] + cw / 2 - at[k][0], dy = cell[c][1] + ch / 2 - at[k][1];
+                int64_t d = dx * dx + dy * dy;
+                if (best < 0 || d < best) { best = d; bk = k; bc = c; }
+            }
+        }
+        cell_of[bk] = bc; taken[bc] = 1;
+    }
+    for (int k = 0; k < n; k++) {
+        const struct comp_window *w = wins[k];
+        int fw = (int)w->cw, fh = win_titlebar_h(w) + (int)w->ch;
+        /* as large as the cell allows, never larger than the window */
+        int64_t sw = fw, sh = fh;
+        if (sw > cw) { sh = sh * cw / sw; sw = cw; }
+        if (sh > ch) { sw = sw * ch / sh; sh = ch; }
+        const int *c = cell[cell_of[k]];
+        rects[k][0] = c[0] + (cw - (int)sw) / 2;
+        rects[k][1] = c[1] + (ch - (int)sh) / 2;
+        rects[k][2] = (int)sw; rects[k][3] = (int)sh;
+    }
+    return n;
+}
+
+static void ov_repaint_all(void) {
+    const fb_info_t *fi = fb_get_info();
+    if (fi) paint_region(0, 0, (int)fi->width, (int)fi->height);
+}
+
+static void ov_enter(void) {
+    struct comp_window *wins[OV_MAX]; int rects[OV_MAX][4];
+    int n = ov_layout(wins, rects);
+    uint64_t now = time_get_ns();
+    int turned = g_ov && g_ov_leaving;
+    g_ov = 1; g_ov_leaving = 0; g_ov_hover = 0; g_ghosts_still = 0; g_ov_keyed = 0;
+    spring_to(&g_ov_dim, SPRING_PX(OV_DIM), spring_params(ANIM_SPRING_OVERVIEW), now);
+    for (int k = 0; k < n; k++) {
+        struct comp_window *w = wins[k];
+        struct ghost *g = ghost_of(w->id);
+        if (g) {                                   /* still in the air: back from where it is */
+            ghost_aim(g, rects[k], 255, ANIM_SPRING_OVERVIEW, now);
+            continue;
+        }
+        for (int i = 0; i < GHOSTS_MAX && !g; i++) if (g_ghosts[i].kind == ANIM_NONE) g = &g_ghosts[i];
+        if (!g) break;
+        int f[4];
+        win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+        f[2] -= f[0]; f[3] -= f[1];
+        g->kind = ANIM_OVERVIEW; g->win_id = w->id; g->have_last = 0;
+        g->chrome = (uint8_t)win_shadows(w); g->focus = 1;
+        for (int i = 0; i < 4; i++) spring_init(&g->r[i], SPRING_PX(f[i]), now);
+        g->a0 = g->a1 = 255; g->s0 = f[2]; g->axis = 0;
+        g_nghosts++;
+        ghost_aim(g, rects[k], 255, ANIM_SPRING_OVERVIEW, now);
+        w->visible = 0; w->arriving = 0;
+    }
+    reset_pointer_capture_locked();
+    kprintf("compositor: overview of %d windows%s\n", n, turned ? ", turned back" : "");
+    ov_repaint_all();
+}
+
+/* Home, all of them; `pick` in front. */
+static void ov_leave(uint32_t pick) {
+    uint64_t now = time_get_ns();
+    g_ov_leaving = 1; g_ov_hover = 0; g_ghosts_still = 0;
+    spring_to(&g_ov_dim, 0, spring_params(ANIM_SPRING_OVERVIEW), now);
+    struct comp_window *pw = pick ? win_by_id(pick) : 0;
+    if (pw) pw->z = g_next_z++;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (!w) continue;
+        int f[4];
+        win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+        f[2] -= f[0]; f[3] -= f[1];
+        ghost_aim(g, f, 255, ANIM_SPRING_OVERVIEW, now);
+    }
+    kprintf("compositor: overview closed%s%s\n", pw ? ", in front: " : "", pw ? (pw->app[0] ? pw->app : "a window") : "");
+    ov_repaint_all();
+}
+
+void compositor_overview_toggle(uint32_t pick) {
+    spin_lock(&g_comp_lock);
+    if (session_input_owner()) { comp_unlock(); return; }
+    if (!g_ov || g_ov_leaving) ov_enter();
+    else ov_leave(pick);
+    comp_unlock();
+}
+
+/* The overview window under (x, y), drawn last on top: 0 if none. */
+static uint32_t ov_hit(int x, int y) {
+    uint32_t hit = 0;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW) continue;
+        int r[4], a; ghost_rect(g, r, &a);
+        if (x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]) hit = g->win_id;
+    }
+    return hit;
+}
+
+/* The ring moves to `to`: what both thumbnails cover. */
+static void ov_ring_to(uint32_t to) {
+    if (to == g_ov_hover) return;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW || (g->win_id != to && g->win_id != g_ov_hover)) continue;
+        int r[4], a; ghost_rect(g, r, &a);
+        paint_region(r[0] - 6, r[1] - 6, r[0] + r[2] + 6, r[1] + r[3] + 6);
+    }
+    g_ov_hover = to;
+}
+
+/* The pointer, while the overview is up: hover and the click. Once the keys
+ * have moved the ring it stays theirs until the pointer moves, so a pointer
+ * left resting on one window does not take it back. */
+static void ov_pointer(int x, int y, int pressed) {
+    static int lx = -1, ly = -1;
+    uint32_t hit = ov_hit(x, y);
+    if (x != lx || y != ly) { lx = x; ly = y; g_ov_keyed = 0; }
+    if (!g_ov_keyed) ov_ring_to(hit);
+    if (pressed) { ov_leave(hit); g_buttons_suppressed = 1; }   /* the press ends here */
+}
+
+/* The window the arrows move the ring to (dir 1 left, 2 right, 3 up, 4 down):
+ * the nearest whose middle lies that way, distance across counting twice;
+ * from nothing ringed, the window in front. */
+static uint32_t ov_neighbour(int dir) {
+    const struct ghost *cur = 0, *front = 0;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW) continue;
+        if (g->win_id == g_ov_hover) cur = g;
+        const struct comp_window *w = win_by_id(g->win_id), *fw = front ? win_by_id(front->win_id) : 0;
+        if (w && (!fw || w->z > fw->z)) front = g;
+    }
+    if (!cur) return front ? front->win_id : 0;
+    int r[4], a; ghost_rect(cur, r, &a);
+    int cx = r[0] + r[2] / 2, cy = r[1] + r[3] / 2;
+    uint32_t best = cur->win_id; int64_t score = -1;
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind != ANIM_OVERVIEW || g == cur) continue;
+        int q[4]; ghost_rect(g, q, &a);
+        int dx = q[0] + q[2] / 2 - cx, dy = q[1] + q[3] / 2 - cy;
+        int along = dir == 1 ? -dx : dir == 2 ? dx : dir == 3 ? -dy : dy;
+        int across = dir <= 2 ? imax(dy, -dy) : imax(dx, -dx);
+        if (along <= 0) continue;
+        int64_t sc = (int64_t)along + 2 * (int64_t)across;
+        if (score < 0 || sc < score) { score = sc; best = g->win_id; }
+    }
+    return best;
+}
+
+void compositor_overview_key(int dir) {
+    spin_lock(&g_comp_lock);
+    if (g_ov && !g_ov_leaving) {
+        if (!dir) ov_leave(g_ov_hover);          /* Return: the one ringed, in front (or none) */
+        else { g_ov_keyed = 1; ov_ring_to(ov_neighbour(dir)); }
+    }
+    comp_unlock();
+}
+
+/* The ring around the window under the pointer, and the dimming, in a region. */
+static void fill_clip(int x, int y, int w, int h, fb_color_t c, int rx0, int ry0, int rx1, int ry1);
+/* It hugs the thumbnail: OV_RING px around it, its arcs concentric with the
+ * thumbnail's corners (radius `rad`), so it is an even band all the way
+ * round -- the arcs 4x4 supersampled, as a window's own corners are. */
+#define OV_RING 3
+static void ov_draw_ring(const int r[4], int rad, int rx0, int ry0, int rx1, int ry1) {
+    int ox = r[0] - OV_RING, oy = r[1] - OV_RING, ow = r[2] + 2 * OV_RING, oh = r[3] + 2 * OV_RING;
+    int ro = rad + OV_RING;
+    fb_color_t c = g_desktop.accent;
+    fill_clip(ox + ro, oy, ow - 2 * ro, OV_RING, c, rx0, ry0, rx1, ry1);
+    fill_clip(ox + ro, oy + oh - OV_RING, ow - 2 * ro, OV_RING, c, rx0, ry0, rx1, ry1);
+    fill_clip(ox, oy + ro, OV_RING, oh - 2 * ro, c, rx0, ry0, rx1, ry1);
+    fill_clip(ox + ow - OV_RING, oy + ro, OV_RING, oh - 2 * ro, c, rx0, ry0, rx1, ry1);
+    const int ro8 = (ro * 8) * (ro * 8), ri8 = (rad * 8) * (rad * 8);
+    int lr = (int)((c >> 16) & 255), lg = (int)((c >> 8) & 255), lb = (int)(c & 255);
+    for (int k = 0; k < 4; k++) {
+        int bx = (k & 1) ? ox + ow - ro : ox, by = (k & 2) ? oy + oh - ro : oy;
+        int cx = (k & 1) ? bx : bx + ro, cy = (k & 2) ? by : by + ro;       /* the arcs' centre */
+        for (int y = imax(by, ry0); y < imin(by + ro, ry1); y++)
+            for (int x = imax(bx, rx0); x < imin(bx + ro, rx1); x++) {
+                int cov = 0;
+                for (int sy = 0; sy < 4; sy++)
+                    for (int sx = 0; sx < 4; sx++) {
+                        int dx = (x - cx) * 8 + sx * 2 + 1, dy = (y - cy) * 8 + sy * 2 + 1;
+                        int d = dx * dx + dy * dy;
+                        cov += d <= ro8 && d > ri8;
+                    }
+                if (!cov) continue;
+                uint32_t cur = fb_get_pixel((uint32_t)x, (uint32_t)y);
+                int cr = (int)((cur >> 16) & 255), cg = (int)((cur >> 8) & 255), cb = (int)(cur & 255);
+                fb_put_pixel_c((uint32_t)x, (uint32_t)y, FB_RGB((lr * cov + cr * (16 - cov)) / 16,
+                                                                (lg * cov + cg * (16 - cov)) / 16,
+                                                                (lb * cov + cb * (16 - cov)) / 16));
+            }
+    }
+}
+static uint32_t g_ov_black[8192];        /* a row of black, read with a stride of 0 */
+static void ov_dim_cpu(int rx0, int ry0, int rx1, int ry1) {
+    int a = spring_px(&g_ov_dim);
+    if (a <= 0) return;
+    int w = rx1 - rx0;
+    if (w <= 0 || ry1 <= ry0 || w > (int)(sizeof g_ov_black / sizeof *g_ov_black)) return;
+    fb_blit_uniform(rx0, ry0, w, ry1 - ry0, g_ov_black, 0, (uint32_t)(a > 255 ? 255 : a));
+}
+
+/* THE TILE PREVIEW. A window dragged against an edge of the work area tiles
+ * when it is let go -- the app's runtime does it (em_app.c): against the left
+ * or right edge, that half; against the top, all of it -- and until the hand
+ * let go nothing said so. While a window that will tile is held against an
+ * edge, a wash of the accent shows where it will go, under the window,
+ * growing out of it on a spring; off the edge, or let go (as the window
+ * flies there), it fades. The rule is the runtime's, read from where the
+ * window is: snapping on, the window chromeless, resizable, and dragged by a
+ * zone it declared. Caller holds g_comp_lock. */
+#define TP_EDGE   4                /* em_app.c's margin */
+#define TP_ALPHA  72               /* the wash at its full, 0-255 */
+static struct { int on; uint32_t win_id; struct spring r[4], a; int last[4], have_last; } g_tp;
+
+static int tile_target(const struct comp_window *w, int out[4]) {
+    if (!(g_desktop.flags & EMBK_DESKTOP_SNAP) || !w->chromeless || !w->resizable ||
+        w->desktop || w->widget || w->translucent) return 0;
+    int x0, y0, x1, y1, fw = (int)w->cw, fh = win_titlebar_h(w) + (int)w->ch;
+    work_area_for(w->x, w->y, fw, fh, &x0, &y0, &x1, &y1);
+    int aw = x1 - x0, ah = y1 - y0;
+    out[1] = y0; out[3] = ah;
+    if (w->x <= x0 + TP_EDGE)            { out[0] = x0;          out[2] = aw / 2;      return 1; }
+    if (w->x + fw >= x1 - TP_EDGE)       { out[0] = x0 + aw / 2; out[2] = aw - aw / 2; return 1; }
+    if (w->y <= y0 + TP_EDGE)            { out[0] = x0;          out[2] = aw;          return 1; }
+    return 0;
+}
+
+static void tp_rect(int r[4]) { for (int i = 0; i < 4; i++) r[i] = spring_px(&g_tp.r[i]); }
+static void tp_dirty(void) {
+    int r[4]; tp_rect(r);
+    paint_region(r[0] - 2, r[1] - 2, r[0] + r[2] + 2, r[1] + r[3] + 2);
+    if (g_tp.have_last)
+        paint_region(g_tp.last[0] - 2, g_tp.last[1] - 2, g_tp.last[0] + g_tp.last[2] + 2, g_tp.last[1] + g_tp.last[3] + 2);
+    for (int i = 0; i < 4; i++) g_tp.last[i] = r[i];
+    g_tp.have_last = 1;
+}
+
+/* After the dragged window moved (or the drag ended: w 0). */
+static void tp_update(const struct comp_window *w) {
+    int t[4], on = w && tile_target(w, t);
+    uint64_t now = time_get_ns();
+    struct spring_params p = spring_params(SPRING_SNAPPY);
+    if (on) {
+        if (!g_tp.on && spring_px(&g_tp.a) <= 0) {          /* out of the window itself */
+            int f[4];
+            win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+            f[2] -= f[0]; f[3] -= f[1];
+            for (int i = 0; i < 4; i++) spring_init(&g_tp.r[i], SPRING_PX(f[i]), now);
+            g_tp.have_last = 0;
+        }
+        for (int i = 0; i < 4; i++)
+            if (g_tp.r[i].target != SPRING_PX(t[i])) spring_to(&g_tp.r[i], SPRING_PX(t[i]), p, now);
+        if (g_tp.a.target != SPRING_PX(TP_ALPHA)) spring_to(&g_tp.a, SPRING_PX(TP_ALPHA), p, now);
+        g_tp.win_id = w->id;
+    } else if (g_tp.on && g_tp.a.target != 0) {
+        spring_to(&g_tp.a, 0, p, now);
+    }
+    g_tp.on = on;
+}
+static int tp_moving(void) {
+    if (g_tp.a.moving) return 1;
+    for (int i = 0; i < 4; i++) if (g_tp.r[i].moving) return 1;
+    return 0;
+}
+/* A frame of it (anim_frame). */
+static void tp_frame(uint64_t now) {
+    if (!tp_moving()) return;
+    spring_step(&g_tp.a, now);
+    for (int i = 0; i < 4; i++) spring_step(&g_tp.r[i], now);
+    tp_dirty();
+}
+
+/* Drawn under the window being dragged: the wash, its corners rounded. */
+static uint32_t g_tp_row[8192], g_tp_rgb = 0xFFFFFFFFu;
+static void tp_draw_cpu(int rx0, int ry0, int rx1, int ry1) {
+    int a = spring_px(&g_tp.a), r[4];
+    if (a <= 0) return;
+    tp_rect(r);
+    if (r[2] <= 0 || r[3] <= 0) return;
+    if (g_tp_rgb != g_desktop.accent) {
+        g_tp_rgb = g_desktop.accent;
+        for (unsigned i = 0; i < sizeof g_tp_row / sizeof *g_tp_row; i++) g_tp_row[i] = 0xFF000000u | g_tp_rgb;
+    }
+    int x0 = imax(r[0], rx0), y0 = imax(r[1], ry0), x1 = imin(r[0] + r[2], rx1), y1 = imin(r[1] + r[3], ry1);
+    if (x1 <= x0 || y1 <= y0 || x1 - x0 > (int)(sizeof g_tp_row / sizeof *g_tp_row)) return;
+    corners_save_at(r[0], r[1], r[0] + r[2], r[1] + r[3], rx0, ry0, rx1, ry1);
+    fb_blit_uniform(x0, y0, x1 - x0, y1 - y0, g_tp_row, 0, (uint32_t)(a > 255 ? 255 : a));
+    corners_carve_ring(0, 0);
+}
+
+/* ...and over it, the target's outline: a big window covers most of its own
+ * wash, and the outline says where it goes whatever is in the way. */
+#define TP_RING 2
+static void tp_ring_cpu(int rx0, int ry0, int rx1, int ry1) {
+    int a = spring_px(&g_tp.a), r[4];
+    if (a <= 0 || g_tp_rgb != g_desktop.accent) return;      /* (the row is the wash's) */
+    tp_rect(r);
+    uint32_t alpha = (uint32_t)(a * 255 / TP_ALPHA > 255 ? 255 : a * 255 / TP_ALPHA);
+    int e[4][4] = { { r[0], r[1], r[2], TP_RING }, { r[0], r[1] + r[3] - TP_RING, r[2], TP_RING },
+                    { r[0], r[1], TP_RING, r[3] }, { r[0] + r[2] - TP_RING, r[1], TP_RING, r[3] } };
+    for (int k = 0; k < 4; k++) {
+        int x0 = imax(e[k][0], rx0), y0 = imax(e[k][1], ry0);
+        int x1 = imin(e[k][0] + e[k][2], rx1), y1 = imin(e[k][1] + e[k][3], ry1);
+        if (x1 > x0 && y1 > y0 && x1 - x0 <= (int)(sizeof g_tp_row / sizeof *g_tp_row))
+            fb_blit_uniform(x0, y0, x1 - x0, y1 - y0, g_tp_row, 0, alpha);
+    }
+}
+
+/* A DOUBLE CLICK where a window is dragged by -- its title bar, or a zone the
+ * app declared -- zooms it, as on the Mac: it fills the work area, or goes
+ * back (the app's runtime does the layout, EMBK_WIN_ACTION_MAXIMIZE, and the
+ * resize flies: zoom_hold). Two presses on one window, close together, within
+ * DOUBLE_MS of each other by the times the DRIVER took them (`first`, `last`
+ * of the `n` this tick): a slow tick can carry both, and timing them by when
+ * they were handled would part two quick clicks. The second starts no drag. */
+#define DOUBLE_MS 450
+static uint32_t g_dbl_id, g_dbl_t;
+/* Where the window is dragged by: its title bar but for its lights, or a
+ * zone the app declared. */
+static int win_drag_spot(const struct comp_window *w, int x, int y) {
+    int a, b, c, e;
+    if ((win_close_rect(w, &a, &b, &c, &e) && x >= a && x < c && y >= b && y < e) ||
+        (win_min_rect(w, &a, &b, &c, &e) && x >= a && x < c && y >= b && y < e) ||
+        (win_max_rect(w, &a, &b, &c, &e) && x >= a && x < c && y >= b && y < e)) return 0;
+    if (y < w->y + win_titlebar_h(w)) return 1;
+    int lx = x - w->x, ly = y - (w->y + win_titlebar_h(w));
+    for (int k = 0; k < w->drag_n; k++) {
+        const int16_t *r = w->drag_r[k];
+        if (lx >= r[0] && ly >= r[1] && lx < r[0] + r[2] && ly < r[1] + r[3]) return 1;
+    }
+    return 0;
+}
+static int      g_dbl_x, g_dbl_y;
+static int zoom_double(const struct comp_window *w, int x, int y, uint32_t first, uint32_t last, uint32_t n) {
+    int dbl = (n >= 2 && last - first < DOUBLE_MS) ||
+              (g_dbl_id == w->id && first - g_dbl_t < DOUBLE_MS &&
+               imax(x - g_dbl_x, g_dbl_x - x) <= 4 && imax(y - g_dbl_y, g_dbl_y - y) <= 4);
+    g_dbl_id = dbl ? 0 : w->id; g_dbl_t = last; g_dbl_x = x; g_dbl_y = y;
+    if (dbl) kprintf("compositor: %s zoomed by a double click\n", w->app[0] ? w->app : "a window");
+    return dbl;
 }
 
 /* ---- compositing -------------------------------------------------------- *
@@ -934,6 +2021,623 @@ static void draw_titlebar(struct comp_window *w, int focused, int rx0, int ry0, 
 }
 
 /* Draw one window's chrome + content clipped to region [rx0,ry0)-(rx1,ry1). */
+/* ---- a window that shows through: its backdrop ------------------------- */
+
+static void backdrop_free(struct comp_window *w) {
+    if (w->bd_sharp) kfree(w->bd_sharp);
+    if (w->bd_blur) kfree(w->bd_blur);
+    w->bd_sharp = w->bd_blur = 0;
+    w->bd_w = w->bd_h = 0; w->bd_valid = 0;
+}
+
+/* The part of a window's content on the screen, in window coordinates; 0 if
+ * none of it is. */
+static int mat_visible(const struct comp_window *w, int *vx0, int *vy0, int *vx1, int *vy1) {
+    const fb_info_t *fi = fb_get_info();
+    int cx0 = w->x, cy0 = w->y + win_titlebar_h(w);
+    *vx0 = imax(0, -cx0); *vy0 = imax(0, -cy0);
+    *vx1 = imin((int)w->cw, (int)fi->width - cx0); *vy1 = imin((int)w->ch, (int)fi->height - cy0);
+    return *vx1 > *vx0 && *vy1 > *vy0;
+}
+/* Hidden whole by one opaque window above it -- its rect, less the corners
+ * it rounds off: what is behind a window nobody can see is not worth a blur.
+ * Measured: a Terminal behind Settings re-blurred the desktop on every one of
+ * its frames while the display changed, and under emulation that held the
+ * compositor long enough for the desktop to miss its own redraw. */
+static int mat_hidden(const struct comp_window *w) {
+    int x0, y0, x1, y1;
+    win_frame_rect(w, &x0, &y0, &x1, &y1);
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        const struct comp_window *o = &g_wins[i];
+        if (o == w || !o->used || !o->visible || !o->presented || o->z <= w->z || o->sliding) continue;
+        if (o->mat_alpha || o->translucent || o->glass || o->desktop || o->widget) continue;   /* not opaque */
+        if (!session_ui_allowed(o->pid) || !on_workspace(o)) continue;
+        int ox0, oy0, ox1, oy1, r = win_shadows(o) ? WIN_RADIUS : 0;
+        win_frame_rect(o, &ox0, &oy0, &ox1, &oy1);
+        if (x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1) continue;
+        /* clear of its rounded corners: within its straight edges one way or the other */
+        if ((x0 >= ox0 + r && x1 <= ox1 - r) || (y0 >= oy0 + r && y1 <= oy1 - r)) return 1;
+    }
+    return 0;
+}
+/* A SLIDING window blurs nothing: it carries the blur it kept, of what was
+ * behind it where it rests -- where it lands, or the place it left. Blurring
+ * again under a window that moves a screen's width in a third of a second is
+ * a frame's whole budget per window, for a backdrop nobody can follow. */
+static int mat_blurs(const struct comp_window *w) {
+    return w->used && w->visible && w->presented && w->mat_alpha && w->mat_blur && w->content &&
+           session_ui_allowed(w->pid) && on_workspace(w) && !w->sliding && !fx_reduced();
+}
+/* The kept blur covers the whole window (it was all on the screen) */
+static int mat_kept_whole(const struct comp_window *w) {
+    return w->bd_valid && w->bd_blur && w->bd_w == w->cw && w->bd_h == w->ch && !w->bd_vx0 && !w->bd_vy0 &&
+           w->bd_vx1 == (int)w->cw && w->bd_vy1 == (int)w->ch;
+}
+
+/* A repaint the backdrop asks for after this one: the blur of a change
+ * reaches past what was repainted. paint_region does it before returning. */
+static int g_mat_more, g_mat_x0, g_mat_y0, g_mat_x1, g_mat_y1;
+static void mat_more(int x0, int y0, int x1, int y1) {
+    if (!g_mat_more) { g_mat_x0 = x0; g_mat_y0 = y0; g_mat_x1 = x1; g_mat_y1 = y1; g_mat_more = 1; return; }
+    g_mat_x0 = imin(g_mat_x0, x0); g_mat_y0 = imin(g_mat_y0, y0);
+    g_mat_x1 = imax(g_mat_x1, x1); g_mat_y1 = imax(g_mat_y1, y1);
+}
+
+/* A repaint touching a window whose blur is not known whole -- new, resized,
+ * moved on or off the screen -- or (on the GPU, which keeps no copy) any
+ * window that blurs, covers all of that window: the blur reads all of what
+ * is behind it, and only a repaint of all of it has that in hand. */
+static int layers_shown(const struct comp_window *w);   /* fwd */
+static int layer_moving(const struct comp_layer *L);   /* fwd */
+/* Its material box on the screen, as its kept frost knows it (clipped to it). */
+static int frost_box(const int m[4], int c[4]) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return 0;
+    c[0] = imax(m[0], 0); c[1] = imax(m[1], 0);
+    c[2] = imin(m[0] + m[2], (int)fi->width) - c[0]; c[3] = imin(m[1] + m[3], (int)fi->height) - c[1];
+    return c[2] > 1 && c[3] > 1;
+}
+static int layer_frost_known(const struct comp_layer *L, const int m[4], int a) {
+    int c[4];
+    return a >= 250 && L->fr_valid && !layer_moving(L) && frost_box(m, c) &&
+           c[0] == L->fr_x && c[1] == L->fr_y && c[2] == L->fr_w && c[3] == L->fr_h;
+}
+/* A layer that blurs what is behind it reads all of what is behind it: a
+ * repaint that touches it covers it whole -- unless its frost is kept (CPU,
+ * at rest, the same box): then what the repaint covers is read and compared,
+ * and the rest is already right (layer_frost_cpu). */
+static void region_grow_layers(int *rx0, int *ry0, int *rx1, int *ry1, int gpu) {
+    for (int pass = 0; pass < 2; pass++) {
+        int grew = 0;
+        for (int i = 0; i < LAYERS_MAX; i++) {
+            const struct comp_layer *L = &g_layers[i];
+            if (!L->used || L->parked || !L->presented || L->material != EMBK_LM_BLUR) continue;
+            const struct comp_window *w = win_by_id(L->win_id);
+            if (!w || !layers_shown(w)) continue;
+            int r[4], m[4], a; layer_geom(L, w, r, &a);
+            if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
+            layer_mat_rect(L, r, m);
+            int x0 = m[0], y0 = m[1], x1 = m[0] + m[2], y1 = m[1] + m[3];
+            if (x1 <= *rx0 || x0 >= *rx1 || y1 <= *ry0 || y0 >= *ry1) continue;
+            if (!gpu && layer_frost_known(L, m, a)) continue;
+            if (x0 < *rx0) { *rx0 = x0; grew = 1; }
+            if (y0 < *ry0) { *ry0 = y0; grew = 1; }
+            if (x1 > *rx1) { *rx1 = x1; grew = 1; }
+            if (y1 > *ry1) { *ry1 = y1; grew = 1; }
+        }
+        if (!grew) break;
+    }
+}
+
+static void region_grow_material(int *rx0, int *ry0, int *rx1, int *ry1, int gpu) {
+    for (int pass = 0; pass < 2; pass++) {
+        int grew = 0;
+        for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+            struct comp_window *w = &g_wins[i];
+            int vx0, vy0, vx1, vy1;
+            if (!mat_blurs(w) || !mat_visible(w, &vx0, &vy0, &vx1, &vy1) || mat_hidden(w)) continue;
+            int cx0 = w->x, cy0 = w->y + win_titlebar_h(w);
+            int x0 = cx0 + vx0, y0 = cy0 + vy0, x1 = cx0 + vx1, y1 = cy0 + vy1;
+            if (x1 <= *rx0 || x0 >= *rx1 || y1 <= *ry0 || y0 >= *ry1) continue;
+            int known = !gpu && w->bd_valid && w->bd_w == w->cw && w->bd_h == w->ch &&
+                        w->bd_vx0 == vx0 && w->bd_vy0 == vy0 && w->bd_vx1 == vx1 && w->bd_vy1 == vy1;
+            if (known) continue;
+            if (x0 < *rx0) { *rx0 = x0; grew = 1; }
+            if (y0 < *ry0) { *ry0 = y0; grew = 1; }
+            if (x1 > *rx1) { *rx1 = x1; grew = 1; }
+            if (y1 > *ry1) { *ry1 = y1; grew = 1; }
+        }
+        if (!grew) break;
+    }
+}
+
+/* What is behind the window, where this repaint covers it: read before the
+ * window draws anything (its own shadow included), compared with what was
+ * there, and blurred again where it changed. */
+static uint32_t g_bd_row[8192];
+/* The kept blur, saturated where it was just made (pix_saturate_row): kept
+ * that way, so a frame that shows it pays nothing for it. */
+static void mat_vibrancy(struct comp_window *w, int x0, int y0, int x1, int y1) {
+    for (int y = y0; y < y1; y++) pix_saturate_row(w->bd_blur + (size_t)y * w->cw + x0, x1 - x0, PIX_VIBRANCY, 0);
+}
+static void mat_capture(struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
+    int vx0, vy0, vx1, vy1;
+    if (!mat_visible(w, &vx0, &vy0, &vx1, &vy1)) return;
+    /* hidden: nothing to blur, and what it keeps goes stale -- the repaint
+     * that shows it again covers all of it (region_grow_material) */
+    if (mat_hidden(w)) { w->bd_valid = 0; return; }
+    int cx0 = w->x, cy0 = w->y + win_titlebar_h(w), cw = (int)w->cw;
+    int ix0 = imax(vx0, rx0 - cx0), iy0 = imax(vy0, ry0 - cy0);
+    int ix1 = imin(vx1, rx1 - cx0), iy1 = imin(vy1, ry1 - cy0);
+    if (ix1 <= ix0 || iy1 <= iy0 || ix1 - ix0 > (int)(sizeof g_bd_row / sizeof *g_bd_row)) return;
+    if (!w->bd_sharp || w->bd_w != w->cw || w->bd_h != w->ch) {
+        backdrop_free(w);
+        w->bd_sharp = kmalloc((uint64_t)w->cw * w->ch * 4);
+        w->bd_blur = w->bd_sharp ? kmalloc((uint64_t)w->cw * w->ch * 4) : 0;
+        if (!w->bd_sharp || !w->bd_blur) { backdrop_free(w); return; }   /* no memory: no blur */
+        w->bd_w = w->cw; w->bd_h = w->ch;
+    }
+    if (w->bd_vx0 != vx0 || w->bd_vy0 != vy0 || w->bd_vx1 != vx1 || w->bd_vy1 != vy1) {
+        w->bd_valid = 0;
+        w->bd_vx0 = vx0; w->bd_vy0 = vy0; w->bd_vx1 = vx1; w->bd_vy1 = vy1;
+    }
+    int n = ix1 - ix0, chx0 = ix1, chy0 = iy1, chx1 = ix0, chy1 = iy0;
+    for (int y = iy0; y < iy1; y++) {
+        fb_read_rect(cx0 + ix0, cy0 + y, n, 1, g_bd_row, (uint32_t)n);
+        uint32_t *kept = w->bd_sharp + (size_t)y * cw + ix0;
+        int a = 0, b = n - 1;
+        if (w->bd_valid) {
+            while (a < n && kept[a] == g_bd_row[a]) a++;
+            if (a == n) continue;
+            while (b > a && kept[b] == g_bd_row[b]) b--;
+        }
+        memcpy(kept + a, g_bd_row + a, (size_t)(b - a + 1) * 4);
+        chx0 = imin(chx0, ix0 + a); chx1 = imax(chx1, ix0 + b + 1);
+        chy0 = imin(chy0, y); chy1 = imax(chy1, y + 1);
+    }
+    if (!w->bd_valid) {
+        /* region_grow_material made this repaint cover all of it */
+        if (ix0 != vx0 || iy0 != vy0 || ix1 != vx1 || iy1 != vy1) return;
+        if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, vx0, vy0, vx1, vy1, w->mat_blur) == 0) {
+            mat_vibrancy(w, vx0, vy0, vx1, vy1);
+            w->bd_valid = 1;
+        }
+        return;
+    }
+    if (chx1 <= chx0) return;                                    /* nothing behind it changed */
+    int m = backdrop_reach(w->mat_blur);
+    int ex0 = imax(vx0, chx0 - m), ey0 = imax(vy0, chy0 - m), ex1 = imin(vx1, chx1 + m), ey1 = imin(vy1, chy1 + m);
+    if (backdrop_blur(w->bd_sharp, w->bd_blur, cw, vx0, vy0, vx1, vy1, ex0, ey0, ex1, ey1, w->mat_blur)) {
+        w->bd_valid = 0; return;
+    }
+    mat_vibrancy(w, ex0, ey0, ex1, ey1);
+    if (ex0 < ix0 || ey0 < iy0 || ex1 > ix1 || ey1 > iy1) mat_more(cx0 + ex0, cy0 + ey0, cx0 + ex1, cy0 + ey1);
+}
+
+/* ---- layers: their pages, their motion, their drawing ------------------- */
+
+static uint64_t layer_bytes(const struct comp_layer *L) { return (uint64_t)L->npages * PAGE_SIZE; }
+
+/* Give the pages back: out of the client (while its address space is still
+ * alive -- the same rule as a shared window's), out of the kernel's view. */
+static void layer_frost_free(struct comp_layer *L) {
+    kfree(L->fr_sharp); kfree(L->fr_blur);
+    L->fr_sharp = L->fr_blur = 0; L->fr_w = L->fr_h = 0; L->fr_valid = 0;
+}
+static void layer_free(struct comp_layer *L) {
+    layer_frost_free(L);
+    gpu_image_doom(&L->gimg);
+    if (L->client_pml4 && L->client_va)
+        for (uint32_t i = 0; i < L->npages; i++) vmm_unmap_in(L->client_pml4, L->client_va + (uint64_t)i * PAGE_SIZE);
+    if (L->kview) vmm_kunmap_pages(L->kview, L->npages);
+    if (L->phys) {
+        for (uint32_t i = 0; i < L->npages; i++) pmm_free_page(L->phys[i]);
+        kfree(L->phys);
+    }
+    memset(L, 0, sizeof *L);
+}
+
+/* Repaint where it is and where it was: what a move, a fade or a new picture
+ * changes on screen. */
+static void layer_damage(struct comp_layer *L) {
+    struct comp_window *w = win_by_id(L->win_id);
+    if (!w) return;
+    int x0, y0, x1, y1; layer_extent(L, w, &x0, &y0, &x1, &y1);
+    if (L->have_last) {
+        x0 = imin(x0, L->last[0]); y0 = imin(y0, L->last[1]);
+        x1 = imax(x1, L->last[2]); y1 = imax(y1, L->last[3]);
+    }
+    layer_extent(L, w, &L->last[0], &L->last[1], &L->last[2], &L->last[3]);
+    L->have_last = 1;
+    paint_region(x0, y0, x1, y1);
+}
+
+/* The application is done with it: its pixels stay, for the window's next
+ * layer that fits -- or go, past what one window may keep. */
+static void layer_park(struct comp_layer *L) {
+    if (L->have_last) paint_region(L->last[0], L->last[1], L->last[2], L->last[3]);
+    int parked = 0;
+    for (int i = 0; i < LAYERS_MAX; i++)
+        parked += g_layers[i].used && g_layers[i].parked && g_layers[i].win_id == L->win_id;
+    if (parked >= LAYER_PARKED_PER_WIN) { layer_free(L); return; }
+    gpu_image_doom(&L->gimg);
+    layer_frost_free(L);
+    L->parked = 1; L->presented = 0; L->npend = 0; L->have_last = 0; L->destroy_at_rest = 0;
+    L->id = 0;
+}
+
+/* every layer of a window, when the window goes */
+static void layers_free_window(uint32_t win_id) {
+    for (int i = 0; i < LAYERS_MAX; i++)
+        if (g_layers[i].used && g_layers[i].win_id == win_id) layer_free(&g_layers[i]);
+}
+
+static int layer_moving(const struct comp_layer *L) {
+    return L->x.moving || L->y.moving || L->scale.moving || L->opacity.moving;
+}
+static void layers_count_moving(void) {
+    int n = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        n += L->used && !L->parked && L->presented && (layer_moving(L) || L->destroy_at_rest);
+    }
+    g_layers_moving = n;
+}
+
+/* one property toward its target: jumping there, or on its spring */
+static void layer_go(struct spring *sp, int64_t target, int snap, struct embk_spring how, uint64_t now,
+                     uint32_t delay_ms) {
+    if (snap || !how.response_ms) { spring_set(sp, target, now); return; }
+    spring_to(sp, target, spring_params((uint32_t)how.response_ms * g_slowmo,
+                                        how.damping_milli ? how.damping_milli : 1000u), now);
+    /* A DELAY: the spring's clock starts later. Until then it holds where it
+     * is, and says it is moving -- so the frames keep coming to start it. */
+    if (delay_ms && sp->moving) { sp->t0_ns = now + (uint64_t)delay_ms * g_slowmo * 1000000ull; sp->steps = 0; }
+}
+
+static void layer_apply(struct comp_layer *L, const struct embk_layer_op *op, uint64_t now) {
+    /* REDUCE MOTION: nothing travels or grows -- it is simply there -- and a
+     * fade stays, short, as the Mac keeps its crossfades */
+    int still = (g_desktop.flags & EMBK_DESKTOP_REDUCED_MOTION) != 0;
+    struct embk_spring fade = op->fade;
+    if (still && fade.response_ms > 150) fade.response_ms = 150;
+    uint32_t delay = still ? 0 : op->delay_ms;
+    if (op->set & EMBK_LP_POS) {
+        layer_go(&L->x, SPRING_PX(op->x), still || (op->snap & EMBK_LP_POS), op->move, now, delay);
+        layer_go(&L->y, SPRING_PX(op->y), still || (op->snap & EMBK_LP_POS), op->move, now, delay);
+    }
+    if (op->set & EMBK_LP_OPACITY)
+        layer_go(&L->opacity, SPRING_PX(op->opacity), op->snap & EMBK_LP_OPACITY, fade, now, delay);
+    if (op->set & EMBK_LP_SCALE) {
+        uint32_t sc = op->scale_milli < 10 ? 10 : op->scale_milli > 1000 ? 1000 : op->scale_milli;
+        layer_go(&L->scale, SPRING_PX(sc), still || (op->snap & EMBK_LP_SCALE), op->grow, now, delay);
+        L->ax = op->anchor_x_milli > 1000 ? 1000 : op->anchor_x_milli;
+        L->ay = op->anchor_y_milli > 1000 ? 1000 : op->anchor_y_milli;
+    }
+    if (op->set & EMBK_LP_LOOK) {
+        L->radius = op->radius; L->material = op->material; L->flags = op->flags;
+        L->mat_x = op->mat_x; L->mat_y = op->mat_y; L->mat_w = op->mat_w; L->mat_h = op->mat_h;
+        L->sh_dy = op->shadow_dy; L->sh_blur = op->shadow_blur; L->sh_alpha = op->shadow_alpha;
+    }
+    if (op->op == EMBK_LOP_DESTROY) L->destroy_at_rest = 1;
+}
+
+/* the frame thread, each frame: every moving layer to where its springs are
+ * now; one that is done and was told to go, parked */
+static void layers_step(uint64_t now) {
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented) continue;
+        if (!layer_moving(L) && !L->destroy_at_rest) continue;
+        spring_step(&L->x, now); spring_step(&L->y, now);
+        spring_step(&L->scale, now); spring_step(&L->opacity, now);
+        layer_damage(L);
+        if (!layer_moving(L) && L->destroy_at_rest) layer_park(L);
+    }
+    layers_count_moving();
+}
+
+/* Drawn with its window: are this window's layers on screen at all? */
+static int layers_shown(const struct comp_window *w) {
+    return w->visible && w->presented && session_ui_allowed(w->pid) && win_shown(w) && !g_ov;
+}
+
+/* THE FROST UNDER A LAYER AT REST, kept: what the repaint covers of its box
+ * is read and compared with what was behind it before; the same -- the
+ * layer's own picture changed, not what it stands on -- and the kept blur is
+ * laid back. Changed: blurred again, whole, as fb_blur_region does it (one
+ * box, saturated), and the rest of the box shown too (mat_more). 0: not kept
+ * (moving, no memory, too wide) -- blur it the plain way. */
+static uint32_t g_frost_made, g_frost_kept;   /* blurs made, and laid back (perf windows) */
+static int layer_frost_cpu(struct comp_layer *L, const int m[4], int bx0, int by0, int bx1, int by1) {
+    int c[4];
+    if (layer_moving(L) || 2 * GLASS_BLUR + 1 > PIX_BOX_MAX_WIN || !frost_box(m, c) ||
+        c[2] > (int)(sizeof g_bd_row / sizeof *g_bd_row)) { layer_frost_free(L); return 0; }
+    if (!L->fr_sharp || L->fr_w != c[2] || L->fr_h != c[3]) {
+        layer_frost_free(L);
+        L->fr_sharp = kmalloc((uint64_t)c[2] * (uint64_t)c[3] * 4);
+        L->fr_blur = L->fr_sharp ? kmalloc((uint64_t)c[2] * (uint64_t)c[3] * 4) : 0;
+        if (!L->fr_sharp || !L->fr_blur) { layer_frost_free(L); return 0; }
+        L->fr_w = c[2]; L->fr_h = c[3]; L->fr_valid = 0;
+    }
+    if (L->fr_x != c[0] || L->fr_y != c[1]) { L->fr_x = c[0]; L->fr_y = c[1]; L->fr_valid = 0; }
+    bx0 = imax(bx0, c[0]); by0 = imax(by0, c[1]); bx1 = imin(bx1, c[0] + c[2]); by1 = imin(by1, c[1] + c[3]);
+    if (bx1 <= bx0 || by1 <= by0) return 1;
+    int whole = bx0 == c[0] && by0 == c[1] && bx1 == c[0] + c[2] && by1 == c[1] + c[3];
+    if (!L->fr_valid && !whole) return 0;            /* region_grow_layers covers it whole then */
+    int n = bx1 - bx0, changed = !L->fr_valid;
+    for (int y = by0; y < by1; y++) {
+        fb_read_rect(bx0, y, n, 1, g_bd_row, (uint32_t)n);
+        uint32_t *kept = L->fr_sharp + (size_t)(y - c[1]) * (size_t)c[2] + (size_t)(bx0 - c[0]);
+        if (!changed && !memcmp(kept, g_bd_row, (size_t)n * 4)) continue;
+        memcpy(kept, g_bd_row, (size_t)n * 4);
+        changed = 1;
+    }
+    if (changed) {
+        size_t px = (size_t)c[2] * (size_t)c[3];
+        /* pix_box_blur's scratch: a picture's worth, and three sums a column */
+        uint32_t *tmp = kmalloc(px * 4), *col = tmp ? kmalloc((size_t)c[2] * 3 * 4) : 0;
+        if (!tmp || !col) { kfree(tmp); kfree(col); L->fr_valid = 0; return 0; }
+        memcpy(L->fr_blur, L->fr_sharp, px * 4);
+        pix_box_blur(L->fr_blur, c[2], c[3], GLASS_BLUR, tmp, col);
+        for (int y = 0; y < c[3]; y++) pix_saturate_row(L->fr_blur + (size_t)y * c[2], c[2], PIX_VIBRANCY, 0);
+        kfree(tmp); kfree(col);
+        L->fr_valid = 1; g_frost_made++;
+        if (!whole) mat_more(c[0], c[1], c[0] + c[2], c[1] + c[3]);   /* the rest of it, blurred anew */
+    } else g_frost_kept++;
+    fb_blit(bx0, by0, n, by1 - by0, L->fr_blur + (size_t)(by0 - c[1]) * (size_t)c[2] + (size_t)(bx0 - c[0]),
+            (uint32_t)c[2]);
+    return 1;
+}
+
+static void layers_draw_cpu(const struct comp_window *w, int rx0, int ry0, int rx1, int ry1) {
+    if (!layers_shown(w)) return;
+    int idx[LAYERS_MAX], n = layers_of(w->id, idx);
+    for (int k = 0; k < n; k++) {
+        const struct comp_layer *L = &g_layers[idx[k]];
+        if (!L->presented || !L->px) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
+        int x0, y0, x1, y1; layer_extent(L, w, &x0, &y0, &x1, &y1);
+        if (x1 <= rx0 || y1 <= ry0 || x0 >= rx1 || y0 >= ry1) continue;
+        if (L->sh_alpha && L->sh_blur && !fx_reduced()) {
+            struct fb_shadow_layer sl = { L->sh_dy, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u };
+            fb_shadow_layers(r[0], r[1], r[0] + r[2], r[1] + r[3], L->radius, &sl, 1, rx0, ry0, rx1, ry1);
+        }
+        /* MATERIAL: what is behind it, blurred, under its own pixels -- the
+         * screen as composed so far, which the repaint covers whole
+         * (region_grow_layers). Its corners keep the sharp backdrop outside
+         * the arc. Faded with the layer: a layer half in frosts half. */
+        int carved = 0;
+        if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0) {
+            int m[4]; layer_mat_rect(L, r, m);
+            int bx0 = imax(m[0], rx0), by0 = imax(m[1], ry0), bx1 = imin(m[0] + m[2], rx1), by1 = imin(m[1] + m[3], ry1);
+            if (bx1 > bx0 && by1 > by0) {
+                int rad = L->radius * spring_px(&L->scale) / 1000;
+                g_corner_r_override = rad < 1 ? 0 : rad > WIN_R_MAX ? WIN_R_MAX : rad;
+                if (g_corner_r_override) { corners_save_at(m[0], m[1], m[0] + m[2], m[1] + m[3], rx0, ry0, rx1, ry1); carved = 1; }
+                if (a >= 250) {
+                    if (!layer_frost_cpu((struct comp_layer *)L, m, bx0, by0, bx1, by1))
+                        fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);   /* saturated: frosted, not muddy */
+                }
+                else {
+                    /* part way in: the frost at the layer's own opacity, over the sharp */
+                    {
+                        uint32_t *keep = kmalloc((size_t)(bx1 - bx0) * (size_t)(by1 - by0) * 4);
+                        if (keep) {
+                            fb_read_rect(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0));
+                            fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                            fb_blit_uniform(bx0, by0, bx1 - bx0, by1 - by0, keep, (uint32_t)(bx1 - bx0), 255u - (uint32_t)a);
+                            kfree(keep);
+                        }
+                    }
+                }
+            }
+        }
+        if (L->flags & EMBK_LF_FILL) {
+            /* one colour over its rect: a uniform blend of a row of it */
+            static uint32_t fill_row[4096];
+            uint32_t c = L->px[0], ca = c >> 24;
+            int fx0 = imax(r[0], rx0), fy0 = imax(r[1], ry0), fx1 = imin(r[0] + r[2], rx1), fy1 = imin(r[1] + r[3], ry1);
+            if (ca && fx1 > fx0 && fy1 > fy0 && fx1 - fx0 <= 4096) {
+                uint32_t cr = ((c >> 16) & 255u) * 255u / ca, cg = ((c >> 8) & 255u) * 255u / ca, cb = (c & 255u) * 255u / ca;
+                uint32_t straight = 0xff000000u | (cr > 255 ? 255 : cr) << 16 | (cg > 255 ? 255 : cg) << 8 | (cb > 255 ? 255 : cb);
+                for (int x = 0; x < fx1 - fx0; x++) fill_row[x] = straight;
+                fb_blit_uniform(fx0, fy0, fx1 - fx0, fy1 - fy0, fill_row, 0, ca * (uint32_t)a / 255u);
+            }
+        } else
+        fb_blit_scaled_over(r[0], r[1], r[2], r[3], L->px, (int32_t)L->w, (int32_t)L->h, L->w,
+                            (uint32_t)a, g_ghost_smooth, rx0, ry0, rx1, ry1);
+        if (carved) corners_carve_ring(0, 0);
+        g_corner_r_override = 0;
+    }
+}
+
+static int layers_draw_gpu(const struct comp_window *w, const struct gpu_compose *gc) {
+    if (!layers_shown(w)) return 0;
+    int idx[LAYERS_MAX], n = layers_of(w->id, idx);
+    for (int k = 0; k < n; k++) {
+        struct comp_layer *L = &g_layers[idx[k]];
+        if (!L->presented || !L->px) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        if (a <= 0 || r[2] <= 0 || r[3] <= 0) continue;
+        if (!L->gimg && gc->image_create(L->px, L->w, L->h, L->w * 4, &L->gimg)) { L->gimg = 0; return -1; }
+        struct gpu_rect fr = { r[0], r[1], r[2], r[3] };
+        if (L->sh_alpha && L->sh_blur && !fx_reduced()) {
+            struct gpu_rect cast = { r[0], r[1] + L->sh_dy, r[2], r[3] };
+            gc->shadow(&cast, &fr, L->radius, L->sh_blur, (uint32_t)L->sh_alpha * (uint32_t)a / 255u);
+        }
+        if (L->material == EMBK_LM_BLUR && !fx_reduced() && GLASS_BLUR > 0 && !(L->flags & EMBK_LF_FILL)) {
+            int m[4]; layer_mat_rect(L, r, m);
+            struct gpu_rect mr = { m[0], m[1], m[2], m[3] };
+            gc->blur(&mr, GLASS_BLUR, &mr, (uint32_t)(L->radius * spring_px(&L->scale) / 1000), PIX_VIBRANCY);
+        }
+        struct gpu_draw d = { .image = L->gimg, .src = { 0, 0, (int32_t)L->w, (int32_t)L->h }, .dst = fr,
+                              .opaque = 0, .opacity = (uint8_t)a };
+        gc->draw(&d);
+    }
+    return 0;
+}
+
+/* Is screen (x, y) on an opaque pixel of one of this window's layers that
+ * takes the pointer? */
+static int layer_hit(const struct comp_window *w, int x, int y) {
+    if (!layers_shown(w)) return 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used || L->parked || !L->presented || L->win_id != w->id || !L->px || !(L->flags & EMBK_LF_HIT)) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        if (a <= 0 || r[2] <= 0 || r[3] <= 0 || x < r[0] || y < r[1] || x >= r[0] + r[2] || y >= r[1] + r[3]) continue;
+        if (L->flags & EMBK_LF_FILL) { if (L->px[0] >> 24) return 1; continue; }
+        uint32_t lx = (uint32_t)((int64_t)(x - r[0]) * L->w / (uint32_t)r[2]);
+        uint32_t ly = (uint32_t)((int64_t)(y - r[1]) * L->h / (uint32_t)r[3]);
+        if (lx < L->w && ly < L->h && (L->px[(size_t)ly * L->w + lx] >> 24)) return 1;
+    }
+    return 0;
+}
+
+/* ---- the layer calls (syscalls 166-168) ---------------------------------- */
+
+static struct comp_layer *layer_of(int pid, uint32_t win, uint32_t id) {
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (L->used && !L->parked && L->id == id && L->win_id == win && L->pid == pid) return L;
+    }
+    return 0;
+}
+
+int64_t compositor_layer_create(struct process *client, uint32_t win, uint32_t w, uint32_t h, uint64_t *out_va) {
+    const fb_info_t *fi = fb_get_info();
+    if (!client || !fi || !w || !h || w > fi->width || h > fi->height) return -EMBK_EINVAL;
+    int pid = (int)client->pid;
+    uint64_t bytes = (uint64_t)w * h * 4;
+    uint64_t now = time_get_ns();
+
+    /* a parked layer of this window that fits: its pages, again */
+    spin_lock(&g_comp_lock);
+    struct comp_window *cw = win_find(pid, win);
+    if (!cw || !cw->shared) { comp_unlock(); return -EMBK_EINVAL; }
+    int live = 0; uint64_t mine = 0, all = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (!L->used) continue;
+        all += layer_bytes(L);
+        if (L->win_id != win) continue;
+        mine += layer_bytes(L);
+        live += !L->parked;
+    }
+    if (live >= EMBK_LAYER_MAX_PER_WINDOW) { comp_unlock(); return -EMBK_ENOSPC; }
+    struct comp_layer *fit = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        struct comp_layer *L = &g_layers[i];
+        if (L->used && L->parked && L->win_id == win && layer_bytes(L) >= bytes &&
+            (!fit || L->npages < fit->npages)) fit = L;
+    }
+    if (fit) {
+        fit->parked = 0; fit->id = g_layer_next_id++; fit->w = w; fit->h = h; fit->seq = ++g_layer_seq;
+        spring_init(&fit->x, 0, now); spring_init(&fit->y, 0, now);
+        spring_init(&fit->scale, SPRING_PX(1000), now); spring_init(&fit->opacity, SPRING_PX(255), now);
+        fit->ax = fit->ay = 500; fit->radius = fit->material = fit->flags = 0;
+        fit->sh_dy = 0; fit->sh_blur = fit->sh_alpha = 0;
+        uint32_t id = fit->id; uint64_t va = fit->client_va;
+        comp_unlock();
+        if (out_va) *out_va = va;
+        return id;
+    }
+    if (mine + bytes > LAYER_WIN_BYTES || all + bytes > LAYER_ALL_BYTES) { comp_unlock(); return -EMBK_ENOMEM; }
+    comp_unlock();
+
+    /* new pages, mapped into the client as a shared window's are */
+    uint32_t npages = (uint32_t)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint64_t *phys = (uint64_t *)kmalloc((size_t)npages * sizeof(uint64_t));
+    if (!phys) return -EMBK_ENOMEM;
+    uint32_t got = 0;
+    for (; got < npages; got++) { uint64_t p = pmm_alloc_page(); if (!p) break; phys[got] = p; }
+    uint64_t kview = got == npages ? vmm_kmap_pages(phys, npages) : 0;
+    if (!kview) {
+        for (uint32_t i = 0; i < got; i++) pmm_free_page(phys[i]);
+        kfree(phys); return -EMBK_ENOMEM;
+    }
+    memset((void *)(uintptr_t)kview, 0, (size_t)npages * PAGE_SIZE);   /* transparent */
+    uint64_t cva = client->shared_next_va, va = cva;
+    for (uint32_t i = 0; i < npages; i++, va += PAGE_SIZE)
+        if (vmm_map_in(client->pml4_phys, va, phys[i], VMM_USER | VMM_WRITABLE | VMM_NX) < 0) break;
+    if (va != cva + (uint64_t)npages * PAGE_SIZE) {
+        for (uint64_t u = cva; u < va; u += PAGE_SIZE) vmm_unmap_in(client->pml4_phys, u);
+        vmm_kunmap_pages(kview, npages);
+        for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
+        kfree(phys); return -EMBK_ENOMEM;
+    }
+    client->shared_next_va = va;
+
+    spin_lock(&g_comp_lock);
+    struct comp_layer *L = 0;
+    for (int i = 0; i < LAYERS_MAX && !L; i++) if (!g_layers[i].used) L = &g_layers[i];
+    if (!L || !win_find(pid, win)) {
+        comp_unlock();
+        for (uint64_t u = cva; u < va; u += PAGE_SIZE) vmm_unmap_in(client->pml4_phys, u);
+        vmm_kunmap_pages(kview, npages);
+        for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
+        kfree(phys);
+        return L ? -EMBK_EINVAL : -EMBK_ENOSPC;
+    }
+    memset(L, 0, sizeof *L);
+    L->used = 1; L->id = g_layer_next_id++; L->win_id = win; L->pid = pid; L->w = w; L->h = h; L->seq = ++g_layer_seq;
+    L->phys = phys; L->npages = npages; L->kview = kview; L->client_va = cva; L->client_pml4 = client->pml4_phys;
+    L->px = (uint32_t *)(uintptr_t)kview;
+    spring_init(&L->x, 0, now); spring_init(&L->y, 0, now);
+    spring_init(&L->scale, SPRING_PX(1000), now); spring_init(&L->opacity, SPRING_PX(255), now);
+    L->ax = L->ay = 500;
+    uint32_t id = L->id;
+    comp_unlock();
+    if (out_va) *out_va = cva;
+    return id;
+}
+
+int64_t compositor_layer_set(int pid, uint32_t win, const struct embk_layer_op *ops, uint32_t n, uint32_t flags) {
+    uint64_t now = time_get_ns();
+    spin_lock(&g_comp_lock);
+    int64_t rc = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        struct comp_layer *L = layer_of(pid, win, ops[k].id);
+        if (!L) { rc = -EMBK_EINVAL; continue; }
+        if ((flags & EMBK_LS_AT_PRESENT) || (!L->presented && L->npend)) {
+            if (L->npend < 4) L->pend[L->npend++] = ops[k];
+            else { L->pend[3] = ops[k]; }           /* the newest wins the last place */
+            continue;
+        }
+        layer_apply(L, &ops[k], now);
+        if (L->presented) layer_damage(L);
+        if (L->destroy_at_rest && !layer_moving(L)) layer_park(L);
+    }
+    layers_count_moving();
+    comp_unlock();
+    return rc;
+}
+
+int64_t compositor_layer_present(int pid, uint32_t win, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h) {
+    uint64_t now = time_get_ns();
+    spin_lock(&g_comp_lock);
+    struct comp_layer *L = layer_of(pid, win, id);
+    if (!L) { comp_unlock(); return -EMBK_EINVAL; }
+    if (g_gc && L->gimg) {
+        struct gpu_rect r = { x, y, w, h };
+        if (r.x < 0) { r.w += r.x; r.x = 0; }
+        if (r.y < 0) { r.h += r.y; r.y = 0; }
+        if (r.x + r.w > (int32_t)L->w) r.w = (int32_t)L->w - r.x;
+        if (r.y + r.h > (int32_t)L->h) r.h = (int32_t)L->h - r.y;
+        if (r.w > 0 && r.h > 0) g_gc->image_update(L->gimg, &r);
+    }
+    L->presented = 1;
+    for (int k = 0; k < L->npend; k++) layer_apply(L, &L->pend[k], now);
+    L->npend = 0;
+    layer_damage(L);
+    if (L->destroy_at_rest && !layer_moving(L)) layer_park(L);
+    layers_count_moving();
+    comp_unlock();
+    return 0;
+}
+
 static void paint_window(struct comp_window *w, int focused,
                          int rx0, int ry0, int rx1, int ry1) {
     int fx0, fy0, fx1, fy1;
@@ -952,15 +2656,16 @@ static void paint_window(struct comp_window *w, int focused,
      * ugliest moment in launching anything. Now that the open animation waits
      * for the first real frame anyway, simply don't draw the window until it
      * has one: the desktop stays whole, and then the window grows in. */
-    if (!w->presented || (!session_ui_allowed(w->pid) || !on_workspace(w))) return;
+    if (!w->presented || (!session_ui_allowed(w->pid) || !win_shown(w))) return;
 
-    /* the drop shadow: drawn first (outside the frame) so the window content
-     * lands on top of it, offset downward, and deeper while focused. */
+    /* what is behind a window that shows through, before it casts its shadow */
+    if (mat_blurs(w)) mat_capture(w, rx0, ry0, rx1, ry1);
+
+    /* the shadow: drawn first so the window lands on top of it -- and under
+     * its corners' arcs, so the carve below finds it already in the backdrop */
     if (shadow && g_desktop.shadows) {
-        int sw_  = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-        int sa_  = (focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE) * (g_desktop.shadows==2?3:2)/2;
-        fb_glow_rect(fx0, fy0 + SHADOW_DY, fx1, fy1 + SHADOW_DY, sw_,
-                     0, 0, 0, (uint8_t)sa_, rx0, ry0, rx1, ry1);
+        struct fb_shadow_layer sl[2];
+        fb_shadow_layers(fx0, fy0, fx1, fy1, WIN_RADIUS, sl, shadow_layers(focused, sl), rx0, ry0, rx1, ry1);
     }
 
     /* stash the corner backdrops NOW: everything below this line overwrites
@@ -992,12 +2697,24 @@ static void paint_window(struct comp_window *w, int focused,
              * this window. A glass WIDGET renders a translucent tint -> composite
              * per-pixel so the frosted aurora shows through it; an acrylic app
              * window renders opaque -> lay it over at a uniform translucency. */
-            if(GLASS_BLUR>0)fb_blur_region(sx0,sy0,sx1-sx0,sy1-sy0,GLASS_BLUR);
+            if(GLASS_BLUR>0) {
+                if (fx_reduced()) fill_clip(sx0, sy0, sx1 - sx0, sy1 - sy0, g_desktop.background, rx0, ry0, rx1, ry1);
+                else fb_blur_region(sx0,sy0,sx1-sx0,sy1-sy0,GLASS_BLUR);
+            }
             if(w->widget && GLASS_ALPHA==255)fill_clip(sx0,sy0,sx1-sx0,sy1-sy0,g_desktop.background,rx0,ry0,rx1,ry1);
             if (w->widget)
                 fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
             else
                 fb_blit_uniform(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw, GLASS_ALPHA);
+        } else if (w->mat_alpha) {
+            /* a window that shows through: its own alpha, over the kept blur
+             * of what is behind it (or the sharp backdrop, with no blur). A
+             * sliding window carries its kept blur along, if it has all of it. */
+            if (w->mat_blur && fx_reduced())          /* the tier's tint, not a blur */
+                fill_clip(sx0, sy0, sx1 - sx0, sy1 - sy0, g_desktop.background, rx0, ry0, rx1, ry1);
+            else if (w->mat_blur && w->bd_valid && w->bd_blur && (!w->sliding || mat_kept_whole(w)))
+                fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, w->bd_blur + (size_t)src_y * w->cw + src_x, w->cw);
+            fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else if (w->desktop || w->translucent) {
             /* the home desktop and a translucent bar render a transparent canvas
              * with only some opaque pixels; composite per-pixel over the SHARP
@@ -1011,8 +2728,10 @@ static void paint_window(struct comp_window *w, int focused,
                 int by0 = imax(sy0, cy0 + w->blur_y);
                 int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w);
                 int by1 = imin(sy1, cy0 + w->blur_y + w->blur_h);
-                if (bx1 > bx0 && by1 > by0)
-                    fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                if (bx1 > bx0 && by1 > by0) {
+                    if (fx_reduced()) fill_clip(bx0, by0, bx1 - bx0, by1 - by0, g_desktop.background, rx0, ry0, rx1, ry1);
+                    else fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+                }
             }
             fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else {
@@ -1112,6 +2831,7 @@ static void draw_cursor(int cx, int cy) {
  * never in a window backing store.  Restoring this small snapshot avoids
  * recomposing the complete desktop for every pointer movement. */
 static void cursor_restore_under(void) {
+    if (g_hw_cursor) return;          /* nothing of ours is on the screen */
     if (!g_cursor_valid || !g_cursor_under_valid) return;
     /* One clipped blit also produces one dirty-region update.  The old
      * per-pixel restore acquired the framebuffer dirty lock hundreds of times
@@ -1122,7 +2842,7 @@ static void cursor_restore_under(void) {
 }
 
 static void cursor_capture_and_draw(void) {
-    if (!g_cursor_valid) return;
+    if (!g_cursor_valid || g_hw_cursor) return;
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     for (int y = 0; y < CURSOR_H; y++) {
@@ -1149,11 +2869,27 @@ static void region_grow_corners(int *rx0, int *ry0, int *rx1, int *ry1) {
         for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
             struct comp_window *w = &g_wins[i];
             if (!w->used || !w->visible || !win_shadows(w)) continue;
-            int bx[4], by[4], cx[4], cy[4];
+            int bx[4], by[4], cx[4], cy[4], dx, dy;
             if (!corner_boxes(w, bx, by, cx, cy)) continue;
+            slide_offset(w, &dx, &dy);          /* where a sliding one is drawn */
             for (int k = 0; k < 4; k++) {
+                bx[k] += dx; by[k] += dy;
                 if (bx[k] + r <= *rx0 || bx[k] >= *rx1 ||
                     by[k] + r <= *ry0 || by[k] >= *ry1) continue;   /* no touch */
+                if (bx[k]     < *rx0) { *rx0 = bx[k];     grew = 1; }
+                if (by[k]     < *ry0) { *ry0 = by[k];     grew = 1; }
+                if (bx[k] + r > *rx1) { *rx1 = bx[k] + r; grew = 1; }
+                if (by[k] + r > *ry1) { *ry1 = by[k] + r; grew = 1; }
+            }
+        }
+        for (int gi = 0; gi < GHOSTS_MAX; gi++) {    /* and a flying window's */
+            const struct ghost *g = &g_ghosts[gi];
+            if (g->kind == ANIM_NONE || ghost_slides(g) || !g->chrome) continue;
+            int gr[4], ga, bx[4], by[4], cx[4], cy[4];
+            ghost_rect(g, gr, &ga);
+            if (!corner_boxes_at(gr[0], gr[1], gr[0] + gr[2], gr[1] + gr[3], bx, by, cx, cy)) continue;
+            for (int k = 0; k < 4; k++) {
+                if (bx[k] + r <= *rx0 || bx[k] >= *rx1 || by[k] + r <= *ry0 || by[k] >= *ry1) continue;
                 if (bx[k]     < *rx0) { *rx0 = bx[k];     grew = 1; }
                 if (by[k]     < *ry0) { *ry0 = by[k];     grew = 1; }
                 if (bx[k] + r > *rx1) { *rx1 = bx[k] + r; grew = 1; }
@@ -1196,8 +2932,12 @@ static void gpu_fall_back(const char *why) {
         if (g_wins[i].gimg) gc->image_destroy(g_wins[i].gimg);
         g_wins[i].gimg = 0; g_wins[i].gimg_px = 0;
     }
-    uint32_t *singles[] = { &g_canvas_img, &g_aurora_img, &g_cursor_img, &g_snap_img };
-    for (unsigned i = 0; i < 4; i++) { if (*singles[i]) gc->image_destroy(*singles[i]); *singles[i] = 0; }
+    uint32_t *singles[] = { &g_canvas_img, &g_aurora_img, &g_cursor_img };
+    for (unsigned i = 0; i < 3; i++) { if (*singles[i]) gc->image_destroy(*singles[i]); *singles[i] = 0; }
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        if (g_ghosts[i].snap_img) gc->image_destroy(g_ghosts[i].snap_img);
+        g_ghosts[i].snap_img = 0;
+    }
     g_canvas_px = 0;
     g_gc = 0;
     fb_set_composed_elsewhere(false);
@@ -1245,14 +2985,20 @@ static void cursor_layer_over(const uint32_t *layer, int ox, int oy) {
         }
 }
 
-static int gpu_cursor_image(void) {
-    if (!cursor_layers_ready) g_cursor_img_stale = 1;
+/* The cursor as one premultiplied picture in g_cursor_px. */
+static void cursor_build_px(void) {
     cursor_prepare_layers();
-    if (g_cursor_img && !g_cursor_img_stale) return 0;
     memset(g_cursor_px, 0, sizeof g_cursor_px);
     cursor_layer_over(cursor_shadow, 2, 2);
     cursor_layer_over(cursor_outer_layer, 0, 0);
     cursor_layer_over(cursor_inner_layer, 0, 0);
+}
+
+static int gpu_cursor_image(void) {
+    if (!cursor_layers_ready) g_cursor_img_stale = 1;
+    cursor_prepare_layers();
+    if (g_cursor_img && !g_cursor_img_stale) return 0;
+    cursor_build_px();
     if (g_cursor_img) g_gc->image_update(g_cursor_img, &(struct gpu_rect){ 0, 0, CURSOR_W, CURSOR_H });
     else if (g_gc->image_create(g_cursor_px, CURSOR_W, CURSOR_H, CURSOR_W * 4, &g_cursor_img)) { g_cursor_img = 0; return -1; }
     g_cursor_img_stale = 0;
@@ -1268,7 +3014,7 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
     int px0 = fx0, py0 = fy0, px1 = fx1, py1 = fy1;
     if (shadow) { px0 -= SHADOW_PAD; py0 -= SHADOW_PAD; px1 += SHADOW_PAD; py1 += SHADOW_PAD; }
     if (px1 <= rx0 || px0 >= rx1 || py1 <= ry0 || py0 >= ry1) return 0;
-    if (!w->presented || (!session_ui_allowed(w->pid) || !on_workspace(w))) return 0;
+    if (!w->presented || (!session_ui_allowed(w->pid) || !win_shown(w))) return 0;
     if (gpu_window_image(w)) return -1;
 
     struct gpu_rect frame = { fx0, fy0, fx1 - fx0, fy1 - fy0 };
@@ -1278,10 +3024,12 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
     uint32_t ring_rgb = focused ? g_desktop.accent : g_desktop.text;
 
     if (shadow && g_desktop.shadows) {
-        int sw_ = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
-        int sa_ = (focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE) * (g_desktop.shadows == 2 ? 3 : 2) / 2;
-        struct gpu_rect cast = { fx0, fy0 + SHADOW_DY, fx1 - fx0, fy1 - fy0 };
-        gc->shadow(&cast, &frame, radius, (uint32_t)sw_, (uint32_t)sa_);
+        struct fb_shadow_layer sl[2];
+        int nl = shadow_layers(focused, sl);
+        for (int i = 0; i < nl; i++) {          /* the CPU's two layers, one call each */
+            struct gpu_rect cast = { fx0, fy0 + sl[i].dy, fx1 - fx0, fy1 - fy0 };
+            gc->shadow(&cast, &frame, radius, (uint32_t)sl[i].width, sl[i].peak);
+        }
     }
 
     if (chrome) {
@@ -1314,17 +3062,33 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
             /* frost what is already drawn behind; a glass widget lays its
              * translucent tint over it, an acrylic window its opaque pixels at
              * a uniform translucency (paint_window's two cases) */
-            if (GLASS_BLUR > 0) gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius);
+            if (GLASS_BLUR > 0) {
+                if (fx_reduced()) gc->fill(&shown, g_desktop.background);
+                else gc->blur(&shown, (uint32_t)GLASS_BLUR, round ? &frame : 0, radius, PIX_VIBRANCY);
+            }
             if (w->widget && GLASS_ALPHA == 255) gc->fill(&shown, g_desktop.background);
             if (w->widget) d.opaque = 0;
             else d.opacity = (uint8_t)GLASS_ALPHA;
+        } else if (w->mat_alpha) {
+            /* the repaint covers all of the window (region_grow_material), so
+             * the blur reads all of what is behind it: two box passes of half
+             * the radius, the tent the CPU's backdrop_blur draws */
+            if (w->mat_blur && fx_reduced()) {
+                gc->fill(&shown, g_desktop.background);
+            } else if (w->mat_blur) {
+                uint32_t half = (uint32_t)(w->mat_blur + 1) / 2;
+                gc->blur(&shown, half, 0, 0, 0);                  /* saturated once, at the end */
+                gc->blur(&shown, half, round ? &frame : 0, radius, PIX_VIBRANCY);
+            }
+            d.opaque = 0;
         } else if (w->desktop || w->translucent) {
             if (w->blur_set && GLASS_BLUR > 0) {
                 int bx0 = imax(sx0, cx0 + w->blur_x), by0 = imax(sy0, cy0 + w->blur_y);
                 int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w), by1 = imin(sy1, cy0 + w->blur_y + w->blur_h);
                 if (bx1 > bx0 && by1 > by0) {
                     struct gpu_rect b = { bx0, by0, bx1 - bx0, by1 - by0 };
-                    gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0);
+                    if (fx_reduced()) gc->fill(&b, g_desktop.background);
+                    else gc->blur(&b, (uint32_t)GLASS_BLUR, 0, 0, PIX_VIBRANCY);
                 }
             }
             d.opaque = 0;
@@ -1334,11 +3098,78 @@ static int paint_window_gpu(struct comp_window *w, int focused, int rx0, int ry0
     return 0;
 }
 
+/* ---- the statistics overlay (GUI+Shift+P, serial `perf hud`) ------------ *
+ * What composing costs, on the screen it is costing: drawn by the compositor
+ * over every window and under the cursor, at the primary output's top right,
+ * just below the bar. The text is formatted at the refresh (hud_tick), never
+ * inside a compose, and the overlay's own repaints are charged to
+ * EMBK_COMP_SRC_HUD, which the totals leave out -- turning it on does not move
+ * the numbers it shows. Plain 8x16 text on purpose: it is an instrument. */
+#define HUD_ROWS       COMP_STATS_HUD_ROWS
+#define HUD_W          (COMP_STATS_HUD_COLS * 8 + 16)
+#define HUD_H          (HUD_ROWS * 16 + 12)
+#define HUD_REFRESH_MS 500
+static volatile int g_hud_want;          /* asked for, from any context       */
+static int          g_hud_on;            /* on screen (compositor lock)       */
+static uint64_t     g_hud_at;            /* uptime ms of the last refresh     */
+static char         g_hud_rows[HUD_ROWS][COMP_STATS_HUD_COLS + 1];
+
+static void hud_rect(int *x0, int *y0, int *x1, int *y1) {
+    outputs_whole(fb_get_info());
+    const struct layout_rect *o = &g_outs[0];
+    *x1 = o->x + (int)o->w - 12; *x0 = *x1 - HUD_W;
+    *y0 = o->y + WORK_TOP + 8;   *y1 = *y0 + HUD_H;
+}
+
+/* Into the backbuffer, clipped to the region. 1 if anything was drawn. */
+static int hud_draw(int rx0, int ry0, int rx1, int ry1) {
+    if (!g_hud_on) return 0;
+    int x0, y0, x1, y1; hud_rect(&x0, &y0, &x1, &y1);
+    int cx0 = imax(x0, rx0), cy0 = imax(y0, ry0), cx1 = imin(x1, rx1), cy1 = imin(y1, ry1);
+    if (cx1 <= cx0 || cy1 <= cy0) return 0;
+    fb_set_clip(cx0, cy0, cx1, cy1);
+    fb_fill_rect(x0, y0, x1 - x0, y1 - y0, FB_RGB(0x10, 0x14, 0x18));
+    fb_color_t edge = g_desktop.accent;
+    fb_fill_rect(x0, y0, x1 - x0, 1, edge); fb_fill_rect(x0, y1 - 1, x1 - x0, 1, edge);
+    fb_fill_rect(x0, y0, 1, y1 - y0, edge); fb_fill_rect(x1 - 1, y0, 1, y1 - y0, edge);
+    for (int i = 0; i < HUD_ROWS; i++)
+        fb_draw_string(g_hud_rows[i], x0 + 8, y0 + 6 + i * 16,
+                       0xec, 0xf0, 0xec, 0x10, 0x14, 0x18);
+    fb_reset_clip();
+    return 1;
+}
+
+int compositor_hud_toggle(void) {
+    g_hud_want = !g_hud_want;
+    return g_hud_want;
+}
+int compositor_hud_shown(void) { return g_hud_on; }
+
+/* From the kernel loop: bring the overlay up or down as asked, and refresh it
+ * twice a second while it is up. The text is made before the lock is taken --
+ * comp_stats asks the compositor which renderer it has. */
+void compositor_hud_tick(void) {
+    if (!g_active || (!g_hud_want && !g_hud_on)) return;
+    uint64_t now = timer_uptime_ms();
+    int want = g_hud_want;
+    if (want == g_hud_on && now - g_hud_at < HUD_REFRESH_MS) return;
+    char rows[HUD_ROWS][COMP_STATS_HUD_COLS + 1];
+    if (want) comp_stats_hud_text(rows);
+    spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_HUD;
+    if (want) memcpy(g_hud_rows, rows, sizeof rows);
+    g_hud_on = want; g_hud_at = now;
+    int x0, y0, x1, y1; hud_rect(&x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    comp_unlock();
+}
+
 /* paint_region on the GPU. 0: drawn and shown; -1: the GPU could not. */
 static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
     const struct gpu_compose *gc = g_gc;
     const fb_info_t *fi = fb_get_info();
     int W = (int)fi->width, H = (int)fi->height;
+    g_paint_px += (uint64_t)(rx1 - rx0) * (uint64_t)(ry1 - ry0);
     for (unsigned i = 0; i < g_gpu_ndoomed; i++) gc->image_destroy(g_gpu_doomed[i]);
     g_gpu_ndoomed = 0;
     if (gpu_canvas(fi)) return -1;
@@ -1349,7 +3180,7 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
         g_aurora_img = 0;
         return -1;
     }
-    if (g_cursor_valid && gpu_cursor_image()) return -1;
+    if (g_cursor_valid && !g_hw_cursor && gpu_cursor_image()) return -1;
 
     struct gpu_rect dmg = { rx0, ry0, rx1 - rx0, ry1 - ry0 };
     /* Without the aurora, the gradient is drawn on the canvas and shown from it. */
@@ -1366,41 +3197,124 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
     while (drawn < COMP_MAX_WINDOWS) {
         int best = -1;
         for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-            if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+            if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !win_shown(&g_wins[i]))) continue;
             if (g_wins[i].z <= last_z) continue;
             if (best < 0 || g_wins[i].z < g_wins[best].z) best = i;
         }
         if (best < 0) break;
-        if (paint_window_gpu(&g_wins[best], g_wins[best].z == tz, rx0, ry0, rx1, ry1)) return -1;
+        {
+            struct comp_window *bw = &g_wins[best];
+            if (bw->id == g_tp.win_id && spring_px(&g_tp.a) > 0) {   /* the tile preview, under it */
+                static uint32_t tp_px, tp_img, tp_img_rgb = 0xFFFFFFFFu;
+                if (tp_img && tp_img_rgb != g_desktop.accent) gpu_image_doom(&tp_img);
+                if (!tp_img) {
+                    tp_px = 0xFF000000u | g_desktop.accent; tp_img_rgb = g_desktop.accent;
+                    if (gc->image_create(&tp_px, 1, 1, 4, &tp_img)) tp_img = 0;
+                }
+                if (tp_img) {
+                    int r[4], a = spring_px(&g_tp.a); tp_rect(r);
+                    struct gpu_rect fr = { r[0], r[1], r[2], r[3] };
+                    struct gpu_draw d = { .image = tp_img, .src = { 0, 0, 1, 1 }, .dst = fr, .opaque = 1,
+                                          .opacity = (uint8_t)(a > 255 ? 255 : a), .radius = (uint8_t)WIN_RADIUS, .frame = fr };
+                    gc->draw(&d);
+                }
+            }
+            int dx, dy; slide_offset(bw, &dx, &dy);
+            bw->x += dx; bw->y += dy;
+            int failed = paint_window_gpu(bw, bw->z == tz, rx0, ry0, rx1, ry1);
+            if (!failed) failed = layers_draw_gpu(bw, gc);
+            bw->x -= dx; bw->y -= dy;
+            if (!failed && bw->id == g_tp.win_id && spring_px(&g_tp.a) * 2 > TP_ALPHA) {   /* its outline, over it */
+                int r[4]; tp_rect(r);
+                struct gpu_rect e[4] = { { r[0], r[1], r[2], TP_RING }, { r[0], r[1] + r[3] - TP_RING, r[2], TP_RING },
+                                         { r[0], r[1], TP_RING, r[3] }, { r[0] + r[2] - TP_RING, r[1], TP_RING, r[3] } };
+                for (int k = 0; k < 4; k++) gc->fill(&e[k], g_desktop.accent);
+            }
+            if (failed) return -1;
+        }
         last_z = g_wins[best].z;
         drawn++;
     }
 
-    if (g_anim.kind != ANIM_NONE) {
+    if (g_ov && spring_px(&g_ov_dim) > 0) {
+        /* the overview's dimming: one black pixel, stretched, at its opacity */
+        static uint32_t black_px = 0xFF000000u;
+        static uint32_t black_img;
+        if (!black_img && g_gc->image_create(&black_px, 1, 1, 4, &black_img)) black_img = 0;
+        if (black_img) {
+            int a = spring_px(&g_ov_dim);
+            struct gpu_draw dd = { .image = black_img, .src = { 0, 0, 1, 1 }, .dst = { rx0, ry0, rx1 - rx0, ry1 - ry0 },
+                                   .opaque = 1, .opacity = (uint8_t)(a > 255 ? 255 : a) };
+            gc->draw(&dd);
+        }
+    }
+    for (int gi = 0; gi < GHOSTS_MAX; gi++) {
+        struct ghost *g = &g_ghosts[gi];
+        if (g->kind == ANIM_NONE || ghost_slides(g)) continue;   /* a slide is drawn as its window */
         uint32_t ghost = 0; int sw_ = 0, sh_ = 0;
-        if (g_anim.snap) {
-            /* anim_finish dooms it with the copy, so one here is of this copy */
-            if (!g_snap_img && g_gc->image_create(g_anim.snap, (uint32_t)g_anim.snap_w, (uint32_t)g_anim.snap_h,
-                                                  (uint32_t)g_anim.snap_w * 4, &g_snap_img)) { g_snap_img = 0; return -1; }
-            ghost = g_snap_img; sw_ = g_anim.snap_w; sh_ = g_anim.snap_h;
+        if (g->snap) {
+            /* ghost_free dooms it with the copy, so one here is of this copy */
+            if (!g->snap_img && g_gc->image_create(g->snap, (uint32_t)g->snap_w, (uint32_t)g->snap_h,
+                                                   (uint32_t)g->snap_w * 4, &g->snap_img)) { g->snap_img = 0; return -1; }
+            ghost = g->snap_img; sw_ = g->snap_w; sh_ = g->snap_h;
         } else {
-            struct comp_window *aw_ = win_by_id(g_anim.win_id);
+            struct comp_window *aw_ = win_by_id(g->win_id);
             if (aw_ && aw_->content) {
                 if (gpu_window_image(aw_)) return -1;
                 ghost = aw_->gimg; sw_ = (int)aw_->cw; sh_ = (int)aw_->ch;
             }
         }
         if (ghost) {
-            int r[4], alpha; anim_frame_rect(r, &alpha);
+            int r[4], alpha; ghost_rect(g, r, &alpha);
             if (alpha > 0 && r[2] > 0 && r[3] > 0) {
-                struct gpu_draw d = { .image = ghost, .src = { 0, 0, sw_, sh_ }, .dst = { r[0], r[1], r[2], r[3] },
-                                      .opaque = 1, .opacity = (uint8_t)alpha };
+                struct gpu_rect fr = { r[0], r[1], r[2], r[3] };
+                uint32_t radius = g->chrome ? (uint32_t)WIN_RADIUS : 0;
+                if (g->chrome) {                 /* the window's shadow, faded with it */
+                    struct fb_shadow_layer sl[2];
+                    int nl = shadow_layers(g->focus, sl);
+                    for (int k = 0; k < nl; k++) {
+                        struct gpu_rect cast = { r[0], r[1] + sl[k].dy, r[2], r[3] };
+                        gc->shadow(&cast, &fr, radius, (uint32_t)sl[k].width, sl[k].peak * (uint32_t)alpha / 255u);
+                    }
+                }
+                if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover) {
+                    /* the ring: a plate of the accent under the thumbnail, OV_RING
+                     * px larger and its radius as much larger -- concentric arcs,
+                     * so what shows is an even band */
+                    static uint32_t ring_px, ring_img, ring_rgb = 0xFFFFFFFFu;
+                    if (ring_img && ring_rgb != g_desktop.accent) gpu_image_doom(&ring_img);
+                    if (!ring_img) {
+                        ring_px = 0xFF000000u | g_desktop.accent; ring_rgb = g_desktop.accent;
+                        if (gc->image_create(&ring_px, 1, 1, 4, &ring_img)) ring_img = 0;
+                    }
+                    if (ring_img) {
+                        struct gpu_rect o = { r[0] - OV_RING, r[1] - OV_RING, r[2] + 2 * OV_RING, r[3] + 2 * OV_RING };
+                        struct gpu_draw rd = { .image = ring_img, .src = { 0, 0, 1, 1 }, .dst = o, .opaque = 1,
+                                               .opacity = (uint8_t)alpha, .radius = (uint8_t)(radius + OV_RING), .frame = o };
+                        gc->draw(&rd);
+                    }
+                }
+                struct gpu_draw d = { .image = ghost, .src = { 0, 0, sw_, sh_ }, .dst = fr,
+                                      .opaque = 1, .opacity = (uint8_t)alpha, .radius = (uint8_t)radius, .frame = fr };
                 gc->draw(&d);
             }
         }
     }
 
-    if (g_cursor_valid) {
+    /* the overlay is drawn by the CPU into the canvas, as a title bar is */
+    if (hud_draw(rx0, ry0, rx1, ry1)) {
+        int x0, y0, x1, y1; hud_rect(&x0, &y0, &x1, &y1);
+        x0 = imax(imax(x0, rx0), 0); y0 = imax(imax(y0, ry0), 0);
+        x1 = imin(imin(x1, rx1), W); y1 = imin(imin(y1, ry1), H);
+        if (x1 > x0 && y1 > y0) {
+            struct gpu_rect r = { x0, y0, x1 - x0, y1 - y0 };
+            gc->image_update(g_canvas_img, &r);
+            struct gpu_draw d = { .image = g_canvas_img, .src = r, .dst = r, .opaque = 1, .opacity = 255 };
+            gc->draw(&d);
+        }
+    }
+
+    if (g_cursor_valid && !g_hw_cursor) {
         struct gpu_draw d = { .image = g_cursor_img, .src = { 0, 0, CURSOR_W, CURSOR_H },
                               .dst = { g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H }, .opaque = 0, .opacity = 255 };
         gc->draw(&d);
@@ -1408,24 +3322,117 @@ static int paint_region_gpu(int rx0, int ry0, int rx1, int ry1) {
     return gc->end();
 }
 
-static void paint_region(int rx0, int ry0, int rx1, int ry1) {
+static void paint_region_now(int rx0, int ry0, int rx1, int ry1);
+
+static void compose_region(int rx0, int ry0, int rx1, int ry1);
+
+/* Fold [x0,x1) x [y0,y1) into the damage: into every rect it touches, the
+ * union then tried again, so the list stays disjoint; with the list full, into
+ * the rect the union grows least. A rect keeps the cause it was first
+ * recorded with. */
+static void damage_add(int x0, int y0, int x1, int y1, unsigned src) {
+    for (int merged = 1; merged; ) {
+        merged = 0;
+        for (int i = 0; i < g_ndmg; i++) {
+            struct dmg_rect *d = &g_dmg[i];
+            if (x0 > d->x1 || d->x0 > x1 || y0 > d->y1 || d->y0 > y1) continue;
+            x0 = imin(x0, d->x0); y0 = imin(y0, d->y0);
+            x1 = imax(x1, d->x1); y1 = imax(y1, d->y1);
+            src = d->src;
+            g_dmg[i] = g_dmg[--g_ndmg];
+            merged = 1;
+            break;
+        }
+    }
+    if (g_ndmg < DMG_MAX) {
+        g_dmg[g_ndmg++] = (struct dmg_rect){ x0, y0, x1, y1, src };
+        return;
+    }
+    int best = 0; int64_t best_growth = 0;
+    for (int i = 0; i < g_ndmg; i++) {
+        const struct dmg_rect *d = &g_dmg[i];
+        int64_t was = (int64_t)(d->x1 - d->x0) * (d->y1 - d->y0);
+        int64_t now = (int64_t)(imax(x1, d->x1) - imin(x0, d->x0)) * (imax(y1, d->y1) - imin(y0, d->y0));
+        if (i == 0 || now - was < best_growth) { best = i; best_growth = now - was; }
+    }
+    struct dmg_rect *d = &g_dmg[best];
+    d->x0 = imin(x0, d->x0); d->y0 = imin(y0, d->y0);
+    d->x1 = imax(x1, d->x1); d->y1 = imax(y1, d->y1);
+}
+
+/* Ask for a screen region to be composed: recorded for the next frame, or --
+ * before the frame thread runs -- composed now. Caller holds g_comp_lock. */
+static void paint_region(int x0, int y0, int x1, int y1) {
+    if (!g_comp_thread) { compose_region(x0, y0, x1, y1); return; }
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return;
+    x0 = imax(x0, 0); y0 = imax(y0, 0);
+    x1 = imin(x1, (int)fi->width); y1 = imin(y1, (int)fi->height);
+    if (x1 <= x0 || y1 <= y0) return;
+    damage_add(x0, y0, x1, y1, g_src);
+    g_need_kick = 1;
+}
+
+/* Compose every recorded rect, each charged to the cause it was recorded with.
+ * Caller holds g_comp_lock. */
+static void compose_pending_locked(void) {
+    struct dmg_rect todo[DMG_MAX];
+    int n = g_ndmg;
+    for (int i = 0; i < n; i++) todo[i] = g_dmg[i];
+    g_ndmg = 0;
+    unsigned was = g_src;
+    for (int i = 0; i < n; i++) {
+        g_src = todo[i].src;
+        compose_region(todo[i].x0, todo[i].y0, todo[i].x1, todo[i].y1);
+    }
+    g_src = was;
+}
+
+/* Every compose goes through here, so every compose is measured: its time from
+ * the first pixel to the presentation, its area, and the cause in g_src. */
+static void compose_region(int rx0, int ry0, int rx1, int ry1) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return;
+    g_paint_px = 0;
+    uint64_t t0 = time_get_ns();
+    paint_region_now(rx0, ry0, rx1, ry1);
+    if (!g_paint_px) return;                  /* clipped away: nothing composed */
+    uint64_t screen = (uint64_t)fi->width * fi->height;
+    comp_stats_record(g_src, t0, time_get_ns(), g_paint_px, g_paint_px * 10 >= screen * 9);
+}
+
+static void paint_region_now(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     int W = (int)fi->width, H = (int)fi->height;
+    int gpu = gpu_compose_now() != 0;
+    region_grow_layers(&rx0, &ry0, &rx1, &ry1, gpu);
+    region_grow_material(&rx0, &ry0, &rx1, &ry1, gpu);
     region_grow_corners(&rx0, &ry0, &rx1, &ry1);
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;
     if (rx1 > W) rx1 = W; if (ry1 > H) ry1 = H;
     if (rx1 <= rx0 || ry1 <= ry0) return;
-    if (gpu_compose_now()) {
+    if (gpu) {
         if (paint_region_gpu(rx0, ry0, rx1, ry1)) gpu_fall_back("a frame could not be drawn");
         return;
     }
+    g_mat_more = 0;
     paint_region_cpu(rx0, ry0, rx1, ry1);
+    /* the margin a changed backdrop's blur reaches: blurred already, shown
+     * now (twice at most -- a second round finds nothing changed) */
+    for (int round = 0; round < 2 && g_mat_more; round++) {
+        int x0 = imax(g_mat_x0, 0), y0 = imax(g_mat_y0, 0), x1 = imin(g_mat_x1, W), y1 = imin(g_mat_y1, H);
+        g_mat_more = 0;
+        region_grow_corners(&x0, &y0, &x1, &y1);
+        x0 = imax(x0, 0); y0 = imax(y0, 0); x1 = imin(x1, W); y1 = imin(y1, H);
+        if (x1 > x0 && y1 > y0) paint_region_cpu(x0, y0, x1, y1);
+    }
 }
 
 static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     int W = (int)fi->width, H = (int)fi->height;
+    g_paint_px += (uint64_t)(rx1 - rx0) * (uint64_t)(ry1 - ry0);
 
     /* Remove the software cursor before changing the composed framebuffer.
      * This also guarantees that its saved background never contains a previous
@@ -1449,33 +3456,63 @@ static void paint_region_cpu(int rx0, int ry0, int rx1, int ry1) {
     while (drawn < COMP_MAX_WINDOWS) {
         int best = -1;
         for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-            if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !on_workspace(&g_wins[i]))) continue;
+            if (!g_wins[i].used || !g_wins[i].visible || (!session_ui_allowed(g_wins[i].pid) || !win_shown(&g_wins[i]))) continue;
             if (g_wins[i].z <= last_z) continue;
             if (best < 0 || g_wins[i].z < g_wins[best].z) best = i;
         }
         if (best < 0) break;
-        paint_window(&g_wins[best], g_wins[best].z == tz, rx0, ry0, rx1, ry1);
+        {
+            struct comp_window *bw = &g_wins[best];
+            if (bw->id == g_tp.win_id) tp_draw_cpu(rx0, ry0, rx1, ry1);   /* under the window it is for */
+            int dx, dy; slide_offset(bw, &dx, &dy);
+            bw->x += dx; bw->y += dy;
+            paint_window(bw, bw->z == tz, rx0, ry0, rx1, ry1);
+            layers_draw_cpu(bw, rx0, ry0, rx1, ry1);   /* its layers, just above it */
+            bw->x -= dx; bw->y -= dy;
+            if (bw->id == g_tp.win_id) tp_ring_cpu(rx0, ry0, rx1, ry1);
+        }
         last_z = g_wins[best].z;
         drawn++;
     }
 
-    /* 2b) the flying ghost of a window being opened or parked. Drawn HERE --
-     *     above the windows, below the cursor -- so every repaint composes it
-     *     correctly, whatever triggered the repaint. */
-    if (g_anim.kind != ANIM_NONE) {
+    /* 2a) the overview's dimming, over the desktop and under its windows */
+    if (g_ov) ov_dim_cpu(rx0, ry0, rx1, ry1);
+
+    /* 2b) the ghosts of windows in motion. Drawn HERE -- above the windows,
+     *     below the cursor -- so every repaint composes them correctly,
+     *     whatever triggered the repaint. */
+    for (int gi = 0; gi < GHOSTS_MAX; gi++) {
+        const struct ghost *g = &g_ghosts[gi];
+        if (g->kind == ANIM_NONE || ghost_slides(g)) continue;   /* a slide is drawn as its window */
         const uint32_t *src = 0; int sw_ = 0, sh_ = 0;
-        if (g_anim.snap) {
-            src = g_anim.snap; sw_ = g_anim.snap_w; sh_ = g_anim.snap_h;
+        if (g->snap) {
+            src = g->snap; sw_ = g->snap_w; sh_ = g->snap_h;
         } else {
-            struct comp_window *aw = win_by_id(g_anim.win_id);
+            struct comp_window *aw = win_by_id(g->win_id);
             if (aw && aw->content) { src = aw->content; sw_ = (int)aw->cw; sh_ = (int)aw->ch; }
         }
         if (src) {
-            int r[4], alpha; anim_frame_rect(r, &alpha);
+            int r[4], alpha; ghost_rect(g, r, &alpha);
+            int round = 0;
+            if (g->chrome && alpha > 0 && r[2] > 0 && r[3] > 0) {
+                /* as the window would be: its shadow, faded with it, and its corners */
+                struct fb_shadow_layer sl[2];
+                int nl = shadow_layers(g->focus, sl);
+                for (int k = 0; k < nl; k++) sl[k].peak = sl[k].peak * (uint32_t)alpha / 255u;
+                if (nl) fb_shadow_layers(r[0], r[1], r[0] + r[2], r[1] + r[3], WIN_RADIUS, sl, nl, rx0, ry0, rx1, ry1);
+                corners_save_at(r[0], r[1], r[0] + r[2], r[1] + r[3], rx0, ry0, rx1, ry1);
+                round = 1;
+            }
             fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], src, sw_, sh_,
-                                   (uint32_t)sw_, (uint32_t)alpha, rx0, ry0, rx1, ry1);
+                                   (uint32_t)sw_, (uint32_t)alpha, g_ghost_smooth, rx0, ry0, rx1, ry1);
+            if (round) corners_carve_ring(0, 0);
+            if (g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover)
+                ov_draw_ring(r, round ? WIN_RADIUS : 0, rx0, ry0, rx1, ry1);
         }
     }
+
+    /* 2c) the statistics overlay, above everything but the cursor */
+    hud_draw(rx0, ry0, rx1, ry1);
 
     /* 3) save the fresh pixels below the cursor, then put it back on top. */
     cursor_capture_and_draw();
@@ -1499,6 +3536,7 @@ static void enforce_focus(void) {
     if (nt == g_top_id) return;
     struct comp_window *old = win_by_id(g_top_id);   /* previously focused */
     g_top_id = nt;
+    g_post_ui = 1;                                   /* both apps' `focused` flipped */
     /* Repaint both windows' footprints (grown by the shadow band) so DEPTH
      * follows focus: the window losing focus redraws with the shallow shadow,
      * the one gaining it with the deep one. That difference is now the focus
@@ -1521,6 +3559,8 @@ static void enforce_focus(void) {
  * the client first and freed exactly once here (not again by the client's
  * address-space teardown). */
 static void win_free_backing(struct comp_window *w) {
+    layers_free_window(w->id);
+    backdrop_free(w);
     gpu_image_doom(&w->gimg);
     w->gimg_px = 0;
     if (w->shared) {
@@ -1552,25 +3592,29 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     if (cw == 0 || ch == 0 || cw > fi->width || ch + COMP_TITLEBAR_H > fi->height)
         return -EMBK_EINVAL;
 
+    char app[24];
+    process_exec_name((uint32_t)pid, app, (int)sizeof app);   /* the scheduler's lock: not under ours */
     spin_lock(&g_comp_lock);
     int slot = -1;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++)
         if (!g_wins[i].used) { slot = i; break; }
-    if (slot < 0) { spin_unlock(&g_comp_lock); return -EMBK_ENOMEM; }
+    if (slot < 0) { comp_unlock(); return -EMBK_ENOMEM; }
 
     uint32_t *buf = (uint32_t *)kmalloc((size_t)cw * ch * 4);
-    if (!buf) { spin_unlock(&g_comp_lock); return -EMBK_ENOMEM; }
+    if (!buf) { comp_unlock(); return -EMBK_ENOMEM; }
     /* start opaque black so an un-presented window isn't garbage */
     for (size_t i = 0; i < (size_t)cw * ch; i++) buf[i] = 0xFF000000u;
 
     struct comp_window *w = &g_wins[slot];
     w->used = 1;
+    w->drag_n = 0;
     w->id = g_next_id++;
     w->pid = pid;
+    memcpy(w->app, app, sizeof w->app);
     w->x = x; w->y = y;
     w->cw = cw; w->ch = ch;
     w->z = g_next_z++;
-    w->visible = 1;
+    w->visible = 1; w->arriving = 0;
     w->workspace=g_desktop.workspace;
     w->menu_keyboard = 0;
     w->desktop = 0;
@@ -1578,9 +3622,11 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->widget = 0;
     w->glass = 0;
     w->translucent = 0;
-    w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
+    w->pr_pending = w->pr_phase = w->sent_right = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
+    w->mat_alpha = w->mat_blur = 0;
     w->content = buf;
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
@@ -1597,7 +3643,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
         paint_region(fx0, fy0, fx1, fy1);
     }
     enforce_focus();   /* the new window is now front; demote the old front */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     kprintf("compositor: window %u created (%ux%u) for pid %d\n",
             (unsigned)id, (unsigned)cw, (unsigned)ch, pid);
     return (int64_t)id;
@@ -1653,19 +3699,22 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     }
     client->shared_next_va = cva + (uint64_t)npages * PAGE_SIZE;
 
+    char app[24];
+    process_exec_name(client->pid, app, (int)sizeof app);   /* the scheduler's lock: not under ours */
     spin_lock(&g_comp_lock);
     int slot = -1;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) if (!g_wins[i].used) { slot = i; break; }
     if (slot < 0) {
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         for (uint32_t i = 0; i < npages; i++) vmm_unmap_in(client->pml4_phys, cva + (uint64_t)i * PAGE_SIZE);
         vmm_kunmap_pages(kview, npages);
         for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
         kfree(phys); return -EMBK_ENOMEM;
     }
     struct comp_window *w = &g_wins[slot];
-    w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid;
-    w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
+    w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid; w->drag_n = 0;
+    memcpy(w->app, app, sizeof w->app);
+    w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1; w->arriving = 0;
     w->workspace=g_desktop.workspace;
     w->menu_keyboard = 0;
     w->desktop = desktop;
@@ -1689,7 +3738,9 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->widget = widget;
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
-    w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->mat_alpha = w->mat_blur = 0;
+    w->pend_head = w->pend_count = w->pend_phase = w->sent_left = 0;
+    w->pr_pending = w->pr_phase = w->sent_right = 0;
     w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
@@ -1708,7 +3759,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     if (!g_active) { g_active = 1; paint_region(0, 0, (int)fi->width, (int)fi->height); }
     else { int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1); paint_region(fx0, fy0, fx1, fy1); }
     enforce_focus();
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     if (out_client_va) *out_client_va = cva;
     kprintf("compositor: %s window %u created (%ux%u, %u pages) for pid %d\n",
             desktop ? "desktop" : "shared",
@@ -1732,13 +3783,52 @@ int64_t compositor_win_create_chromeless(struct process *client, uint32_t cw, ui
     return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 0, 0, out_client_va);
 }
 
-/* Resize a SHARED window's content to (nw,nh): allocate a fresh page backing,
- * map it into the client at a new VA (returned via out_client_va), swap it in,
- * and repaint the union of the old+new footprints. The OLD backing is unmapped
- * and freed after the swap; the client must stop using its old pointer as soon
- * as this returns (the EmApp runtime does the swap synchronously). */
+/* What the window showed, ow x oh, laid out again as nw x nh: the rows kept,
+ * and what is new repeating the last column and row -- the window's own edge,
+ * not black, until the app has drawn at its size. `dst` may be `src` (a
+ * resize within the pages it has): rows move toward the end when the window
+ * widens, so walk them backwards then. */
+static void content_relayout(uint32_t *dst, const uint32_t *src, uint32_t ow, uint32_t oh,
+                             uint32_t nw, uint32_t nh) {
+    uint32_t cw = nw < ow ? nw : ow, rows = nh < oh ? nh : oh;
+    if (dst == src && nw > ow)
+        for (uint32_t r = rows; r-- > 0;) memmove(dst + (uint64_t)r * nw, src + (uint64_t)r * ow, (size_t)cw * 4);
+    else
+        for (uint32_t r = 0; r < rows; r++) memmove(dst + (uint64_t)r * nw, src + (uint64_t)r * ow, (size_t)cw * 4);
+    for (uint32_t r = 0; r < rows && cw < nw; r++) {
+        uint32_t *row = dst + (uint64_t)r * nw, edge = row[cw - 1];
+        for (uint32_t x = cw; x < nw; x++) row[x] = edge;
+    }
+    for (uint32_t r = rows; r < nh; r++) memcpy(dst + (uint64_t)r * nw, dst + (uint64_t)(rows - 1) * nw, (size_t)nw * 4);
+}
+/* The window's content is now nw x nh. Caller holds g_comp_lock. */
+static void win_take_size(struct comp_window *w, uint32_t nw, uint32_t nh) {
+    w->cw = nw; w->ch = nh;
+    /* full screen means covering the output it is on, not the whole desktop */
+    const fb_info_t *fi = fb_get_info();
+    if (fi) outputs_whole(fi);
+    int32_t cx = w->x + (int32_t)nw / 2, cy = w->y + (int32_t)nh / 2;
+    layout_clamp_point(g_outs, g_nouts, &cx, &cy);
+    int oi = layout_rect_at(g_outs, g_nouts, cx, cy);
+    const struct layout_rect *o = &g_outs[oi < 0 ? 0 : oi];
+    w->fullscreen = (nw >= o->w && nh >= o->h);
+}
+
+/* Resize a SHARED window's content to (nw,nh). Within the pages it has, in
+ * place: same pages, same client VA. Beyond them, a fresh backing with room
+ * to spare (half as much again, up to the screen) is mapped at a new VA
+ * (returned via out_client_va) and swapped in, and the OLD one unmapped and
+ * freed after; the client must stop using its old pointer as soon as this
+ * returns (the EmApp runtime does the swap synchronously). Either way the
+ * union of the old and new footprints is repainted.
+ *
+ * A LIVE resize -- the corner grip, a step a frame -- is never a zoom (a
+ * fast drag can move a long way between two frames) and is not logged. Its
+ * steps mostly fit: a window dragged smaller always does, one dragged larger
+ * re-allocates a handful of times, where every step used to cost a backing,
+ * page tables that were never given back and VA that never is. */
 int64_t compositor_win_resize(struct process *client, uint32_t id,
-                              uint32_t nw, uint32_t nh, uint64_t *out_client_va) {
+                              uint32_t nw, uint32_t nh, int live, uint64_t *out_client_va) {
     const fb_info_t *fi = fb_get_info();
     if (!fi || !client) return -EMBK_EINVAL;
     /* Translucent system bars are legitimately shorter than app content.
@@ -1746,14 +3836,45 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
      * intercepting clicks after its menu was dismissed. */
     spin_lock(&g_comp_lock);
     struct comp_window *owner=win_find((int)client->pid,id);
-    if (!owner || !owner->shared) {spin_unlock(&g_comp_lock);return -EMBK_ENOENT;}
+    if (!owner || !owner->shared) {comp_unlock();return -EMBK_ENOENT;}
     uint32_t min_h=owner->translucent ? 24u : 90u;
-    spin_unlock(&g_comp_lock);
+    uint64_t have = (uint64_t)owner->npages * PAGE_SIZE;
+    comp_unlock();
     if (nw < 120 || nh < min_h || nw > fi->width || nh > fi->height) return -EMBK_EINVAL;
 
-    /* new backing first (outside the lock: pmm/vmm work) */
     uint64_t bytes = (uint64_t)nw * nh * 4;
-    uint32_t npages = (uint32_t)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (bytes <= have) {                          /* within its pages: in place */
+        int ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1;
+        spin_lock(&g_comp_lock);
+        struct comp_window *w = win_find((int)client->pid, id);
+        if (!w || !w->shared || (uint64_t)w->npages * PAGE_SIZE < bytes) { comp_unlock(); return -EMBK_EINVAL; }
+        win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
+        int zfrom[4], zw = (int)w->cw, zh = (int)w->ch;
+        uint32_t *zold = 0;
+        if (!live && zoom_eligible(w, nw, nh) && (zold = (uint32_t *)kmalloc((size_t)zw * zh * 4)) != 0) {
+            memcpy(zold, w->content, (size_t)zw * zh * 4);
+            win_frame_rect(w, &zfrom[0], &zfrom[1], &zfrom[2], &zfrom[3]);
+            zfrom[2] -= zfrom[0]; zfrom[3] -= zfrom[1];
+        }
+        content_relayout(w->content, w->content, w->cw, w->ch, nw, nh);
+        win_take_size(w, nw, nh);
+        gpu_image_doom(&w->gimg);                 /* its size changed */
+        if (zold) zoom_hold(w, zfrom, zold, zw, zh);
+        win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
+        g_src = EMBK_COMP_SRC_MOVE;
+        paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
+        if (out_client_va) *out_client_va = w->client_va;
+        comp_unlock();
+        if (!live) kprintf("compositor: win %u resized to %ux%u for pid %d\n",
+                           (unsigned)id, (unsigned)nw, (unsigned)nh, (int)client->pid);
+        return (int64_t)id;
+    }
+
+    /* new backing first (outside the lock: pmm/vmm work), with room to grow */
+    uint64_t room = bytes + bytes / 2, screen = (uint64_t)fi->width * fi->height * 4;
+    if (room > screen) room = screen;
+    if (room < bytes) room = bytes;
+    uint32_t npages = (uint32_t)((room + PAGE_SIZE - 1) / PAGE_SIZE);
     uint64_t *phys = (uint64_t *)kmalloc((size_t)npages * sizeof(uint64_t));
     if (!phys) return -EMBK_ENOMEM;
     uint32_t got = 0;
@@ -1780,7 +3901,6 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
         kfree(phys); return -EMBK_ENOMEM;
     }
     client->shared_next_va = cva + (uint64_t)npages * PAGE_SIZE;
-    for (size_t i = 0; i < (size_t)nw * nh; i++) ((uint32_t *)kview)[i] = 0xFF000000u;
 
     /* swap under the lock; remember the old backing to free after */
     uint64_t *ophys = 0; uint32_t onpages = 0; uint64_t okview = 0, ocva = 0, opml4 = 0;
@@ -1788,33 +3908,33 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find((int)client->pid, id);
     if (!w || !w->shared) {
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         for (uint32_t i = 0; i < npages; i++) vmm_unmap_in(client->pml4_phys, cva + (uint64_t)i * PAGE_SIZE);
         vmm_kunmap_pages(kview, npages);
         for (uint32_t i = 0; i < npages; i++) pmm_free_page(phys[i]);
         kfree(phys); return -EMBK_EINVAL;
     }
     win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
-    ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
-    uint32_t copyw=nw<w->cw?nw:w->cw,copyh=nh<w->ch?nh:w->ch;
-    for(uint32_t row=0;row<copyh;row++)
-        memcpy((uint32_t *)kview+(uint64_t)row*nw,w->content+(uint64_t)row*w->cw,(size_t)copyw*4);
-    w->cw = nw; w->ch = nh;
-    {   /* full screen means covering the output it is on, not the whole desktop */
-        outputs_whole(fi);
-        int32_t cx = w->x + (int32_t)nw / 2, cy = w->y + (int32_t)nh / 2;
-        layout_clamp_point(g_outs, g_nouts, &cx, &cy);
-        int oi = layout_rect_at(g_outs, g_nouts, cx, cy);
-        const struct layout_rect *o = &g_outs[oi < 0 ? 0 : oi];
-        w->fullscreen = (nw >= o->w && nh >= o->h);
+    /* a big change is a motion (zoom_hold): keep what it looked like */
+    int zfrom[4], zw = (int)w->cw, zh = (int)w->ch;
+    uint32_t *zold = 0;
+    if (!live && zoom_eligible(w, nw, nh) && (zold = (uint32_t *)kmalloc((size_t)zw * zh * 4)) != 0) {
+        memcpy(zold, w->content, (size_t)zw * zh * 4);
+        win_frame_rect(w, &zfrom[0], &zfrom[1], &zfrom[2], &zfrom[3]);
+        zfrom[2] -= zfrom[0]; zfrom[3] -= zfrom[1];
     }
+    ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
+    content_relayout((uint32_t *)kview, w->content, w->cw, w->ch, nw, nh);
+    win_take_size(w, nw, nh);
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
     gpu_image_doom(&w->gimg);                    /* it was over the old pages */
+    if (zold) zoom_hold(w, zfrom, zold, zw, zh);
     win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);   /* new footprint */
+    g_src = EMBK_COMP_SRC_MOVE;
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 
     /* free the OLD backing (nobody references it any more) */
     if (ophys) {
@@ -1824,8 +3944,8 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
         kfree(ophys);
     }
     if (out_client_va) *out_client_va = cva;
-    kprintf("compositor: win %u resized to %ux%u for pid %d\n",
-            (unsigned)id, (unsigned)nw, (unsigned)nh, (int)client->pid);
+    if (!live) kprintf("compositor: win %u resized to %ux%u for pid %d\n",
+                       (unsigned)id, (unsigned)nw, (unsigned)nh, (int)client->pid);
     return (int64_t)id;
 }
 
@@ -1871,7 +3991,7 @@ int compositor_win_is_shared(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
     int s = w ? w->shared : 0;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return s;
 }
 
@@ -1880,15 +4000,17 @@ uint32_t *compositor_win_content(int pid, uint32_t id, uint32_t *cw, uint32_t *c
     struct comp_window *w = win_find(pid, id);
     uint32_t *buf = 0;
     if (w) { buf = w->content; if (cw) *cw = w->cw; if (ch) *ch = w->ch; }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return buf;
 }
 
 int64_t compositor_win_damage(int pid, uint32_t id,
                               uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) {
     spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_PRESENT;
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
+    comp_stats_present(pid, w->desktop ? "(desktop)" : w->title, rx, ry, rw ? rw : w->cw, rh ? rh : w->ch);
     if (rw == 0 || rh == 0) { rx = 0; ry = 0; rw = w->cw; rh = w->ch; }
     if (rx > w->cw) rx = w->cw; if (ry > w->ch) ry = w->ch;
     if (rx + rw > w->cw) rw = w->cw - rx;
@@ -1901,6 +4023,11 @@ int64_t compositor_win_damage(int pid, uint32_t id,
      * made yet is made whole when it is first drawn) */
     if (g_gc && w->gimg && w->gimg_px == w->content)
         g_gc->image_update(w->gimg, &(struct gpu_rect){ (int32_t)rx, (int32_t)ry, (int32_t)rw, (int32_t)rh });
+    if (w->zoom_wait) {
+        /* drawn at its new size: the held picture flies there */
+        struct ghost *zg = ghost_of(w->id);
+        if (zg && zg->kind == ANIM_ZOOM) zoom_release(w, zg); else w->zoom_wait = 0;
+    }
     if (!w->presented) {
         /* first real frame: this is the moment the window becomes something
          * worth showing, so this -- not create -- is where it grows in. */
@@ -1908,18 +4035,26 @@ int64_t compositor_win_damage(int pid, uint32_t id,
         anim_start(w, ANIM_OPEN);
         int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
         paint_region(fx0, fy0, fx1, fy1);
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         return 0;
     }
     paint_region(sx0, sy0, sx0 + (int)rw, sy0 + (int)rh);
-    spin_unlock(&g_comp_lock);
+    {   /* in the air (the overview, a flight): where it is drawn changed too */
+        struct ghost *gg = ghost_of(w->id);
+        if (gg && !gg->snap && !ghost_slides(gg)) {
+            int r[4], a; ghost_rect(gg, r, &a);
+            paint_region(r[0], r[1], r[0] + r[2], r[1] + r[3]);
+        }
+    }
+    comp_unlock();
     return 0;
 }
 
 static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int raise) {
     spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_MOVE;
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
     int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
     const fb_info_t *fi = fb_get_info();
     /* A translucent bar IS the top-strip chrome, so it may sit above WORK_TOP
@@ -1934,13 +4069,22 @@ static int64_t win_position(int pid, uint32_t id, int32_t x, int32_t y, int rais
      * because this clamp put the window back under it. */
     if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi)
         clamp_to_work(w, &x, &y);
+    /* THE POINTER, AS THIS WINDOW SEES IT, MOVES THE OTHER WAY. The content-
+     * local position an app reads (compositor_win_input) was worked out by the
+     * last frame against where the window WAS; an app dragging itself reads
+     * it, moves the window, and reads again -- and until the next frame
+     * re-derives it, that second read is against the old place, so the drag
+     * counts the same motion twice and the window runs away from the hand.
+     * Shift it with the window, now. */
+    if (g_ptr_pid == pid && g_ptr_win == id) { g_ptr_lx -= x - w->x; g_ptr_ly -= y - w->y; }
+    if (x != w->x || y != w->y) motion_now();
     w->x = x; w->y = y;
     if(raise)w->z = w->widget ? g_widget_z++ : g_next_z++;   /* explicit moves raise */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
     /* repaint the union of old and new footprints in one region */
     paint_region(imin(ox0, nx0), imin(oy0, ny0), imax(ox1, nx1), imax(oy1, ny1));
     if(raise)enforce_focus();   /* automatic reflow preserves focus */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -1955,21 +4099,21 @@ int64_t compositor_win_where(int pid,uint32_t id,struct comp_win_geometry *out) 
     spin_lock(&g_comp_lock);
     struct comp_window *w=win_find(pid,id);
     if(w)*out=(struct comp_win_geometry){w->x,w->y,w->cw,w->ch};
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return w?0:-EMBK_ENOENT;
 }
 
 int64_t compositor_win_destroy(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
     int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
     win_free_backing(w);                       /* frees copy buf OR unmaps+frees shared pages */
     w->used = 0; w->visible = 0;
     if (id == g_top_id) g_top_id = 0;          /* force focus recompute below */
     paint_region(fx0, fy0, fx1, fy1);          /* expose whatever was behind */
     enforce_focus();                           /* promote the new front window */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -1983,13 +4127,11 @@ int64_t compositor_win_destroy(int pid, uint32_t id) {
 void compositor_exit_pid(int pid) {
     spin_lock(&g_comp_lock);
     int found = 0;
-    int animated = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || w->pid != pid || !w->visible) continue;
-        /* Collapse the FIRST real window on the way out (one motion at a time,
-         * and an app's second window is chrome or a widget anyway). */
-        if (!animated) { anim_start(w, ANIM_CLOSE); animated = (g_anim.kind == ANIM_CLOSE); }
+        if (!w->used || w->pid != pid || !(w->visible || ghost_of(w->id))) continue;
+        /* each of its windows collapses on the way out, a ghost apiece */
+        anim_start(w, ANIM_CLOSE);
         w->visible = 0;
         if (w->id == g_top_id) g_top_id = 0;
         int x0, y0, x1, y1;
@@ -1998,28 +4140,46 @@ void compositor_exit_pid(int pid) {
         found = 1;
     }
     if (found) enforce_focus();
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* An app parking ITSELF. Chromeless windows (every EmUI V4 app) have no kernel
  * title bar to click, so the toolkit's own MinimizeButton needs a way in --
  * otherwise minimize would exist only for the handful of apps still using
  * kernel chrome. */
+/* Park a window in the dock. Caller holds g_comp_lock. */
+static void win_park(struct comp_window *w) {
+    if (w->minimized) return;
+    w->minimized = 1;
+    if (w->id == g_top_id) g_top_id = 0;
+    anim_start(w, ANIM_PARK);          /* hides it; the ghost flies down */
+    int x0, y0, x1, y1;
+    win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    enforce_focus();
+}
+
 int compositor_win_minimize(int pid, uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w || w->desktop) { spin_unlock(&g_comp_lock); return -1; }
-    if (!w->minimized) {
-        w->minimized = 1;
-        if (w->id == g_top_id) g_top_id = 0;
-        anim_start(w, ANIM_PARK);          /* hides it; the ghost flies down */
-        int x0, y0, x1, y1;
-        win_repaint_rect(w, &x0, &y0, &x1, &y1);
-        paint_region(x0, y0, x1, y1);
-        enforce_focus();
-    }
-    spin_unlock(&g_comp_lock);
+    if (!w || w->desktop) { comp_unlock(); return -1; }
+    win_park(w);
+    comp_unlock();
     return 0;
+}
+
+/* GUI+M: the window in front into the dock, as the minimise light does. */
+void compositor_minimize_front(void) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *c = &g_wins[i];
+        if (!c->used || c->desktop || c->widget || c->translucent || !c->title[0]) continue;
+        if (!c->visible || !on_workspace(c)) continue;
+        if (!w || c->z > w->z) w = c;
+    }
+    if (w) win_park(w);
+    comp_unlock();
 }
 
 /* Lift the desktop layer above every app window, or drop it back to the ground.
@@ -2047,7 +4207,7 @@ void compositor_repaint_all(void) {
     if (!fi) return;
     spin_lock(&g_comp_lock);
     paint_region(0, 0, (int)fi->width, (int)fi->height);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 int compositor_desktop_front(int pid, int on) {
@@ -2083,7 +4243,7 @@ int compositor_desktop_front(int pid, int on) {
         }
         break;
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return rc;
 }
 
@@ -2138,7 +4298,7 @@ int compositor_win_list(struct comp_win_info *out, int max) {
         out[j + 1] = key;
     }
 
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }
 
@@ -2165,7 +4325,7 @@ int compositor_cycle_window(void) {
         if (!w->used || !on_workspace(w) || w->desktop || w->widget || w->translucent || !w->title[0]) continue;
         if (!front || w->z > front->z) front = w;
     }
-    if (!front) { spin_unlock(&g_comp_lock); return 0; }
+    if (!front) { comp_unlock(); return 0; }
 
     /* The highest z BELOW the front one; with nothing below, the front stays. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
@@ -2174,7 +4334,7 @@ int compositor_cycle_window(void) {
         if (w->desktop || w->widget || w->translucent || !w->title[0]) continue;
         if (w->z < front->z && (!next || w->z > next->z)) next = w;
     }
-    if (!next) { spin_unlock(&g_comp_lock); return 0; }
+    if (!next) { comp_unlock(); return 0; }
 
     if (next->minimized) {
         next->minimized = 0;
@@ -2187,7 +4347,7 @@ int compositor_cycle_window(void) {
         paint_region(x0, y0, x1, y1);
     }
     enforce_focus();
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 1;
 }
 
@@ -2196,6 +4356,14 @@ int compositor_cycle_window(void) {
 /* Ask a window to close, and remember when we asked. */
 static void win_ask_close(struct comp_window *w) {
     w->pending_action = 2;                     /* EMBK_WIN_ACTION_CLOSE */
+    g_post_ui = 1;
+    if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
+}
+/* The same ask for the whole app (GUI+Q), named so it is not taken for one
+ * of its tabs. */
+static void win_ask_quit(struct comp_window *w) {
+    w->pending_action = 8;                     /* EMBK_WIN_ACTION_QUIT */
+    g_post_ui = 1;
     if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
 }
 
@@ -2218,7 +4386,7 @@ int compositor_close_overdue(int *out, int max) {
          * there, a frozen picture of an application that no longer exists.
          * That is exactly what the old close path did at click time and what
          * was lost when closing became a request. */
-        w->visible = 0;
+        w->visible = 0; w->arriving = 0;
         if (w->id == g_top_id) g_top_id = 0;
         int x0, y0, x1, y1;
         win_repaint_rect(w, &x0, &y0, &x1, &y1);
@@ -2227,7 +4395,7 @@ int compositor_close_overdue(int *out, int max) {
 
         out[n++] = w->pid;
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }
 
@@ -2241,7 +4409,7 @@ int compositor_close_front(void) {
         if (!w || c->z > w->z) w = c;
     }
     if (w) win_ask_close(w);                   /* ask; the grace timer kills */
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return 0;
 }
 
@@ -2271,21 +4439,23 @@ int compositor_quit_front(void) {
             struct comp_window *c = &g_wins[i];
             if (!c->used || c->pid != pid) continue;
             if (c->desktop || c->widget) continue;   /* not a window of its own */
-            win_ask_close(c);
+            win_ask_quit(c);
             n++;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }
 
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
-    if(session_input_owner() || !session_ui_allowed(pid)){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+    if(session_input_owner() || !session_ui_allowed(pid)){comp_unlock();return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].pid==pid &&
        !g_wins[i].desktop && !g_wins[i].widget && !g_wins[i].translucent) {
         if(g_desktop.workspace!=g_wins[i].workspace) {
+            unsigned was=g_desktop.workspace;
             g_desktop.workspace=g_wins[i].workspace;reset_pointer_capture_locked();
+            workspace_slide(was,g_desktop.workspace);
         }
         break;
     }
@@ -2312,7 +4482,7 @@ int compositor_restore_pid(int pid) {
     if (changed) enforce_focus();
     const fb_info_t *fi=fb_get_info();
     if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return changed;
 }
 
@@ -2331,10 +4501,11 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
     int stepx = ((x1 - x0) / 64) + 1, stepy = ((y1 - y0) / 8) + 1;
     uint64_t sum = 0; uint32_t n = 0;
     spin_lock(&g_comp_lock);
+    compose_pending_locked();        /* the screen as it is, not a frame ago */
     /* composed on the GPU: the screen is there, not in the backbuffer -- read
      * it back into the backbuffer first (the scanout's own pages) */
     if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         return -1;
     }
     for (int yy = y0; yy < y1; yy += stepy) {
@@ -2345,7 +4516,7 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
             n++;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n ? (int)(sum / n) : -1;
 }
 
@@ -2374,14 +4545,15 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
     if (need > cap) return -1;
     uint32_t n = 0;
     spin_lock(&g_comp_lock);
+    compose_pending_locked();        /* see backdrop_luma */
     if (g_gc && g_gc->read(&(struct gpu_rect){ x0, y0, x1 - x0, y1 - y0 })) {   /* see backdrop_luma */
-        spin_unlock(&g_comp_lock);
+        comp_unlock();
         return -1;
     }
     for (int yy = y0; yy < y1; yy++)
         for (int xx = x0; xx < x1; xx++)
             out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return (int)n;
 }
 
@@ -2391,18 +4563,18 @@ int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t c
 int compositor_win_close_ack(int pid,uint32_t id) {
     spin_lock(&g_comp_lock);
     struct comp_window *w=win_find(pid,id);
-    if (!w) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    if (!w) {comp_unlock();return -EMBK_EINVAL;}
     w->asked_close_ms=0;
-    spin_unlock(&g_comp_lock);return 0;
+    comp_unlock();return 0;
 }
 
 int compositor_win_menu(int pid,uint32_t id,int active) {
     if (active != 0 && active != 1) return -EMBK_EINVAL;
     spin_lock(&g_comp_lock);
     struct comp_window *w=win_find(pid,id);
-    if (!w || !w->translucent) {spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
+    if (!w || !w->translucent) {comp_unlock();return -EMBK_EINVAL;}
     w->menu_keyboard=active;
-    spin_unlock(&g_comp_lock);return 0;
+    comp_unlock();return 0;
 }
 
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
@@ -2410,12 +4582,28 @@ int compositor_win_menu(int pid,uint32_t id,int active) {
 int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = win_find(pid, id);
-    if (!w) { spin_unlock(&g_comp_lock); return -1; }
+    if (!w) { comp_unlock(); return -1; }
     w->blur_set = (w_ > 0 && h_ > 0);
     w->blur_x = x; w->blur_y = y; w->blur_w = w_; w->blur_h = h_;
     int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
     paint_region(x0, y0, x1, y1);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
+    return 0;
+}
+
+int compositor_win_set_material(int pid, uint32_t id, int alpha, int blur) {
+    if (blur < 0 || blur > COMP_MAT_BLUR_MAX) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
+    if (w->desktop || w->widget || w->translucent || w->glass) { comp_unlock(); return -EMBK_EINVAL; }
+    w->mat_alpha = alpha ? 1 : 0;
+    w->mat_blur = alpha ? (uint8_t)blur : 0;
+    if (!w->mat_blur) backdrop_free(w);
+    w->bd_valid = 0;                         /* a new radius: blurred again, all of it */
+    int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    comp_unlock();
     return 0;
 }
 
@@ -2433,7 +4621,7 @@ void compositor_reap_pid(int pid) {
             if (g_wins[i].id == g_top_id) g_top_id = 0;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* Advance any running window motion by one frame. Called from the boot CPU's
@@ -2441,21 +4629,62 @@ void compositor_reap_pid(int pid) {
  * compositor spinlock is never taken from an IRQ, and the ~100Hz timer that
  * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
  * which is almost always. */
-void compositor_anim_tick(void) {
-    if (g_anim.kind == ANIM_NONE) return;        /* cheap unlocked pre-check */
+static void anim_frame(void) {
+    if (!g_nghosts && !g_ov && !tp_moving() && !g_layers_moving) return;   /* cheap unlocked pre-check */
     spin_lock(&g_comp_lock);
-    if (g_anim.kind == ANIM_NONE) { spin_unlock(&g_comp_lock); return; }
-
-    int num, den; anim_progress(&num, &den);
-    if (num >= den) { anim_finish(); spin_unlock(&g_comp_lock); return; }
-
-    int x0, y0, x1, y1;
-    anim_dirty(&x0, &y0, &x1, &y1);
-    int r[4], a; anim_frame_rect(r, &a);
-    for (int i = 0; i < 4; i++) g_anim.last[i] = r[i];
-    g_anim.have_last = 1;
-    paint_region(x0, y0, x1, y1);            /* draws the ghost itself */
-    spin_unlock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_ANIM;
+    uint64_t now = time_get_ns();
+    tp_frame(now);
+    if (g_layers_moving) layers_step(now);
+    int held = 0;                            /* windows held still: in the overview, under the fingers */
+    if (g_ov) {
+        /* the dimming, on its spring: all the screen, while it moves */
+        int was = spring_px(&g_ov_dim);
+        spring_step(&g_ov_dim, now);
+        if (spring_px(&g_ov_dim) != was) ov_repaint_all();
+        int left = 0;
+        for (int gi = 0; gi < GHOSTS_MAX; gi++) left += g_ghosts[gi].kind == ANIM_OVERVIEW;
+        if (g_ov_leaving && !left && !g_ov_dim.moving) {
+            g_ov = 0; g_ov_leaving = 0;
+            enforce_focus(); ov_repaint_all();
+        }
+    }
+    for (int gi = 0; gi < GHOSTS_MAX; gi++) {
+        struct ghost *g = &g_ghosts[gi];
+        if (g->kind == ANIM_NONE) continue;
+        struct comp_window *w = win_by_id(g->win_id);
+        if (g_swipe_hold && ghost_slides(g)) { held++; continue; }   /* under the fingers (swipe_place) */
+        if (g->kind == ANIM_OVERVIEW && !g_ov_leaving && ghost_landed(g)) {
+            if (g->have_last) { held++; continue; } /* in its place: it stays, still */
+        }
+        if (g->kind == ANIM_ZOOM && w && w->zoom_wait) {
+            /* held until the app has drawn at its new size -- not for ever */
+            if (timer_uptime_ms() - w->zoom_since_ms < ZOOM_WAIT_MS) continue;
+            zoom_release(w, g);
+        }
+        /* a window that moves or resizes while it opens, slides or zooms: the
+         * ghost follows (a slide drawn from the window's own pixels must keep
+         * its size) */
+        if (w && (g->kind == ANIM_OPEN || g->kind == ANIM_UNPARK || g->kind == ANIM_ZOOM || ghost_slides(g))) {
+            int f[4];
+            win_frame_rect(w, &f[0], &f[1], &f[2], &f[3]);
+            f[2] -= f[0]; f[3] -= f[1];
+            if (ghost_slides(g)) f[0] += g->off_x;
+            for (int i = 0; i < 4; i++)
+                if (g->r[i].target != SPRING_PX(f[i])) spring_to(&g->r[i], SPRING_PX(f[i]), g->r[i].p, now);
+        }
+        for (int i = 0; i < 4; i++) spring_step(&g->r[i], now);
+        /* landed -- but a window in the overview stays a ghost until it goes home */
+        if (ghost_landed(g) && !(g->kind == ANIM_OVERVIEW && !g_ov_leaving)) { anim_finish(g); continue; }
+        int x0, y0, x1, y1;
+        ghost_dirty(g, &x0, &y0, &x1, &y1);
+        int r[4], a; ghost_rect(g, r, &a);
+        for (int i = 0; i < 4; i++) g->last[i] = r[i];
+        g->have_last = 1;
+        paint_region(x0, y0, x1, y1);        /* draws the ghosts itself */
+    }
+    g_ghosts_still = held;
+    comp_unlock();
 }
 
 /* IS SOMETHING BEING DRAGGED, and by whom.
@@ -2479,13 +4708,14 @@ static void reset_pointer_capture_locked(void) {
     mouse_discard_presses();(void)mouse_take_wheel();
     g_cap_pid=0;g_cap_win=0;g_dragging=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
     g_drag_on=0;g_drag_pid=0;g_ptr_wheel=0;g_buttons_suppressed=1;
-    for(int i=0;i<COMP_MAX_WINDOWS;i++)g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+    for(int i=0;i<COMP_MAX_WINDOWS;i++){g_wins[i].pend_head=g_wins[i].pend_count=g_wins[i].pend_phase=0;
+                                        g_wins[i].pr_pending=g_wins[i].pr_phase=0;}
 }
 void compositor_drag_set(int on, uint32_t pid) {
     spin_lock(&g_comp_lock);
     g_drag_on = on ? 1 : 0;
     g_drag_pid = on ? pid : 0;
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* Take the drop pending for `pid`, if any. 1 and the details, or 0. */
@@ -2502,11 +4732,79 @@ int compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly) {
         got = 1;
         break;
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return got;
 }
 
-void compositor_pointer_tick(void) {
+/* ---- the cursor plane (gpu.h cursor_image / cursor_place) -------------------
+ * Where the display can put the pointer over the scanout itself, it does, and
+ * the pointer moving composes nothing: the mouse driver's notification places
+ * it (compositor_input_kick) the moment it moves, beat or no beat. The
+ * picture is sent once, and again when its style changes. Everywhere else --
+ * or with `perf cursor sw` -- the compositor draws it into every frame. */
+static int g_hw_cursor_off;        /* `perf cursor sw`, or the plane failed */
+static int g_hw_cursor_stale = 1;  /* the picture must be sent again */
+
+static const struct gpu_driver *cursor_driver(void) {
+    const struct gpu_driver *g = gpu_active();
+    return g && g->cursor_image && g->cursor_place && !g_hw_cursor_off ? g : 0;
+}
+
+/* The output under (x, y), the point made relative to it. */
+static unsigned cursor_output(int32_t *x, int32_t *y) {
+    for (unsigned i = 0; i < g_nouts; i++) {
+        const struct layout_rect *o = &g_outs[i];
+        if (*x >= o->x && *y >= o->y && *x < o->x + (int32_t)o->w && *y < o->y + (int32_t)o->h) {
+            *x -= o->x; *y -= o->y;
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* Bring the plane up, or its picture up to date, or -- turned off -- hand
+ * the pointer back to composition. Frame thread, under the lock. */
+static void cursor_plane_sync(int32_t x, int32_t y) {
+    const struct gpu_driver *g = cursor_driver();
+    if (!g) {
+        if (g_hw_cursor) {
+            const struct gpu_driver *a = gpu_active();
+            if (a && a->cursor_place) a->cursor_place(0, 0, 0, false, false);
+            g_hw_cursor = 0; g_cursor_under_valid = 0;
+            paint_region(g_cursor_x, g_cursor_y, g_cursor_x + CURSOR_W, g_cursor_y + CURSOR_H);
+        }
+        return;
+    }
+    if (!cursor_layers_ready) g_hw_cursor_stale = 1;
+    if (g_hw_cursor && !g_hw_cursor_stale) return;
+    cursor_build_px();
+    if (!g->cursor_image(g_cursor_px, CURSOR_W, CURSOR_H, 0, 0)) {
+        g_hw_cursor_off = 1;
+        kprintf("compositor: the cursor plane refused the pointer; drawing it\n");
+        return;
+    }
+    if (!g_hw_cursor) {
+        /* take ours off the screen before the plane's goes on */
+        cursor_restore_under();
+        g_hw_cursor = 1;
+        paint_region(g_cursor_x, g_cursor_y, g_cursor_x + CURSOR_W, g_cursor_y + CURSOR_H);
+        kprintf("compositor: the pointer is on %s's cursor plane\n", g->name);
+    }
+    g_hw_cursor_stale = 0;
+    int32_t ox = x, oy = y;
+    unsigned out = cursor_output(&ox, &oy);
+    g->cursor_place(out, ox, oy, true, true);
+}
+
+void compositor_cursor_plane(int on) {
+    spin_lock(&g_comp_lock);
+    g_hw_cursor_off = !on;
+    g_hw_cursor_stale = 1;
+    g_need_kick = 1;
+    comp_unlock();
+}
+
+static void pointer_frame(void) {
     if (!g_active) return;               /* no desktop yet -> nothing to route */
     int32_t x, y; uint32_t b;
     mouse_get_state(&x, &y, &b);
@@ -2517,6 +4815,16 @@ void compositor_pointer_tick(void) {
     }
 
     spin_lock(&g_comp_lock);
+    g_src = EMBK_COMP_SRC_POINTER;
+    gesture_frame_locked();                  /* several fingers first: they may own this frame */
+    cursor_plane_sync(x, y);
+    /* the pointer moved or a button changed: whichever app it is over (or was)
+     * has something to read. Pending presses and the wheel are input too. */
+    { static int32_t sx = -1, sy = -1; static uint32_t sb;
+      if (x != sx || y != sy || b != sb || mouse_presses_pending()) {
+          if (x != sx || y != sy) motion_now();
+          sx = x; sy = y; sb = b; g_post_ui = 1;
+      } }
     struct comp_window *captured=g_cap_pid?win_find(g_cap_pid,g_cap_win):0;
     if(g_cap_pid && (!captured || !captured->visible || !on_workspace(captured) || !session_ui_allowed(captured->pid)))
         reset_pointer_capture_locked();
@@ -2547,10 +4855,17 @@ void compositor_pointer_tick(void) {
 
     if (!g_cursor_valid) {
         g_cursor_x = x; g_cursor_y = y; g_cursor_valid = 1;
-        if (g_gc) paint_region(x, y, x + CURSOR_W, y + CURSOR_H);
+        if (g_hw_cursor) { }
+        else if (g_gc) paint_region(x, y, x + CURSOR_W, y + CURSOR_H);
         else { cursor_capture_and_draw(); fb_present(); }
     }
 
+    if (g_ov && !g_ov_leaving) {
+        /* THE OVERVIEW HAS THE POINTER: hover rings a window, a press picks
+         * one (or none); nothing reaches an app */
+        ov_pointer(x, y, presses || (left && !prev));
+        presses = 0; b &= ~(uint32_t)MOUSE_BTN_LEFT; left = 0;
+    }
     int raised = 0;
     int close_pid = 0;   /* unused since closing became a request, kept so the
                           * unlock-then-act shape below stays obvious */
@@ -2591,6 +4906,36 @@ void compositor_pointer_tick(void) {
         }
     }
 
+    /* a right press, latched on the window under it -- counted by the driver
+     * as it arrived, so one made and let go between two ticks is not lost */
+    uint32_t rtime = 0;
+    int rpress = mouse_take_right_press(&rtime);
+    if (suppressed) rpress = 0;
+    if (!rpress && (b & MOUSE_BTN_RIGHT) && !(g_prev_buttons & MOUSE_BTN_RIGHT)) {
+        rpress = 1; rtime = (uint32_t)timer_uptime_ms();   /* a device that only sets the level */
+    }
+    if (rpress) {
+        struct comp_window *wp = topmost_at(x, y);
+        if (wp) {
+            int clx = x - wp->x, cly = y - (wp->y + win_titlebar_h(wp));
+            if (clx >= 0 && clx < (int)wp->cw && cly >= 0 && cly < (int)wp->ch) {
+                wp->pr.x = (int16_t)clx; wp->pr.y = (int16_t)cly; wp->pr.t = rtime;
+                wp->pr_pending = 1; wp->pr_phase = 0; g_post_ui = 1;
+            }
+        }
+    }
+
+    /* WHOLE CLICKS between two ticks -- a slow tick, the button up again
+     * before it is seen -- make no press edge below. Counted all the same where
+     * a window is dragged by: a double click zooms it, and a single one may be
+     * the first half of one. */
+    if (!left && !prev && presses) {
+        struct comp_window *w = topmost_at(x, y);
+        if (w && !w->desktop && w->visible && win_drag_spot(w, x, y) &&
+            zoom_double(w, x, y, press_ev[0].t, press_ev[presses - 1].t, presses)) {
+            w->pending_action = 1; g_post_ui = 1;             /* EMBK_WIN_ACTION_MAXIMIZE */
+        }
+    }
     if (left && !prev) {
         struct comp_window *w = topmost_at(x, y);
         if (w && !w->desktop) {
@@ -2644,12 +4989,38 @@ void compositor_pointer_tick(void) {
             }
             if (!title_control && w->visible && y < w->y + win_titlebar_h(w)) {
                 /* grabbed the title bar (also valid when already front) */
-                g_dragging = 1; g_drag_id = w->id;
-                g_drag_dx = x - w->x; g_drag_dy = y - w->y;
+                if (zoom_double(w, x, y, press_ev[0].t, press_ev[presses - 1].t, presses)) {
+                    w->pending_action = 1; g_post_ui = 1;         /* EMBK_WIN_ACTION_MAXIMIZE */
+                }
+                else {
+                    g_dragging = 1; g_drag_id = w->id; g_drag_region = 0; g_drag_moved = 0;
+                    g_drag_dx = x - w->x; g_drag_dy = y - w->y;
+                }
+            } else if (!title_control && w->visible && w->drag_n) {
+                /* grabbed a region the app declared: the compositor drags */
+                int lx = x - w->x, ly = y - (w->y + win_titlebar_h(w));
+                for (int k = 0; k < w->drag_n; k++) {
+                    const int16_t *r = w->drag_r[k];
+                    if (lx >= r[0] && ly >= r[1] && lx < r[0] + r[2] && ly < r[1] + r[3]) {
+                        if (zoom_double(w, x, y, press_ev[0].t, press_ev[presses - 1].t, presses)) {
+                            w->pending_action = 1; g_post_ui = 1; break;
+                        }
+                        g_dragging = 1; g_drag_id = w->id; g_drag_region = 1; g_drag_moved = 0;
+                        g_drag_dx = x - w->x; g_drag_dy = y - w->y;
+                        break;
+                    }
+                }
             }
         }
     }
-    if (!left && prev) g_dragging = 0;   /* release ends any drag */
+    if (!left && prev && g_dragging) {   /* release ends any drag */
+        /* an app whose region was dragged learns where its window went, and
+         * that a drag ended -- the runtime snaps on it (em_app.c) */
+        struct comp_window *dw = win_by_id(g_drag_id);
+        if (g_drag_region && g_drag_moved && dw) { dw->pending_action = 9; g_post_ui = 1; }   /* EMBK_WIN_ACTION_MOVED */
+        g_dragging = 0; g_drag_region = 0;
+        tp_update(0);                         /* the window flies there; the wash goes */
+    }
 
     /* drag: move the grabbed window to follow the pointer */
     if (g_dragging && left) {
@@ -2661,11 +5032,13 @@ void compositor_pointer_tick(void) {
                 const fb_info_t *fi = fb_get_info();
                 if (fi && !w->widget && !w->translucent)
                     clamp_to_work(w, &nx, &ny);
+                if (nx != w->x || ny != w->y) g_drag_moved = 1;
                 w->x = nx; w->y = ny;
                 int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
                 DIRTY(ox0, oy0, ox1, oy1);
                 DIRTY(nx0, ny0, nx1, ny1);
             }
+            tp_update(g_drag_region ? w : 0);   /* held against an edge: where it will go */
         }
     }
 
@@ -2681,7 +5054,15 @@ void compositor_pointer_tick(void) {
 
     /* On the GPU there is no save-under: where the cursor was is drawn again
      * from the layers, and where it is now with them. */
-    if (have) {
+    if (cursor_moved && g_hw_cursor) {
+        /* the plane carries it: put it where the frame ended up (a warp
+         * between monitors) -- the notification already moved it here */
+        const struct gpu_driver *g = gpu_active();
+        int32_t ox = x, oy = y;
+        unsigned out = cursor_output(&ox, &oy);
+        if (g && g->cursor_place) g->cursor_place(out, ox, oy, true, false);
+        if (have) paint_region(bx0, by0, bx1, by1);
+    } else if (have) {
         if (g_gc && cursor_moved) {
             DIRTY(ocx, ocy, ocx + CURSOR_W, ocy + CURSOR_H);
             DIRTY(x, y, x + CURSOR_W, y + CURSOR_H);
@@ -2693,9 +5074,18 @@ void compositor_pointer_tick(void) {
             if (near_) paint_region(imin(x, ocx), imin(y, ocy), imax(x, ocx) + CURSOR_W, imax(y, ocy) + CURSOR_H);
             else { paint_region(ocx, ocy, ocx + CURSOR_W, ocy + CURSOR_H); paint_region(x, y, x + CURSOR_W, y + CURSOR_H); }
         } else {
+            /* the cursor alone, on the CPU: a compose too, and measured as one */
+            uint64_t t0 = time_get_ns();
             cursor_capture_and_draw();
             fb_present();
+            comp_stats_record(EMBK_COMP_SRC_POINTER, t0, time_get_ns(), (uint64_t)CURSOR_W * CURSOR_H * 2, 0);
         }
+    }
+    /* how long the pointer's motion took to reach the screen: from the driver
+     * noticing it to the compose above that drew the cursor there */
+    if (cursor_moved) {
+        uint64_t moved = mouse_take_motion_ns();
+        if (moved) comp_stats_pointer(time_get_ns() - moved);
     }
     if (raised) enforce_focus();   /* demote whoever used to be front */
 
@@ -2726,7 +5116,9 @@ void compositor_pointer_tick(void) {
     }
 
     g_ptr_pid = 0;
-    if (!g_dragging) {
+    /* under the overview no app has the pointer: the dock under it would
+     * light its labels for a pointer that is the overview's */
+    if (!g_dragging && !(g_ov && !g_ov_leaving)) {
         if (!(b & MOUSE_BTN_LEFT)) g_cap_pid = 0;      /* release ends capture */
         struct comp_window *cap = g_cap_pid ? win_find(g_cap_pid, g_cap_win) : 0;
         if (cap && cap->visible) {
@@ -2741,7 +5133,9 @@ void compositor_pointer_tick(void) {
             if (h) {
                 int lx = x - h->x;
                 int ly = y - (h->y + win_titlebar_h(h));
-                if (lx >= 0 && lx < (int)h->cw && ly >= 0 && ly < (int)h->ch) {
+                /* past the content only on a layer of it: there the window has it,
+                 * at coordinates that may be negative or past its size */
+                if ((lx >= 0 && lx < (int)h->cw && ly >= 0 && ly < (int)h->ch) || layer_hit(h, x, y)) {
                     g_ptr_pid = h->pid; g_ptr_win = h->id;
                     g_ptr_lx = lx; g_ptr_ly = ly; g_ptr_buttons = b;
                     if ((b & MOUSE_BTN_LEFT) && !(g_prev_buttons & MOUSE_BTN_LEFT)) {
@@ -2753,11 +5147,11 @@ void compositor_pointer_tick(void) {
     }
     /* drain the scroll wheel every tick; route it to the hovered window's app */
     int32_t wheel = mouse_take_wheel();
-    if (wheel && g_ptr_pid && !suppressed) g_ptr_wheel += wheel;
+    if (wheel && g_ptr_pid && !suppressed) { g_ptr_wheel += wheel; g_post_ui = 1; motion_now(); }
 
     g_prev_buttons = b;
     #undef DIRTY
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 
     /* A close-button click terminates the owning process OUTSIDE g_comp_lock:
      * process_kill -> process_reap_slot -> compositor_reap_pid re-takes
@@ -2794,18 +5188,36 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
      * button is still physically down on that window, drop the latch instead
      * (the real-time path is already delivering it; replaying would double-
      * fire), which also keeps slider drags on real button state. */
+    uint32_t sent = focused ? g_ptr_buttons : 0;   /* what this poll hands the app */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
         if (!w->used || w->pid != pid || !w->pend_count) continue;
         struct comp_click *q = &w->pend_q[w->pend_head];
-        if (w->pend_phase == 0) {
+        if (w->pend_phase == 0 && w->sent_left) {
+            /* THE APP STILL HOLDS THE LAST PRESS. It saw that one live, then
+             * the release and this press both came and went between its polls.
+             * Handing it "down" again is no edge, and the click is lost --
+             * measured: the third click of a triple, and now and then the
+             * second of a double, under emulation. The release goes first;
+             * the press itself follows on the next poll. */
+            if (lx) *lx = q->x;
+            if (ly) *ly = q->y;
+            if (buttons) *buttons = 0;
+            if (win) *win = w->id;
+            if (when) *when = q->t;
+            focused = 1;
+            sent = 0;
+        } else if (w->pend_phase == 0) {
             /* The live path is already delivering this one if the button is
              * STILL DOWN on this window and there is nothing queued behind it
              * -- replaying would double-fire, and would also break slider drags
              * by feeding them a synthetic release. With more than one waiting,
-             * the extras are by definition presses the app has not seen. */
+             * the extras are by definition presses the app has not seen. The
+             * latch still knows when this press was made, and the live state
+             * does not. */
             if (w->pend_count == 1 && focused && w->id == g_ptr_win &&
                 (g_ptr_buttons & MOUSE_BTN_LEFT)) {
+                if (when) *when = q->t;
                 w->pend_count = 0;
             } else {
                 if (lx) *lx = q->x;
@@ -2814,6 +5226,7 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
                 if (win) *win = w->id;
                 if (when) *when = q->t;         /* when the press really happened */
                 focused = 1;
+                sent = MOUSE_BTN_LEFT;
                 w->pend_phase = 1;              /* release replays next poll */
             }
         } else {
@@ -2823,12 +5236,44 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
             if (win) *win = w->id;
             if (when) *when = q->t;
             focused = 1;
+            sent = 0;
             w->pend_head = (uint8_t)((w->pend_head + 1) % COMP_CLICK_Q);
             w->pend_count--;
             w->pend_phase = 0;
         }
         break;
     }
+    /* ...and a right press the app has not seen: down on one poll, up on the
+     * next -- unless this poll is already handing it a left replay, or the app
+     * saw it live (it held the button), or it is still down on that window,
+     * which the live state delivers */
+    int left_replay = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++)
+        if (g_wins[i].used && g_wins[i].pid == pid && g_wins[i].pend_count) left_replay = 1;
+    for (int i = 0; i < COMP_MAX_WINDOWS && !left_replay; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->pid != pid || !w->pr_pending) continue;
+        int live = focused && w->id == g_ptr_win && (g_ptr_buttons & MOUSE_BTN_RIGHT);
+        if (w->pr_phase == 0 && (live || w->sent_right)) { w->pr_pending = 0; break; }
+        if (lx) *lx = w->pr.x;
+        if (ly) *ly = w->pr.y;
+        if (win) *win = w->id;
+        if (when) *when = w->pr.t;
+        focused = 1;
+        if (w->pr_phase == 0) {
+            if (buttons) *buttons = MOUSE_BTN_RIGHT;
+            sent = MOUSE_BTN_RIGHT; w->pr_phase = 1;
+        } else {
+            if (buttons) *buttons = 0;
+            sent = 0; w->pr_pending = 0; w->pr_phase = 0;
+        }
+        break;
+    }
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++)
+        if (g_wins[i].used && g_wins[i].pid == pid) {
+            g_wins[i].sent_left = (sent & MOUSE_BTN_LEFT) != 0;
+            g_wins[i].sent_right = (sent & MOUSE_BTN_RIGHT) != 0;
+        }
     /* Window-manager commands share the otherwise ordinary `win` result.
      * The high bit distinguishes them without changing the stable syscall ABI. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
@@ -2838,20 +5283,475 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
             break;
         }
     }
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return focused;
 }
+
+/* ---- the frame thread ------------------------------------------------------
+ * One frame: the pointer (its motion, clicks, title-bar drags, the cursor),
+ * window motion, then every rect of damage composed. Each step records what it
+ * changed and the last one composes it all, so a frame in which the cursor
+ * moved over an animating window under a presenting app is still one pass. */
+static uint64_t g_frame_seq;           /* frames composed since boot           */
+static uint64_t g_frame_due_ns;        /* when the frame in progress was due    */
+static uint64_t g_frame_period_ns = 16666667;  /* 60 Hz until an output says otherwise */
+
+/* FRAME WAITERS (compositor_frame_wait). The frame's number and time are
+ * published after the unlock and every waiter woken under the scheduler lock,
+ * which is also where a waiter checks before it blocks -- so a waiter either
+ * sees the frame it wanted or is on the queue when the wake comes. */
+static struct wait_queue g_frame_wq;
+static volatile uint64_t g_frame_done, g_frame_done_ns;
+
+static int comp_continuous(void);
+/* ---- the rate (frameclock.h) ----------------------------------------------
+ * What the display can do is read once a second (outside the lock: describing
+ * the display takes it), unless `perf display` set a display that is not
+ * there -- the simulated 120 Hz or VRR output the tests run. Each frame then
+ * asks frameclock which rate the moment wants. */
+static struct fc_display g_fc_display;
+static int      g_fc_simulated;
+static uint64_t g_fc_read_ns;
+static uint32_t g_power_cap_mhz;
+static uint32_t g_frame_cost_us;            /* a recent bad frame, fading */
+static uint64_t g_frame_cost_ns;            /* when it last faded */
+static int      g_periodic;                 /* frames keep coming: motion, or an app asked */
+static uint32_t g_rate_mhz = FC_DEFAULT_MHZ;
+
+/* ANIMATING APPLICATIONS: a process waiting for frames is drawing motion, and
+ * gets frames at the rate it asked (embk_win_frame_rate) -- the display's top
+ * if it did not say, as the system's own toolkit is the one asking. */
+#define FC_REQUESTS 16
+static struct { int pid; uint32_t pref_mhz; uint64_t until_ns; } g_req[FC_REQUESTS];
+
+/* Caller holds g_comp_lock. The slot for `pid`, made if need be (the oldest
+ * goes when the table is full). */
+static int request_slot(int pid) {
+    int free_i = -1, oldest = 0;
+    for (int i = 0; i < FC_REQUESTS; i++) {
+        if (g_req[i].pid == pid) return i;
+        if (!g_req[i].pid && free_i < 0) free_i = i;
+        if (g_req[i].until_ns < g_req[oldest].until_ns) oldest = i;
+    }
+    int i = free_i >= 0 ? free_i : oldest;
+    g_req[i].pid = pid; g_req[i].pref_mhz = 0; g_req[i].until_ns = 0;
+    return i;
+}
+
+static uint32_t requests_now(uint64_t now) {
+    uint32_t want = 0;
+    for (int i = 0; i < FC_REQUESTS; i++) {
+        if (!g_req[i].pid || g_req[i].until_ns <= now) continue;
+        uint32_t p = g_req[i].pref_mhz ? g_req[i].pref_mhz : FC_MAX;
+        if (p > want) want = p;
+    }
+    return want;
+}
+
+/* `pid` wants its motion drawn at `pref_mhz` (0: as fast as the display goes). */
+int compositor_frame_rate(int pid, uint32_t pref_mhz) {
+    spin_lock(&g_comp_lock);
+    g_req[request_slot(pid)].pref_mhz = pref_mhz;
+    comp_unlock();
+    return 0;
+}
+
+/* `perf display 120`, `perf display 48-120` (VRR), `perf display auto`. */
+void compositor_simulate_display(uint32_t refresh_mhz, uint32_t vrr_min_mhz, uint32_t vrr_max_mhz) {
+    spin_lock(&g_comp_lock);
+    g_fc_simulated = refresh_mhz || vrr_max_mhz;
+    g_fc_display = (struct fc_display){ refresh_mhz ? refresh_mhz : vrr_max_mhz, vrr_min_mhz, vrr_max_mhz };
+    g_fc_read_ns = 0;
+    comp_unlock();
+    comp_wake();
+}
+
+/* Before each frame, outside the lock. */
+static void comp_rate_update(uint64_t now) {
+    if (!g_fc_simulated && now - g_fc_read_ns > 1000000000ull) {
+        g_fc_read_ns = now;
+        uint32_t mhz = display_refresh_mhz();
+#if defined(__x86_64__)
+        struct embk_policy pol; power_policy_get(&pol);
+        uint32_t cap = pol.profile == EMBK_PROFILE_EFFICIENCY ? 60000u : 0u;
+#else
+        uint32_t cap = 0;
+#endif
+        spin_lock(&g_comp_lock);
+        /* 0 is "cannot say right now" (no mode list during a change), not a
+         * display that lost its refresh: keep the last one it said */
+        if (!g_fc_simulated && mhz) g_fc_display = (struct fc_display){ mhz, 0, 0 };
+        g_power_cap_mhz = cap;
+        comp_unlock();
+    }
+    spin_lock(&g_comp_lock);
+    struct fc_inputs in = {
+        .motion = now < __atomic_load_n(&g_motion_until_ns, __ATOMIC_RELAXED) || comp_continuous() || g_dragging,
+        .request_mhz = requests_now(now),
+        .frame_cost_us = g_frame_cost_us,
+        .power_cap_mhz = g_power_cap_mhz,
+    };
+    g_rate_mhz = fc_rate_mhz(&g_fc_display, &in);
+    g_periodic = in.motion || in.request_mhz;
+    g_frame_period_ns = fc_period_ns(g_rate_mhz);
+    struct fc_display disp = g_fc_display;
+    comp_unlock();
+    comp_stats_rate(disp.refresh_mhz, disp.vrr_min_mhz, disp.vrr_max_mhz, g_rate_mhz, g_frame_cost_us);
+}
+
+/* THE EFFECTS GOVERNOR: the tier (g_fx) for the frames to come, from what
+ * frames cost -- the same measure as the rate's, the last bad frame fading --
+ * against a 60 Hz frame, not the period of the moment: the rate governor
+ * stretches that when frames are dear, and effects judged by it would come
+ * back exactly when the rate had given way. Effects give way first; the rate
+ * only once even reduced effects cannot keep 60. Down when what frames that
+ * compose cost, averaged (a quarter each), stays over half of one for
+ * FX_OVER_NS -- a drag of something heavy, not one dear frame (an app's first,
+ * a big ghost), which would change every shadow on the screen for nothing;
+ * stillness ends a heavy run. Back up only once frames take under a quarter
+ * AND it has held for a while. The while doubles (to 16 s)
+ * each time full effects come back only to be too much again at once, so a
+ * heavy scene that full effects cannot afford does not flicker between the
+ * two; it is two seconds again once full has lasted. A change repaints the
+ * screen -- itself a heavy frame, which the half second after a change does
+ * not count. Held by the Effects setting or `perf effects`. Under the lock. */
+#define FX_HOLD_MIN_NS  2000000000ull
+#define FX_HOLD_MAX_NS 16000000000ull
+#define FX_GRACE_NS      500000000ull
+#define FX_FRAME_NS       16666667ull     /* 60 Hz */
+#define FX_OVER_NS        150000000ull
+#define FX_IDLE_NS        200000ull       /* a frame cheaper than this composed nothing */
+#define FX_STILL_NS       250000000ull    /* this long without composing: the run is over */
+static volatile int g_fx_override;
+static uint64_t     g_fx_since_ns, g_fx_hold_ns = FX_HOLD_MIN_NS;
+static uint64_t     g_fx_avg_ns, g_fx_over_ns, g_fx_composed_ns;   /* the average; since when over; last compose */
+static void fx_choose(uint64_t now, uint64_t frame_ns, uint64_t cost_ns);
+/* At once: an idle desktop draws no frame for the change to wait for. */
+void compositor_effects_override(int mode) {
+    spin_lock(&g_comp_lock);
+    g_fx_override = mode >= 0 && mode <= 2 ? mode : 0;
+    fx_choose(time_get_ns(), 0, (uint64_t)g_frame_cost_us * 1000u);
+    comp_unlock();
+}
+
+/* `frame_ns`: this frame's cost; `cost_ns`: the fading measure. */
+static void fx_choose(uint64_t now, uint64_t frame_ns, uint64_t cost_ns) {
+    int mode = g_fx_override ? g_fx_override
+             : (g_desktop.flags & EMBK_DESKTOP_EFFECTS_FULL) ? 1
+             : (g_desktop.flags & EMBK_DESKTOP_EFFECTS_REDUCED) ? 2 : 0;
+    int want = mode == 1 ? FX_FULL : mode == 2 ? FX_REDUCED : g_fx;
+    /* a frame that composed nothing (the hand between two reports) says
+     * nothing; stillness ends the run */
+    if (frame_ns > FX_IDLE_NS) { g_fx_avg_ns = (g_fx_avg_ns * 3 + frame_ns) / 4; g_fx_composed_ns = now; }
+    else if (now - g_fx_composed_ns > FX_STILL_NS) g_fx_avg_ns = 0;
+    if (g_fx_avg_ns * 2 <= FX_FRAME_NS) g_fx_over_ns = 0;
+    else if (!g_fx_over_ns) g_fx_over_ns = now;
+    if (!mode && now - g_fx_since_ns >= FX_GRACE_NS) {
+        if (g_fx == FX_FULL && g_fx_over_ns && now - g_fx_over_ns >= FX_OVER_NS) {
+            want = FX_REDUCED;
+            uint64_t lasted = now - g_fx_since_ns;
+            g_fx_hold_ns = lasted < 2 * g_fx_hold_ns && g_fx_since_ns
+                         ? (g_fx_hold_ns * 2 > FX_HOLD_MAX_NS ? FX_HOLD_MAX_NS : g_fx_hold_ns * 2)
+                         : FX_HOLD_MIN_NS;
+        } else if (g_fx == FX_REDUCED && cost_ns * 4 < FX_FRAME_NS && now - g_fx_since_ns >= g_fx_hold_ns) {
+            want = FX_FULL;
+        }
+    }
+    if (want != g_fx) {
+        g_fx = want; g_fx_since_ns = now;
+        kprintf("compositor: effects %s (%s, frame %u us)\n", want ? "reduced" : "full",
+                mode ? "held" : "by cost", (unsigned)((want ? g_fx_avg_ns : cost_ns) / 1000u));
+        const fb_info_t *fi = fb_get_info();
+        if (fi) paint_region(0, 0, (int)fi->width, (int)fi->height);
+    }
+    comp_stats_effects((uint32_t)g_fx, (uint32_t)mode);
+}
+
+static void comp_frame(void) {
+    pointer_frame();
+    anim_frame();
+    spin_lock(&g_comp_lock);
+    uint64_t c0 = time_get_ns();
+    compose_pending_locked();
+    uint64_t seq = ++g_frame_seq;
+    uint64_t now = time_get_ns();
+    /* THE GOVERNOR'S MEASURE: this frame's cost, or the last bad one fading --
+     * by TIME, halving every 250 ms. Fading per frame left one heavy frame
+     * (a window opening) holding the rate down through the stillness after
+     * it, where few frames come to fade it. */
+    uint32_t cost = (uint32_t)((now - c0) / 1000u);
+    while (g_frame_cost_us && now - g_frame_cost_ns >= 250000000ull) {
+        g_frame_cost_us /= 2; g_frame_cost_ns += 250000000ull;
+    }
+    if (cost >= g_frame_cost_us) { g_frame_cost_us = cost; g_frame_cost_ns = now; }
+    /* filtered ghosts while frames cost under half the period; back to them
+     * only under a quarter, so one motion does not flicker between the two */
+    uint64_t cost_ns = (uint64_t)g_frame_cost_us * 1000u;
+    if (cost_ns * 2 > g_frame_period_ns) g_ghost_smooth = 0;
+    else if (cost_ns * 4 < g_frame_period_ns) g_ghost_smooth = 1;
+    fx_choose(now, (uint64_t)cost * 1000u, cost_ns);
+    comp_unlock();
+    comp_stats_frame(now, g_frame_period_ns);
+    __atomic_store_n(&g_frame_done_ns, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_frame_done, seq, __ATOMIC_RELEASE);
+    sched_lock();
+    wait_queue_wake_all(&g_frame_wq);
+    sched_unlock();
+}
+
+/* Block until the frame thread finishes a frame after this call -- asking for
+ * one, so it comes whether or not anything changed. -EMBK_ENOSYS before the
+ * frame thread runs (the caller paces itself), -EMBK_ETIMEDOUT if no frame
+ * came within `timeout_ms` (0: 100 ms), -EMBK_ECANCELED if told to stop. */
+int compositor_frame_wait(int pid, struct embk_frame_info *out, uint32_t timeout_ms) {
+    if (!g_comp_thread) return -EMBK_ENOSYS;
+    spin_lock(&g_comp_lock);
+    g_req[request_slot(pid)].until_ns = time_get_ns() + MOTION_HOLD_NS;
+    comp_unlock();
+    uint64_t target = __atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE) + 1;
+    comp_wake();
+    uint64_t deadline = timer_uptime_ms() + (timeout_ms ? timeout_ms : 100);
+    for (;;) {
+        sched_lock();
+        if (__atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE) >= target) { sched_unlock(); break; }
+        if (timer_uptime_ms() >= deadline) { sched_unlock(); return -EMBK_ETIMEDOUT; }
+        sched_block_timeout_locked(&g_frame_wq, deadline);        /* returns unlocked */
+        struct thread *t = current_thread;
+        if (t && t->proc && t->proc->cancelled) return -EMBK_ECANCELED;
+    }
+    if (out) {
+        out->seq = __atomic_load_n(&g_frame_done, __ATOMIC_ACQUIRE);
+        out->frame_ns = __atomic_load_n(&g_frame_done_ns, __ATOMIC_RELAXED);
+        out->period_ns = g_frame_period_ns;
+        out->next_ns = out->frame_ns + out->period_ns;
+    }
+    return 0;
+}
+
+/* `perf beat N`: the frame thread keeps its beat for N seconds as if in
+ * motion, composing nothing -- the clock alone, measured (comp_stats'
+ * intervals), with no input rate or app in the way. */
+static volatile uint64_t g_beat_until_ns;
+void compositor_beat_test(uint32_t seconds) {
+    __atomic_store_n(&g_beat_until_ns, time_get_ns() + (uint64_t)seconds * 1000000000ull, __ATOMIC_RELAXED);
+    comp_wake();
+}
+
+/* Work that keeps frames coming without a kick: window motion in flight, the
+ * overview's dimming coming or going (and its end), or a beat being measured. */
+static int comp_continuous(void) {
+    /* (windows held still in the overview or under resting fingers are not
+     * motion: an app drawing in one kicks a frame like any present, and so
+     * does a finger moving) */
+    return g_nghosts > g_ghosts_still || (g_ov && (g_ov_leaving || g_ov_dim.moving)) || tp_moving() ||
+           g_layers_moving ||
+           time_get_ns() < __atomic_load_n(&g_beat_until_ns, __ATOMIC_RELAXED);
+}
+
+static void comp_thread_main(void) {
+    /* A DEADLINE, not a priority: a frame that is late is a frame dropped,
+     * and one that is early buys nothing. Reserved only while frames keep
+     * coming -- motion, or an app that asked for a rate -- and given back when
+     * the desktop is still: a reservation is admission capacity every other
+     * periodic thread is refused while it is held, and a compositor blocked
+     * on a still desktop is using none of it. What it may spend at deadline
+     * priority is what its frames cost (fc_budget_ms); past that it competes
+     * like anyone else, and so does a frame a refused reservation left it. */
+    uint32_t period_ms = 0, budget_ms = 0;
+    spin_lock(&g_comp_lock);
+    g_comp_thread = current_thread;
+    comp_unlock();
+    kprintf("compositor: frame thread running; it reserves time while frames keep coming\n");
+    for (;;) {
+        sched_lock();
+        if (__atomic_load_n(&g_kicked, __ATOMIC_ACQUIRE) || comp_continuous()) {
+            sched_unlock();
+        } else if (!budget_ms) {
+            sched_block_current_locked(&g_comp_wq);       /* returns unlocked */
+        } else {
+            /* STILL, BUT RESERVED: blocked until the hold that keeps the
+             * reservation runs out at the latest, so it is given back then --
+             * nothing else would wake a compositor on a still desktop. */
+            sched_block_timeout_locked(&g_comp_wq, timer_uptime_ms() + MOTION_HOLD_NS / 1000000u + 1);
+            if (!__atomic_load_n(&g_kicked, __ATOMIC_ACQUIRE) && !comp_continuous()) {
+                comp_rate_update(time_get_ns());
+                if (!g_periodic) { sched_declare_period(0, 0); period_ms = budget_ms = 0; }
+                continue;                                 /* no frame was asked for */
+            }
+        }
+        __atomic_store_n(&g_kicked, 0, __ATOMIC_RELEASE);
+
+        /* ON THE BEAT, OR AT ONCE. A desktop that has been still for a period
+         * composes the moment it is asked -- the first frame after idle is the
+         * one a hand is waiting for. One that is moving composes a period
+         * after the last frame was due, phase-locked rather than measured
+         * from when that frame finished, so the beat does not drift by the
+         * cost of each frame. */
+        uint64_t now = time_get_ns();
+        comp_rate_update(now);
+        uint32_t want_ms = 0, want_budget = 0;
+        if (g_periodic) {
+            want_ms = (uint32_t)(g_frame_period_ns / 1000000u);
+            if (want_ms < SCHED_MIN_PERIOD_MS) want_ms = SCHED_MIN_PERIOD_MS;
+            want_budget = fc_budget_ms(want_ms, g_frame_cost_us,
+                                       (uint32_t)(sched_precise_lead_ns() / 1000u));
+        }
+        if ((want_ms != period_ms || want_budget != budget_ms) &&
+            !sched_declare_period(want_ms, want_budget)) {
+            period_ms = want_ms; budget_ms = want_budget;
+        }
+        g_frame_due_ns = fc_next_due(g_frame_due_ns, g_frame_period_ns, now);
+        /* to the nanosecond: the timer is armed for the beat itself */
+        if (g_frame_due_ns > now) {
+            sched_sleep_until_ns(g_frame_due_ns);
+            uint64_t woke = time_get_ns();
+            comp_stats_late(woke > g_frame_due_ns ? woke - g_frame_due_ns : 0);
+        }
+        comp_frame();
+    }
+}
+
+void compositor_input_kick(void);
+/* The frame thread, made once the scheduler runs. Until it is running every
+ * paint composes inline, and the kernel loop's ticks do the pointer and the
+ * motion as they always did. */
+void compositor_start(void) {
+    static int started;
+    if (started) return;
+    started = 1;
+    mouse_set_notify(compositor_input_kick);
+    ui_events_init();
+    sched_timed_queue(&g_frame_wq);
+    sched_timed_queue(&g_comp_wq);
+    if (!process_create_kthread(comp_thread_main, NULL))
+        kprintf("compositor: no frame thread; composing inline\n");
+}
+
+/* The rects of (pid,id)'s content the compositor drags it by; n 0 clears. */
+void compositor_win_set_resizable(int pid, uint32_t id) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (w) w->resizable = 1;
+    comp_unlock();
+}
+
+int compositor_win_drag_regions(int pid, uint32_t id, const int32_t (*rects)[4], unsigned n) {
+    if (n > COMP_DRAG_REGIONS) return -EMBK_EINVAL;
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (!w) { comp_unlock(); return -EMBK_ENOENT; }
+    w->drag_n = 0;
+    for (unsigned k = 0; k < n; k++) {
+        /* clipped to the content, not refused for reaching past it: the part
+         * inside the window is a perfectly good place to hold it by */
+        int64_t x0 = rects[k][0], y0 = rects[k][1];
+        int64_t x1 = x0 + rects[k][2], y1 = y0 + rects[k][3];
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > (int64_t)w->cw) x1 = w->cw; if (y1 > (int64_t)w->ch) y1 = w->ch;
+        if (x1 <= x0 || y1 <= y0) continue;
+        int16_t *r = w->drag_r[w->drag_n++];
+        r[0] = (int16_t)x0; r[1] = (int16_t)y0; r[2] = (int16_t)(x1 - x0); r[3] = (int16_t)(y1 - y0);
+    }
+    int taken = w->drag_n;
+    comp_unlock();
+    return taken;
+}
+
+/* `perf windows`: where every visible titled window is, for a test that drags
+ * one and wants to know it came back. */
+void compositor_print_windows(void) {
+    spin_lock(&g_comp_lock);
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        const struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->visible || !w->title[0] || w->desktop) continue;
+        char name[COMP_TITLE_MAX + 1]; int k = 0;
+        for (; w->title[k] && k < COMP_TITLE_MAX; k++) name[k] = w->title[k] == ' ' ? '_' : w->title[k];
+        name[k] = 0;
+        kprintf("perf: window title=%s x=%d y=%d w=%u h=%u space=%u z=%d drag_n=%u drag0=%d,%d,%d,%d\n", name, (int)w->x, (int)w->y,
+                w->cw, w->ch, w->workspace, w->z, (unsigned)w->drag_n, w->drag_n ? w->drag_r[0][0] : 0, w->drag_n ? w->drag_r[0][1] : 0,
+                w->drag_n ? w->drag_r[0][2] : 0, w->drag_n ? w->drag_r[0][3] : 0);
+    }
+    kprintf("perf: workspace now=%u count=%u\n", g_desktop.workspace, g_desktop.workspace_count);
+    if (spring_px(&g_tp.a) > 0 || g_tp.on) {
+        int r[4]; tp_rect(r);
+        kprintf("perf: tile on=%d x=%d y=%d w=%d h=%d alpha=%d to=%d,%d,%d,%d\n", g_tp.on, r[0], r[1], r[2], r[3],
+                spring_px(&g_tp.a), spring_px(&(struct spring){ .x = g_tp.r[0].target }),
+                spring_px(&(struct spring){ .x = g_tp.r[1].target }), spring_px(&(struct spring){ .x = g_tp.r[2].target }),
+                spring_px(&(struct spring){ .x = g_tp.r[3].target }));
+    }
+    { int32_t px, py; uint32_t pb; mouse_get_state(&px, &py, &pb);
+      kprintf("perf: pointer x=%d y=%d buttons=%u\n", (int)px, (int)py, (unsigned)pb); }
+    for (int i = 0; i < g_dock_tn; i++)
+        kprintf("perf: dock app=%s x=%d y=%d w=%d h=%d\n", g_dock_t[i].app,
+                g_dock_t[i].x, g_dock_t[i].y, g_dock_t[i].w, g_dock_t[i].h);
+    /* and every ghost in the air: where it is, how opaque, where it is going */
+    for (int i = 0; i < GHOSTS_MAX; i++) {
+        const struct ghost *g = &g_ghosts[i];
+        if (g->kind == ANIM_NONE) continue;
+        const struct comp_window *w = win_by_id(g->win_id);
+        int r[4], a; ghost_rect(g, r, &a);
+        kprintf("perf: ghost kind=%s app=%s x=%d y=%d w=%d h=%d alpha=%d to=%d,%d,%d,%d ring=%d\n", anim_names[g->kind],
+                w && w->app[0] ? w->app : "-", r[0], r[1], r[2], r[3], a,
+                spring_px(&(struct spring){ .x = g->r[0].target }), spring_px(&(struct spring){ .x = g->r[1].target }),
+                spring_px(&(struct spring){ .x = g->r[2].target }), spring_px(&(struct spring){ .x = g->r[3].target }),
+                g->kind == ANIM_OVERVIEW && g->win_id == g_ov_hover);
+    }
+    /* and every layer: whose, where it is now, how opaque and large, where it
+     * is going, whether it is still moving; parked ones as how many */
+    int parked = 0;
+    for (int i = 0; i < LAYERS_MAX; i++) {
+        const struct comp_layer *L = &g_layers[i];
+        if (!L->used) continue;
+        if (L->parked) { parked++; continue; }
+        const struct comp_window *w = win_by_id(L->win_id);
+        if (!w) continue;
+        int r[4], a; layer_geom(L, w, r, &a);
+        kprintf("perf: layer app=%s id=%u x=%d y=%d w=%d h=%d alpha=%d scale=%d to=%d,%d,%d,%d moving=%d shown=%d\n",
+                w->app[0] ? w->app : "-", L->id, r[0], r[1], r[2], r[3], a, spring_px(&L->scale),
+                spring_px(&(struct spring){ .x = L->x.target }), spring_px(&(struct spring){ .x = L->y.target }),
+                spring_px(&(struct spring){ .x = L->opacity.target }), spring_px(&(struct spring){ .x = L->scale.target }),
+                layer_moving(L), L->presented && layers_shown(w));
+    }
+    if (parked) kprintf("perf: layers parked=%d\n", parked);
+    kprintf("perf: frost made=%u kept=%u\n", g_frost_made, g_frost_kept);
+    comp_unlock();
+    kprintf("perf: end\n");
+}
+
+/* The mouse moved, a button changed or the wheel turned (mouse.c). From any
+ * context, the interrupt included. */
+
+void compositor_input_kick(void) {
+    if (g_hw_cursor) {
+        const struct gpu_driver *g = gpu_active();
+        if (g && g->cursor_place) {
+            int32_t x, y; uint32_t b;
+            mouse_get_state(&x, &y, &b);
+            unsigned out = cursor_output(&x, &y);
+            if (g->cursor_place(out, x, y, true, false)) {
+                uint64_t moved = mouse_take_motion_ns();
+                if (moved) comp_stats_pointer(time_get_ns() - moved);
+            }
+        }
+    }
+    comp_wake();
+}
+
+/* The kernel loop's ticks: the frame thread's work once it runs, and the old
+ * inline pump until then (boot, or no thread). */
+void compositor_pointer_tick(void) { if (!g_comp_thread) pointer_frame(); }
+void compositor_anim_tick(void)    { if (!g_comp_thread) anim_frame(); }
 
 void compositor_session_changed(void) {
     spin_lock(&g_comp_lock);
     g_drag_id=0;reset_pointer_capture_locked();
     uint32_t owner=session_input_owner();
-    g_anim.kind=ANIM_NONE;
+    ghosts_land_all();
     if(owner)for(unsigned i=0;i<COMP_MAX_WINDOWS;i++)
         if(g_wins[i].used && g_wins[i].pid==owner)g_wins[i].presented=false;
     const fb_info_t *fi=fb_get_info();
     if(fi)paint_region(0,0,fi->width,fi->height);
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
 }
 
 /* The shell publishes geometry and bounded appearance. Workspace changes only
@@ -2863,22 +5763,23 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
     /* Session transitions also take this lock before completing. A request
      * queued before a lock must recheck ownership when it actually runs. */
     if(operation && (!session_ui_allowed(pid) || session_input_owner())) {
-        spin_unlock(&g_comp_lock);return -EMBK_EPERM;
+        comp_unlock();return -EMBK_EPERM;
     }
     int reset_capture=0;
     if(operation==EMBK_DESKTOP_CONFIGURE) {
         uint32_t owns=0;
         for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && g_wins[i].pid==pid)owns=g_wins[i].id;
         const fb_info_t *fi=fb_get_info();
-        if(!owns){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+        if(!owns){comp_unlock();return -EMBK_EPERM;}
         if(!fi || state->left+state->right>fi->width/2 || state->top+state->bottom>fi->height/2 ||
            state->left>256 || state->right>256 || state->top>256 || state->bottom>256 ||
            state->radius>12 || state->shadows>2 || state->decoration>2 || state->cursor_style>2 ||
            state->cursor_size>1 || state->shortcut_modifier>1 || state->blur>16 || state->opacity<127 || state->opacity>255 || state->workspace_count<1 || state->workspace_count>6 ||
-           state->flags&~7u || state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
-            spin_unlock(&g_comp_lock);return -EMBK_EINVAL;
+           state->flags&~31u || (state->flags&(EMBK_DESKTOP_EFFECTS_FULL|EMBK_DESKTOP_EFFECTS_REDUCED))==(EMBK_DESKTOP_EFFECTS_FULL|EMBK_DESKTOP_EFFECTS_REDUCED) ||
+           state->background>0xffffff || state->text>0xffffff || state->accent>0xffffff || state->danger>0xffffff || state->secondary>0xffffff) {
+            comp_unlock();return -EMBK_EINVAL;
         }
-        if(g_anim.kind!=ANIM_NONE)anim_finish();
+        ghosts_land_all();
         unsigned before=g_desktop.workspace;
         int new_owner=g_desktop_owner!=(int)owns;
         unsigned active=new_owner?0:before;g_desktop_owner=(int)owns;
@@ -2888,15 +5789,19 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
         keyboard_set_shortcut_modifier(state->shortcut_modifier);
         cursor_layers_ready=0;
     } else if(operation) {
-        if(g_desktop_front){spin_unlock(&g_comp_lock);return -EMBK_EBUSY;}
-        if(state->workspace>=g_desktop.workspace_count){spin_unlock(&g_comp_lock);return -EMBK_EINVAL;}
-        if(g_anim.kind!=ANIM_NONE)anim_finish();
+        if(g_desktop_front){comp_unlock();return -EMBK_EBUSY;}
+        if(state->workspace>=g_desktop.workspace_count){comp_unlock();return -EMBK_EINVAL;}
         if(operation==EMBK_DESKTOP_MOVE_FRONT) {
+            ghosts_land_all();
             struct comp_window *front=front_app_window();
             if(front && !front->desktop && !front->translucent && !front->widget) {
                 reset_capture=front->workspace!=state->workspace;front->workspace=state->workspace;
             }
-        } else {reset_capture=g_desktop.workspace!=state->workspace;g_desktop.workspace=state->workspace;}
+        } else {
+            unsigned was=g_desktop.workspace;
+            reset_capture=was!=state->workspace;g_desktop.workspace=state->workspace;
+            workspace_slide(was,state->workspace);
+        }
     }
     if(operation) {
         /* Palette/geometry publication must retain a held gesture. Clearing its
@@ -2905,16 +5810,16 @@ int compositor_desktop_control(int pid,unsigned operation,struct embk_desktop *s
         enforce_focus();const fb_info_t *fi=fb_get_info();
         if(fi)paint_region(0,0,(int)fi->width,(int)fi->height);
     }
-    *state=g_desktop;spin_unlock(&g_comp_lock);return 0;
+    *state=g_desktop;comp_unlock();return 0;
 }
 
 int compositor_request_launcher(void) {
     spin_lock(&g_comp_lock);
-    if(session_input_owner()){spin_unlock(&g_comp_lock);return -EMBK_EPERM;}
+    if(session_input_owner()){comp_unlock();return -EMBK_EPERM;}
     for(int i=0;i<COMP_MAX_WINDOWS;i++)if(g_wins[i].used && g_wins[i].desktop && session_ui_allowed(g_wins[i].pid)) {
-        g_wins[i].pending_action=7;spin_unlock(&g_comp_lock);return 0;
+        g_wins[i].pending_action=7;g_post_ui=1;comp_unlock();return 0;
     }
-    spin_unlock(&g_comp_lock);return -EMBK_ENOENT;
+    comp_unlock();return -EMBK_ENOENT;
 }
 /* target -1/-2 walk backward/forward; nonnegative targets are direct spaces. */
 int compositor_workspace_key(int target,int move) {
@@ -2926,7 +5831,7 @@ int compositor_workspace_key(int target,int move) {
         next=(int)g_desktop.workspace+(target==-1?-1:1);
         if(g_desktop.flags&EMBK_DESKTOP_WRAP)next=(next+(int)g_desktop.workspace_count)%(int)g_desktop.workspace_count;
     }
-    state.workspace=(unsigned)next;spin_unlock(&g_comp_lock);
+    state.workspace=(unsigned)next;comp_unlock();
     if(!pid)return -EMBK_ENOENT;
     return compositor_desktop_control(pid,move?EMBK_DESKTOP_MOVE_FRONT:EMBK_DESKTOP_SWITCH,&state);
 }
@@ -2941,7 +5846,7 @@ int compositor_desktop_healthy(void) {
         if(w->desktop)desktop=1;
         if(!strcmp(w->title,"TopBar"))strip=1;
     }
-    spin_unlock(&g_comp_lock);return desktop && strip;
+    comp_unlock();return desktop && strip;
 }
 
 /* What composes the desktop: 1 and its name when a GPU does, else 0. */
@@ -2949,12 +5854,12 @@ int compositor_renderer(char *name, unsigned len) {
     spin_lock(&g_comp_lock);
     const struct gpu_compose *gc = g_gc;
     if (name && len) snprintf(name, len, "%s", gc ? gc->name : "Software");
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return gc != 0;
 }
 
 void compositor_display_lock(void) {spin_lock(&g_comp_lock);}
-void compositor_display_unlock(void) {spin_unlock(&g_comp_lock);}
+void compositor_display_unlock(void) {comp_unlock();}
 /* A new surface -- and, with several monitors, a new arrangement of them.
  * Windows on an output that went away move to the primary; every window is
  * kept inside the work area of the output it is on now. */
@@ -2992,7 +5897,7 @@ struct fb_surface *compositor_select_layout(struct fb_surface *next, const struc
         g_cursor_under_valid=0;g_cursor_valid=0;
         gpu_image_doom(&g_canvas_img);   /* over the old backbuffer, which is released after this */
         g_cap_pid=0;g_cap_win=0;g_dragging=0;g_drag_on=0;g_ptr_buttons=0;g_buttons_suppressed=1;
-        anim_finish();
+        ghosts_land_all();
         g_nouts=0;
         for(unsigned i=0;i<n && i<LAYOUT_MAX_OUTPUTS;i++)g_outs[g_nouts++]=rects[i];
         outputs_whole(fi);
@@ -3017,9 +5922,12 @@ struct fb_surface *compositor_select_layout(struct fb_surface *next, const struc
         layout_clamp_point(g_outs,g_nouts,&px,&py);
         mouse_warp(px,py);
         g_prev_layout=now;
-        paint_region(0,0,fi->width,fi->height);
+        /* NOW, not at the next frame: the caller shows this surface next, and
+         * whatever damage was waiting was measured on the one it replaces */
+        g_ndmg=0;
+        compose_region(0,0,fi->width,fi->height);
     }
-    spin_unlock(&g_comp_lock);return old;
+    comp_unlock();return old;
 }
 struct fb_surface *compositor_select_display(struct fb_surface *next) {
     return compositor_select_layout(next,0,0,0);
@@ -3029,6 +5937,6 @@ unsigned compositor_outputs(struct layout_rect *out,unsigned max) {
     outputs_whole(fb_get_info());
     unsigned n=g_nouts<max?g_nouts:max;
     for(unsigned i=0;i<n;i++)out[i]=g_outs[i];
-    spin_unlock(&g_comp_lock);
+    comp_unlock();
     return n;
 }

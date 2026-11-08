@@ -102,7 +102,7 @@ int sval_render(const struct value *v, struct wire_buf *out);
 #define SVAL_WIRE_SECTION ".embk_sval"
 
 /* Presentation colour (ANSI SGR), for terminals that declare support
- * (TERM=emlink*). OFF by default so pipes, saves and the serial console
+ * (TERM set, and not "dumb"). OFF by default so pipes, saves and the serial console
  * never see escape bytes -- colour is a property of the DISPLAY, which is
  * why it lives here in the presenter and never in the values themselves. */
 void sval_set_colour(int on);

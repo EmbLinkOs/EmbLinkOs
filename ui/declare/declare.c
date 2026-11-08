@@ -397,11 +397,31 @@ static struct instance_handle enter_container(enum instance_kind kind, uint8_t a
     else { g_cursor_over++; g_depth_overflowed = 1; }   /* clamp, and stay balanced */
     return inst;
 }
+/* A LAYER IS DECLARED EVERY FRAME, like the rest of a box. A retained
+ * instance can be met again as another box -- an unkeyed overlay's place
+ * taken by the row after it once the overlay is gone -- and a promotion it
+ * kept would make that row a layer nobody asked for. So the boxes promoted
+ * this frame are noted, and one that closes promoted without being among them
+ * is the window's again. */
+#define PROMOTED_PER_FRAME 64
+static struct instance_handle g_promoted_now[PROMOTED_PER_FRAME];
+static int g_promoted_n;
+static uint64_t g_promoted_serial;
+static int promoted_now(struct instance_handle h) {
+    if (g_promoted_serial != g_frame_serial) return 0;
+    for (int i = 0; i < g_promoted_n; i++)
+        if (g_promoted_now[i].index == h.index && g_promoted_now[i].generation == h.generation) return 1;
+    return 0;
+}
+
 static void exit_container(void) {
     if (g_cursor_over > 0) { g_cursor_over--; return; }
     if (g_cursor_top < 0) return;
     struct instance_handle parent = g_cursor[g_cursor_top].parent;
     sweep_unvisited_children(parent);
+    struct instance *b = instance_resolve(parent);
+    struct scene_node *sn = b ? scene_resolve(g_sa, b->scene_node) : 0;
+    if (sn && sn->promoted && !promoted_now(parent)) scene_set_promoted(g_sa, b->scene_node, false, 0, 0);
     g_cursor_top--;
 }
 
@@ -495,8 +515,7 @@ void ui_set_corner_radius(float r) {
     struct instance *b = cur_box(); if (!b) return;
     if (b->shadow.has_corner && b->shadow.corner_radius == r) return;
     b->shadow.corner_radius = r; b->shadow.has_corner = true;
-    struct scene_node *sn = scene_resolve(g_sa, b->scene_node);
-    if (sn) { sn->corner_radius = r; sn->dirty = true; }
+    scene_set_corner_radius(g_sa, b->scene_node, r);   /* content: the corners' pixels change */
     g_mutation_count++;
 }
 void ui_set_padding(float top, float right, float bottom, float left) {
@@ -559,6 +578,20 @@ void ui_set_opacity(float opacity) {
     /* guarded scene setter: unchanged opacity does not re-dirty, so a group at
      * full opacity (the steady state after a transition) costs nothing. */
     scene_set_opacity(g_sa, b->scene_node, opacity);
+}
+void ui_set_scale(float scale, float anchor_x, float anchor_y) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_group_scale(g_sa, b->scene_node, scale, anchor_x, anchor_y);   /* guarded */
+}
+void ui_set_promoted(bool on, const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_promoted(g_sa, b->scene_node, on, appear, disappear);   /* guarded */
+    if (g_promoted_serial != g_frame_serial) { g_promoted_serial = g_frame_serial; g_promoted_n = 0; }
+    if (on && g_promoted_n < PROMOTED_PER_FRAME) g_promoted_now[g_promoted_n++] = b->self;
+}
+void ui_set_layer_spring(uint16_t response_ms, uint16_t damping_milli) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_layer_spring(g_sa, b->scene_node, response_ms, damping_milli);
 }
 void ui_set_offset(float x, float y) {
     struct instance *b = cur_box(); if (!b) return;
@@ -689,6 +722,14 @@ void ui_set_align(enum layout_align a) {
  * ui_set_clip_children to make a scroll viewport). Re-layouts only on change. */
 void ui_set_scroll_offset(float dy) {
     struct instance *b = cur_box(); if (!b) return;
+    /* WHOLE PIXELS. The view's own position (a spring's) is fractional and
+     * stays so; what the content is SHIFTED by is not. A fractional shift
+     * resamples every glyph and edge in the view each frame -- they shimmer
+     * as it glides -- and it is a move no renderer can make by copying rows,
+     * so every glide frame and the clamped last step of a scroll repainted
+     * the whole viewport. Rounded, the frame IS the last one moved, and
+     * scene_render's scroll blit takes it. */
+    dy = (float)(long)(dy < 0 ? dy - 0.5f : dy + 0.5f);
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
     if (ln && ln->scroll_offset != dy) { ln->scroll_offset = dy; ln->dirty = true; }
 }
@@ -809,17 +850,32 @@ void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float 
     scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
 }
 
-void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
-                    float width_px, float height_px) {
+static struct instance *image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                                    float width_px, float height_px) {
     bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, 0, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
-    if (!n) return;
+    if (!n) return 0;
     struct layout_node *ln = layout_resolve(g_la, n->layout_node);
     if (ln) {
         ln->width.mode = SIZE_FIXED;   ln->width.fixed_value = width_px;
         ln->height.mode = SIZE_FIXED;  ln->height.fixed_value = height_px;
     }
     scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
+    return n;
+}
+void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                    float width_px, float height_px) {
+    (void)image_sized(key, pixels, iw, ih, width_px, height_px);
+}
+
+/* As ui_image_sized, for a buffer the caller edits in place: only (dx,dy,dw,dh)
+ * -- image pixels -- changed since the last frame, and only that is repainted
+ * and presented. dw or dh <= 0: nothing changed. A new buffer or size is still
+ * all new. */
+void ui_image_sized_damage(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                           float width_px, float height_px, int dx, int dy, int dw, int dh) {
+    struct instance *n = image_sized(key, pixels, iw, ih, width_px, height_px);
+    if (n && dw > 0 && dh > 0) scene_set_image_damage(g_sa, n->scene_node, (float)dx, (float)dy, (float)dw, (float)dh);
 }
 
 /* As ui_image_sized, but draws the image as a stencil filled with `tint` (the

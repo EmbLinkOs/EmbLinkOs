@@ -1,0 +1,16 @@
+{
+  "cursor_x": 0,
+  "cursor_y": 5,
+  "alternate": 0,
+  "cursor_visible": 1,
+  "title": "golden window title",
+  "cols": 80,
+  "rows": 12,
+  "command": [
+    "python3",
+    "osc.py"
+  ],
+  "frozen": false,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

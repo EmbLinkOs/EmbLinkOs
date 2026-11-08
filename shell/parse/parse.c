@@ -26,6 +26,7 @@ struct parser {
     char               *err;
     size_t              errcap;
     bool                failed;
+    bool                at_end;    /* the first error was at the end of input */
 };
 
 static const struct token *pk(struct parser *P)  { return &P->toks[P->pos]; }
@@ -34,6 +35,7 @@ static const struct token *adv(struct parser *P) { return &P->toks[P->pos < P->n
 static void perr(struct parser *P, const struct token *at, const char *msg) {
     if (P->failed) return;               /* keep the FIRST error */
     P->failed = true;
+    P->at_end = at->type == TOK_EOF;
     snprintf(P->err, P->errcap, "%zu:%zu: %s", at->line, at->col, msg);
 }
 
@@ -765,7 +767,7 @@ static struct stmt *parse_stmt(struct parser *P) {
 
 struct block *parse_program(const struct token *toks, size_t ntoks,
                             char *err, size_t errcap) {
-    struct parser P = { toks, ntoks, 0, err, errcap, false };
+    struct parser P = { toks, ntoks, 0, err, errcap, false, false };
     if (errcap) err[0] = '\0';
 
     for (size_t i = 0; i < ntoks; i++) {
@@ -785,12 +787,34 @@ struct block *parse_program(const struct token *toks, size_t ntoks,
     return b;
 }
 
+bool program_incomplete(const char *src) {
+    size_t n = 0;
+    struct token *toks = lex(src, &n);
+    if (!toks) return false;
+    bool more = false, lexed = true;
+    for (size_t i = 0; i < n; i++)
+        if (toks[i].type == TOK_ERROR) {
+            lexed = false;
+            more = toks[i].lexeme && (strstr(toks[i].lexeme, "unterminated") || strstr(toks[i].lexeme, "trailing backslash"));
+            break;
+        }
+    if (lexed) {
+        char err[8];
+        struct parser P = { toks, n, 0, err, sizeof err, false, false };
+        struct block *b = parse_stmts_until(&P, TOK_EOF);
+        if (b) block_free(b);
+        else more = P.at_end;
+    }
+    lex_free_tokens(toks, n);
+    return more;
+}
+
 /* -------------------------------------------------------------------------
  * The entry point: let-statement or pipeline, then require EOF (trailing
  * tokens are an error, not silently ignored).
  * ------------------------------------------------------------------------- */
 struct stmt *parse(const struct token *toks, size_t ntoks, char *err, size_t errcap) {
-    struct parser P = { toks, ntoks, 0, err, errcap, false };
+    struct parser P = { toks, ntoks, 0, err, errcap, false, false };
     if (errcap) err[0] = '\0';
 
     /* surface a lexer error immediately, wherever it sits */

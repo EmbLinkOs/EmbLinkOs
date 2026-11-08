@@ -1,0 +1,313 @@
+{
+ "cols": 80,
+ "prompt": "$ ",
+ "history": [
+  "echo first",
+  "head src/main.c",
+  "echo hello world",
+  "wc README.md"
+ ],
+ "files": [
+  "README.md",
+  "notes.txt",
+  "src/main.c"
+ ],
+ "recorded": "2026-10-26",
+ "reference": "zsh-syntax-highlighting 0.8.0, zsh-autosuggestions v0.7.1, under tmux 3.8",
+ "lines": [
+  {
+   "name": "command",
+   "typed": [
+    "echo hello world"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m hello world",
+   "cursor": [
+    18,
+    0
+   ]
+  },
+  {
+   "name": "unknown",
+   "typed": [
+    "frobnicate --verbose"
+   ],
+   "row": "$ \u001b[1m\u001b[31mfrobnicate\u001b[0m --verbose",
+   "cursor": [
+    22,
+    0
+   ]
+  },
+  {
+   "name": "quotes",
+   "typed": [
+    "echo 'single quoted' \"double quoted\""
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m \u001b[33m'single quoted'\u001b[39m \u001b[33m\"double quoted\"\u001b[39m",
+   "cursor": [
+    38,
+    0
+   ]
+  },
+  {
+   "name": "escape",
+   "typed": [
+    "echo \"a \\\" b\""
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m \u001b[33m\"a \u001b[36m\\\"\u001b[33m b\"\u001b[39m",
+   "cursor": [
+    15,
+    0
+   ]
+  },
+  {
+   "name": "pipe",
+   "typed": [
+    "echo hi | wc"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m hi | \u001b[32mwc\u001b[39m",
+   "cursor": [
+    14,
+    0
+   ]
+  },
+  {
+   "name": "separator",
+   "typed": [
+    "echo ok; frobnicate"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m ok; \u001b[1m\u001b[31mfrobnicate\u001b[0m",
+   "cursor": [
+    21,
+    0
+   ]
+  },
+  {
+   "name": "comment",
+   "typed": [
+    "echo hi # a comment"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m hi \u001b[1m\u001b[30m# a comment\u001b[0m",
+   "cursor": [
+    21,
+    0
+   ]
+  },
+  {
+   "name": "path",
+   "typed": [
+    "head README.md notes.txt"
+   ],
+   "row": "$ \u001b[32mhead\u001b[39m \u001b[4mREADME.md\u001b[0m \u001b[4mnotes.txt\u001b[0m",
+   "cursor": [
+    26,
+    0
+   ]
+  },
+  {
+   "name": "path-dir",
+   "typed": [
+    "head src/"
+   ],
+   "row": "$ \u001b[32mhead\u001b[39m \u001b[4msrc/\u001b[0m\u001b[90mmain.c\u001b[39m",
+   "cursor": [
+    11,
+    0
+   ]
+  },
+  {
+   "name": "path-quoted",
+   "typed": [
+    "head \"README.md\""
+   ],
+   "row": "$ \u001b[32mhead\u001b[39m \u001b[33m\"README.md\"\u001b[39m",
+   "cursor": [
+    18,
+    0
+   ]
+  },
+  {
+   "name": "path-prefix",
+   "typed": [
+    "uniq READ"
+   ],
+   "row": "$ \u001b[32muniq\u001b[39m \u001b[4mREAD\u001b[0m",
+   "cursor": [
+    11,
+    0
+   ]
+  },
+  {
+   "name": "path-missing",
+   "typed": [
+    "head nothere.txt"
+   ],
+   "row": "$ \u001b[32mhead\u001b[39m nothere.txt",
+   "cursor": [
+    18,
+    0
+   ]
+  },
+  {
+   "name": "unterminated",
+   "typed": [
+    "echo \"unterminated"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m \u001b[33m\"unterminated",
+   "cursor": [
+    20,
+    0
+   ]
+  },
+  {
+   "name": "substitution",
+   "typed": [
+    "echo $(wc)"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m \u001b[35m$(\u001b[32mwc\u001b[35m)\u001b[39m",
+   "cursor": [
+    12,
+    0
+   ]
+  },
+  {
+   "name": "for",
+   "typed": [
+    "for x in"
+   ],
+   "row": "$ \u001b[33mfor\u001b[39m x in",
+   "cursor": [
+    10,
+    0
+   ]
+  },
+  {
+   "name": "suggest",
+   "typed": [
+    "ec"
+   ],
+   "row": "$ \u001b[1m\u001b[31mec\u001b[0m\u001b[90mho hello world\u001b[39m",
+   "cursor": [
+    4,
+    0
+   ]
+  },
+  {
+   "name": "suggest-typed",
+   "typed": [
+    "ech"
+   ],
+   "row": "$ \u001b[1m\u001b[31mech\u001b[0m\u001b[90mo hello world\u001b[39m",
+   "cursor": [
+    5,
+    0
+   ]
+  },
+  {
+   "name": "suggest-backspace",
+   "typed": [
+    "ech",
+    "[BSpace]"
+   ],
+   "row": "$ \u001b[1m\u001b[31mec\u001b[0m\u001b[90mho hello world\u001b[39m",
+   "cursor": [
+    4,
+    0
+   ]
+  },
+  {
+   "name": "suggest-none",
+   "typed": [
+    "xyz"
+   ],
+   "row": "$ \u001b[1m\u001b[31mxyz\u001b[0m",
+   "cursor": [
+    5,
+    0
+   ]
+  },
+  {
+   "name": "suggest-path",
+   "typed": [
+    "head s"
+   ],
+   "row": "$ \u001b[32mhead\u001b[39m \u001b[4ms\u001b[0m\u001b[90mrc/main.c\u001b[39m",
+   "cursor": [
+    8,
+    0
+   ]
+  },
+  {
+   "name": "suggest-right",
+   "typed": [
+    "ec",
+    "[Right]"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m hello world",
+   "cursor": [
+    18,
+    0
+   ]
+  },
+  {
+   "name": "suggest-end-of-line",
+   "typed": [
+    "ec",
+    "[C-e]"
+   ],
+   "row": "$ \u001b[32mecho\u001b[39m hello world",
+   "cursor": [
+    18,
+    0
+   ]
+  },
+  {
+   "name": "suggest-left",
+   "typed": [
+    "ec",
+    "[Left]"
+   ],
+   "row": "$ \u001b[1m\u001b[31mec\u001b[0m\u001b[90mho hello world\u001b[39m",
+   "cursor": [
+    3,
+    0
+   ]
+  },
+  {
+   "name": "suggest-left-right",
+   "typed": [
+    "ec",
+    "[Left]",
+    "[Right]"
+   ],
+   "row": "$ \u001b[1m\u001b[31mec\u001b[0m\u001b[90mho hello world\u001b[39m",
+   "cursor": [
+    4,
+    0
+   ]
+  },
+  {
+   "name": "suggest-up",
+   "typed": [
+    "ec",
+    "[Up]"
+   ],
+   "row": "$ \u001b[32mwc\u001b[39m \u001b[4mREADME.md\u001b[0m",
+   "cursor": [
+    14,
+    0
+   ]
+  },
+  {
+   "name": "suggest-enter",
+   "typed": [
+    "ec",
+    "[Enter]"
+   ],
+   "row": "$ \u001b[1m\u001b[31mec\u001b[0m",
+   "cursor": [
+    2,
+    2
+   ]
+  }
+ ]
+}

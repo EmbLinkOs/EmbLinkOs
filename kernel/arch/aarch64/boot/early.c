@@ -44,6 +44,8 @@
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/console.h"
 #include "gfx/compositor.h"
+#include "gfx/comp_stats.h"
+#include "drivers/char/serial.h"
 #include "drivers/input/virtio_input.h"
 #include "net/net.h"             /* net_init: still not called here -- see below */
 #include "drivers/input/mouse.h"
@@ -764,6 +766,7 @@ void arch_early_main(uint64_t dtb_phys) {
     pl011_irq_enable();
 
     kworker_init();
+    compositor_start();        /* the frame thread, as on x86 (kernel/main.c) */
     vmo_writeback_init();
     power_init();
 
@@ -1222,10 +1225,12 @@ void arch_early_main(uint64_t dtb_phys) {
             if (wrr >= 0 && wrr < 10)
                 kprintf("  [info] round-robin's worst was only %d ms -- the load\n"
                         "         did not contend, so this is not evidence\n", wrr);
+            /* ring 3's: the compositor's frame thread reserves for itself
+             * while frames keep coming, and it is not the test's to free */
             kprintf("  [%s] no reservation outlived its thread (%u permille)\n",
-                    sched_reserved_permille() == 0 ? " ok " : "FAIL",
-                    sched_reserved_permille());
-            if (sched_reserved_permille() != 0)
+                    sched_reserved_permille_user() == 0 ? " ok " : "FAIL",
+                    sched_reserved_permille_user());
+            if (sched_reserved_permille_user() != 0)
                 selftest_fails++;
         }
     }
@@ -1678,13 +1683,37 @@ void arch_early_main(uint64_t dtb_phys) {
             else if(sk>=SYSKEY_MOVE_SPACE_1 && sk<SYSKEY_MOVE_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_MOVE_SPACE_1,1);
             else if(sk==SYSKEY_SPACE_PREVIOUS || sk==SYSKEY_SPACE_NEXT)compositor_workspace_key(sk==SYSKEY_SPACE_PREVIOUS?-1:-2,0);
             else if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_PERF_HUD) compositor_hud_toggle();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
+            else if (sk == SYSKEY_MINIMIZE) compositor_minimize_front();
+            else if (sk == SYSKEY_OVERVIEW) compositor_overview_toggle(0);
+            else if (sk >= SYSKEY_OVERVIEW_LEFT && sk <= SYSKEY_OVERVIEW_PICK)
+                compositor_overview_key(sk == SYSKEY_OVERVIEW_PICK ? 0 : sk - SYSKEY_OVERVIEW_LEFT + 1);
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
                 if (pid) process_kill((uint32_t)pid);
             }
         }
         compositor_anim_tick();
+        compositor_hud_tick();
+        /* The serial console's `perf`, `perf reset` and `perf hud`, as on x86
+         * (kernel/main.c). Only those: this arch has no kernel shell to hand
+         * any other line to, and a desktop measured under HVF is the point --
+         * it runs at the host's own speed, which TCG never shows. */
+        {
+            static char line[64];
+            static unsigned n;
+            while (serial_has_char()) {
+                char c = serial_read_char();
+                if (c == '\r' || c == '\n') {
+                    line[n] = 0;
+                    if (n && !comp_stats_command(line) && !pointer_command(line))
+                        kprintf("[cmd] unknown command: %s\n", line);
+                    n = 0;
+                } else if ((c == '\b' || c == 127) && n) n--;
+                else if (c >= 32 && c <= 126 && n + 1 < sizeof line) line[n++] = c;
+            }
+        }
         arch_cpu_idle();
     }
 }

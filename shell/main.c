@@ -11,9 +11,12 @@
  * (sval_structured_out -- the shell itself was composed into a bigger
  * pipeline), EMIT the result as a frame; otherwise pretty-print to fd 1.
  *
- * Line editing is deliberately minimal: the kernel console delivers raw
- * keystrokes with NO echo, so the shell echoes what it reads and handles
- * backspace itself. History/cursor keys are the future terminal app's job.
+ * The interactive line is the shell's own (shell/edit): on a terminal it
+ * draws the prompt, edits, completes (shell/complete) and recalls history
+ * itself, in raw mode; on the kernel console, which parses no escapes, the
+ * same editor works with backspaces. The prompt is framed in OSC 133 marks
+ * (A with edit=shell, B, C, D;status) so the terminal knows where prompts and
+ * commands begin and that it must not edit the line itself.
  * ========================================================================== */
 #include "lex/lex.h"
 #include "parse/parse.h"
@@ -21,13 +24,21 @@
 #include "eval/exec.h"
 #include "sval/sval.h"
 #include "hist/hist.h"
-#include "embk.h"        /* EMBK_KEY_UP/DOWN -- the kernel's private arrow codes */
+#include "edit/edit.h"
+#include "complete/complete.h"
+#include "complete/highlight.h"
+#include "prompt/prompt.h"
+#include "prompt/prompt_os.h"
+#include "prompt/wizard_os.h"
+#include "embk.h"
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 
 
 #define LINE_MAX_LEN 512
@@ -124,7 +135,7 @@ static bool block_defines_a_command(const struct block *b) {
  *
  * While a program runs, ^C is AIMED AT THIS SHELL and caught rather than
  * cancelling it (embk_intr_catch). At the prompt it is handed back to nobody,
- * where the kernel delivers it as the byte 0x03 and read_line treats it as a
+ * where the kernel delivers it as the byte 0x03 and the line editor treats it as a
  * line-edit key -- which is what a person expects an empty prompt's ^C to do.
  *
  * Routing it at SELF used to be impossible: ^C set the sticky cancellation
@@ -169,7 +180,9 @@ static int run_program(const char *src, struct scope *top) {
     }
 
     struct exec_out out = { FLOW_NORMAL, value_null(), false };
+    (void)exec_interrupt_hit(true);
     int rc = block_exec(prog, top, print_sink, NULL, &out);
+    bool interrupted = exec_interrupt_hit(true);
 
     if (g_console_session || g_terminal_session) {
         shell_interrupt_route(-1);
@@ -201,7 +214,7 @@ static int run_program(const char *src, struct scope *top) {
     } else {
         block_free(prog);
     }
-    return rc != 0 ? 1 : 0;
+    return interrupted ? 130 : rc != 0 ? 1 : 0;      /* ^C: 128 + SIGINT, as every shell has it */
 }
 
 /* One typed line. Kept as its own name because that is what the REPL, `-c`
@@ -252,92 +265,174 @@ static void bind_args(struct scope *top, int argc, char **argv, int first) {
     (void)scope_bind(top, "args", list);
 }
 
-/* Wipe the on-screen line and replace it with `text` -- what an Up/Down
- * recall does. "\b \b" per char is the portable erase (back up, overwrite
- * with a space, back up again); the terminal and the kernel console both
- * understand it, so no cursor-addressing escapes are needed. */
-static void line_replace(char *buf, size_t cap, size_t *len, const char *text) {
-    while (*len > 0) { puts1("\b \b"); (*len)--; }
-    if (!text) { buf[0] = '\0'; return; }
-    size_t n = strlen(text);
-    if (n >= cap) n = cap - 1;
-    memcpy(buf, text, n);
-    buf[n] = '\0';
-    *len = n;
-    if (n) write(1, buf, n);                    /* echo the recalled line */
+/* -------------------------------------------------------------------------
+ * The interactive line: the editor (shell/edit), fed from fd 0.
+ * ------------------------------------------------------------------------- */
+static struct editor *g_ed;
+static char g_ahead[512];             /* keys typed past the end of the last line */
+static size_t g_ahead_n;
+
+static void out_write(void *ctx, const char *bytes, size_t n) {
+    (void)ctx;
+    while (n) {
+        ssize_t w = write(1, bytes, n);
+        if (w <= 0) return;
+        bytes += w;
+        n -= (size_t)w;
+    }
+}
+static bool unfinished(void *ctx, const char *text) { (void)ctx; return program_incomplete(text); }
+
+static int terminal_cols(void) {
+    struct winsize ws;
+    if (ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_col) return ws.ws_col;
+    return 80;
 }
 
-/* -------------------------------------------------------------------------
- * Interactive line read: echo (the console doesn't), backspace, enter, and
- * Up/Down history recall.
- *
- * The kernel delivers arrows as its own private single-byte codes
- * (EMBK_KEY_UP/DOWN = 0x13/0x14, see the keyboard driver) -- NOT ANSI escape
- * sequences -- so recall is a plain byte check, no escape-state machine.
- * That's true whether the shell is read by the Terminal (which forwards the
- * codes) or the kernel console (whose fd-0 read yields them directly).
- *
- * `browse` = how many steps back from the live line: 0 = the line being
- * typed, 1 = newest history entry, ... count = oldest. Down past the newest
- * returns to an EMPTY line (bash returns to the partially-typed line; we
- * don't stash it -- a deliberate simplification, documented).
- * Returns the line length, or -1 on read error / EOF.
- * ------------------------------------------------------------------------- */
-static int read_line(char *buf, size_t cap) {
+/* An ESC with nothing after it yet: wait a moment for the rest of a key's
+ * sequence before deciding it was the Escape key itself. */
+static bool input_within(int ms) {
+    for (int waited = 0; waited < ms; waited += 5) {
+        if (embk_fd_poll(0, EMBK_POLLIN) & EMBK_POLLIN) return true;
+        embk_sleep_ms(5);
+    }
+    return false;
+}
+
+static struct prompt_state g_pstate;      /* the prompt's state (below) */
+static struct p10k_git g_git;
+
+static enum edit_result edit_one_line(const struct edit_prompt *prompt, enum edit_mode mode) {
+    edit_begin(g_ed, prompt, mode, mode == EDIT_VT ? terminal_cols() : 80);
+    enum edit_result r = EDIT_MORE;
+    if (g_ahead_n) {
+        size_t used = 0;
+        r = edit_feed(g_ed, g_ahead, g_ahead_n, &used);
+        memmove(g_ahead, g_ahead + used, g_ahead_n - used);
+        g_ahead_n -= used;
+    }
+    while (r == EDIT_MORE) {
+        /* An answer the prompt is still waiting for (the git status): watch
+         * for it beside the keys, and draw the prompt again when it comes. */
+        while (prompt_os_git_waiting() >= 0 && !(embk_fd_poll(0, EMBK_POLLIN) & EMBK_POLLIN)) {
+            if (prompt_os_git_answer(prompt_p10k_config(), &g_git)) {
+                g_pstate.git = g_git.repo ? &g_git : NULL;
+                prompt_os_fresh();
+                edit_reprompt(g_ed);
+            } else embk_sleep_ms(10);
+        }
+        char buf[256];
+        ssize_t n = read(0, buf, sizeof buf);
+        if (n <= 0) return EDIT_EOF;
+        size_t used = 0;
+        r = edit_feed(g_ed, buf, (size_t)n, &used);
+        if (r != EDIT_MORE) {
+            size_t rest = (size_t)n - used;
+            if (rest > sizeof g_ahead - g_ahead_n) rest = sizeof g_ahead - g_ahead_n;
+            memcpy(g_ahead + g_ahead_n, buf + used, rest);
+            g_ahead_n += rest;
+        }
+        while (r == EDIT_MORE && edit_pending_escape(g_ed) && !input_within(40))
+            r = edit_escape_timeout(g_ed);
+    }
+    return r;
+}
+
+/* A plain line from a pipe: no terminal on the other end, nothing to draw. */
+static int read_plain_line(char *buf, size_t cap) {
     size_t len = 0;
-    size_t browse = 0;
     for (;;) {
         char c;
-        int n = read(0, &c, 1);
-        if (n <= 0) return -1;
-        if (c == '\n' || c == '\r') {
-            puts1("\n");
-            buf[len] = '\0';
-            hist_push(buf);                     /* empty/dup lines self-filter */
-            return (int)len;
-        }
-        if (c == '\b' || c == 0x7f) {          /* backspace / DEL */
-            if (len > 0) {
-                len--;
-                puts1("\b \b");                 /* erase on screen */
-            }
-            continue;
-        }
-        if (c == (char)EMBK_KEY_UP) {
-            if (browse < hist_count()) {
-                browse++;
-                line_replace(buf, cap, &len, hist_get(hist_count() - browse));
-            }
-            continue;
-        }
-        if (c == (char)EMBK_KEY_DOWN) {
-            if (browse > 0) {
-                browse--;
-                line_replace(buf, cap, &len,
-                             browse ? hist_get(hist_count() - browse) : NULL);
-            }
-            continue;
-        }
-        if (c == 0x04) {                            /* ^D = EOF */
-            if (len == 0) return -1;             /* empty line = leave */
-            continue;                            /* non-empty line = ignore */
-        }
-        if (c == 0x03) {                            /* ^C = abandon this line, re-prompt.
-                                                     * The line is NOT hist_push'd (that is
-                                                     * the Enter path only), so a killed
-                                                     * line never enters history -- Up then
-                                                     * recalls the previous REAL command. */
-            puts1("^C\n");
-            buf[0] = '\0';
-            return 0;                            /* empty line: main loop re-prompts */
-        }
-        if ((unsigned char)c < 0x20) continue;  /* ignore other control chars */
-        if (len + 1 < cap) {
-            buf[len++] = c;
-            write(1, &c, 1);                    /* echo */
-            browse = 0;                          /* typing leaves history */
-        }
+        if (read(0, &c, 1) <= 0) { buf[len] = '\0'; return len ? (int)len : -1; }
+        if (c == '\n') break;
+        if (c != '\r' && len + 1 < cap) buf[len++] = c;
     }
+    buf[len] = '\0';
+    return (int)len;
+}
+
+/* ~ for home, as every shell names where it stands. */
+static void prompt_where(char *where, size_t cap) {
+    char cwd[192];
+    if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
+    const char *home = getenv("HOME");
+    size_t hl = home ? strlen(home) : 0;
+    if (hl > 1 && strncmp(cwd, home, hl) == 0 && (cwd[hl] == '/' || cwd[hl] == 0))
+        snprintf(where, cap, "~%s", cwd + hl);
+    else
+        snprintf(where, cap, "%s", cwd);
+}
+
+/* The prompt (shell/prompt): built from what the shell is doing now, and
+ * built again for a new width (edit_host.reprompt) from the same state. */
+static struct prompt_state g_pstate;
+static struct prompt_text g_ptext;
+static struct p10k_git g_git;
+
+/* Background jobs that have not finished: Powerlevel10k's background_jobs. */
+static int unfinished_jobs(void) {
+    jobs_poll();
+    int n = 0;
+    for (size_t i = 0; i < jobs_count(); i++) {
+        const struct job *j = jobs_at(i);
+        if (j && j->id && !j->reaped) n++;
+    }
+    return n;
+}
+static void prompt_into(struct edit_prompt *p) {
+    p->text = g_ptext.left;
+    p->right = g_ptext.right[0] ? g_ptext.right : NULL;
+    p->transient = g_ptext.transient[0] ? g_ptext.transient : NULL;
+}
+static void reprompt(void *ctx, int cols, struct edit_prompt *p) {
+    (void)ctx;
+    prompt_build(&g_pstate, cols, &g_ptext);
+    prompt_into(p);
+}
+
+/* Whether directory `dir` lists `name`. Looking a missing file up costs a
+ * line in the kernel's log, so the start of every shell looks first. */
+static bool listed(const char *dir, const char *name) {
+    static struct embk_dirent ents[64];
+    int64_t n = embk_readdir(dir[0] ? dir : "/", ents, 64);
+    for (int64_t i = 0; i < n; i++) if (!strcmp(ents[i].name, name)) return true;
+    return false;
+}
+
+/* ~/.config/shell/prompt.esh, then rc.esh, for a session a person types
+ * into: the prompt `prompt configure` wrote (it loads ~/.config/shell/p10k.zsh),
+ * then the person's own options (prompt set ...) and whatever else they want
+ * every time. Scripts and -c do not read them. Their errors are printed; the
+ * shell starts anyway. */
+static void source_rc(struct scope *top) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char base[200], config[224], shell[240], path[256];
+    snprintf(base, sizeof base, "%s", strcmp(home, "/") ? home : "");
+    snprintf(config, sizeof config, "%s/.config", base);
+    snprintf(shell, sizeof shell, "%s/shell", config);
+    if (!listed(base, ".config") || !listed(config, "shell")) return;
+    static const char *const files[] = { "prompt.esh", "rc.esh" };
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        if (!listed(shell, files[i])) continue;
+        snprintf(path, sizeof path, "%s/%s", shell, files[i]);
+        (void)run_script(path, top);
+    }
+}
+
+/* History lives in the user's home and is appended as lines are accepted, so
+ * every Terminal tab and every session adds to the same one. */
+static void open_history(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0] || !strcmp(home, "/")) return;
+    char path[256];
+    static const char *const dirs[] = { "/.local", "/.local/share", "/.local/share/shell" };
+    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+        snprintf(path, sizeof path, "%s%s", home, dirs[i]);
+        (void)embk_mkdir(path);                 /* already there: fine */
+    }
+    snprintf(path, sizeof path, "%s/.local/share/shell/history", home);
+    (void)hist_open(path);
 }
 
 /* Defaults this SHELL chooses for the commands it runs.
@@ -377,7 +472,7 @@ int main(int argc, char **argv) {
         embk_tty_mode(EMBK_TTY_RAW);
         /* At OUR prompt, ^C is a LINE-EDIT key (kill the input line), NOT a
          * cancellation -- so route it to NOBODY, which makes it arrive as the
-         * byte 0x03 that read_line handles. Routing ^C to SELF was wrong: it
+         * byte 0x03 the line editor handles. Routing ^C to SELF was wrong: it
          * cancels this process, and the cancel flag is STICKY with no way to
          * clear it, so the shell could never read again -- one ^C exited it.
          * eval_extern hands the route to a CHILD for its lifetime (there ^C IS a
@@ -386,12 +481,13 @@ int main(int argc, char **argv) {
         g_console_session = 1;
     }
 
-    /* Colour is opt-IN by the display: the GUI terminal names itself via
-     * TERM=emlink and parses SGR; the serial console and plain pipes never
-     * see an escape byte. The same contract Linux uses (TERM decides). */
+    /* Colour is opt-IN by the display: the GUI terminal says what it is
+     * (TERM=xterm-256color) and parses SGR; the serial console and plain
+     * pipes never see an escape byte. The same contract Linux uses: TERM
+     * decides, and an unset TERM or "dumb" means no escapes. */
     {
         const char *t = getenv("TERM");
-        if (!g_console_session && t && strncmp(t, "emlink", 6) == 0)
+        if (!g_console_session && t && t[0] && strcmp(t, "dumb") != 0)
             sval_set_colour(1);
     }
 
@@ -423,34 +519,103 @@ int main(int argc, char **argv) {
     }
 
     puts1("EmbLink shell -- structured pipelines. `exit` leaves.\n");
-    char line[LINE_MAX_LEN];
+    bool interactive = g_terminal_session || g_console_session;
+    if (interactive) open_history();
+    if (interactive) source_rc(&top);
+    /* No prompt configured: Powerlevel10k's wizard, as zsh starts it */
+    if (g_terminal_session && wizard_os_wanted()) (void)wizard_os_run(false, NULL, 0);
+    struct edit_host host = { out_write, shell_complete, unfinished, &top, reprompt, shell_highlight };
+    g_ed = edit_new(&host);
+    /* While the line is edited the shell reads every key itself: no line
+     * discipline, no echo, ^C as a byte (the editor's own), CR as CR. */
+    struct termios editing = g_prompt_attr;
+    editing.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG);
+    editing.c_iflag &= ~(tcflag_t)ICRNL;
+    editing.c_cc[VMIN] = 1;
+    editing.c_cc[VTIME] = 0;
+    int status = -1;                          /* the last command's; -1 before the first */
+    uint64_t duration = 0;                    /* how long it ran, ms */
+    char last_where[200] = "", last_cwd[192] = "";   /* where the last prompt was */
+    (void)scope_bind(&top, "status", value_int(0));
+    char plain[LINE_MAX_LEN];
     for (;;) {
-        /* The GUI terminal draws its OWN prompt (user@host:cwd$) on its input
-         * line, so printing "embk> " into its transcript would just be a second
-         * prompt sitting in the scrollback. Instead we hand it the one thing it
-         * cannot know -- our current directory -- as a marker line it consumes
-         * and never shows. The serial console still gets a human prompt. */
-        if (g_console_session) {
-            puts1("embk> ");
-        } else {
-            char cwd[192];
+        const char *line = NULL;
+        if (g_terminal_session && g_ed) {
+            /* Where the last command left the cursor is not known: zsh's
+             * PROMPT_SP. Fill the row and come back -- output that did not end
+             * in a newline keeps a reverse '%' after it, and the prompt starts
+             * on a row of its own either way. Then the modes a program may have
+             * left behind are reset, and the bar cursor of the prompt set. */
+            int cols = terminal_cols();
+            char fill[2112];
+            int k = snprintf(fill, sizeof fill, "\033[?1049l\033[?1l\033>\033[?25h\033[0m\033[5 q\033[1;7m%%\033[0m");
+            for (int i = 1; i < cols && k < (int)sizeof fill - 8; i++) fill[k++] = ' ';
+            memcpy(fill + k, "\r \r", 3);
+            out_write(NULL, fill, (size_t)k + 3);
+            if (status >= 0) {
+                char done[32];
+                snprintf(done, sizeof done, "\033]133;D;%d\007", status);
+                puts1(done);
+            }
+            char where[200], cwd[192], shown[192], mark[256];
+            prompt_where(where, sizeof where);
             if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
-            const char *integration=getenv("EMBLINK_PROMPT");
-            if (integration && !strcmp(integration,"1")) {
-                /* OSC shell integration, distinct from ordinary C0 bytes and
-                 * terminated without adding a row to the terminal screen. */
-                for (char *p=cwd;*p;p++) if ((unsigned char)*p<32 || (unsigned char)*p==127) *p='?';
-                puts1("\033[?1049l\033[?1l\033[?2004l\033[?25h\033[0m");
-                puts1("\033]133;A;cwd="); puts1(cwd); puts1("\007");
-            } else puts1("embk> ");
+            memcpy(shown, cwd, sizeof shown);
+            for (char *p = shown; *p; p++) if ((unsigned char)*p < 32 || (unsigned char)*p == 127) *p = '?';
+            snprintf(mark, sizeof mark, "\033]133;A;edit=shell;cwd=%s\007", shown);
+            time_t now = time(NULL);
+            struct tm *tm = localtime(&now);
+            /* Powerlevel10k asks about the directory and the repository:
+             * fresh listings for every prompt */
+            bool p10k = prompt_p10k_source() != NULL;
+            if (p10k) prompt_os_fresh();
+            shell_highlight_fresh();                   /* programs installed since are commands now */
+            const char *user = getenv("USER");
+            g_pstate = (struct prompt_state){
+                .user = user, .host = getenv("HOSTNAME"), .dir = where, .last_dir = last_where,
+                .status = status, .duration_ms = duration,
+                .hour = tm ? tm->tm_hour : 0, .minute = tm ? tm->tm_min : 0, .second = tm ? tm->tm_sec : 0,
+                .pwd = cwd, .last_pwd = last_cwd, .home = getenv("HOME"),
+                .year = tm ? tm->tm_year + 1900 : 1970, .month = tm ? tm->tm_mon + 1 : 1,
+                .mday = tm ? tm->tm_mday : 1, .wday = tm ? tm->tm_wday : 4,
+                .jobs = p10k ? unfinished_jobs() : 0, .root = user && !strcmp(user, "root"),
+                .git = p10k && prompt_os_gitstatus(prompt_p10k_config(), cwd, &g_git) ? &g_git : NULL,
+                .fs = p10k ? &prompt_os_fs : NULL };
+            prompt_build(&g_pstate, cols, &g_ptext);
+            const char *program = getenv("TERM_PROGRAM");
+            bool ours = program && !strcmp(program, "EmbLinkTerminal");
+            struct edit_prompt prompt = { mark, NULL, "\033[2m...\033[0m ", "\033]133;B\007",
+                                          ours ? "\033]133;R\007" : NULL, NULL, NULL };
+            prompt_into(&prompt);
+            (void)tcsetattr(0, TCSANOW, &editing);
+            enum edit_result r = edit_one_line(&prompt, EDIT_VT);
+            (void)tcsetattr(0, TCSANOW, &g_prompt_attr);
+            puts1("\033[0 q");
+            snprintf(last_where, sizeof last_where, "%s", where);
+            snprintf(last_cwd, sizeof last_cwd, "%s", cwd);
+            if (r == EDIT_EOF) break;
+            if (r == EDIT_CANCEL) { status = 130; continue; }
+            line = edit_line(g_ed);
+        } else if (g_console_session && g_ed) {
+            struct edit_prompt prompt = { NULL, "embk> ", "...> ", NULL, NULL, NULL, NULL };
+            enum edit_result r = edit_one_line(&prompt, EDIT_DUMB);
+            if (r == EDIT_EOF) break;
+            if (r == EDIT_CANCEL) continue;
+            line = edit_line(g_ed);
+        } else {
+            puts1("embk> ");
+            if (read_plain_line(plain, sizeof plain) < 0) break;
+            line = plain;
         }
-        int n = read_line(line, sizeof line);
-        if (n < 0) break;                      /* console EOF/error: leave */
         if (strcmp(line, "exit") == 0) break;
-        const char *integration=getenv("EMBLINK_PROMPT");
-        if (integration && !strcmp(integration,"1")) puts1("\033]133;C\007");
-        (void)run_line(line, &top);
+        if (interactive) hist_push(line);
+        if (g_terminal_session) puts1("\033]133;C\007");
+        uint64_t started = embk_uptime_ms();
+        status = run_line(line, &top);
+        duration = embk_uptime_ms() - started;
+        (void)scope_bind(&top, "status", value_int(status));
     }
+    edit_free(g_ed);
     if (g_console_session) embk_tty_mode(EMBK_TTY_COOKED);
     scope_free(&top);
     return 0;

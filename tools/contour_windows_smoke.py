@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Native minimum-size, maximize/restore and layout-board acceptance."""
 from pathlib import Path
-import shutil,tempfile,time
+import os,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_ui import NativeUI
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='contour-windows-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='contour-windows-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     def eventually(check,message):
@@ -37,8 +37,17 @@ def main():
         ui.click_text(w,'Right')
         eventually(lambda:d.window('Settings')['x']==640 and d.window('Settings')['cw']==640,'right tiling failed')
         d.snap('window-tiled')
+        # DRAGGED INTO AN EDGE, IT TILES. The compositor drags it by the title
+        # (a region the app declared), tells the app where it went when the
+        # button comes up, and the app snaps to the half it reached.
+        w=d.window('Settings');ui.move(w['x']+w['cw']//2,w['y']+18);d.g.pump(.5)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});d.g.pump(.5)
+        ui.move(w['x']+w['cw']//2-900,w['y']+18);d.g.pump(.5)
+        d.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'});d.g.pump(2)
+        eventually(lambda:d.window('Settings')['x']==0 and d.window('Settings')['cw']==640,'dragging into the left edge did not tile left')
+        d.snap('window-dragged-left')
         assert b'PANIC' not in d.g.seen
-        print('PASS: compact resize minimums, fill/restore through the hover board, and right-half tiling',flush=True)
+        print('PASS: compact resize minimums, fill/restore through the hover board, right-half tiling, and tiling by dragging into an edge',flush=True)
     finally:
         try:d.snap('last')
         finally:d.g.close()

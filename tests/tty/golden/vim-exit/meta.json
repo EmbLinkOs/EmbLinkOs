@@ -1,0 +1,16 @@
+{
+  "cursor_x": 0,
+  "cursor_y": 15,
+  "alternate": 0,
+  "cursor_visible": 1,
+  "cols": 80,
+  "rows": 24,
+  "command": [
+    "sh",
+    "-c",
+    "head -8 README.md vt.h; exec vim -u NONE -i NONE -N -c \"syntax on\" vt.h"
+  ],
+  "frozen": false,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

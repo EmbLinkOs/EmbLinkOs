@@ -104,9 +104,12 @@ struct vring_used {
 #define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D     0x0205
 #define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D   0x0206
 #define VIRTIO_GPU_CMD_SUBMIT_3D               0x0207
+#define VIRTIO_GPU_CMD_UPDATE_CURSOR           0x0300
+#define VIRTIO_GPU_CMD_MOVE_CURSOR             0x0301
 #define VIRTIO_GPU_RESP_OK_NODATA              0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO        0x1101
 
+#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 1   // memory bytes B,G,R,A -- the cursor
 #define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM 2   // memory bytes B,G,R,X
 
 #define VIRTIO_GPU_F_VIRGL 0                 // feature bits (bank 0)
@@ -258,6 +261,41 @@ struct virtio_gpu_state {
 
 static struct virtio_gpu_state g_vgpu;
 
+/* ---- the cursor plane -------------------------------------------------------
+ * virtio-gpu's second queue carries the CURSOR: a 64 x 64 picture the host
+ * puts over the scanout itself, and moves without anything being composed.
+ * The pointer moving is then a few bytes on this queue -- sent from the mouse
+ * driver's own notification, the interrupt included, rather than waiting for
+ * the compositor's next frame -- and composing never draws a cursor at all.
+ *
+ * The device answers nothing on this queue, so a command is one device-
+ * readable descriptor and nothing waits for it. A slot is free again once the
+ * used index has passed it; with every slot in flight a move is dropped (the
+ * next one carries the newer position anyway). Its own lock, IRQ-safe, never
+ * the control queue's. */
+#define VCUR_Q       16
+#define VCUR_SIZE    64
+#define VCUR_RES_ID  0x7fffff01u
+
+struct virtio_gpu_cursor_pos { uint32_t scanout_id, x, y, padding; } __attribute__((packed));
+struct virtio_gpu_update_cursor {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_cursor_pos pos;
+    uint32_t resource_id, hot_x, hot_y, padding;
+} __attribute__((packed));
+
+static struct {
+    struct vring_desc desc[VCUR_Q] __attribute__((aligned(4096)));
+    struct { uint16_t flags, idx, ring[VCUR_Q]; } __attribute__((packed)) avail __attribute__((aligned(4096)));
+    struct { uint16_t flags, idx; struct vring_used_elem ring[VCUR_Q]; } __attribute__((packed)) used __attribute__((aligned(4096)));
+    struct virtio_gpu_update_cursor cmd[VCUR_Q] __attribute__((aligned(64)));
+    uint32_t pixels[VCUR_SIZE * VCUR_SIZE] __attribute__((aligned(4096)));
+    uint16_t size, notify_off;
+    bool queue, resource;
+    uint32_t hot_x, hot_y;
+} g_vcur;
+static spinlock_t vcur_lock = SPINLOCK_INIT;
+
 // ---- MMIO helpers -----------------------------------------------------------
 static inline uint8_t  vr8(volatile uint8_t *b, uint32_t o)  { return *(volatile uint8_t  *)(b + o); }
 static inline uint16_t vr16(volatile uint8_t *b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
@@ -400,6 +438,15 @@ static bool vgpu_init_transport(const struct pci_device *dev) {
         return false;
     }
     s->vq_size = qsize;
+
+    /* The cursor queue (index 1). Without it the compositor draws the pointer
+     * itself, as it does on every other display. */
+    memset(&g_vcur.desc, 0, sizeof g_vcur.desc);
+    memset((void *)&g_vcur.avail, 0, sizeof g_vcur.avail);
+    memset((void *)&g_vcur.used, 0, sizeof g_vcur.used);
+    g_vcur.size = virtio_pci_setup_queue(&s->vp, 1, VCUR_Q, g_vcur.desc, (void *)&g_vcur.avail,
+                                         (void *)&g_vcur.used, &g_vcur.notify_off);
+    g_vcur.queue = g_vcur.size != 0;
 
     virtio_pci_driver_ok(&s->vp);
 
@@ -834,6 +881,77 @@ static const struct gpu_compose *vgpu_compose(void) {
     return virgl_compose();
 }
 
+/* Queue one cursor command. Any context; false if the queue is full or gone. */
+static bool vcur_send(uint32_t type, unsigned scanout, int32_t x, int32_t y, uint32_t resource) {
+    if (!g_vcur.queue || g_vgpu.failed) return false;
+    spin_lock(&vcur_lock);
+    uint16_t in_flight = (uint16_t)(g_vcur.avail.idx - __atomic_load_n(&g_vcur.used.idx, __ATOMIC_ACQUIRE));
+    if (in_flight >= g_vcur.size) { spin_unlock(&vcur_lock); return false; }
+    uint16_t slot = (uint16_t)(g_vcur.avail.idx % g_vcur.size);
+    struct virtio_gpu_update_cursor *c = &g_vcur.cmd[slot];
+    memset(c, 0, sizeof *c);
+    c->hdr.type = type;
+    c->pos.scanout_id = scanout;
+    c->pos.x = (uint32_t)(x < 0 ? 0 : x);
+    c->pos.y = (uint32_t)(y < 0 ? 0 : y);
+    c->resource_id = resource;
+    c->hot_x = g_vcur.hot_x; c->hot_y = g_vcur.hot_y;
+    g_vcur.desc[slot].addr = vgpu_dma(c);
+    g_vcur.desc[slot].len = sizeof *c;
+    g_vcur.desc[slot].flags = 0;
+    g_vcur.desc[slot].next = 0;
+    g_vcur.avail.ring[slot] = slot;
+    __sync_synchronize();
+    g_vcur.avail.idx++;
+    __sync_synchronize();
+    vw16((volatile uint8_t *)g_vgpu.notify_base, (uint32_t)g_vcur.notify_off * g_vgpu.notify_off_multiplier, 1);
+    spin_unlock(&vcur_lock);
+    return true;
+}
+
+/* The pointer's picture: premultiplied 0xAARRGGBB, at most 64 x 64, with its
+ * hot spot. The host wants straight alpha, so each pixel is divided back out.
+ * Schedulable context only: the resource is made and filled on the control
+ * queue, which waits. */
+static bool vgpu_cursor_image(const uint32_t *argb, uint32_t w, uint32_t h, uint32_t hot_x, uint32_t hot_y) {
+    if (!g_vcur.queue || w > VCUR_SIZE || h > VCUR_SIZE) return false;
+    if (!g_vcur.resource) {
+        struct virtio_gpu_resource_create_2d c = {0};
+        c.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+        c.resource_id = VCUR_RES_ID;
+        c.format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+        c.width = VCUR_SIZE; c.height = VCUR_SIZE;
+        if (!vgpu_simple_cmd(&c, sizeof c)) return false;
+        if (!vgpu_backing(VCUR_RES_ID, g_vcur.pixels, sizeof g_vcur.pixels)) return false;
+        g_vcur.resource = true;
+    }
+    for (uint32_t y = 0; y < VCUR_SIZE; y++)
+        for (uint32_t x = 0; x < VCUR_SIZE; x++) {
+            uint32_t p = x < w && y < h ? argb[y * w + x] : 0, a = p >> 24;
+            if (a && a < 255) {
+                uint32_t r = ((p >> 16) & 255) * 255 / a, g = ((p >> 8) & 255) * 255 / a, b = (p & 255) * 255 / a;
+                p = a << 24 | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
+            }
+            g_vcur.pixels[y * VCUR_SIZE + x] = p;
+        }
+    struct virtio_gpu_transfer_to_host_2d t = {0};
+    t.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    t.r = (struct virtio_gpu_rect){ 0, 0, VCUR_SIZE, VCUR_SIZE };
+    t.resource_id = VCUR_RES_ID;
+    if (!vgpu_simple_cmd(&t, sizeof t)) return false;
+    g_vcur.hot_x = hot_x; g_vcur.hot_y = hot_y;
+    return true;
+}
+
+/* Show the picture at (x, y) on output `scanout` (its own coordinates), or
+ * hide it. `image` re-reads the picture (after vgpu_cursor_image); otherwise
+ * only the position changes. Any context. */
+static bool vgpu_cursor_place(unsigned scanout, int32_t x, int32_t y, bool visible, bool image) {
+    if (!g_vcur.resource) return false;
+    if (!visible) return vcur_send(VIRTIO_GPU_CMD_UPDATE_CURSOR, scanout, x, y, 0);
+    return vcur_send(image ? VIRTIO_GPU_CMD_UPDATE_CURSOR : VIRTIO_GPU_CMD_MOVE_CURSOR, scanout, x, y, VCUR_RES_ID);
+}
+
 static const struct gpu_driver g_vgpu_driver = {
     .name = "virtio-gpu",
     .prepare=vgpu_prepare,.select=vgpu_select,.release=vgpu_release,.describe=vgpu_describe,.resource_id=vgpu_resource,
@@ -843,6 +961,7 @@ static const struct gpu_driver g_vgpu_driver = {
     .output_count = vgpu_output_count, .output_info = vgpu_output_info,
     .apply_layout = vgpu_apply_layout, .poll_outputs = vgpu_poll_outputs,
     .compose = vgpu_compose,
+    .cursor_image = vgpu_cursor_image, .cursor_place = vgpu_cursor_place,
 };
 
 const struct gpu_driver *virtio_gpu_probe(void) {

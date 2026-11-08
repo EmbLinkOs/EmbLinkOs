@@ -1,0 +1,24 @@
+[38;5;130m  2 [35m#define EMBLINK_VT_H[39m                
+[38;5;130m  3 [35m#include [31m<stdint.h>[39m                 
+[38;5;130m  4 [35m#include [31m<stddef.h>[39m                 
+[38;5;130m  5 [35m#include [31m<stdbool.h>[39m                
+[38;5;130m  6 [39m                
+[38;5;130m  7 [35m#define VT_COLS [31m220[39m                 
+[38;5;130m  8 [35m#define VT_ROWS [31m60[39m                  
+[38;5;130m  9 [35m#define VT_HISTORY [31m300[39m              
+[38;5;130m 10 [35m#define VT_DEFAULT [31m0xffffffffu[39m      
+[38;5;130m 11 [35m#define VT_BOLD [31m1u[39m                  
+[38;5;130m 12 [35m#define VT_DIM [31m2u[39m                   
+[38;5;130m 13 [35m#define VT_ITALIC [31m4u[39m                
+[38;5;130m 14 [35m#define VT_UNDERLINE [31m8u[39m             
+[38;5;130m 15 [35m#define VT_INVERSE [31m16u[39m              
+[38;5;130m 16 [35m#define VT_HIDDEN [31m32u[39m               
+[38;5;130m 17 [35m#define VT_STRIKE [31m64u[39m               
+[38;5;130m 18 [39m                
+[38;5;130m 19 [34m/* A wide glyph owns its next cell (width=0). Combining storage is bounded;[39m 
+[38;5;130m 20 [34m * this is Unicode cell handling, not a full grapheme/shaping engine. */[39m    
+[38;5;130m 21 [32mstruct[39m vt_cell {
+[38;5;130m 22 [39m    [32muint32_t[39m rune, combining[[31m2[39m], fg, bg;                                    
+[38;5;130m 23 [39m    [32muint8_t[39m width, flags;           
+[1;7mvt.h                                                          23,13           2%
+[0m                                                                                

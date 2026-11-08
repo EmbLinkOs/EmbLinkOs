@@ -1,0 +1,2 @@
+# Cases the screen model is known to show differently from tmux, with why.
+# This list only shrinks: tools/golden_terminal.py fails a listed case that passes.

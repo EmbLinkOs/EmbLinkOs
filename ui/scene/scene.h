@@ -91,6 +91,18 @@ struct paint {
     float           center_x, center_y, radius;    /* PAINT_RADIAL_GRADIENT, node-local */
 };
 
+/* One end of a promoted subtree's motion: relative to where it rests, how
+ * transparent, how much smaller (about its anchor, thousandths of its size)
+ * and how far off it is there, and the spring it travels on. */
+struct scene_layer_motion {
+    uint8_t  opacity;              /* 0..255 */
+    uint16_t scale_milli;          /* 1000: its own size */
+    uint16_t anchor_x_milli, anchor_y_milli;
+    int16_t  dx, dy;
+    uint16_t response_ms, damping_milli;   /* 0 response: it jumps */
+    uint16_t delay_ms;             /* its springs start this much later: a stagger */
+};
+
 struct scene_node {
     bool hit_passthrough; /* decorative subtree, skipped by UI hit testing */
     struct node_handle self;                       /* for validation/debug; self.index
@@ -140,6 +152,25 @@ struct scene_node {
     float backdrop_blur_radius;
 
     float opacity;              /* 0..1; multiplies the WHOLE subtree in traversal */
+    /* A GROUP'S SCALE: below 1 the subtree, flattened as an opacity group is,
+     * is drawn that much smaller toward its anchor (fractions of its bounds:
+     * 0,0 top-left, .5,.5 the middle) -- a popover growing out of where it
+     * opens. Shrinking only, so its unscaled bounds stay where it can draw. */
+    float group_scale, anchor_x, anchor_y;
+
+    /* PROMOTED: this subtree is a piece of the window the COMPOSITOR moves (a
+     * menu, a toast, a tooltip). Where the renderer has a layer host
+     * (scene_render_set_layer_host), it is painted once into a layer of its
+     * own -- not into the window -- and arrives, moves and leaves on the
+     * compositor's springs: `appear` says where it comes FROM, `disappear`
+     * where it goes once the subtree is gone. Without a host it is painted
+     * where it stands, like any other. */
+    bool promoted;
+    struct scene_layer_motion appear, disappear;
+    /* ...and when the APP moves it, changes its opacity or scale while it is
+     * up, the spring that takes it there (0: it is there at once) -- a pulled
+     * window let go short, springing home on the compositor's clock */
+    uint16_t layer_move_ms, layer_move_damping;
 
     /* --- kind-specific payload --- */
     union {
@@ -147,8 +178,12 @@ struct scene_node {
         /* tinted: paint `tint` using the image's ALPHA as coverage, so a
          * single-colour icon behaves exactly like a glyph and follows the
          * theme. Untinted images draw their own colours. */
+        /* damage: what changed in the pixels since the last render -- 0
+         * nothing said, 1 just dmg_* (image pixels; scene_set_image_damage),
+         * 2 all of it (a new buffer or size). */
         struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt;
-                 bool tinted; struct color tint; } image;
+                 bool tinted; struct color tint;
+                 uint8_t damage; float dmg_x, dmg_y, dmg_w, dmg_h; } image;
         struct { const char *utf8; uint32_t font_handle; float size_px; struct color color;
                  struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */
                  /* Content hash of `utf8` as it was when last set. A node holds
@@ -175,6 +210,15 @@ struct scene_node {
                             * (paint, text, image, border...) invalidates the
                             * pixels themselves. The renderer's scroll fast
                             * path tells the two apart with this bit. */
+    bool  dirty_look;      /* dirty_content MINUS how the node is composited:
+                            * opacity and group scale change what a group's
+                            * flattened pixels LOOK like on screen, not the
+                            * pixels themselves, so a group's kept pixels
+                            * (scene_render's group cache) survive them. Any
+                            * other content change sets this too. */
+    bool  dirty_comp;      /* ...and the other half: how the node is composited
+                            * changed (opacity, group scale) -- every pixel of
+                            * its subtree with it. */
 
     /* Opaque tag Piece 3 never interprets -- exists purely so a consumer above
      * (Piece 7's declarative layer) can stash its own identifier (e.g. a packed
@@ -229,6 +273,12 @@ void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color
 
 /* Force-dirty a node whose (aliased) content was edited in place. */
 void scene_mark_dirty(struct scene_arena *a, struct node_handle h);
+/* An image whose buffer was edited in place, but only in (x,y,w,h) -- image
+ * pixels. Only that part is repainted and presented (calls in one frame add
+ * up to the rectangle around them); a terminal line that changed costs that
+ * line, not the window. */
+void scene_set_image_damage(struct scene_arena *a, struct node_handle h,
+                            float x, float y, float w, float ht);
 void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pixels,
                      uint32_t w, uint32_t ht, enum embk_pixfmt fmt);
 /* Draw the image as a MASK filled with `tint` (alpha = coverage). enabled=false
@@ -243,6 +293,13 @@ void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
                                float width, const struct paint *paint);
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius);
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity);
+void scene_set_group_scale(struct scene_arena *a, struct node_handle h, float scale, float anchor_x, float anchor_y);
+void scene_set_corner_radius(struct scene_arena *a, struct node_handle h, float radius);
+/* Promote a subtree to a layer the compositor moves (scene_node.promoted), or
+ * not (on = 0). The motions are copied. */
+void scene_set_layer_spring(struct scene_arena *a, struct node_handle h, uint16_t response_ms, uint16_t damping_milli);
+void scene_set_promoted(struct scene_arena *a, struct node_handle h, bool on,
+                        const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);
 void scene_set_z(struct scene_arena *a, struct node_handle h, float z);
 

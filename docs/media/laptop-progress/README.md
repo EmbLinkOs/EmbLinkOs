@@ -1,9 +1,9 @@
 # Laptop progress captures
 
-155 actual EmbLinkOS captures document the original laptop work, its
+239 actual EmbLinkOS captures document the original laptop work, its
 integration with master through `a281865`, system-menu polish after PR #40,
 recoverable document workspaces, the Contour desktop redesign, keyboard
-interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition and the native shell running any program. PNG exports preserve
+interaction, private terminal sessions, VT screen emulation, process compatibility, ordered POSIX spawn, spawn-based sh, shared descriptor I/O, managed system upgrades, live display configuration, several monitors, GPU composition, the native shell running any program and a real Terminal: keys, the shells' own line editing, an xterm-compatible screen, its own fonts and renderer, tabs, selection, find and links, and profiles with Preferences and windows that show through; and then the prompt, Powerlevel10k-style: rc.esh, a right side, a transient prompt, Powerlevel10k's own engine drawing a Mac's configuration and every style, git status read by the system's own daemon, Powerlevel10k's configuration wizard, and the line suggested from history and coloured as it is typed; and then the desktop measuring what composing it costs, keeping time at 120 Hz, windows moving on springs, windows casting real shadows, glass you can see through, a new face, spaces that slide, a dock that answers, notices that come and go, windows that zoom, effects that give way, every window at once, a tile shown before it is taken, type spaced for its size, spaces that follow the hand, windows resized as they are dragged, an overview the keys can walk, both themes audited for contrast, pages that scroll by moving their pixels, layers the compositor moves while their app sleeps, menus that come and go on them, a library that rises on them over the desktop, glass on them that the compositor frosts, toasts and dimmings that come and go on them, rows that arrive a beat apart, and a window pulled on one. PNG exports preserve
 original pixels and dimensions; no retouching, reconstruction or upscaling.
 All are QEMU captures. They do not establish physical laptop compatibility.
 
@@ -14,7 +14,539 @@ merged OS; desktop captures are 1280 × 800, recovery captures 800 × 600.
 The merged-desktop guest (21–38) includes a **synthetic ACPI fixture** throughout;
 backlight, battery and lid readings do not come from physical hardware.
 
-## Latest: the native shell runs any program
+## Latest: the desktop measures itself, then keeps time
+
+The first step of the fluid desktop: before anything is made faster, the compositor says what composing costs -- every compose timed and charged to the cause that asked for it and the window that presented, and the pointer's motion timed to the screen ([DESKTOP_PERFORMANCE.md](../../DESKTOP_PERFORMANCE.md)). The second gives it a frame clock: one compose a frame, at a rate that rises to the display's top under a hand and falls back to 60, on a beat kept to the nanosecond.
+
+### What composing costs, on the screen it costs
+
+GUI+Shift+P: the compositor's own account at the top right -- CPU composing 1280 × 800, composes and megapixels in the last second, compose time (median, 95th percentile, worst), the pointer's motion-to-screen latency, and composes by cause. The baseline at 241cb9d, after `tools/perf_smoke.py`'s five scenes, under TCG.
+
+![The EmbLinkOS desktop with Settings open and the compositor statistics overlay at the top right](208-perf-hud.png)
+
+### Nothing to compose, so nothing composed
+
+The same five scenes after P0: the overlay reads 0 composes a second on a desktop where nothing changes, where the baseline composed ten. The pixel loops run -O2, and nothing is presented that did not change. Under TCG.
+
+![The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 0 composes a second](209-perf-after-p0.png)
+
+### A real core composing
+
+arm64 under HVF, on the host's own core: window motion at about 100 frames a second (A31 -- 31 frames to open and close a Terminal), a compose median of 2.7 ms in that scene, the pointer reaching the screen in 0.2 ms. The text layout here is wrong -- icons below their labels, the top bar cut off -- and was before P0; it is recorded in [TODO.md](../../TODO.md).
+
+![The EmbLinkOS desktop on arm64 with the compositor statistics overlay; Settings' sidebar icons sit below their labels](210-perf-arm64-hvf.png)
+
+### On the beat at 120 Hz
+
+The frame clock told the display is a fixed 120 Hz one (`perf display 120`) and keeping the beat (`perf beat`): the overlay reads 120 of 120 Hz, 120 frames in the last second, a beat of 8.33 ms with a 95th percentile of 9.53. Under TCG; arm64 under HVF keeps the same beat to a p95 of 8.8 ms ([the beat](../../DESKTOP_PERFORMANCE.md#the-beat)).
+
+![The EmbLinkOS desktop with Settings open and the compositor statistics overlay reading 120/120Hz, 120 fps, beat 8.33 ms](211-frame-clock-120.png)
+
+### A window on its way to the dock
+
+Settings minimised with GUI+M, photographed in flight: the ghost of its window, fully opaque, on four springs toward its own tile in the dock -- the tile the desktop told the compositor about. Slowed ten times (`perf slowmo 10`) to be photographed; the motion is the same. Under TCG.
+
+![The EmbLinkOS desktop with a shrunken copy of the Settings window in mid-air between where it was and the dock](212-park-in-flight.png)
+
+### Into its own tile
+
+A moment later: the window over the Settings tile and fading into it -- opaque the whole way down, fading only in the last tenth of the trip. Clicked back before it lands, it turns around from where it is.
+
+![The EmbLinkOS dock with a small fading copy of the Settings window landing on the Settings tile](213-park-at-the-tile.png)
+
+### A shadow with two layers
+
+Settings casting the new shadow: a wide, soft key shadow well below the window and a tight ambient one at its edge, both rounded with the window's corners. The shadow it replaces was one square-cornered band, 16 px wide and 3 px down (compare 211). Under TCG, composed on the CPU.
+
+![The EmbLinkOS desktop with the Settings window casting a soft, rounded shadow onto the wallpaper](214-two-layer-shadow.png)
+
+### Glass you can see through
+
+The Applications launcher on the new default material: translucent (35%) over a 12 px blur, the backdrop saturated as it shows through (vibrancy), with the two-layer shadow beneath the sheet. The default had been 18% over 6 px -- a surface 82% opaque. Under TCG.
+
+![The EmbLinkOS Applications launcher, a translucent dark sheet over the blurred, darkened wallpaper](215-launcher-glass.png)
+
+### Set in Inter
+
+Settings in the interface's new face, Inter: Regular for text, SemiBold for headings and emphasis, DejaVu Sans kept as the fallback for anything Inter does not cover. Compare 214, the same window in DejaVu Sans. Under TCG.
+
+![The EmbLinkOS Settings window, Appearance page, set in the Inter typeface](216-inter.png)
+
+### Between two spaces
+
+GUI+2 pressed with Settings open on the first space, photographed mid-slide: the window on its way off the left of the screen as the second space comes in, drawn as itself -- rounded corners, title bar and shadow -- on four springs. Pressed back mid-slide, it turns round where it is. Slowed ten times (`perf slowmo 10`) to be photographed. Under TCG.
+
+![The EmbLinkOS desktop with the Settings window half off the left edge of the screen, sliding away as the top bar reads Space 2](217-spaces-slide.png)
+
+### The pointer's plate, on its way
+
+The pointer moved from the Files tile to Settings, photographed as the dock's plate glides after it on a spring: here it is passing under the Files icon. One plate, gliding -- the icons never move under the aim. Under TCG.
+
+![The EmbLinkOS dock with a dark rounded plate half under the Files icon, between Files and Terminal](218-dock-plate.png)
+
+### Files, starting
+
+Files clicked in the dock: while it starts, its icon hops above its tile, which has just lit as running. The one time a dock icon moves, after the click; it settles once the app's window is up. Under TCG.
+
+![The EmbLinkOS dock with the Files icon raised above its lit tile while the app starts](219-dock-hop.png)
+
+### A second notice
+
+A second notice arriving: its banner slides in from the screen's edge on top while the first glides down to make room, both on springs. Banners leave the way they came -- when their time is up, clicked, or flicked away -- and stay while the pointer is on them. Under TCG.
+
+![Two EmbLinkOS notification banners at the top right: 'Second' sliding in from the edge above 'First', which is moving down](220-banners-stack.png)
+
+### Zooming
+
+A double click on Settings' bar, photographed as the window zooms to fill the work area: drawn from its new pixels, on its way from the old frame to the new on a spring, with its rounded corners and shadow. Slowed ten times (`perf slowmo 10`) to be photographed; scaled nearest-neighbour here because frames under TCG are too dear for filtering. Under TCG.
+
+![The EmbLinkOS Settings window, nearly filling the screen, part-way through zooming to the full work area](221-zoom.png)
+
+### Effects, reduced
+
+The Applications library in the reduced effects tier (`perf effects reduced`; Settings > Appearance > Effects): no blur to compute, the sheet's own tint drawn whole -- what the compositor falls back to while frames run long, and the toolkit with it. Compare 215, the same sheet in the full tier, the wallpaper frosted through it. arm64 under HVF.
+
+![The EmbLinkOS Applications library as an opaque grey sheet over the dark wallpaper](222-effects-reduced.png)
+
+### The overview
+
+GUI+Up: the overview. Settings and the Terminal, each flown on springs to a place of its own over the dimmed desktop -- the windows themselves, scaled and live, with their corners and shadows. A click on one brings it in front as both fly home; Esc leaves them as they were. Under TCG.
+
+![The EmbLinkOS overview: the Settings and Terminal windows side by side, scaled down, over a dimmed desktop](223-overview.png)
+
+### Where it will go
+
+Settings dragged by its bar against the left edge and held: the outline of the left half it will take when let go, over the window, and the accent's wash under it. Let go, it flies there. Under TCG.
+
+![The EmbLinkOS Settings window held against the left edge, with an accent outline marking the left half of the screen](224-tile-preview.png)
+
+### Spaced for its size
+
+Settings again, with Inter set as its designer publishes it for each size: the titles and headings close up (0.22 px a pair at 17 px, 0.44 at 23), the 13 px text is left nearly as drawn, and the smallest type opens a little. Measuring, wrapping and the caret take the same spacing as the pixels. Compare 216, the same window before. Under TCG.
+
+![The EmbLinkOS Settings window, Appearance page, set in Inter with size-dependent letter-spacing](225-inter-tracked.png)
+
+### Spaces under the hand
+
+Three fingers on a touchscreen, held 560 px to the left: the first space (Settings) going off one side and the second (the Terminal) coming in from the other, both following the hand one to one while the bar, the dock and the wallpaper stay. Let go past a third of the screen, or flicked, the second space is taken and the windows carry on at the hand's speed; short of it they spring back. Three fingers up open the overview. Fingers driven over QMP on a virtio-multitouch device; arm64 under HVF.
+
+![The EmbLinkOS desktop mid-swipe: Settings sliding off to the left and the Terminal coming in from the right edge](226-spaces-under-the-hand.png)
+
+### Resized as it is dragged
+
+Settings held by its corner grip, dragged out from 980 × 660 and not yet let go: already 1127 × 753 and laid out at that size -- its rows wider, its controls at the new right edge. The window is the size the hand says on every frame of the drag, both ways, and never flies. Built on EmbCC's C library; arm64 under HVF.
+
+![The EmbLinkOS Settings window enlarged almost to the screen's edges while its corner grip is held](227-live-resize.png)
+
+### The ring, by the keys
+
+The overview, the Terminal ringed by the Left arrow: a rounded band of the accent hugging it, concentric with its corners. Each window sits in the cell nearest where it stands -- the Terminal, on the left of the screen, on the left here. Return brings the ringed window in front as they all fly home; the dock under the overview no longer lights for the pointer. arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS overview: the Terminal on the left with a rounded accent ring around it, Settings smaller on the right, over the dimmed desktop](228-overview-ring.png)
+
+### Light, audited
+
+Settings in the light theme after the contrast audit: every control's edge -- the preset buttons, the hex field, the segmented controls -- now at 3:1 against what it stands on (it was 1.9:1, and read as hardly there), and every text tone readable at 4.5:1 on every ground it is set on, captions in input wells included. Tones that already read were left as they were designed. arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS Settings window, Appearance page, in the light theme with clearly outlined controls](229-light-audited.png)
+
+### Scrolled by moving
+
+Settings caught mid-glide, eight notches down its Appearance page. Each frame that moved the page copied the rows it already had and painted only the strip it uncovered -- the scroll bar's thumb, moving the other way, no longer stops that -- and the view shifts by whole pixels, so what is copied is exactly what painting it would give. Scrolled back to the top, the pane is the same picture to the pixel. A scroll frame here costs 0.44-1.23 ms where it cost 2.85-3.84. arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS Settings window scrolled partway down its Appearance page, palette, typography and materials options showing, the scroll bar thumb a third of the way down](230-scrolled-by-moving.png)
+
+### A layer in motion
+
+A layer, caught half way in: a card the application painted once, hanging below its window the way a menu does, its rounded corners and translucent body its own alpha -- the Terminal's text shows through it. The application sent it in with one call and went back to sleep; the compositor is moving it, on springs, on its own frame clock: 122 frames at a steady 16.67 ms while the app presented nothing. Slowed six times to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.
+
+![A small window titled Layer demo with a translucent, rounded, striped card hanging below it, half faded in and slightly smaller than full size](231-a-layer-in-motion.png)
+
+### A menu on a layer
+
+Files' context menu, half way in. The toolkit painted it once -- its frosted tint, its border, its shadow -- into a layer of the window, and the compositor brings it in on a spring, from transparent, a little smaller and a few pixels up, and takes it out again when it closes, after the toolkit has already forgotten it. Files builds a handful of frames for the whole arrival where it used to build one a frame and repaint its window nineteen times. Slowed to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS Files window with a small context menu offering New Folder and Refresh, caught part-way through fading in](232-a-menu-on-a-layer.png)
+
+### The library on layers
+
+The library half way in. The desktop painted its dimming and its glass sheet once each, into two layers of its window, and the compositor brings them in: the dimming fading over the desktop, the sheet rising and growing into place over it. The desktop paints a millisecond a frame of it where it painted five, and repaints its whole surface four times where it did twenty-three. Slowed sixteen times to be photographed (perf slowmo). arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS desktop with the Applications library half faded in over a partly dimmed wallpaper, its grid of app icons slightly smaller than full size](233-the-library-on-layers.png)
+
+### Glass the compositor frosts
+
+The top bar's EmbLink menu, now a layer. The bar is a window that shows through, so the menu's glass has nothing of its own to frost; the compositor does it, blurring what is really on the screen under the panel -- here Files' sidebar, faintly through the tint -- inside the panel's rounded rectangle and nowhere else, while its shadow and everything round it stay sharp. Opening and closing the menu now costs the bar 0.4 M pixels where it cost 24 M. x86 under TCG, on EmbCC's C library. (Below the menu the screen is grey: the bar's window, grown for the menu, was not cleared -- a fault fixed since, capture 238.)
+
+![The EmbLinkOS top bar's EmbLink menu open over a Files window, the sidebar labels faintly blurred through the menu panel](234-glass-the-compositor-frosts.png)
+
+### A toast on a layer
+
+Files copies a file and says so in a toast, "Copied settings.conf", over the foot of its list. The toast is a layer: the compositor raises it and, two and a half seconds later, sinks it, and Files sleeps in between -- it asked for one wake, for when the toast is to leave, instead of a frame every frame (2 frames built while it stayed). arm64 under HVF, on EmbCC's C library.
+
+![The Files window with a dark rounded toast reading Copied settings.conf above its status line](235-a-toast-on-a-layer.png)
+
+### A sheet over its dimming
+
+Move to Trash asks first. The sheet rises on its layer, and the dimming behind it is now a layer of its own under the sheet's -- one colour, the window's size -- that fades in and out on its own spring, where it used to be simply there. arm64 under HVF, on EmbCC's C library.
+
+![The Files window dimmed behind a sheet asking Move this file to the Trash, with Cancel and Move to Trash buttons](236-a-sheet-over-its-dimming.png)
+
+### Rows a beat apart
+
+The library arriving, slowed by four: its second row is still fainter and lower than the first. Each row is a layer over the sheet while it comes in, on a delay the compositor keeps (45 ms a row at full speed), and then the sheet's pixels again; the desktop draws none of the motion. arm64 under HVF, on EmbCC's C library.
+
+![The Applications library with its first row of icons fully shown and its second row still faint and slightly lower](237-rows-a-beat-apart.png)
+
+### The screen behind a menu
+
+The top bar's EmbLink menu open over the desktop, and the desktop still there: wallpaper and dock. With the bar's menus on layers, the bar's window -- grown to the screen while a menu is open, to catch a click anywhere -- was no longer cleared, and showed an old frame, grey, below the bar (capture 234). A resize of it is a cleared, whole repaint again. arm64 under HVF, on EmbCC's C library.
+
+![The EmbLinkOS desktop with the top bar's EmbLink menu open and the wallpaper and dock visible around it](238-the-screen-behind-a-menu.png)
+
+### A pull on a layer
+
+v7demo's close grip pulled: its content is a layer while it is pulled, moved toward the hand and faded by the compositor over the window's empty frame. Let go short, the compositor springs it home and the app presents twice for all of it; pulled on, the window closes with its picture in it. arm64 under HVF, on EmbCC's C library.
+
+![A small Editor window whose content is faded and shifted right inside its frame, its red close grip held](239-a-pull-on-a-layer.png)
+
+## The prompt, Powerlevel10k-style
+
+With the terminal real, the prompt that runs in it: the system the Mac's Powerlevel10k setup is built on, here in the native shell. First the plumbing -- `~/.config/shell/rc.esh` read by every shell a person types into, the `prompt` builtin setting options by Powerlevel10k's names, a right side the editor keeps out of the typing's way, and a transient prompt ([SHELL.md](../../SHELL.md#the-prompt)).
+
+Then the engine: Powerlevel10k 1.20's prompt ported to C in the shell, held cell for cell to recordings of p10k itself on a Mac -- 18 configurations, 288 prompts. A person's `.p10k.zsh` is read by `prompt import-p10k`, or its settings written as `prompt set` lines; `prompt style` draws the styles `p10k configure` starts from.
+
+Then the wizard: `prompt configure` is p10k configure, its questions and pages held cell for cell to recordings of p10k's own (454 pages), and the configuration it writes line for line. A new account's first Terminal starts it by itself; the answers from the Mac's own header make the Mac's prompt.
+
+And the line itself, as the Mac's zsh-autosuggestions and zsh-syntax-highlighting draw it: the rest of a history line suggested after the cursor, and the colours of what is typed -- held cell for cell to the two plugins under zsh.
+
+### A suggestion from history
+
+Two letters typed, and the rest of the newest line in history that starts with them follows the cursor in colour 8, as zsh-autosuggestions draws it; ec itself is red until it is a command.
+
+![A suggestion from history, in the EmbLinkOS Terminal](204-line-suggestion.png)
+
+### Right takes it
+
+At the end of the line Right takes the whole suggestion: echo is a command, green, and the quoted text yellow.
+
+![Right takes it, in the EmbLinkOS Terminal](205-line-suggestion-taken.png)
+
+### Colours as the line is typed
+
+zsh-syntax-highlighting's default styles on this shell's language: ls and where green, the directory that is there underlined, the string yellow, the comment bold -- nothing run yet.
+
+![Colours as the line is typed, in the EmbLinkOS Terminal](206-line-colours.png)
+
+### A word on its way to a file
+
+read is not a file, but readme.txt is: while the word ends the line it is underlined, as zsh-syntax-highlighting's path_prefix is.
+
+![A word on its way to a file, in the EmbLinkOS Terminal](207-line-path-on-its-way.png)
+
+### The wizard, on its own, in a new account's first shell
+
+A fresh account opens the Terminal for the first time: its shell finds no prompt configuration and starts Powerlevel10k's configuration wizard, p10k's greeting saying why. First, the font: does it draw a diamond?
+
+![The wizard, on its own, in a new account's first shell: prompt configure on EmbLinkOS](188-prompt-wizard-first-start.png)
+
+### Does the font draw a lock?
+
+The glyph that tells a font with Font Awesome icons from one without. On the Mac the answers come from, it did not.
+
+![Does the font draw a lock?: prompt configure on EmbLinkOS](189-prompt-wizard-lock.png)
+
+### Let's try another one
+
+A second lock, from another icon set. No again: diamonds without icons, so POWERLEVEL9K_MODE is powerline.
+
+![Let's try another one: prompt configure on EmbLinkOS](190-prompt-wizard-lock-again.png)
+
+### Prompt style
+
+Lean, classic, rainbow and pure, drawn from the wizard's own sample prompts as p10k draws them -- the page is held cell for cell to p10k configure's.
+
+![Prompt style: prompt configure on EmbLinkOS](191-prompt-wizard-style.png)
+
+### Character set
+
+Unicode, or ASCII for a font with neither.
+
+![Character set: prompt configure on EmbLinkOS](192-prompt-wizard-charset.png)
+
+### Prompt colours
+
+Lean in 256 colours, or in the terminal's 8.
+
+![Prompt colours: prompt configure on EmbLinkOS](193-prompt-wizard-colors.png)
+
+### Show current time?
+
+No clock, a 12-hour one or a 24-hour one.
+
+![Show current time?: prompt configure on EmbLinkOS](194-prompt-wizard-time.png)
+
+### Prompt height
+
+One line, or two: the information above, the typing below.
+
+![Prompt height: prompt configure on EmbLinkOS](195-prompt-wizard-height.png)
+
+### Prompt connection
+
+What joins the two sides of the first line: nothing, dots or a solid line.
+
+![Prompt connection: prompt configure on EmbLinkOS](196-prompt-wizard-connection.png)
+
+### Prompt frame
+
+No frame, on the left, on the right, or both.
+
+![Prompt frame: prompt configure on EmbLinkOS](197-prompt-wizard-frame.png)
+
+### Frame colour
+
+Four greys for the frame, with p10k's marker pointing at it; the Mac's answer is the darkest.
+
+![Frame colour: prompt configure on EmbLinkOS](198-prompt-wizard-frame-color.png)
+
+### Prompt spacing
+
+Compact, or sparse: an empty line before each prompt.
+
+![Prompt spacing: prompt configure on EmbLinkOS](199-prompt-wizard-spacing.png)
+
+### Prompt flow
+
+Concise, or fluent: on master, took 5s, at 04:23:42 PM.
+
+![Prompt flow: prompt configure on EmbLinkOS](200-prompt-wizard-flow.png)
+
+### Transient prompt
+
+Whether a line, once accepted, keeps only ❯ -- so the scrollback shows the commands, not every full prompt.
+
+![Transient prompt: prompt configure on EmbLinkOS](201-prompt-wizard-transient.png)
+
+### The prompt the answers make
+
+The answers in the header of the Mac's ~/.p10k.zsh make that file again, byte for byte but the date, at ~/.config/shell/p10k.zsh; prompt.esh loads it in every shell from now on. The frame, the home, the 12-hour clock.
+
+![The prompt the answers make: prompt configure on EmbLinkOS](202-prompt-wizard-done.png)
+
+### prompt configure, and q
+
+Typed in a second tab -- which loaded the configuration by itself -- `prompt configure` greets as p10k configure does; q leaves it, saying how to run it again.
+
+![prompt configure, and q: prompt configure on EmbLinkOS](203-prompt-wizard-quit.png)
+
+### Git status, from the repository itself
+
+gitstatus.elf, the shell's gitstatusd, reads the sample repository ~/Projects/hello from its own files -- its packed history one commit ahead of origin/main (⇡1), an edited file (!1), a new one (?1), a file under the ignored build/ left out -- and the prompt draws it as on the Mac.
+
+![Git status in the prompt, drawn on EmbLinkOS](187-prompt-gitstatus.png)
+
+### The Mac's prompt, on EmbLinkOS
+
+The configuration p10k configure wrote on a Mac -- lean, frame, 12-hour clock, transient -- as `prompt set` lines in rc.esh, drawn by the shell's own Powerlevel10k engine: the directory with its anchors, the branch (grey until the git status daemon answers), Ctrl+C's ✘ INT, a background job's ≡, and every accepted line kept as ❯ alone, red after a failure.
+
+![The Mac’s prompt, drawn on EmbLinkOS](182-prompt-p10k-mac-config.png)
+
+### Classic, by `prompt style`
+
+`prompt style classic`: Powerlevel10k's classic style from /system/share/powerlevel10k, its powerline segments and frame drawn in the Terminal's own Meslo Nerd Font.
+
+![Classic, by `prompt style` in EmbLinkOS](183-prompt-p10k-classic.png)
+
+### Rainbow
+
+`prompt style rainbow`: the same engine, every segment on its own background.
+
+![Rainbow in EmbLinkOS](184-prompt-p10k-rainbow.png)
+
+### Pure
+
+`prompt style pure`: the style of Pure, in Powerlevel10k's terms.
+
+![Pure in EmbLinkOS](185-prompt-p10k-pure.png)
+
+### Lean
+
+`prompt style lean`, the style the Mac's configuration began from.
+
+![Lean in EmbLinkOS](186-prompt-p10k-lean.png)
+
+### A right side, and the short way
+
+rc.esh, read by the new tab's shell, gives the prompt a right side -- the last command's status (✘ and its code), its duration past three seconds, the time -- and a transient prompt: lines already run keep only the prompt character, green or red by how the command before went.
+
+![A right side, and the short way in EmbLinkOS](180-prompt-right-side.png)
+
+### The prompt’s options, as commands
+
+`prompt` lists the options rc.esh set; `prompt set transient off` from the prompt itself puts the full prompt back, the right side kept as zsh keeps its RPROMPT.
+
+![The prompt’s options, as commands in EmbLinkOS](181-prompt-options.png)
+
+## A real Terminal, key by key
+
+The Terminal is being rebuilt into a real one -- then a Powerlevel10k-style prompt system on top (docs/TODO.md has the roadmap). First, keys: the character stream cannot tell Up from Ctrl+S (both 0x13) or Backspace from Ctrl+H, and F1-F12 never arrived at all. The kernel queue now records which key made every byte, USB keyboards are decoded like PS/2 ones, and the Terminal encodes keys exactly as xterm does. See [TERMINAL.md](../../TERMINAL.md#keys).
+
+### Keys with identity
+
+Up and Ctrl+S are the same byte, and F5 has none; the kernel queue now records which key made each byte. ttyprobe --identity shows what the Terminal sent for keys pressed over QMP: F-keys, modified arrows, Alt as Meta, Backspace against Ctrl+Backspace, and the keypad in application mode -- each as xterm sends it.
+
+![Keys with identity in EmbLinkOS](156-terminal-key-identity.png)
+
+The shell then took its line back from the terminal: it draws its prompt, edits, completes and recalls history itself, as readline is bash's ([SHELL.md](../../SHELL.md#10-the-line--the-shell-edits-its-own)).
+
+### Completion from what the shell knows
+
+Tab on a word many commands share opens a menu of the shell's builtins, its keywords and the programs in /system/bin and /data/apps; Tab again chooses. The shell completes, not the terminal.
+
+![Completion from what the shell knows in EmbLinkOS](157-shell-edit-completion.png)
+
+### Searching history as you type
+
+Ctrl+R and three letters find the earlier command containing them; the search line sits under the prompt, Enter runs the match and Escape puts the line back.
+
+![Searching history as you type in EmbLinkOS](158-shell-edit-search.png)
+
+### A block typed the way it is written
+
+Enter on an open brace adds a line under a '...' prompt instead of reporting an error; the closed block runs as one program.
+
+![A block typed the way it is written in EmbLinkOS](159-shell-edit-multiline.png)
+
+### History that outlives the window
+
+The Terminal was closed and a new one opened: its shell lists what the first one ran from ~/.local/share/shell/history, and Up recalls the multi-line program whole.
+
+![History that outlives the window in EmbLinkOS](160-shell-edit-history.png)
+
+### sh on the same editor
+
+With both shells editing their own lines, the Terminal's own line editor is gone: it is a screen. The POSIX sh port edits its line with the native shell's editor: a loop typed one line at a time continues under '...' until done closes it, and Tab completes from sh's builtins and the programs on the system.
+
+![sh on the same editor in EmbLinkOS](161-sh-edit.png)
+
+Then the screen itself: the model behind the Terminal is now xterm-compatible -- the sequences programs send, the answers they expect, colours kept by palette index, a scrollback of logical lines, and text that re-wraps on every resize ([TERMINAL.md](../../TERMINAL.md#screen-model-and-interactions)).
+
+### What a program can draw, and what the terminal answers
+
+ttyprobe --xterm runs with TERM=xterm-256color and COLORTERM=truecolor. Its card shows bold, dim, strike, inverse and overline; single, double, curly, dotted and dashed underlines, two of them in their own colours (58); the 16- and 256-colour palettes; a truecolour gradient; and an OSC 8 link. The model holds italic, the CJK cells and the combining accent too: the renderer draws them in M5. Below the card are seven questions programs ask a terminal (DA1, DA2, XTVERSION, DECRQM, OSC 10, XTGETTCAP, CSI 18 t), each answer checked by the program.
+
+![What a program can draw, and what the terminal answers in EmbLinkOS](162-terminal-xterm-card.png)
+
+### Mouse and focus reports
+
+With mouse reporting on (1000, SGR encoding 1006), a left click, a right click and the wheel both ways reach the program with the cell they happened on. Focus reports (1004) say when another window takes the keyboard and when it comes back.
+
+![Mouse and focus reports in EmbLinkOS](163-terminal-xterm-mouse-focus.png)
+
+### Text re-wraps when the window narrows
+
+Narrowed from 156 columns to 74, the 233-character line re-wraps from two rows to four. The cursor stays at the prompt, and the rows that no longer fit above it moved into the scrollback.
+
+![Text re-wraps when the window narrows in EmbLinkOS](164-terminal-xterm-reflow.png)
+
+### The scrollback re-wraps too
+
+Shift+PgUp pages back to the top of the card. The scrollback stores logical lines, not rows, so what was written at 156 columns is read back laid out at 74, with its colours and underlines kept.
+
+![The scrollback re-wraps too in EmbLinkOS](165-terminal-xterm-scrollback.png)
+
+And then the pixels: Terminal draws in MesloLGS Nerd Font Mono, the face of the Mac setup it follows, in four faces with DejaVu after it; draws box lines, blocks, braille and Powerline separators itself so they meet cell to cell; and repaints and presents only the rows that changed ([TERMINAL.md](../../TERMINAL.md#fonts-and-the-renderer)).
+
+### Meslo Nerd Font, Powerline segments and frames that join
+
+ttyprobe --glyphs writes a sample in the Terminal: the four MesloLGS Nerd Font Mono faces, Armenian letters drawn from DejaVu because Meslo has none (the Ω and ♫ after them are Meslo's own), and a Powerlevel10k-style framed prompt -- Powerline segments meeting without a seam, the frame lines joining the rows, Nerd Font icons for the OS, the folder and the branch. Below it are frames of every weight, blocks, braille and the Powerline shapes, which Terminal draws itself to fill the cell; a row of icons, one of them from Unicode plane 15; then the underline styles in their own colours. The real prompt engine comes later; this is a program writing what one would.
+
+![Meslo Nerd Font, Powerline segments and frames that join in EmbLinkOS](166-terminal-render-glyphs.png)
+
+### A screen that scrolls every frame
+
+ttyprobe --bench writes 1 MiB of coloured lines as fast as Terminal takes them: 13,618 lines in 145 s on this host, which emulates every x86 instruction. Each frame replaces the whole screen here, so the renderer draws every row (about 35 ms) and the window presents in full; output that changes a row presents that row.
+
+![A screen that scrolls every frame in EmbLinkOS](167-terminal-render-bench.png)
+
+Then the window around the screen: tabs that each keep their own shell, a mouse selection that stays on its text as output scrolls, find in the scrollback, links that open in the app they belong to, a menu on the right button, and zoom ([TERMINAL.md](../../TERMINAL.md#tabs-selection-find-links)).
+
+### Two tabs, two shells
+
+Super+T opens a second tab with its own shell, screen and scrollback; the first keeps what it had. The strip of tabs shows once there are two. Ctrl+Tab moves between them, and Super+W closes one, its shell reaped and its PTY freed.
+
+![Two tabs, two shells in EmbLinkOS](168-terminal-tabs.png)
+
+### A selection made with the mouse
+
+A drag selects exactly the cells it covers, here first-tab. A double click takes the word (first-tab-42, hyphens and all) and a triple click the line; Super+C copies the selection and Super+V pastes it at the prompt.
+
+![A selection made with the mouse in EmbLinkOS](169-terminal-selection.png)
+
+### Find in the scrollback
+
+Super+F opens a field over the screen. Every match is marked, the one found more strongly, and the view follows it into the scrollback. Enter and the arrows step between matches; Escape or Done closes the field.
+
+![Find in the scrollback in EmbLinkOS](170-terminal-find.png)
+
+### A link under Super
+
+With Super held, the link under the pointer is underlined and its address shows in the title. A click opens it: a file:// folder in Files, a file in Editor, a web address in Vellum.
+
+![A link under Super in EmbLinkOS](171-terminal-link.png)
+
+### The right-button menu
+
+Copy, Paste, Select All, Find, Clear Scrollback, New Tab and Close Tab, each with its key. The title still reports the last action: Files opened /data/apps.
+
+![The right-button menu in EmbLinkOS](172-terminal-menu.png)
+
+### Zoom
+
+Super+= and Super+- change the font a pixel at a time and Super+0 puts it back. Every tab reflows to the new cell size, and the title shows it.
+
+![Zoom in EmbLinkOS](173-terminal-zoom.png)
+
+Then its profiles: Clear Dark by default -- the Mac profile it follows, converted from its plist -- at 95% over a blur of the desktop; Preferences beside the screen; any change a profile file goes through, taken by every window showing it ([TERMINAL.md](../../TERMINAL.md#profiles-and-preferences)).
+
+### Clear Dark, as the Mac has it
+
+The default profile is the Mac's Clear Dark, converted from its Terminal plist: MesloLGS Nerd Font Mono at 14 px, its sixteen colours in sRGB, a 120 x 30 window, and the background at 95% over a blur of the desktop -- the faint teal is the wallpaper behind it.
+
+![Clear Dark, as the Mac has it in EmbLinkOS](174-terminal-clear-dark.png)
+
+### Preferences beside the screen
+
+Super+, opens Preferences as a panel beside the screen, so a change is seen as it is made: the profile, its font, size and spacing, bold, the cursor, the colours, the window and the shell. Edits go to the profile file, which other windows showing it read again.
+
+![Preferences beside the screen in EmbLinkOS](175-terminal-preferences.png)
+
+### The sixteen, and a colour picker
+
+Each of the sixteen colours, and the text, bold, background, selection and cursor colours, is a swatch; a click opens a picker for it, and the screen takes the colour as it is dragged.
+
+![The sixteen, and a colour picker in EmbLinkOS](176-terminal-colours.png)
+
+### A window that shows through
+
+The profile file written from the shell -- as another window or an editor would -- and the window takes it within a second: at 60% the Files window behind it shows through, blurred. The compositor keeps the blur and redoes only where the backdrop changes.
+
+![A window that shows through in EmbLinkOS](177-terminal-translucent.png)
+
+### The same, composed by the GPU
+
+The same window with the host's GPU composing (virgl): the same tent blur from two half-radius passes, frame for frame with the CPU's.
+
+![The same, composed by the GPU in EmbLinkOS](178-terminal-translucent-gpu.png)
+
+### A new window in the default profile
+
+terminal.conf names Solarized Light, and the next window opens in it, opaque; its bars switch to the light theme so their text can be read on it.
+
+![A new window in the default profile in EmbLinkOS](179-terminal-solarized-light.png)
+
+## The native shell runs any program
 
 The structured shell used to speak only to programs built with its own SDK. A text program -- sh, a port, a script -- now takes its part in a pipeline: what is piped in arrives as text, what it prints is captured as a string when a later stage wants it, and at the end of a line it keeps the terminal. Redirections are words with the arrow attached (`out>`, `err>`, `in<`), because `>` compares here; scripts run by their `#!` line; `source` loads definitions; arguments that break the kernel's limits are refused by name. These are QEMU captures of the Terminal, typed into over QMP; `test shellio` checks the same behaviour on the OS. See [SHELL.md](../../SHELL.md).
 

@@ -9,6 +9,10 @@
 #include "../../kernel/tty/pty.h"
 #define __PROCESS_H__
 #define __FD_H__
+#define __KMALLOC_H__
+static unsigned allocated;
+static void *kcalloc(uint64_t n,uint64_t size) { void *p=calloc(n,size); allocated+=p!=NULL; return p; }
+static void kfree(void *p) { if (p) allocated--; free(p); }
 #define POLLIN 1
 #define POLLOUT 4
 #define POLLHUP 16
@@ -32,7 +36,7 @@ static unsigned seed=0x179362;
 static unsigned random_next(void) { seed=seed*1664525u+1013904223u; return seed; }
 static void close_pair(struct pty *p) { sched_lock(); pty_unref_locked(p,0); pty_unref_locked(p,1); sched_unlock(); }
 static void stream(struct pty *p,int side) {
-    unsigned char model[4096],bytes[512],got[512]; size_t count=0,total_written=0,total_read=0;
+    unsigned char model[32768],bytes[512],got[512]; size_t count=0,total_written=0,total_read=0;
     for (int step=0;step<10000;step++) {
         size_t len=random_next()%sizeof bytes,n=0;
         if ((random_next()>>16)&1) {
@@ -84,10 +88,23 @@ int main(void) {
     assert(pty_live_count()==1 && cancelled==1);
     assert(pty_read(p,1,got,sizeof got,&n,true)==0 && n==0);
     sched_lock(); pty_unpin_locked(p); sched_unlock(); assert(pty_live_count()==0);
-    struct pty *all[16];
-    for (int i=0;i<16;i++) assert(pty_create(&all[i])==0);
-    assert(pty_create(&p)==-EMBK_ENFILE);
-    for (int i=0;i<16;i++) close_pair(all[i]);
-    assert(pty_live_count()==0);
-    puts("PASS: PTY randomized byte streams, canonical bounds, EOF records, interrupt routing and pinned hangup lifetime");
+    struct pty *all[PTY_MAX];
+    for (int i=0;i<PTY_MAX;i++) assert(pty_create(&all[i])==0);
+    assert(pty_create(&p)==-EMBK_ENFILE && allocated==PTY_MAX);   /* a refused one leaves nothing behind */
+    for (int i=0;i<PTY_MAX;i+=2) close_pair(all[i]);
+    assert(pty_live_count()==PTY_MAX/2 && allocated==PTY_MAX/2);
+    for (int i=0;i<PTY_MAX;i+=2) assert(pty_create(&all[i])==0);   /* freed slots open again */
+    for (int i=0;i<PTY_MAX;i++) close_pair(all[i]);
+    assert(pty_live_count()==0 && allocated==0);
+    /* the output queue takes 32 KiB before a writer must wait */
+    assert(pty_create(&p)==0);
+    assert(pty_control(p,1,EMBK_TERMINAL_SET_ATTR,&raw)==0);
+    static unsigned char big[PTY_OUTPUT];
+    memset(big,'o',sizeof big);
+    size_t wrote=0;
+    assert(pty_write(p,1,big,sizeof big,&wrote,true)==0 && wrote==PTY_OUTPUT-0);
+    assert(pty_write(p,1,big,1,&wrote,true)==-EMBK_EAGAIN && pty_avail(p,0)==PTY_OUTPUT);
+    close_pair(p);
+    assert(pty_live_count()==0 && allocated==0);
+    puts("PASS: PTY randomized byte streams, canonical bounds, EOF records, interrupt routing, pinned hangup lifetime, 64 pairs allocated and freed, 32 KiB output queue");
 }

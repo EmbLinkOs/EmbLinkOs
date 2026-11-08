@@ -34,6 +34,17 @@
 #define KV2P(addr)((uint64_t)(addr) - KERNEL_VIRTUAL_BASE) 
 #define KP2V(addr)((uint64_t)(addr) + KERNEL_VIRTUAL_BASE) 
 
+/* How much physical memory the kernel window maps before paging is rebuilt --
+ * pmm_init() writes the page bitmap through it, so the bitmap must fit below
+ * this. The boot page tables decide it: x86's map the first GiB; aarch64's
+ * boot.S maps two (TTBR1, VA = PA + base), which is what puts QEMU virt's RAM,
+ * starting AT 1 GiB, within reach at all. */
+#if defined(__x86_64__)
+#define PMM_BOOT_WINDOW_END 0x40000000ULL
+#else
+#define PMM_BOOT_WINDOW_END 0x80000000ULL
+#endif
+
 #define PAGE_SIZE 4096
 
 

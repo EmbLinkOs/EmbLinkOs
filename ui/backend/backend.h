@@ -43,6 +43,13 @@ struct render_backend {
                         struct color color);
     void (*draw_backdrop_blur)(struct render_target *rt, float x, float y, float w, float h,
                                float corner_radius, float blur_radius);
+    /* ...reading what is behind from `src` at (sx, sy) instead of from `rt`:
+     * glass inside an opacity group, whose own target starts empty -- the
+     * backdrop is the target the group is composited onto. NULL: unsupported,
+     * and the renderer falls back to draw_backdrop_blur. */
+    void (*draw_backdrop_blur_from)(struct render_target *rt, float x, float y, float w, float h,
+                                    float corner_radius, float blur_radius,
+                                    const struct render_target *src, float sx, float sy);
     /* A hairline stroke along the rounded-rect edge, INSIDE the bounds, drawn
      * over the fill. `width` px thick. Antialiased via the same SDF as fills. */
     void (*draw_border)(struct render_target *rt, float x, float y, float w, float h,

@@ -32,6 +32,18 @@ void ui_set_size(struct layout_size w, struct layout_size h);
 void ui_set_size_bounds(float min_w, float max_w, float min_h, float max_h);  /* 0 = unset */
 void ui_set_shadow(bool enabled, float dx, float dy, float blur, struct color color);
 void ui_set_opacity(float opacity);   /* 0..1; wraps the subtree in a group */
+/* Below 1, the subtree (a group) is drawn that much smaller toward the anchor
+ * (fractions of its bounds): a popover growing out of where it opens. Hit
+ * testing keeps the unscaled bounds; a motion, not a layout. */
+void ui_set_scale(float scale, float anchor_x, float anchor_y);
+/* THE OPEN BOX AS A LAYER the compositor moves (scene_set_promoted): it
+ * arrives from `appear` and leaves to `disappear` on the compositor's springs,
+ * painted once, where the runtime has layers. Say it every frame the box is
+ * built; off (false) to paint it in the window again. */
+void ui_set_promoted(bool on, const struct scene_layer_motion *appear, const struct scene_layer_motion *disappear);
+/* ...and the spring a promoted box travels on when the APP changes where it
+ * is, how opaque or how large (0: at once). Say it every frame; unset, 0. */
+void ui_set_layer_spring(uint16_t response_ms, uint16_t damping_milli);
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);
@@ -84,6 +96,11 @@ void ui_text_line(const char *fmt, ...);
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px);
 void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                     float width_px, float height_px);
+/* The same, for a buffer edited in place where only (dx,dy,dw,dh) -- image
+ * pixels -- changed since the last frame: only that is repainted and
+ * presented. dw or dh <= 0: nothing changed. */
+void ui_image_sized_damage(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                           float width_px, float height_px, int dx, int dy, int dw, int dh);
 /* draws the image as a stencil filled with `tint` (its alpha = coverage), so a
  * single-colour icon follows the theme exactly as a glyph does */
 void ui_image_sized_tinted(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,

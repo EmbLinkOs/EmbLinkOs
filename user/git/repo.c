@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <zlib.h>
 
 static void mkdirp(const char *path) { mkdir(path, 0755); }   /* EEXIST is fine */
@@ -98,9 +99,30 @@ static const struct pack_obj *find_obj(const struct pack_obj *objs, int n, const
     return NULL;
 }
 
-/* Recursively write a tree object's entries into `dir`. */
-static int checkout_tree(const char *dir, const struct pack_obj *objs, int n,
-                         const uint8_t tree_sha[20], int *files) {
+/* What the checkout wrote, for the index: path from the work tree's top, mode, object. */
+struct ix_entry { char path[512]; uint32_t mode; uint8_t sha[20]; };
+struct ix_list { struct ix_entry *e; int n, cap; };
+
+static int ix_add(struct ix_list *l, const char *path, uint32_t mode, const uint8_t sha[20]) {
+    if (l->n == l->cap) {
+        int cap = l->cap ? l->cap * 2 : 64;
+        struct ix_entry *e = realloc(l->e, (size_t)cap * sizeof *e);
+        if (!e) return -1;
+        l->e = e;
+        l->cap = cap;
+    }
+    snprintf(l->e[l->n].path, sizeof l->e[l->n].path, "%s", path);
+    l->e[l->n].mode = mode;
+    memcpy(l->e[l->n].sha, sha, 20);
+    l->n++;
+    return 0;
+}
+
+/* Recursively write a tree object's entries into `dir` (`rel`: its path from
+ * the top, "" or "a/b/"): files, links as links, a submodule's empty
+ * directory; each noted for the index. */
+static int checkout_tree(const char *dir, const char *rel, const struct pack_obj *objs, int n,
+                         const uint8_t tree_sha[20], int *files, struct ix_list *ix) {
     const struct pack_obj *t = find_obj(objs, n, tree_sha);
     if (!t || t->type != OBJ_TREE) return -1;
 
@@ -122,21 +144,81 @@ static int checkout_tree(const char *dir, const struct pack_obj *objs, int n,
         const uint8_t *esha = nul + 1;
         if (esha + 20 > end) break;
 
-        char path[1400];
+        char path[1400], sub[512];
         snprintf(path, sizeof path, "%s/%s", dir, name);
-        if (strcmp(mode, "40000") == 0 || strcmp(mode, "040000") == 0) {   /* subtree */
+        snprintf(sub, sizeof sub, "%s%s", rel, name);
+        uint32_t m = (uint32_t)strtoul(mode, NULL, 8);
+        if (m == 040000) {                                                  /* subtree */
+            char subrel[520];
+            snprintf(subrel, sizeof subrel, "%s/", sub);
             mkdirp(path);
-            if (checkout_tree(path, objs, n, esha, files) != 0) return -1;
-        } else {                                                            /* blob */
+            if (checkout_tree(path, subrel, objs, n, esha, files, ix) != 0) return -1;
+        } else if (m == 0160000) {                                          /* a submodule: not fetched */
+            mkdirp(path);
+            if (ix_add(ix, sub, m, esha) != 0) return -1;
+        } else {                                                            /* blob: a file or a link */
             const struct pack_obj *b = find_obj(objs, n, esha);
             if (b && b->type == OBJ_BLOB) {
-                if (write_file(path, b->data, b->size) != 0) return -1;
+                if (m == 0120000) {
+                    char target[1024];
+                    size_t tl = b->size < sizeof target - 1 ? b->size : sizeof target - 1;
+                    memcpy(target, b->data, tl); target[tl] = 0;
+                    if (symlink(target, path) != 0 && write_file(path, b->data, b->size) != 0) return -1;
+                } else {
+                    if (write_file(path, b->data, b->size) != 0) return -1;
+                    if (m == 0100755) (void)chmod(path, 0755);   /* where the filesystem keeps it */
+                }
                 (*files)++;
+                if (ix_add(ix, sub, m == 0100755 || m == 0120000 ? m : 0100644, esha) != 0) return -1;
             }
         }
         p = esha + 20;
     }
     return 0;
+}
+
+static int ix_cmp(const void *a, const void *b) {
+    return strcmp(((const struct ix_entry *)a)->path, ((const struct ix_entry *)b)->path);
+}
+static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+
+/* .git/index, version 2 (Documentation/gitformat-index.txt): every entry
+ * with the stat data the checkout left, so status reads the tree clean. */
+static int write_index(const char *dir, struct ix_list *ix) {
+    qsort(ix->e, (size_t)ix->n, sizeof *ix->e, ix_cmp);
+    size_t cap = 12 + (size_t)ix->n * (62 + 512 + 8) + 20, o = 12;
+    uint8_t *buf = calloc(1, cap);
+    if (!buf) return -1;
+    memcpy(buf, "DIRC", 4);
+    put32(buf + 4, 2);
+    put32(buf + 8, (uint32_t)ix->n);
+    for (int i = 0; i < ix->n; i++) {
+        const struct ix_entry *e = &ix->e[i];
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dir, e->path);
+        struct stat st;
+        memset(&st, 0, sizeof st);
+        if (e->mode != 0160000) (void)lstat(path, &st);
+        uint8_t *q = buf + o;
+        put32(q + 0, (uint32_t)st.st_ctime);
+        put32(q + 8, (uint32_t)st.st_mtime);
+        put32(q + 16, (uint32_t)st.st_dev);
+        put32(q + 20, (uint32_t)st.st_ino);
+        put32(q + 24, e->mode);
+        put32(q + 36, e->mode == 0160000 ? 0 : (uint32_t)st.st_size);
+        memcpy(q + 40, e->sha, 20);
+        size_t nl = strlen(e->path);
+        q[60] = (uint8_t)((nl > 0xfff ? 0xfff : nl) >> 8);
+        q[61] = (uint8_t)(nl > 0xfff ? 0xff : nl);
+        memcpy(q + 62, e->path, nl);
+        o += (62 + nl + 8) & ~(size_t)7;                 /* NUL-padded to a multiple of 8 */
+    }
+    sha1(buf, o, buf + o);
+    char p[1024];
+    snprintf(p, sizeof p, "%s/.git/index", dir);
+    int rc = write_file(p, buf, o + 20);
+    free(buf);
+    return rc;
 }
 
 int repo_checkout(const char *dir, const struct pack_obj *objs, int n,
@@ -151,6 +233,9 @@ int repo_checkout(const char *dir, const struct pack_obj *objs, int n,
     uint8_t tsha[20]; hex2bin(thex, tsha);
 
     int files = 0;
-    if (checkout_tree(dir, objs, n, tsha, &files) != 0) return -1;
-    return files;
+    struct ix_list ix = { 0 };
+    int rc = checkout_tree(dir, "", objs, n, tsha, &files, &ix);
+    if (rc == 0) rc = write_index(dir, &ix);
+    free(ix.e);
+    return rc != 0 ? -1 : files;
 }

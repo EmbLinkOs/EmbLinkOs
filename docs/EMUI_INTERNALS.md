@@ -206,8 +206,14 @@ calls `scene_traverse` and dispatches each visited node to the right vtable
 call, tracking a **dirty-rect cache** of last frame's world-space rects per
 node so `scene_render_frame` can report back exactly which screen regions
 actually changed (`r.dirty[]`, `r.n_dirty`, `r.full`) instead of the caller
-always doing a full repaint. `font.c` is a from-scratch TrueType rasterizer
-(glyf outlines only — no CFF, no hinting, no kerning) with a glyph atlas
+always doing a full repaint. Dirty rects are rounded outward to whole pixels.
+A pixel is repainted only when its centre lies in a rect. A node at a
+fractional place still stains the pixel its edge partly covers, through
+anti-aliasing or through text's truncated pen. Without the rounding, that pixel
+outlived the node: a shrinking window title left a one-pixel sliver of its old
+first letter (`backend_test.c` T9). `font.c` is a from-scratch TrueType rasterizer
+(glyf outlines only — no CFF, no hinting; GPOS pair kerning, and Inter's
+size-dependent tracking, both added between every pair by `font_pair_px`) with a glyph atlas
 cache; `font_install_backend()` is what actually plugs `draw_text` into the
 CPU backend (it's `NULL` until called, which is why every app calls it right
 after loading its font).
@@ -272,6 +278,23 @@ damage rect, and paid only when the window paints; a *drag* re-blurs each step
 (cheap on real GPUs, heavier under plain QEMU/TCG). See
 `kernel/drivers/video/framebuffer.c` (`fb_blit_uniform`, `fb_blur_region`) and
 `kernel/gfx/compositor.c` (`GLASS_BLUR`, `GLASS_ALPHA`).
+
+**Windows that show through** are a different material, set at any time with
+`em_window_material(see_through, blur)` (syscall `embk_win_set_material`).
+Acrylic gives every pixel one alpha; this material uses each pixel's own alpha
+and a per-window blur radius. The window stays an ordinary one -- its
+workspace, its shadow, its place in the layout -- which is what the bars'
+Translucent material is not. The runtime handles the details:
+
+- it clears the canvas to transparent and erases the dirty rects each frame
+  (`render_target.clear_dirty`);
+- a `Window` background given as clear stays clear (`em_window_set_clear`),
+  where on an opaque window it means "the theme's";
+- the view paints what should be seen through, at the alpha it wants.
+
+The compositor keeps the blurred backdrop and redoes it only where the
+backdrop changed (`kernel/gfx/backdrop.c`; docs/TERMINAL.md, Profiles and
+Preferences).
 
 ### `ui/dsl/em.{h,c}` — the DSL
 
@@ -442,6 +465,70 @@ press-then-release across the app's next two polls, because
 `sys_win_input`/`embk_win_input` is a **state poll, not an event queue** — a
 click that happens between two polls with no ongoing signal recording it
 would otherwise be silently eaten.
+
+Each window also remembers whether the app's last poll handed it the button
+**down** (`sent_left`). The app can see one press live, and then that press's
+release and the next press can both happen before it polls again. In that case
+the replay hands it the release first and the press on the poll after.
+Otherwise the replayed "down" follows a "down", which is no edge, and the click
+is lost. That happened under emulation: the third click of a triple click, and
+sometimes the second click of a double. When the live path delivers a latched
+press, the press still carries the time it was made, not the time of the poll.
+
+## Layers: pieces of a window the compositor moves
+
+Since P7 a window can have LAYERS (`user/lib/embk_layer.h`, syscalls 166-168):
+pictures the application painted once, attached to its window, which the
+compositor places, fades and scales on springs in its own frame thread. The
+toolkit reaches them through PROMOTION:
+
+- `ui_set_promoted(on, &appear, &disappear)` on an open box marks its subtree
+  (`scene_node.promoted`, `struct scene_layer_motion` for each end: how
+  transparent, how much smaller about which anchor, how far off, on which
+  spring).
+- `scene_render` with a layer host (`scene_render_set_layer_host`) leaves a
+  promoted subtree out of the window, and in a pass after the window's own
+  painting gives it a layer: painted when anything in it changed (its glass
+  frosted from the window behind it), moved when its place changed, sent in
+  from `appear` the first time it stands still two frames running, and sent
+  out to `disappear` once it is gone from the tree. Without a host it is
+  painted in place like any other subtree.
+- `em_app.c` is the host: it hands layers to the compositor for windows that
+  do not show through (`layers_probe`), and EmUI (`em_layers_on`) then builds
+  menus and tooltips at rest, leaving their motion to the compositor.
+
+A promoted subtree must be built every frame it is meant to stay; the frame it
+is not, it leaves (and the declare layer unpromotes a box that closes without
+having said so that frame: a retained instance met again as another box must
+not inherit the promotion). Hit-testing is unchanged: the toolkit tests its own
+scene, which holds where the subtree rests -- not where the compositor has it
+on the way there.
+
+What else a promoted subtree can say:
+
+- **A layer inside a layer.** A promoted node inside another is a layer of its
+  own, made after the one round it (a window's layers stack in the order they
+  were made) and left out of its pixels, footprint, signature and damage: a
+  sheet over its dimming, the library's rows over its sheet. It is not made
+  before the one round it is (`hold`), and made again above it when that one
+  is (`reborn`).
+- **A delay** (`scene_layer_motion.delay_ms`, the op's `delay_ms`): its springs
+  start that much later -- a stagger, kept by the compositor.
+- **A spring for the app's own moves** (`ui_set_layer_spring`): a change of
+  place, opacity or scale the app makes while the subtree is up travels on it
+  instead of jumping -- a pulled window let go short, springing home.
+- **Already there.** An appear motion that changes nothing (opacity 255, scale
+  1, no offset) is content already on screen -- a window's, promoted for the
+  close pull: it is a layer the same frame, with no settling to wait for.
+- **Taken back.** A subtree still in the tree but no longer promoted is its
+  parent's pixels again: its layer goes at once, with no exit, but only once
+  the runtime has presented those pixels (`scene_render_after_present`), so no
+  frame shows neither.
+
+And the runtime's clock: `em_wake_at(ms)` asks for ONE frame at a time,
+where asking for every frame until then would wake the app sixty times a
+second to learn nothing -- a tooltip's delay, a toast's time on screen, the
+library's rows going back into its sheet, a pulled window home.
 
 ## Adding a new component
 

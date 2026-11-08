@@ -188,7 +188,7 @@ void sc_shadow(const struct sc_surface *t, const struct gpu_rect *clip, const st
 }
 
 void sc_blur(const struct sc_surface *t, const struct gpu_rect *clip, const struct gpu_rect *r0, uint32_t radius,
-             const struct gpu_rect *frame, uint32_t corner, uint32_t *scratch)
+             const struct gpu_rect *frame, uint32_t corner, uint32_t *scratch, uint32_t sat)
 {
     struct gpu_rect s = { 0, 0, t->w, t->h }, r = *r0, a;
     if (!radius || !sc_intersect(&r, &s) || r.w <= 1 || r.h <= 1) return;
@@ -227,8 +227,15 @@ void sc_blur(const struct sc_surface *t, const struct gpu_rect *clip, const stru
             if (y >= a.y && y < a.y + a.h) {
                 int32_t cov = clamp1(ONE / 2 - sdf(&f, cr, x, y));
                 if (cov) {
-                    uint32_t b = 0xff000000u | ((uint32_t)(sum[0] / win) << 16) | ((uint32_t)(sum[1] / win) << 8) |
-                                 (uint32_t)(sum[2] / win);
+                    int32_t cr_ = sum[0] / win, cg = sum[1] / win, cb = sum[2] / win;
+                    if (sat) {                     /* vibrancy: away from its grey (pix_saturate_row) */
+                        int32_t l = (77 * cr_ + 150 * cg + 29 * cb) >> 8;
+                        cr_ = l + (((cr_ - l) * (int32_t)sat) >> 8); cg = l + (((cg - l) * (int32_t)sat) >> 8);
+                        cb = l + (((cb - l) * (int32_t)sat) >> 8);
+                        cr_ = cr_ < 0 ? 0 : cr_ > 255 ? 255 : cr_; cg = cg < 0 ? 0 : cg > 255 ? 255 : cg;
+                        cb = cb < 0 ? 0 : cb > 255 ? 255 : cb;
+                    }
+                    uint32_t b = 0xff000000u | ((uint32_t)cr_ << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
                     uint32_t *p = at(t, x, y);
                     *p = cov == ONE ? b : over(scale(b, (uint32_t)cov), *p);
                 }

@@ -115,6 +115,7 @@ class Machine:
                 "-drive", "if=pflash,format=raw,readonly=on,file=%s" % code,
                 "-drive", "if=pflash,format=raw,file=%s" % vars_,
                 "-device", display,
+                "-fw_cfg", "name=opt/emblink/pointer,string=1",   # aimed by counting: no curve
                 "-device", "qemu-xhci,id=xhci",
                 "-drive", "if=none,id=stick,format=raw,file=%s" % self.stick,
                 "-device", "usb-storage,bus=xhci.0,drive=stick,removable=on,bootindex=1",

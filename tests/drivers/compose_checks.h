@@ -147,7 +147,7 @@ static void compose_checks(const struct gpu_compose *ops)
     struct gpu_rect wl = { 150, 26, 14, 9 };
     gc->fill(&wl, 0xffffff);
     struct gpu_rect br = { 140, 20, 40, 30 };
-    gc->blur(&br, 3, 0, 0);
+    gc->blur(&br, 3, 0, 0, 0);
     assert(gc->end() == 0);
     readback();
     static int src[30][40], hb[30][40], ref[30][40];
@@ -193,13 +193,39 @@ static void compose_checks(const struct gpu_compose *ops)
     struct gpu_rect stripe = { 220, 20, 20, 40 };
     gc->fill(&stripe, 0x000000);
     struct gpu_rect fr = { 200, 20, 40, 40 };
-    gc->blur(&fr, 3, &fr, 10);
+    gc->blur(&fr, 3, &fr, 10, 0);
     assert(gc->end() == 0);
     readback();
     CHECK(px(200, 20) == 0xffffff && px(239, 59) == 0x000000, "rounded blur touched its corners: %06x %06x",
           px(200, 20), px(239, 59));
     CHECK(chan(px(219, 40), 0) > 80 && chan(px(219, 40), 0) < 200 && chan(px(220, 40), 0) > 50 &&
           chan(px(220, 40), 0) < 180, "rounded blur not frosted inside: %06x %06x", px(219, 40), px(220, 40));
+
+    /* 7c. A material's blur is saturated as the CPU's is (pix_saturate_row,
+     * PIX_VIBRANCY): a block of one colour stays that colour, moved away
+     * from its grey -- and with no saturation asked for, it is left as it is. */
+    frame(&all, 0x000000);
+    struct gpu_rect tint = { 260, 20, 40, 40 }, inner = { 270, 30, 20, 20 }, plain = { 260, 70, 40, 40 },
+                    plain_in = { 270, 80, 20, 20 };
+    gc->fill(&tint, 0x3060c0);
+    gc->fill(&plain, 0x3060c0);
+    gc->blur(&inner, 3, 0, 0, 435);
+    gc->blur(&plain_in, 3, 0, 0, 0);
+    assert(gc->end() == 0);
+    readback();
+    {
+        int r = 0x30, g = 0x60, b = 0xc0, l = (77 * r + 150 * g + 29 * b) >> 8, want[3];
+        int c[3] = { r, g, b };
+        for (int k = 0; k < 3; k++) {
+            int v = l + (((c[k] - l) * 435) >> 8);
+            want[k] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+        uint32_t have = px(280, 40);
+        int dr = (int)chan(have, 16) - want[0], dg = (int)chan(have, 8) - want[1], db = (int)chan(have, 0) - want[2];
+        CHECK(dr <= 3 && dr >= -3 && dg <= 3 && dg >= -3 && db <= 3 && db >= -3,
+              "saturated blur %06x, want %02x%02x%02x", have, want[0], want[1], want[2]);
+        CHECK(px(280, 90) == 0x3060c0, "a blur asked for no saturation changed the colour: %06x", px(280, 90));
+    }
 
     /* 8. Scaled: the 64x40 picture into 32x20, linear: a smooth gradient still. */
     frame(&all, 0x000000);
@@ -232,6 +258,24 @@ static void compose_checks(const struct gpu_compose *ops)
     CHECK(px(29, 40) != 0x123456 && px(30, 39) != 0x123456 && px(80, 59) != 0x123456 && px(79, 60) != 0x123456 &&
           px(30, H - 41) != 0x123456, "drawn outside the damage: %06x %06x %06x %06x %06x",
           px(29, 40), px(30, 39), px(80, 59), px(79, 60), px(30, H - 41));
+
+    /* 11. A LAYER: a picture with its own alpha -- half-transparent blue on
+     * its left, nothing on its right -- shrunk to half and drawn at half
+     * opacity over white. Its alpha is kept, not dropped: the blue half is
+     * (0, 0, 64) at 64 over white = (191, 191, 255); the empty half leaves
+     * the white alone. The compositor's layers are drawn like this. */
+    uint32_t *lay = check_pixels(32 * 16);
+    for (int y = 0; y < 16; y++) for (int x = 0; x < 32; x++) lay[y * 32 + x] = x < 16 ? 0x80000080u : 0;
+    uint32_t lay_id;
+    assert(gc->image_create(lay, 32, 16, 128, &lay_id) == 0);
+    frame(&all, 0xffffff);
+    struct gpu_draw ld = { lay_id, { 0, 0, 32, 16 }, { 40, 120, 16, 8 }, 0, 128, 0, 0, { 0, 0, 0, 0 }, 0 };
+    gc->draw(&ld);
+    assert(gc->end() == 0);
+    readback();
+    CHECK(near(px(43, 124), 0xbfbfff, 3), "a scaled, faded picture keeps its alpha: %06x", px(43, 124));
+    CHECK(px(53, 124) == 0xffffff, "and its transparent part leaves what is under it: %06x", px(53, 124));
+    gc->image_destroy(lay_id);
 
     gc->image_destroy(pic_id);
     gc->image_destroy(half_id);

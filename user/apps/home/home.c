@@ -29,6 +29,9 @@
 #include "theme.h"
 #include "scene_render.h"
 #include "font.h"
+#include "em_prof.h"
+/* what the desktop's frames cost it, while `perf apps on` holds (em_prof.h) */
+static struct em_prof g_prof;
 
 static uint8_t *read_file(const char *path, size_t *len) {
     int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
@@ -194,11 +197,13 @@ struct grid_app { char name[32]; char icon[96]; char label[24]; char exec[80]; }
 static struct grid_app g_all[48];
 static int g_all_n = 0;
 static int   g_apps_open = 0;     /* is the launcher grid showing? */
+static int   g_apps_closing;      /* ...and on its way out (apps_set_open) */
 static int   g_apps_frames = 0;   /* debounce the click that opened it */
 static float g_apps_scroll = 0;   /* launcher grid scroll offset */
 static char  g_apps_q[40];        /* the launcher's search text */
 /* Bumped every time the launcher opens; the sheet is keyed by it. See below. */
 static unsigned g_apps_gen = 0;
+static uint64_t g_apps_open_ms;   /* when it opened: its rows arrive a beat apart after it */
 
 /* Enumerate /data/apps/<name>/, keeping those that hold a <name>.elf, and read
  * each one's presentation manifest. home's namespace grants `ro /data/apps`. */
@@ -380,6 +385,7 @@ static void lock_set(int on) {
     if (on) {
         ui_request_focus(INSTANCE_HANDLE_NULL); /* password owns the new modal */
         g_apps_open = 0;                      /* one modal surface at a time */
+        g_apps_closing = 0;
         g_lock_gen++;
         g_lock_msg[0] = 0;
         for (unsigned i = 0; i < sizeof g_lock_pw; i++) g_lock_pw[i] = 0;
@@ -438,9 +444,39 @@ static void poll_lock_request(void) {
 
 
 
+static void apps_apply_open(int open);
+/* IN AND OUT ON A SPRING (apps_grid): the sheet rises and fades in, its tiles
+ * a beat apart, and leaves the same way. Leaving gives everything back AT
+ * ONCE -- the layer goes back down, keys go to whatever is in front, clicks
+ * pass through the fading sheet -- because the hand has already moved on: an
+ * app launched from it, or the dock clicked as it closes, must have its first
+ * keystroke and its click. The sheet fades out behind the windows. Asking it
+ * open again while it leaves turns it round where it is. Reduced motion
+ * closes at once, as it did. */
 static void apps_set_open(int open) {
+    /* on layers it is gone from the tree at once and the compositor plays its
+     * leaving (apps_grid) */
+    if (!open && g_apps_open && !ui_theme()->reduced_motion && !em_layers_on()) {
+        if (!g_apps_closing) {
+            g_apps_closing = 1; em_request_frame();
+            embk_win_desktop_front(0);        /* the layer back down now (above) */
+            g_full_present = 3; g_invalidate = 2;
+        }
+        return;
+    }
+    if (open && g_apps_closing) {             /* turned round: in front again */
+        g_apps_closing = 0; em_request_frame();
+        embk_win_desktop_front(1);
+        g_full_present = 3; g_invalidate = 2;
+        return;
+    }
+    g_apps_closing = 0;
+    apps_apply_open(open);
+}
+static void apps_apply_open(int open) {
     if (open == g_apps_open) return;
-    if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++; }
+    if (open) { ui_request_focus(INSTANCE_HANDLE_NULL); scan_apps(); g_apps_frames = 0; g_apps_scroll = 0; g_apps_q[0] = 0; g_apps_gen++;
+                g_apps_open_ms = embk_uptime_ms(); }
     g_apps_open = open;
     /* Render the new state BEFORE moving the layer when closing, and move it
      * before rendering when opening -- either way the compositor's recompose
@@ -457,9 +493,14 @@ static void apps_set_open(int open) {
      * mutation, and not one pixel of it was painted. The layer came to the
      * front (hiding the menu bar, which is how it looked like a crash) over a
      * desktop that had simply not drawn its launcher. */
-    em_structure_changed();
-    g_invalidate = 2; /* Home owns its loop; it must consume structural invalidation. */
-    g_full_present = 3;
+    /* (On layers the library is not in the desktop's window at all -- it is
+     * the compositor's -- so the window has nothing to repaint for it.) */
+    if (em_layers_on()) em_request_frame();
+    else {
+        em_structure_changed();
+        g_invalidate = 2; /* Home owns its loop; it must consume structural invalidation. */
+        g_full_present = 3;
+    }
     g_dock_dirty = 1;
     /* Say so on the serial console. The launcher is reachable only from the
      * menu bar once an app covers the screen, and a synthesized click cannot
@@ -532,6 +573,7 @@ static const char *monochrome_icon(const char *path) {
     return "/system/images/ui-grid.eic";
 }
 
+static float g_icon_dx, g_icon_dy;   /* a dock icon's launch hop (dock_hop), for the next drag_icon */
 static void drag_icon(struct app_item it, int size, int kind, int idx) {
     /* Key by the app's IDENTITY (its unique path), NOT its slot index. When the
      * list shifts (remove/reorder), an index-keyed instance gets reused for a
@@ -544,8 +586,11 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
     ui_set_align(ALIGN_CENTER);
     /* ALWAYS set opacity, so an instance never stays dimmed after its drag ends */
     ui_set_opacity((g_drag == kind && g_drag_i == idx && g_drag_moved) ? 0.3f : 1.0f);
+    ui_set_offset(g_icon_dx, g_icon_dy);   /* always: an instance never keeps an old hop */
+    em_quiet_hover(kind == 2);               /* the dock's plate is its hover */
     if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(it.icon),size,kind==1?g_desk_ink:ui_theme()->text);
     else ImageButton(it.icon, size);         /* styling only; click/drag handled below */
+    em_quiet_hover(false);
     if (ui_is_active()) {
         g_any_active = 1;
         float px, py; ui_pointer_pos(&px, &py);
@@ -565,6 +610,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
 /* The dock: a centered pill sized to its apps. Captures its own world rect so
  * the drop can hit-test against it. */
 static int dock_running(const char *path);   /* below, with g_running */
+static int dock_launching(const char *path);
 static void wins_poll(void);                 /* likewise: the live window list */
 
 /* THE DOCK DOES NOT REACT TO THE POINTER. It reacts to the MACHINE.
@@ -587,7 +633,9 @@ static void wins_poll(void);                 /* likewise: the live window list *
  *     behind its icon. Not a dot underneath: the dot is a footnote, and
  *     whether an app is running is the single most useful thing this strip
  *     knows. A socket is visible from across the room;
- *   * the pointer gets a quiet backplate, nothing more.
+ *   * the pointer gets a quiet backplate, nothing more -- one plate that
+ *     glides from tile to tile (dock_hover_plate). The one motion an icon
+ *     makes is AFTER the click: a hop while its app starts (dock_hop).
  *
  * What has NOT changed: the floating label that names the icon under the
  * pointer. Every dock ever built names what you point at, because dock art is
@@ -792,6 +840,31 @@ static void desk_ink_poll(void) {
 #define DOCK_PITCH   (DOCK_SLOT_W + 10.0f)
 static float dock_slot_x0(int i) { return g_dockr[0] + 12.0f + (float)i * DOCK_PITCH; }
 
+/* WHERE EACH TILE IS, told to the compositor: a minimised window flies into
+ * its app's tile and back out of it, not toward a guess at the bottom of the
+ * screen. The same geometry the hover test below uses, so the window lands on
+ * the tile the pointer would light. Said again only when it changes. */
+static void dock_publish_targets(void) {
+    static struct embk_dock_target last[EMBK_DOCK_TARGETS_MAX];
+    static int last_n = -1;
+    struct embk_dock_target t[EMBK_DOCK_TARGETS_MAX];
+    int n = 0;
+    for (int i = 0; i < g_dock_n && n < (int)EMBK_DOCK_TARGETS_MAX; i++) {
+        if (!g_dock[i].app) continue;
+        memset(&t[n], 0, sizeof t[n]);
+        strncpy(t[n].app, embk_basename(g_dock[i].app), sizeof t[n].app - 1);
+        float along = g_cfg.dock_edge ? g_dockr[1] + 12 + i * DOCK_PITCH : dock_slot_x0(i);
+        float across = g_cfg.dock_edge ? (g_dockr[0] + g_dockr[2] - DOCK_SLOT_W) * .5f
+                                       : (g_dockr[1] + g_dockr[3] - DOCK_SLOT_W) * .5f;
+        t[n].x = (int32_t)(g_cfg.dock_edge ? across : along);
+        t[n].y = (int32_t)(g_cfg.dock_edge ? along : across);
+        t[n].w = t[n].h = (int32_t)DOCK_SLOT_W;
+        n++;
+    }
+    if (n == last_n && !memcmp(t, last, (size_t)n * sizeof t[0])) return;
+    if (embk_dock_targets(t, (unsigned)n) == 0) { memcpy(last, t, (size_t)n * sizeof t[0]); last_n = n; }
+}
+
 /* Which slot the pointer is over, or -1. The readout and the hover plate both
  * ask this, so they can never disagree about which app you mean. */
 static int dock_hover_index(void) {
@@ -843,9 +916,63 @@ static void dock_label(void) {
     ui_end_stack();
 }
 
+/* Each tile's rect, as last laid out: where the plate goes. */
+#define DOCK_MAX ((int)(sizeof g_dock / sizeof g_dock[0]))
+static float g_tile[DOCK_MAX][4];
+
+/* THE POINTER'S PLATE: one quiet plate under the tile the pointer is over,
+ * gliding from tile to tile on a spring as the pointer runs along the dock --
+ * the plate moves, the icons never do -- and fading at the dock's ends. Back
+ * from outside the dock, it appears where it is wanted rather than sliding in
+ * from where it was left. A first child out of flow (placed from the dock's
+ * own corner: the stack the dock sits in carries the dock's position), so it
+ * is drawn under the tiles -- over a running app's lit socket it slides
+ * beneath it. */
+static void dock_hover_plate(int hov) {
+    const struct ui_theme *t = ui_theme();
+    static int last = -1, gen;
+    static char id[2][24];
+    float a = em_spring("dock.plate", 0, hov >= 0 ? 1.f : 0.f, EmSnappy);
+    if (hov >= 0 && hov < DOCK_MAX && g_tile[hov][2] > 0) {
+        if (last < 0 || a < .05f) gen++;            /* it was gone: no slide in */
+        last = hov;
+    }
+    if (last < 0 || a < .01f) return;
+    snprintf(id[0], sizeof id[0], "dock.plate.x%d", gen);
+    snprintf(id[1], sizeof id[1], "dock.plate.y%d", gen);
+    float x = em_spring(id[0], g_tile[last][0], g_tile[last][0], EmSnappy);
+    float y = em_spring(id[1], g_tile[last][1], g_tile[last][1], EmSnappy);
+    Color fill = t->surface_alt, edge = t->border_strong;
+    fill.a *= a; edge.a *= a;
+    ui_begin_vstack(0x9a7e);
+    ui_set_overlay(true); ui_set_hit_passthrough(true);
+    ui_set_size((struct layout_size){.mode = SIZE_FIXED, .fixed_value = g_tile[last][2]},
+                (struct layout_size){.mode = SIZE_FIXED, .fixed_value = g_tile[last][3]});
+    ui_set_offset(x - g_dockr[0], y - g_dockr[1]);
+    ui_set_paint((struct paint){.kind = PAINT_SOLID, .solid = fill});
+    ui_set_corner_radius(10); ui_set_border(1, edge);
+    ui_end_stack();
+}
+
+/* THE LAUNCH HOP: the one time a dock icon moves -- after the click, never
+ * under the aim. While its app starts the icon hops on the bouncy spring,
+ * until the app puts a window up (or LAUNCH_HOP_MS pass), and settles where
+ * it always was. A click whose answer takes a second has to be seen to have
+ * landed; the socket alone lights only once there is a process. */
+#define LAUNCH_HOP_PX 12.0f
+static float dock_hop(int i, const char *path) {
+    static int up[DOCK_MAX];
+    if (i < 0 || i >= DOCK_MAX) return 0;
+    char id[16]; snprintf(id, sizeof id, "dock.hop%d", i);
+    float y = em_spring(id, 0, up[i] ? -LAUNCH_HOP_PX : 0, EmBouncy);
+    if (up[i] && y <= -LAUNCH_HOP_PX * .9f) up[i] = 0;          /* over the top: fall */
+    else if (!up[i] && y >= -1.f && dock_launching(path)) up[i] = 1;   /* landing: again */
+    return y;
+}
+
 static void dock_pill(void) {
     const struct ui_theme *t = ui_theme();
-    int hov = dock_hover_index();
+    int hov;
 
     /* THE RACK. Not a pill: corner 14 against the pill's 20, which is the
      * theme's own radius_lg -- the same curve every card and panel in the OS
@@ -864,7 +991,12 @@ static void dock_pill(void) {
         }
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
-          if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
+          if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; dock_publish_targets(); } }
+        /* AFTER the rect: each frame starts without one (home_ui), so asked
+         * before this the dock never knew the pointer was over it -- the
+         * pointer's plate this dock was designed with never once appeared */
+        hov = dock_hover_index();
+        dock_hover_plate(hov);
         for (int i = 0; i < g_dock_n; i++) {
             int running = dock_running(g_dock[i].app);
             int over    = (i == hov) && !g_drag;
@@ -890,11 +1022,7 @@ static void dock_pill(void) {
                 edge   = t->border_strong;
                 edge_w = 1;
             }
-            if (over) {
-                plate  = t->surface_alt;
-                edge   = running && g_cfg.dock_dots ? t->accent : t->border_strong;
-                edge_w = 1;
-            }
+            if (over && running && g_cfg.dock_dots) edge = t->accent;   /* the plate is dock_hover_plate's */
 
             /* FIXED-width slot: the tile never moves and never resizes, so the
              * press you aimed is the press that lands. (The Mac trades this
@@ -903,7 +1031,15 @@ static void dock_pill(void) {
             VStack(.width = DOCK_SLOT_W, .height = DOCK_SLOT_W + 6, .align = Center,
                    .justify = Center, .corner = 10, .background = plate,
                    .border = edge_w, .border_color = edge) {
+                float sx, sy, sw, sh;
+                if (ui_open_rect(&sx, &sy, &sw, &sh)) {
+                    g_tile[i][0] = sx; g_tile[i][1] = sy; g_tile[i][2] = sw; g_tile[i][3] = sh;
+                }
+                float hop = dock_hop(i, g_dock[i].app);   /* away from the screen's edge */
+                g_icon_dx = g_cfg.dock_edge == 1 ? -hop : g_cfg.dock_edge == 2 ? hop : 0;
+                g_icon_dy = g_cfg.dock_edge ? 0 : hop;
                 drag_icon(g_dock[i], (int)DOCK_BASE, 2, i);
+                g_icon_dx = g_icon_dy = 0;
                 HStack(.width=running && g_cfg.dock_dots?12:1,.height=2,.background=running && g_cfg.dock_dots?t->accent:T.clear,.corner=1) {}
             }
         }
@@ -1049,10 +1185,33 @@ static void apps_grid(void) {
     float height=g_ph-132;if(height>536)height=536;
     int cols=width<560?4:6;
     char sheet[24];snprintf(sheet,sizeof sheet,"apps%u",g_apps_gen);
+    /* how far in it is: 0 gone, 1 settled (a touch under critical going in) */
+    char sid[24];snprintf(sid,sizeof sid,"apps-in%u",g_apps_gen);
+    /* ON LAYERS the compositor plays all of it -- the dimming in, the sheet
+     * rising and growing in over it, both out again -- and the library is
+     * built here at rest, as one piece (its tiles do not stagger: each would
+     * be a layer of its own). */
+    int lay=em_layers_on();
+    float k=lay?1.f:g_apps_closing?em_spring(sid,0.f,0.f,200,1000):em_spring(sid,0.f,1.f,320,900);
+    if(g_apps_closing && k<=0.02f){g_apps_closing=0;apps_apply_open(0);return;}
+    float kk=k<0?0:k>1?1:k;
+    uint16_t in_ms=ui_theme()->motion_ms>0?320:0,out_ms=ui_theme()->motion_ms>0?200:0;
     Overlay() {
+        /* the dimming comes and goes with it -- on layers the overlay's own,
+         * a layer under the sheet's that fades on the compositor's spring */
+        { Color sc = ui_theme()->scrim; sc.a *= lay ? 1.f : kk;
+          ui_set_paint((struct paint){.kind=PAINT_SOLID,.solid=sc});
+          if (lay) { struct scene_layer_motion in={0,1000,500,500,0,0,in_ms,1000,0},out={0,1000,500,500,0,0,out_ms,1000,0};
+                     ui_set_promoted(true,&in,&out); } }
+        ui_set_hit_passthrough(g_apps_closing);   /* leaving: clicks reach what is behind */
         at_begin(0xA995EE7ull, g_px, g_py);
         VStack(.width=g_pw,.height=g_ph,.align=Center,.justify=Center,.key=sheet) {
             Glass(.width=width,.height=height,.padding=20,.spacing=14,.align=Fill,.corner=10,.shadow=3) {
+                ui_set_opacity(kk);                       /* the glass fades as glass (scene_render: backdrop) */
+                ui_set_scale(0.94f+0.06f*kk,0.5f,0.5f);   /* and zooms in from a little smaller */
+                ui_set_offset(0,(1.f-k)*12.f);
+                { struct scene_layer_motion in={0,940,500,500,0,12,in_ms,900,0},out={0,960,500,500,0,8,out_ms,1000,0};
+                  ui_set_promoted(lay!=0,&in,&out); }
                 HStack(.spacing=12,.align=Center) {
                     Icon(IconGrid).color(T.accent);
                     Text("Applications").title();Spacer();
@@ -1067,15 +1226,51 @@ static void apps_grid(void) {
                 Divider();
                 ScrollView(&g_apps_scroll,height-158,.key="appsgrid") {
                     int count=0;
+                    /* ON LAYERS THE ROWS ARRIVE A BEAT APART: for the entrance
+                     * each row in view is a layer of its own over the sheet's,
+                     * rising in on a delay the compositor keeps -- then, landed,
+                     * the sheet's pixels again (a layer is not clipped by the
+                     * scroller, so only rows wholly in view, and not for long).
+                     * Without layers each tile is offset, as it always was. */
+                    uint64_t now=embk_uptime_ms(),staggered=g_apps_open_ms+2000;
+                    int stagger=lay && in_ms && now<staggered && g_apps_scroll==0;   /* scrolled: not clipped, so back */
+                    if(stagger)em_wake_at(staggered);
+                    float vx,vtop,vw,vh;int vknown=ui_open_rect(&vx,&vtop,&vw,&vh);
+                    int matching=0;for(int i=0;i<g_all_n;i++)matching+=app_matches(g_all[i].label,g_apps_q);
+                    int rows=lay?(matching+cols-1)/cols:1,i=0;
+                    VStack(.spacing=8,.align=Fill) {
+                    for(int row=0;row<rows;row++) {
                     Grid(cols,.spacing=8) {
-                        for(int i=0;i<g_all_n;i++) {
+                        if(lay) {
+                            float rx,ry,rw,rh;
+                            int inview=vknown && ui_open_rect(&rx,&ry,&rw,&rh) && rh>0 && ry+rh<=vtop+vh+0.5f;
+                            uint16_t delay=(uint16_t)(40+row*45);
+                            struct scene_layer_motion in={0,1000,500,500,0,16,in_ms,900,delay},
+                                                      out={0,960,500,500,0,8,out_ms,1000,0};
+                            ui_set_promoted(stagger && inview && row<5,&in,&out);
+                        }
+                        int c=0;
+                        for(;i<g_all_n && (!lay || c<cols);i++) {
                             if(!app_matches(g_all[i].label,g_apps_q))continue;
-                            count++;
-                            VStack(.spacing=6,.align=Center,.py=5) {
+                            count++;c++;
+                            /* in rows of their own, the columns are said outright -- each
+                             * row's grid would size its own, and they would not line up */
+                            float tw=lay?((vknown && vw>0?vw:width-40)-8.f*(cols-1))/cols:0;
+                            VStack(.spacing=6,.align=Center,.py=5,.width=tw) {
+                                /* a beat apart: each tile a little behind the one before */
+                                float d=(float)(count<12?count:12)*0.035f,pi=(k-d)/(1.f-d);
+                                ui_set_offset(0,lay?0.f:(1.f-(pi<0?0:pi>1?1:pi))*16.f);
                                 drag_icon(grid_to_item(i),54,3,i);
                                 Text(g_all[i].label).caption();
                             }
                         }
+                        /* a short row keeps its columns: the cells it lacks, empty */
+                        float tw=lay?((vknown && vw>0?vw:width-40)-8.f*(cols-1))/cols:0;
+                        for(;lay && c<cols;c++) { ui_box_begin(0);
+                            ui_set_size((struct layout_size){.mode=SIZE_FIXED,.fixed_value=tw},(struct layout_size){.mode=SIZE_FIXED,.fixed_value=1});
+                            ui_box_end(); }
+                    }
+                    }
                     }
                     if(!count) {
                         Text("No applications found").body();
@@ -1553,6 +1748,7 @@ static struct {
     char start_dir[256];    /* "" = none; distinguishes independent Files shortcuts */
     int  used;
     int  handle_p1;
+    uint64_t launched_ms;   /* when the dock started it: its icon hops till a window comes */
 } g_running[MAX_TRACKED];
 
 /* WHAT IS ACTUALLY ON SCREEN, as opposed to what this process remembers
@@ -1605,6 +1801,18 @@ static uint32_t win_pid_for(const char *path) {
  *
  * The dock's job is to say what is running on the machine, not what this
  * particular process happens to have started. */
+/* Started from here a moment ago, alive, and with no window up yet. */
+#define LAUNCH_HOP_MS 4000u
+static int dock_launching(const char *path) {
+    if (!path) return 0;
+    uint64_t now = embk_uptime_ms();
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (g_running[i].used && g_running[i].handle_p1 > 0 && !strcmp(g_running[i].path, path) &&
+            now - g_running[i].launched_ms < LAUNCH_HOP_MS && embk_proc_alive(g_running[i].handle_p1 - 1) == 1)
+            return win_pid_for(path) == 0;
+    return 0;
+}
+
 static int dock_running(const char *path) {
     if (!path) return 0;
     for (int i = 0; i < MAX_TRACKED; i++)
@@ -1754,6 +1962,7 @@ static void spawn_app(const char *path, const char *start_dir) {
         snprintf(g_running[slot].start_dir, sizeof g_running[slot].start_dir, "%s", sd);
         g_running[slot].used = 1;
         g_running[slot].handle_p1 = h + 1;
+        g_running[slot].launched_ms = embk_uptime_ms();
     }
     else {
         char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h);
@@ -1855,8 +2064,13 @@ int main(int argc, char **argv, char **envp) {
 
     struct render_target rt = { (uint32_t *)pixels, sw, sh, sw * 4, EMBK_PIXFMT_BGRA8888_PRE };
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    /* THE DESKTOP'S LAYERS: its menus, tooltips and the library come and go
+     * on the compositor's springs, painted once (em_layers_attach) */
+    { const struct scene_layer_host *lh = em_layers_attach(win, 0);
+      if (lh) { scene_render_set_layer_host(&r, lh); em_set_layers(1); } }
 
     em_set_clock(embk_uptime_ms);
+    ui_kit_motion(em_request_frame, embk_uptime_ms);   /* the launcher's scroll glides */
     /* Our menu bar IS topbar.elf -- the Apple-modern glass bar with the drag
      * handle, draggable dock chips, and pin/snap. The desktop no longer draws
      * its own top status bar; this floating bar takes the top strip. */
@@ -1877,6 +2091,13 @@ int main(int argc, char **argv, char **envp) {
         cfg_poll(); /* Load saved preferences before deciding whether to restore a mode. */
         if(embk_uptime_ms()>=screen_next) {
             screen_next=embk_uptime_ms()+200;uint32_t nw=0,nh=0;embk_screen_size(&nw,&nh);
+            /* the compositor's effects tier: the library and the dock's glass
+             * draw their tint while frames run long (scene_render_set_reduced) */
+            { static int fx_tick; struct embk_comp_stats cs;
+              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5) {
+                  if (scene_render_set_reduced((int)cs.effects)) { g_invalidate = 2; g_full_present = 2; }
+                  em_prof_switch(&g_prof, cs.version >= 6 && cs.app_profile, "Desktop");
+              } }
             uint32_t gen_before=g_out_gen;outputs_poll();
             if(g_out_gen!=gen_before && nw==sw && nh==sh) {
                 /* The monitors moved under the same desktop size: re-place, repaint. */
@@ -1889,7 +2110,7 @@ int main(int argc, char **argv, char **envp) {
                     restore_presented=0;pixels=next;sw=nw;sh=nh;g_sw=nw;g_sh=nh;em_set_viewport(nw,nh);
                     outputs_poll();
                     rt=(struct render_target){(uint32_t *)pixels,nw,nh,nw*4,EMBK_PIXFMT_BGRA8888_PRE};
-                    scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());
+                    scene_render_invalidate(&r);   /* everything painted again; its layers kept */
                     for(int i=0;i<g_desk_n;i++)desk_clamp(&g_desk[i]);
                     g_invalidate=2;g_full_present=2;em_structure_changed();
                 }
@@ -1978,7 +2199,7 @@ int main(int argc, char **argv, char **envp) {
         if (g_locked) {
             for (int input; (input=embk_key_poll_input())>0; )
                 if(!g_lock_checking)ui_input_key(input&255,(unsigned)(input>>8)&255);
-        } else if (g_apps_open) {
+        } else if (g_apps_open && !g_apps_closing) {
             for (int input; (input=embk_key_poll_input())>0; ) {
                 int c=input&255;
                 if (c == 27) { apps_set_open(0); break; }   /* Esc dismisses */
@@ -2017,7 +2238,9 @@ int main(int argc, char **argv, char **envp) {
 
         g_launch = 0;
         g_launch_dir = 0;
+        uint64_t pf0 = em_prof_now(&g_prof);
         ui_frame_begin(); em_new_frame(); home_ui(); em_flush();em_tooltip_host();ui_frame_end();
+        uint64_t pf1 = em_prof_now(&g_prof);
         ui_run_layout((float)sw, (float)sh);
 
         /* Structural transitions invalidate a bounded number of frames above.
@@ -2032,12 +2255,22 @@ int main(int argc, char **argv, char **envp) {
         g_dock_dirty = 0;
 
         if (g_invalidate > 0) { g_invalidate--; scene_render_invalidate(&r); }
+        uint64_t pf2b = em_prof_now(&g_prof);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        if (r.wants_frame) em_request_frame();   /* a layer settling into place: the frame that tells */
+        uint64_t pf3 = em_prof_now(&g_prof), pf_px = 0;
+        int pf_full = r.full || g_full_present > 0;
 
-        if (r.full || r.n_dirty == 0 || g_full_present > 0) {
+        /* Nothing dirty is nothing to present. This used to present the whole
+         * desktop instead -- a full-screen compose on every frame the desktop
+         * built and changed nothing in, which while idle was ten a second
+         * (docs/DESKTOP_PERFORMANCE.md). g_full_present still pushes the
+         * whole surface after a structural change. */
+        if (r.full || g_full_present > 0) {
             if (g_full_present > 0) g_full_present--;
             if(embk_win_present(win, pixels, sw, sh)>=0){restore_presented=1;presented_gen=g_out_gen;}
-        } else {
+            pf_px = (uint64_t)sw * sh;
+        } else if (r.n_dirty > 0 || r.has_scroll_present) {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
             if (r.has_scroll_present) {           /* a scroll blit moved pixels */
                 x0 = (int)r.sp_x; y0 = (int)r.sp_y;
@@ -2056,8 +2289,16 @@ int main(int argc, char **argv, char **envp) {
             if (y0 < 0) y0 = 0;
             if (x1 > (int)sw) x1 = (int)sw;
             if (y1 > (int)sh) y1 = (int)sh;
-            if (x1 > x0 && y1 > y0)
+            if (x1 > x0 && y1 > y0) {
                 embk_win_present_rect(win, pixels, sw, sh, x0, y0, x1 - x0, y1 - y0);
+                pf_px = (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+            }
+        }
+        scene_render_after_present(&r);   /* layers taken back into those pixels (the rows): now */
+        if (g_prof.on) {
+            em_prof_frame(&g_prof, pf1 - pf0, pf2b - pf1, pf3 - pf2b,
+                          embk_thread_cpu_ns() - pf3, pf_full, pf_px);
+            if (g_prof.n >= 60) em_prof_flush(&g_prof, "Desktop");
         }
 
         /* a tile was clicked this frame -> launch it as a floating window.
@@ -2066,7 +2307,22 @@ int main(int argc, char **argv, char **envp) {
          * owner has walked away. */
         if (g_launch && !g_locked) spawn_app(g_launch, g_launch_dir);
 
-        embk_sleep_ms(15);   /* pace ~60Hz while YIELDING -- never starve the apps */
+        /* THE NEXT PASS. Something moving -- a frame asked for (a tooltip, a
+         * toast, a caret), an icon being dragged, the surface still to be
+         * pushed whole -- waits for the compositor's next frame. Nothing
+         * moving waits for input, or for the next of this loop's own polls:
+         * the display check every 200 ms is the soonest. This loop rebuilt
+         * and laid out the desktop every 15 ms whatever happened; still, it
+         * now wakes five times a second. */
+        if (em_take_frame_request() || g_drag || g_invalidate > 0 || g_full_present > 0)
+            em_wait_frame(15);
+        else {
+            em_prof_flush(&g_prof, "Desktop");      /* a run of frames ends at the wait */
+            uint64_t now = embk_uptime_ms();
+            int wait = em_wake_wait(now, screen_next > now ? (int)(screen_next - now) : 0);
+            em_take_wake(now);                      /* due: this loop builds every pass anyway */
+            em_wait_input(wait);
+        }
     }
     return 0;
 }

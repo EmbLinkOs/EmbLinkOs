@@ -30,7 +30,7 @@ if not scratch.exists():
     shutil.copyfile(source_image, scratch)
 command = [
     'qemu-system-x86_64', '-cpu', 'max', '-m', '1024', '-smp', os.environ.get('EMBLINK_CPUS', '1'),
-    '-accel', 'tcg,thread=multi', '-display', 'none',
+    '-accel', os.environ.get('EMBLINK_ACCEL', 'tcg,thread=multi'), '-display', 'none',
     '-vga', 'none', '-device', 'virtio-vga,xres=800,yres=600',
     '-serial', f'unix:{serial},server=on,wait=off',
     '-gdb', f'unix:{out / "smoke-gdb.sock"},server=on,wait=off',

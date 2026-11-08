@@ -32,6 +32,9 @@ int32_t mouse_take_wheel(void);   /* consume accumulated scroll delta (+up/-down
  * ticks are, which on a busy kernel loop is wider than any double-click
  * window. */
 int mouse_take_press(uint32_t *when_ms);
+/* Whether a press is waiting to be taken (a racy peek: a hint for a waker). */
+int mouse_presses_pending(void);
+int mouse_take_right_press(uint32_t *when_ms);   /* right presses since last asked (0: none) */
 /* Drop the complete queued press history when input ownership changes. */
 void mouse_discard_presses(void);
 
@@ -47,6 +50,26 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
  * PS/2 path flips its own up-positive y before it gets here. buttons uses
  * MOUSE_BTN_*; wheel is a delta to accumulate (+up). */
 void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel);
+
+/* Buttons held down by a device that has no position of its own (a click a
+ * touchscreen was handed): pressed where the pointer is, and kept down
+ * whatever the pointing devices report until released here. */
+void mouse_hold_buttons(uint32_t mask);
+
+/* The uptime (ns) at which the pointer first moved since this was last taken,
+ * or 0 if it has not -- and clear it. The compositor takes it when it has drawn
+ * the cursor at its new place, which makes the difference the time the motion
+ * took to reach the screen. */
+uint64_t mouse_take_motion_ns(void);
+
+/* Called after every change of position, buttons or wheel, from whatever
+ * context made it -- the PS/2 interrupt included -- and outside the driver's
+ * lock. The compositor's frame thread waits on it rather than polling. */
+void mouse_set_notify(void (*fn)(void));
+
+/* The serial console's `pointer linear` / `pointer accel`: relative motion
+ * 1:1, or on the acceleration curve (the default). 1 if `cmd` was one. */
+int pointer_command(const char *cmd);
 
 /* Put the cursor at (x, y), clamped to the bounds. For the compositor, which
  * keeps it off the parts of a multi-monitor desktop no monitor shows. */

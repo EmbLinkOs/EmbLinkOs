@@ -1,0 +1,24 @@
+==> README.md <==   
+# demo              
+
+A repository for golden terminal streams.                                       
+A change nobody committed.              
+
+==> vt.h <==        
+#ifndef EMBLINK_VT_H                    
+#define EMBLINK_VT_H                    
+#include <stdint.h> 
+#include <stddef.h> 
+#include <stdbool.h>                    
+
+#define VT_COLS 220 
+#define VT_ROWS 60  
+
+
+
+
+
+
+
+
+

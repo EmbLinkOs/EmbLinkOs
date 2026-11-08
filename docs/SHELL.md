@@ -56,6 +56,13 @@ shell/
   eval/      scope, expression evaluator (the ONE coercion site), pipeline
              runner; eval_extern.c spawns external stages (target-only).
   builtins/  ls (OS-backed) + echo/where/select/sort-by/first/count (pure).
+  hist/      history: 10,000 lines, appended to ~/.local/share/shell/history.
+  edit/      the line editor (pure: bytes in, screen bytes out) and the cell
+             width table it shares with the Terminal's screen model (§10).
+  complete/  what Tab offers: builtins, defs, programs, $names, files.
+  prompt/    the prompt's options (`prompt set`) and the prompt built from
+             them: the plain one, or Powerlevel10k's (p10k*.c, pure; the
+             system's answers in prompt_os.c), §10 "The prompt".
   main.c     the REPL / -c driver (shell.elf).
   test/      host tests (make shell-test) + host stubs for the OS pieces.
 ```
@@ -66,8 +73,16 @@ shell/
   no UI dependency). Packed automatically into `embkfs.img` (which grew
   4 MB → 8 MB to fit it).
 - **Test:** `make shell-test` (host: lexer/wire/parser/eval/builtins, OS
-  pieces stubbed) then `test shell` at the kernel serial console (live:
-  spawn, console fds, readdir/stat, exit codes).
+  pieces stubbed; the editor against the Terminal's real screen model,
+  `shell/test/edit_test.c`; completion on a scratch directory,
+  `complete_test.c`) then `test shell`, `test extern` and `test shellio` at
+  the kernel serial console (live: spawn, console fds, readdir/stat, exit
+  codes). `test embbuild shell` rebuilds the shell ON the OS with tcc from
+  `/data/src/shell` (`shell/build.ebm`: twenty-three units, linked with tcc's
+  `libtcc1.o`, which carries `__va_start`), checks it, adopts it as
+  `/system/bin/shell.elf` and checks it again. A new source file goes in
+  four lists: `SHELL_OBJS` (Makefile), `ARM_SHELL_SRC` (aarch64 arch.mk),
+  `build.ebm`, and `_SHELL_SRC` in `tools/embkfs_mkfs/mkfs_embkfs.py`.
 
 ## 2. Running it
 
@@ -546,63 +561,394 @@ ops with `close`/`close_locked`; exit-time fd release via the reap loop +
 kworker) — all verified by `test pipe` (two-process EOF refcounting) and
 `test fd`.
 
-## 10. The Terminal (term.elf) — the shell on screen
+## 10. The line — the shell edits its own
 
-The "Terminal" tile on home (or `run /term.elf`) opens an EmUI window
-hosting the shell. Live-verified: typing `ls` renders the table in the
-window.
+The shell runs on a private pseudo-terminal in the Terminal app
+([TERMINAL.md](TERMINAL.md)), or on the kernel console. Either way **the
+line belongs to the shell**: it draws its prompt, reads every key in raw
+mode, edits, completes and recalls history itself (`shell/edit`,
+`shell/complete`), the way readline is bash's and zle is zsh's. The terminal
+is a screen. (Until 2026-10 the Terminal edited the line and handed the
+shell a finished string; the `sh` port still works that way until it moves
+onto the same editor.)
 
-It is a deliberately **dumb byte terminal** (user/apps/term/term.c): it spawns
-`/shell.elf` with fds 0/1/2 piped (INSTALL_OBJ both ways + fd_install_obj
-for its own ends), forwards keystrokes into the shell's stdin, and renders
-whatever comes back — the shell already does echo, backspace erase and the
-prompt, so the terminal implements no line editing. Three pieces make it
-work:
+### Keys
 
-- **`SYS_fd_avail` (52)** — bytes readable *right now* (pipe: buffered
-  count; console: key waiting; 0 = nothing yet, NOT EOF). A render loop
-  polls instead of blocking in read(). Per-backing `fd_ops.avail` hook.
-- **em_app runtime hooks (V8)** — `em_set_key_hook` (raw keys before the
-  toolkit; the terminal consumes everything but ESC) and `em_set_idle_hook`
-  (runs every loop iteration; drains the pipe + `em_request_frame()`).
-- **Hang-up for free** — closing the window drops the terminal's pipe fds
-  (exit-time reap loop) → the shell's `read(0)` returns EOF → its REPL
-  exits. No signals needed; the plumbing itself hangs up.
+Emacs bindings, as readline and zle have them:
 
-**Monospace + scrollback:** the terminal loads `/mono.ttf` (DejaVu Sans
-Mono, packed by mkfs) via `EmApp.font`, so the shell's space-aligned tables
-line up (verified: the `ps` grid). It keeps a 200-line scrollback ring;
-**PgUp/PgDn** page it (the kernel delivers those as `EMBK_KEY_PGUP/PGDN`
-= 0x0E/0x0F — extended PS/2 0x49/0x51), and typing snaps back to live.
+| Keys | Does |
+|---|---|
+| Left / Right, Ctrl+B / Ctrl+F | a character (an accent moves with its letter) |
+| Ctrl+Left / Ctrl+Right, Alt+B / Alt+F | a word |
+| Home / End, Ctrl+A / Ctrl+E | the start / end of the line |
+| Backspace, Delete, Ctrl+D | delete back / forward (Ctrl+D on an empty line ends the session) |
+| Ctrl+W, Alt+Backspace | kill the word before the cursor (by spaces / by word characters) |
+| Alt+D, Ctrl+Delete | kill the word after the cursor |
+| Ctrl+K / Ctrl+U | kill to the end / start of the line |
+| Ctrl+Y, Alt+Y | yank the last kill, then cycle older kills (consecutive kills join) |
+| Ctrl+_ (Ctrl+/) | undo (typing undoes a word at a time) |
+| Ctrl+T, Alt+U / Alt+L / Alt+C | transpose characters; upper / lower / capitalise a word |
+| Alt+. | the last word of the previous command |
+| Up / Down, Ctrl+P / Ctrl+N | the previous / next line of a multi-line program, else history |
+| PgUp / PgDn | history lines that begin with what is before the cursor |
+| Alt+< / Alt+> | the oldest / the line being typed |
+| Ctrl+R | incremental search: type to search, Ctrl+R / Ctrl+S older / newer, Enter runs the match, Escape or Ctrl+G restores the line, any other key keeps it |
+| Tab, Shift+Tab | complete; again for the menu, then choose with Tab, Shift+Tab or the arrows; Enter takes the choice, Escape puts back what was typed |
+| Enter | run the line -- or, if the program is unfinished, start another line |
+| Alt+Enter | start another line even in a finished program |
+| Ctrl+L | clear the screen, keep the line |
+| Ctrl+C | abandon the line (shown with `^C`; `$status` becomes 130) |
 
-**Command history lives in the SHELL, not the terminal** — the same split
-Linux has (readline is bash's, not xterm's): the shell owns the line buffer
-and does its own echo, so it is the only thing that can erase a line and
-re-draw a recalled one. That gives a clean key split:
+With a suggestion showing (below), Right, End, Ctrl+F and Ctrl+E at the end of
+the line take it whole, and Alt+F and Ctrl+Right take it up to the end of its
+next word.
 
-| keys | owner | does |
+**Unfinished programs** (`program_incomplete()` in `parse.c`): an open `{`
+or `(`, a trailing `|`, an unclosed `$(`, a string that runs off the end.
+Enter then adds a line under a `...` prompt instead of reporting an error, so
+`if`/`for`/`def` blocks are typed the way they are written. A paste arrives
+bracketed: its newlines are newlines in the program, never Enter, and
+nothing pasted runs until Enter is pressed.
+
+**Completion** offers what the shell itself would run: where a command goes
+(the start of a statement, after `|`, `;`, `&`, `(` or `{`), its builtins
+(`builtin_name()`), keywords, `def` commands and the programs in
+`/system/bin` and `/data/apps`; after `$`, the session's names; anywhere
+else, files and directories (hidden ones only for a word starting with `.`).
+A name the lexer would not read as one word -- a space, a leading digit -- is
+offered in double quotes; inside an open quote the quoted word completes, and
+a directory leaves it open to go on into.
+
+### Suggestions and colours
+
+As a Mac's zsh does with **zsh-autosuggestions** and
+**zsh-syntax-highlighting** (their defaults), the Terminal's line is drawn
+with a suggestion and in colour. Neither happens on the kernel console, which
+draws no colour.
+
+**The suggestion** is the rest of the newest history line that starts with
+everything typed, after the cursor in colour 8 (zsh-autosuggestions' `fg=8`).
+It follows zsh-autosuggestions 0.7.1's widgets key for key (`widget()` in
+`shell/edit/edit.c`). Typing along it keeps the rest of it, and so does moving
+the cursor. Changing the line looks again. The history keys (Up, Down, Ctrl+P,
+Ctrl+N, PgUp, PgDn) and Enter drop it: Enter runs what was typed. A search with
+Ctrl+R or the completion menu hides it while open. Ctrl+C leaves the line as it
+was shown, suggestion and all. A word of a suggestion ends where Alt+F stops,
+at the end of a word as in readline; zsh's `forward-word` goes on to the start
+of the next one.
+
+**The colours** are zsh-syntax-highlighting 0.8.0's default styles, on what
+this shell's lexer reads (`shell/complete/highlight.c`):
+
+| What | Drawn |
+|---|---|
+| a command the shell would run where a command goes -- a builtin, a `def`, a program in /system/bin or /data/apps, a path to a file -- and `exit` | green |
+| a word there that names none (or a path to nothing) | red, bold |
+| `if` `else` `while` `for` `def` `let` `return` `break` `continue`, and `{` `}` | yellow (`in` is not, as in zsh) |
+| quoted text, and a redirection (`out>`, `err>`, `in<` ...) | yellow |
+| a double quote's escapes (`\"`, `\n` ...) | cyan |
+| `$(` and its `)` | magenta |
+| a word that names a file or directory that is there -- and while it ends the line, one on its way to a name that is | underlined |
+| a comment | bold black |
+| a `}` or `)` that closes nothing | red, bold |
+
+Everything else -- options, `$names`, numbers, operators -- is drawn plain.
+Files are looked for in directory listings, never by opening a name that may
+not be there, and the programs are listed once per prompt.
+
+**Tests.** `make shell-test` holds the line to the two plugins themselves:
+`tests/edit/highlight.json` holds what zsh drew under tmux on a Mac for 26
+lines that mean the same in both shells (`tools/record_highlight.py`) --
+commands, an unknown one, quotes and an escape, a pipe, a separator, a
+comment, files there and not, a directory, a word on its way to a file's name,
+`$( )`, `for`, and a suggestion shown, typed along, taken by Right and Ctrl+E,
+kept while the cursor moves, dropped by Up and Enter, and none at all.
+`tools/golden_highlight.py` types the same keys into the editor
+(`build/highlight_dump`, the shell's highlighter, the Terminal's screen model)
+and compares the row cell for cell. `shell/test/edit_test.c` and
+`complete_test.c` hold the rest (Alt+F, Ctrl+C, the search, this language's
+keywords, braces, redirections, `def`s), and `tools/shell_highlight_smoke.py`
+checks them live in the Terminal.
+
+### History
+
+Up to 10,000 lines (`shell/hist`), each its own allocation, so a pasted
+multi-line program is one entry. In an interactive session they are appended
+to `~/.local/share/shell/history` as they are accepted (backslash and newline
+escaped, one entry per line) and read back when the next session starts, so
+every Terminal tab adds to the same history; a file grown past 20,000 lines is
+rewritten with the newest 10,000. Empty lines and repeats of the previous line
+are not stored. **`history`** lists it as a Table `{n, command}`, so
+`history | where command =~ "ls"` works.
+
+### What the terminal is told (OSC 133)
+
+Around every prompt the shell writes the standard shell-integration marks:
+
+| Mark | When |
+|---|---|
+| `ESC ] 133;D;<status> BEL` | the previous command finished |
+| `ESC ] 133;A;edit=shell;cwd=<dir> BEL` | the prompt starts here (again after Ctrl+L or a resize redraw) |
+| `ESC ] 133;B BEL` | the prompt ends, input begins |
+| `ESC ] 133;C BEL` | the command runs |
+| `ESC ] 133;R BEL` | (EmbLink Terminal only) every redraw: back to the prompt's start |
+
+`edit=shell` tells the Terminal not to edit the line itself; `cwd=` is last
+and runs to the end of the mark, so a directory may contain `;`. Before the
+prompt the shell resets what a program may have left on (the alternate screen,
+application cursor and keypad modes, a hidden cursor, colours), sets the bar
+cursor, and does zsh's PROMPT_SP: output that did not end in a newline keeps a
+reverse `%` after it and the prompt starts on a row of its own.
+
+While editing it turns on bracketed paste and **in-band resize reports**
+(DECSET 2048), and turns both off before a command runs. When the window is
+resized during a prompt, the Terminal erases from the prompt's first row,
+resizes, and sends `CSI 48;rows;cols;height;width t`; the editor redraws from
+that row at the new width, so a wrapped prompt is never left behind as a
+reflowed duplicate.
+
+### The prompt
+
+`~/.config/shell/prompt.esh` -- what `prompt configure` writes -- and then
+`~/.config/shell/rc.esh` are read when a shell starts for a person -- in the
+Terminal or on the console -- and not for a script or `-c`. Each is an ordinary
+program run in the session's scope, so its `let`s and `def`s stay. A mistake
+in one is printed, and the shell starts anyway.
+
+The prompt is configured with the `prompt` builtin, usually from `rc.esh`.
+Options live for the session.
+
+```
+prompt                          the options, as a table {key, value}
+prompt set KEY VALUE...         set one; several words are one value
+prompt get KEY                  its value, or null
+prompt unset KEY                forget it
+prompt reset                    forget them all
+prompt style [NAME]             Powerlevel10k's style NAME as the base (below);
+                                plain for none; alone, the base's name
+prompt import-p10k FILE         a ~/.p10k.zsh as the base -> {parameters, ignored}
+prompt configure                Powerlevel10k's wizard (below)
+```
+
+A key is lower-case words joined by dots (`dir.anchor.fg`). It may be quoted,
+and so may a value (`prompt set char "❯"`; `12h` is one word, though the
+shell reads it as 12 and h). Without a style the prompt is the plain one,
+`user@host:dir$`, and uses these:
+
+| Option | Values | Default |
 |---|---|---|
-| **Up / Down** | shell | walk history; the line is erased (`"\b \b"` per char) and the recalled one echoed |
-| **PgUp / PgDn** | terminal | scrollback paging |
+| `char` | the prompt character | `$` |
+| `right` | what the right side shows, in order: `status` (✔, or ✘ and the code), `duration` (the last command's, `3s` / `1m 5s` / `1h 2m 3s`), `time` | nothing |
+| `duration.threshold` | seconds a command must run for its duration to show | `3` |
+| `time.format` | `24h` or `12h` | `24h` |
+| `transient` | `off`, `always`, or `same-dir` (not right after the directory changed): an accepted line keeps only the prompt character, green or red by how the last command went | `off` |
 
-The terminal simply stops swallowing Up/Down (`EMBK_KEY_UP/DOWN` =
-0x13/0x14) and forwards them as plain bytes. **No escape-sequence state
-machine anywhere**: the kernel delivers arrows as its own single-byte codes,
-not ANSI — so recall is a byte compare, and it works identically whether
-fd 0 is the Terminal's pipe or the kernel console's keyboard.
+The editor draws the **right side** against the edge, one column in, on the
+row where the typing starts, as zsh's RPROMPT. It stays out of the way: while
+the typing would come within a column of it, it is not drawn. A **transient
+prompt** replaces the whole prompt once Enter accepts the line, so the
+scrollback shows the commands rather than every full prompt. A prompt built
+for one width is built again when the window is resized
+(`edit_host.reprompt`).
 
-`shell/hist/` is the ring (32 entries × 512 B, fixed slots — no allocation,
-oldest falls off; empty lines and adjacent duplicates are never stored,
-bash's `ignoredups`). Down past the newest returns to an empty line — bash
-restores the partially-typed line; we don't stash it (documented
-simplification). **`history`** lists it as a Table `{n, command}`, so
-`history | where command =~ "ls"` works — the payoff of never printing text.
+#### Powerlevel10k
 
-*Terminal gotcha, learned the hard way:* the EmUI container macros
-(`VStack`, `HStack`, …) are brace-scoped **for-loops**, so a `continue` or
-`break` inside one targets the MACRO's hidden loop, not your own — it
-silently skipped the whole render and produced a blank terminal. Use
-if/else inside container scopes.
+`prompt style lean` (or `lean-8colors`, `classic`, `rainbow`, `pure`: the
+configurations `p10k configure` starts from, in `/system/share/powerlevel10k`)
+or `prompt import-p10k ~/.p10k.zsh` makes the prompt Powerlevel10k's. The
+engine (`shell/prompt/p10k*.c`) draws what Powerlevel10k 1.20 draws for that
+configuration: its segments, separators, heads and tails, the frame, the
+gap and the ruler of a prompt of several lines, colours by number, `#rrggbb`
+or name, icons by `POWERLEVEL9K_MODE`, the directory shortened by every
+`SHORTEN_STRATEGY` (`truncate_to_unique` against the directory listings,
+anchored at folder markers such as `.git`, as far as `DIR_MAX_LENGTH` and
+`DIR_MIN_COMMAND_COLUMNS` ask) and styled by its classes, the transient
+prompt, and the empty line above every prompt but the first. It follows p10k's own
+functions line for line, building zsh prompt strings and expanding them at
+the end, so a person's configuration draws the same prompt here as on their
+Mac.
+
+Every option set is then a Powerlevel10k parameter on top of the base, named
+without `POWERLEVEL9K_`, in lower case with dots for underscores, `fg` and
+`bg` for `FOREGROUND` and `BACKGROUND`: `dir.anchor.fg` is
+`POWERLEVEL9K_DIR_ANCHOR_FOREGROUND`, `left_prompt_elements` (or
+`left.prompt.elements`) is `POWERLEVEL9K_LEFT_PROMPT_ELEMENTS`, an array
+given as words. The plain prompt's five keep their meaning: `char` is the
+prompt character, `right` the right side's segments (`duration` is
+`command_execution_time`), `transient`, `duration.threshold` and
+`time.format` p10k's own. Values are p10k's too, with its escapes
+(`'%238F\u256D\u2500'`; single quotes keep the backslash).
+
+```
+# ~/.config/shell/rc.esh -- lean, as the wizard answered on one Mac
+prompt style lean
+prompt set mode powerline
+prompt set right status duration background_jobs time
+prompt set multiline.first.prompt.prefix '%238F\u256D\u2500'
+prompt set multiline.last.prompt.prefix '%238F\u2570\u2500'
+prompt set left.prompt.first.segment.start.symbol ' '
+prompt set multiline.first.prompt.gap.fg 238
+prompt set time.format 12h
+prompt set transient always
+```
+
+**The segments.** `dir`, `vcs`, `prompt_char`, `status` (extended states,
+`INT` for Ctrl+C's 130), `command_execution_time`, `background_jobs`, `time`,
+`context` and `os_icon` are drawn, and `_joined` and `newline` work as in p10k.
+Git comes from the git status daemon (below). `os_icon` shows nothing (EmbLinkOS is not an OS p10k
+knows), `context` is DEFAULT or ROOT. `battery` (no battery reading reaches
+the shell) and the segments for tools this system does not have (`direnv`,
+`asdf`, `kubecontext`... about seventy) draw nothing, and `prompt import-p10k` lists
+those a configuration names. `DIR_SHOW_WRITABLE` asks the system's
+`access(2)`, which allows writing anything that exists (EMBKFS has no
+permission bits).
+
+**Git status.** `/system/bin/gitstatus.elf` (`user/gitstatus/`) is the
+shell's gitstatusd: it speaks gitstatusd's protocol -- requests `id ␟ dir ␟ 0
+␞` on its stdin, answers of gitstatusd's 27 fields on its stdout -- and takes
+its flags (`-s -u -c -d` caps, `-m`, `-e`, `-U -W -D`, `-z`). It reads a
+repository's own files: loose objects and packs (`.idx` v2, offset and ref
+deltas, alternates), refs loose and packed, the configuration (the person's,
+then the repository's), the index (v2 to v4, skip-worktree, assume-unchanged),
+`.gitignore` files with `info/exclude` and `core.excludesFile` (git's
+wildmatch), and linked worktrees and submodules. It answers the branch or
+commit, upstream and push remote with the commits ahead and behind
+(libgit2's walk, as gitstatusd counts), the repository's state (`merge`,
+`rebase-i 1/2`, `cherry-seq`, `bisect`, `am`...), staged, unstaged, conflicted
+and untracked counts, stashes, the tag at HEAD and the commit's summary. It
+keeps, per repository, the HEAD tree by commit, each file's name by its stat
+data, and directory listings by their mtime (EMBKFS moves a directory's mtime
+when an entry comes or goes), so a prompt in a known repository reads only
+what changed.
+
+One daemon runs per shell, started on the first prompt in a repository with
+the configuration's `VCS_*_MAX_NUM`, `VCS_MAX_INDEX_SIZE_DIRTY` and
+`VCS_RECURSE_UNTRACKED_DIRS`; it ends when the shell does. The prompt waits
+`VCS_MAX_SYNC_LATENCY_SECONDS` (0.01) for the answer, as p10k waits for
+gitstatusd; later than that, it shows the repository's last known status in
+the loading colours (or `VCS_LOADING_TEXT` the first time), and the editor
+draws it again the moment the answer comes -- while it watches for keys -- and
+a repository slower than that is not waited for next time.
+`VCS_DISABLED_WORKDIR_PATTERN` leaves a repository out. On EmbLinkOS the exec
+bit is not compared (EMBKFS keeps none). `~/Projects/hello` on the image is a
+small sample repository to see it on; `gitclone` writes the index now too, so
+a fresh clone reads clean.
+
+`make gitstatus-test` holds the daemon to gitstatusd itself: 38 repositories
+built the same way every time (fixed names and dates) in every state above,
+each asked under five sets of flags, then one repository changed eleven times
+under one daemon -- 201 answers, field for field
+(`tools/gitstatus_golden.py`, `tests/gitstatus/golden.json`; `record` asks
+gitstatusd again) -- and `gitclone`'s checkout to git (`git fsck`, `git
+status`). Live, `tools/shell_gitstatus_smoke.py` reads the sample repository
+on the OS: ⇡1, then !1 and ?1 as files change, nothing for an ignored one.
+
+**The importer** reads what p10k writes: `typeset -g POWERLEVEL9K_...` with
+brace lists (`{LEFT,RIGHT}_...`), `'...'`, `"..."` and `$'...'`, arrays across
+lines with their comments, `+=`, locals and `${(j:|:)array}`, `unset -m`, and
+`if [[ ... ]]; then ... elif ... else ... fi` on parameters already set (`==`
+and `!=` with patterns, `-n`, `-z`). Other functions and commands joined by
+`&&` or `||` are zsh's business and are skipped; of `my_git_formatter` the
+importer keeps its colours (its `local meta='%f'` lines), and the formatter
+itself is built in. A file that does not read leaves the prompt as it was and
+says which line stopped it.
+
+**Tests.** `make prompt-test` holds the engine's pieces (`tests/prompt/p10k_test.c`)
+and then whole prompts to Powerlevel10k itself: `tests/prompt/golden` holds
+what p10k drew under tmux on a Mac for fourteen configurations -- a person's
+own `.p10k.zsh`, the four styles, and lean with each variant in
+`tests/prompt/configs/variants` on top (every shortening strategy, the
+directory's anchor, highlight, shortened and separator styles, classes,
+`DIR_TRUNCATE_BEFORE_MARKER`, the segments' other forms) -- in sessions at 100,
+60 and 36 columns (a directory to shorten among neighbours and past a folder
+marker, a failure, Ctrl+C, a slow command, a background job, and repositories
+as gitstatus reports them: dirty, ahead of and behind upstream with a stash and
+a wip commit, a detached HEAD, a merge stopped on a conflict).
+`tools/golden_prompt.py` renders the same states with `build/prompt_dump` and
+compares cell for cell: character, colours, bold. `tools/record_prompts.py` records them again on a Mac with
+zsh, tmux and Powerlevel10k. Live, `tools/shell_p10k_smoke.py` writes that
+configuration as `prompt set` lines into `rc.esh` and checks the prompt the
+shell draws on the OS, then draws every style.
+
+#### `prompt configure`
+
+`prompt configure` is Powerlevel10k's configuration wizard
+(`shell/prompt/wizard.c`: p10k 1.20's internal/wizard.zsh, function for
+function). It asks what `p10k configure` asks, in its order and on its pages,
+on the alternate screen: whether the font draws a diamond, a lock, an upwards
+arrow -- which decides `POWERLEVEL9K_MODE` -- then whether icons fit between
+crosses, the style, character set, colours, time, separators, heads, tails,
+height, connection, frame, the ornaments' colour, spacing, icons, flow and the
+transient prompt, each page showing the prompts to choose between. A page
+that does not fit the window drops its blank lines, then its diagrams, then
+its sample prompts, as p10k's does, and a window under 47 columns by 14 lines
+gets p10k's "Not enough space" page until it is resized. `r` starts over; `q`
+or Ctrl+C quits.
+
+Two questions are not asked. Instant prompt is how zsh shows a prompt before
+.zshrc has finished -- this shell has no slow startup to hide -- so the
+configuration keeps the template's `INSTANT_PROMPT` and the header does not
+list it. p10k's last question, whether to change .zshrc, has nothing to
+change here: the shell reads prompt.esh itself.
+
+The answers make the configuration `p10k configure` would make: the style's
+template from /system/share/powerlevel10k with the same lines changed, byte for
+byte but two words of the header (it says to type `prompt configure`, and it
+does not list instant prompt). It goes to `~/.config/shell/p10k.zsh` -- an
+older one is kept beside it as `p10k.zsh.<date>-<time>` when the person says to
+overwrite it -- and `~/.config/shell/prompt.esh` loads it in every shell from
+then on, under the same "Wizard options:" header:
+
+```
+let p10k = $(prompt import-p10k "~/.config/shell/p10k.zsh")
+```
+
+(`$p10k.ignored` lists the segments it names that draw nothing here). It is
+read before rc.esh, so a person's own `prompt set` lines there still win. The
+shell that ran the wizard loads the configuration straight away.
+
+**The first start.** A shell in the Terminal that finds no prompt
+configuration -- neither file loads a style or sets an option -- runs the
+wizard before its first prompt, as zsh with Powerlevel10k does, and p10k's
+greeting says why. Quitting it says how to keep it away (`prompt set
+disable.configuration.wizard true` in rc.esh, an option that does nothing
+else); otherwise it runs again in the next shell. It does not start by itself
+in a Live session -- a disposable one for trying the system, which skips the
+first-boot setup the same way -- or when EMBLINK_NO_WIZARD is set; `prompt
+configure` runs it anywhere there is a terminal of that size.
+
+**Tests.** `make prompt-test` holds the wizard to `p10k configure` itself:
+`tests/prompt/wizard` holds fifteen paths of answers recorded under tmux on a
+Mac (`tools/record_wizard.py`) -- between them every answer to every question,
+a restart, an overwrite, quitting, the wizard a shell with no configuration
+starts, and a window resized too small and back -- at 100x40, 80x24 and 47x14.
+`tools/golden_wizard.py` drives the wizard (`build/wizard_dump`) with the same
+keys and compares 454 pages cell for cell, and 13 configurations line for
+line. The recording runs where EmbLinkOS does as far as the wizard can tell:
+256 colours and 24-bit ones (COLORTERM), an OS p10k has no icon for, the
+configuration at ~/.config/shell/p10k.zsh. The answers in the header of the
+Mac's own ~/.p10k.zsh (`tests/prompt/configs/user.p10k.zsh`) make that file
+again, but its date. Live, `tools/shell_wizard_smoke.py` makes an account on a
+fresh image, logs in and opens the Terminal: the wizard starts by itself, the
+same answers are typed page by page, and the prompt, the files, a new tab and
+`prompt configure` are checked.
+
+### `$status`
+
+`$status` is the last line's result: 0 on success, 1 on an error, 130 for a
+line abandoned with Ctrl+C -- typed and not run, or stopped while it ran (a
+program it started, a loop, a `sleep`). The same number is the `D` mark's, and
+the prompt's: Powerlevel10k shows 130 as `INT`.
+
+### The console
+
+On the kernel console, which parses no escape sequences, the same editor
+redraws by backspacing and rewriting (`EDIT_DUMB`): the keys arrive as the
+keyboard driver's private bytes (Left 0x11, Right 0x12, Up 0x13, Down 0x14,
+Home 0x02, End 0x05, Delete 0x7F, PgUp/PgDn 0x0E/0x0F) -- the console cannot
+tell them from Ctrl+Q/R/S/T/B/E, which the Terminal can. A multi-line program
+is edited one line at a time there, and completion lists its matches instead
+of opening a menu.
 
 ## 11. The small kernel batch (shipped)
 

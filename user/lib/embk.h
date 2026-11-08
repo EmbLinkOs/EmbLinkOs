@@ -1037,6 +1037,21 @@ static inline int embk_desktop_control(unsigned operation,struct embk_desktop *s
 static inline int embk_key_poll_input(void) {
     return (int)embk_syscall0(EMBK_SYS_key_poll_input);
 }
+/* The same queue with WHICH KEY each byte came from (kernel keyboard.h,
+ * keyboard_poll_key): Up is no longer Ctrl+S, and F1-F12/Insert/Menu arrive as
+ * entries of their own, in order with the text. Zero means empty. Otherwise
+ * bits 0-7 are the byte (0 for EMBK_KEYF_ONLY), 8-15 EMBK_KM_*, 16-31 the key
+ * (EMBK_KC_* or unshifted ASCII; 0 on a character's later UTF-8 bytes), 32-39
+ * EMBK_KEYF_*, and bit 40 is always set. */
+#define EMBK_KEYF_ONLY   0x01   /* a key with no character */
+#define EMBK_KEYF_KEYPAD 0x02   /* from the numeric keypad */
+static inline int64_t embk_key_poll_key(void) {
+    return embk_syscall0(EMBK_SYS_key_poll_key);
+}
+/* 1 while this process's window has the keyboard (keys go to it), else 0. */
+static inline int embk_win_focused(void) {
+    return embk_syscall0(EMBK_SYS_win_focused)==1;
+}
 static inline int embk_key_mods(void) {
     return (int)embk_syscall0(EMBK_SYS_key_mods);
 }
@@ -1118,15 +1133,25 @@ static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, in
                                              * transparent, NO blur -- composited
                                              * over the sharp backdrop. A thin bar
                                              * with a tall invisible dropdown canvas. */
+#define EMBK_WINF_RESIZABLE  (1ULL << 36)   /* the app resizes and tiles it: dragged
+                                             * against an edge it will take half the
+                                             * screen, and the compositor shows where */
 
-/* Resize a shared window's content to w x h. The window's pixel pages are
- * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is
- * dead the moment this returns. Returns the window id, or -EMBK_*. */
+/* Resize a shared window's content to w x h. *out_pixels receives the
+ * window's mapping base -- the same one when the size fits the pages it has,
+ * else NEW ones, and then the old pointer is dead the moment this returns:
+ * always switch to what comes back. Returns the window id, or -EMBK_*. */
 static inline int embk_win_resize(int id, uint32_t w, uint32_t h, void **out_pixels) {
     uint64_t va = 0;
     int rc = (int)embk_syscall4(EMBK_SYS_win_resize, id, w, h, (int64_t)(intptr_t)&va);
     if (rc >= 0 && out_pixels) *out_pixels = (void *)(intptr_t)va;
     return rc;
+}
+/* In w: this resize is a step of a live one (a corner grip being dragged):
+ * never a zoom however far it went since the last, and not logged. */
+#define EMBK_WIN_RESIZE_LIVE (1u << 31)
+static inline int embk_win_resize_live(int id, uint32_t w, uint32_t h, void **out_pixels) {
+    return embk_win_resize(id, w | EMBK_WIN_RESIZE_LIVE, h, out_pixels);
 }
 
 /* Zero-copy window with style flags. Same as embk_win_create_shared plus
@@ -1179,6 +1204,76 @@ static inline int embk_win_place(int id,int32_t x,int32_t y) {
 struct embk_win_geometry { int32_t x, y; uint32_t width, height; };
 static inline int embk_win_where(int id, struct embk_win_geometry *out) {
     return (int)embk_syscall2(EMBK_SYS_win_where, id, (int64_t)(intptr_t)out);
+}
+
+/* What composing the desktop costs: composes, pixels, time, causes, and the
+ * pointer's motion-to-screen latency (embk_comp_stats.h). */
+#include "embk_comp_stats.h"
+static inline int embk_comp_stats(struct embk_comp_stats *out) {
+    return (int)embk_syscall1(EMBK_SYS_comp_stats, (int64_t)(intptr_t)out);
+}
+
+/* Wait until something an interface answers happens -- a key, the pointer
+ * over or clicking a window, focus, a window asked to close -- or `timeout_ms`
+ * passes. *seq is the last sequence seen (start at 0); returns 1 when it moved
+ * (and updates it), 0 on timeout. Poll the input afterwards to learn what:
+ * the wake may have been for another window. */
+static inline int embk_ui_wait(uint32_t *seq, uint32_t timeout_ms) {
+    return (int)embk_syscall2(EMBK_SYS_ui_wait, (int64_t)(intptr_t)seq, timeout_ms);
+}
+
+/* Wait for the compositor's next frame (asking for one). For motion: draw,
+ * present, wait, draw the next for info.next_ns. 0, or -EMBK_ENOSYS when the
+ * kernel has no frame clock (pace yourself), -EMBK_ETIMEDOUT after
+ * `timeout_ms` (0: 100 ms) with no frame. */
+static inline int embk_win_frame(struct embk_frame_info *info, uint32_t timeout_ms) {
+    return (int)embk_syscall2(EMBK_SYS_win_frame, (int64_t)(intptr_t)info, timeout_ms);
+}
+
+/* The rate this program's motion wants while it waits for frames, in
+ * millihertz: 24000 for a 24 fps video, 0 for as fast as the display goes
+ * (the default). The compositor gives the slowest rate the display can keep
+ * that is no slower than this, or exactly this on a variable-rate display. */
+static inline int embk_win_frame_rate(uint32_t pref_mhz) {
+    return (int)embk_syscall1(EMBK_SYS_win_frame_rate, pref_mhz);
+}
+
+/* Where the compositor drags this window by, itself: up to four content-local
+ * rects {x, y, w, h} -- a title bar's empty middle. A press there moves the
+ * window in the frame the pointer moves, with no round trip through the app,
+ * even when the app is busy; the app gets EMBK_WIN_ACTION_MOVED when a drag
+ * that moved it ends. n 0 clears. */
+/* Returns how many rects it took (clipped to the content; one wholly outside
+ * is dropped), or -err. */
+static inline int embk_win_drag_regions(int id, const int32_t (*rects)[4], unsigned n) {
+    return (int)embk_syscall3(EMBK_SYS_win_drag_regions, id, (int64_t)(intptr_t)rects, n);
+}
+
+/* LAYERS: pieces of a window the compositor moves itself (embk_layer.h). */
+#include "embk_layer.h"
+/* A layer of window `win`, w x h: its id (> 0), its pixels mapped at *va
+ * (premultiplied, w words a row, transparent to start), or -err. */
+static inline int64_t embk_layer_create(int win, uint32_t w, uint32_t h, uint64_t *va) {
+    return embk_syscall4(EMBK_SYS_layer_create, win, w, h, (int64_t)(intptr_t)va);
+}
+/* Where layers go, and how: n ops (at most EMBK_LAYER_OPS_MAX), applied in
+ * order -- now, or with EMBK_LS_AT_PRESENT at each layer's next present. */
+static inline int embk_layer_set(int win, const struct embk_layer_op *ops, uint32_t n, uint32_t flags) {
+    return (int)embk_syscall4(EMBK_SYS_layer_set, win, (int64_t)(intptr_t)ops, n, flags);
+}
+/* The layer's pixels in (x, y, w, h) changed: shown from the next frame. */
+static inline int embk_layer_present(int win, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h) {
+    return (int)embk_syscall4(EMBK_SYS_layer_present, win, id,
+                              (int64_t)(((uint64_t)(uint32_t)x << 32) | (uint32_t)y),
+                              (int64_t)(((uint64_t)(uint32_t)w << 32) | (uint32_t)h));
+}
+
+/* THE DESKTOP SAYS WHERE ITS DOCK TILES ARE: a window of `app` that is
+ * minimised flies into that tile, and back out of it when restored. Only the
+ * process that owns the desktop layer may say; each call replaces the last
+ * (at most EMBK_DOCK_TARGETS_MAX; 0 clears). */
+static inline int embk_dock_targets(const struct embk_dock_target *t, unsigned n) {
+    return (int)embk_syscall2(EMBK_SYS_dock_targets, (int64_t)(intptr_t)t, n);
 }
 
 /* Destroy a window and erase it from the desktop. */
@@ -1294,6 +1389,14 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * still comes from embk_drop_take. */
 #define EMBK_WIN_ACTION_DROP      0x80000003u
 #define EMBK_WIN_ACTION_LAUNCHER  0x80000007u
+/* QUIT THE APP (GUI+Q): asked of every window the front app has, and timed
+ * like CLOSE. Told apart from CLOSE (GUI+W, which may mean "this tab") so an
+ * app with tabs or documents can close all of them, not one. */
+#define EMBK_WIN_ACTION_QUIT      0x80000008u
+/* YOU WERE DRAGGED. The compositor moved the window by a region the app
+ * declared (embk_win_drag_regions) and the button is up again: where it went
+ * is embk_win_where's, and a runtime snaps to an edge from there. */
+#define EMBK_WIN_ACTION_MOVED     0x80000009u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *
@@ -1410,6 +1513,18 @@ static inline int64_t embk_puts(int fd, const char *s) {
  * the app declares the part that is actually opaque. w<=0 clears it. */
 static inline int embk_win_blur_rect(int win, int x, int y, int w, int h) {
     return (int)embk_syscall5(EMBK_SYS_win_blur_rect, win, x, y, w, h);
+}
+
+/* An ordinary app window that shows through: with `alpha` set its pixels are
+ * composited by their own (premultiplied) alpha, over what is behind it
+ * blurred by `blur` pixels (0 sharp, at most 32); alpha 0 makes it opaque
+ * again. Unlike EMBK_WINF_TRANSLUCENT it stays a normal window -- its own
+ * workspace, its shadow, its place in the layout -- and can change at any
+ * time (a terminal's opacity setting). The compositor keeps the blur and
+ * redoes only where the backdrop changed. */
+#define EMBK_WIN_BLUR_MAX 32
+static inline int embk_win_set_material(int win, int alpha, int blur) {
+    return (int)embk_syscall3(EMBK_SYS_win_set_material, win, alpha, blur);
 }
 
 /* Bring back an app you started: un-minimizes any window it parked and raises

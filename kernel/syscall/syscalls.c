@@ -36,6 +36,7 @@
 #include "acpi/display.h"
 #include "drivers/video/gpu.h"
 #include "../../user/lib/embk_gpu.h"
+#include "../../user/lib/embk_layer.h"   /* layers: struct embk_layer_op */
 #include "block/partition.h"
 #define EMBK_DISK_IS_PARTITION 1u
 #include "../../user/lib/embk_child.h"
@@ -56,6 +57,8 @@
 #include "tty/pty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
+#include "gfx/comp_stats.h"
+#include "gfx/ui_events.h"
 #include "ipc/clipboard.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
@@ -1552,6 +1555,14 @@ static int64_t sys_win_menu(const struct sysargs *a) {
                                (uint32_t)a->arg[0],(int)a->arg[1]);
 }
 
+/* A window that shows through what is behind it: its pixels by their own
+ * alpha, over that blurred by arg2 pixels (compositor_win_set_material). */
+static int64_t sys_win_set_material(const struct sysargs *a) {
+    if (a->arg[0] > UINT32_MAX || a->arg[1] > 1 || a->arg[2] > COMP_MAT_BLUR_MAX) return -EMBK_EINVAL;
+    return compositor_win_set_material(current_process ? (int)current_process->pid : 0,
+                                       (uint32_t)a->arg[0], (int)a->arg[1], (int)a->arg[2]);
+}
+
 static int64_t sys_win_blur_rect(const struct sysargs *a) {
     return compositor_win_blur_rect(current_process ? (int)current_process->pid : 0,
                                     (uint32_t)a->arg[0], (int)a->arg[1], (int)a->arg[2],
@@ -1571,6 +1582,22 @@ static int64_t sys_key_poll_input(const struct sysargs *a) {
     uint32_t focus=compositor_focused_pid();
     if(focus && current_process && current_process->pid!=focus)return 0;
     return keyboard_poll_input();
+}
+/* key_poll_input's queue with the key behind each byte: Up is not Ctrl+S, and
+ * F5 is an entry of its own (keyboard.h, keyboard_poll_key). Gated by focus
+ * exactly as key_poll_input is, for the same reason. */
+static int64_t sys_key_poll_key(const struct sysargs *a) {
+    (void)a;
+    uint32_t focus=compositor_focused_pid();
+    if(focus && current_process && current_process->pid!=focus)return 0;
+    return (int64_t)keyboard_poll_key();
+}
+/* Whether the caller's window is the one keys go to: a terminal tells the
+ * program in it (DECSET 1004) when it gains and loses the keyboard. */
+static int64_t sys_win_focused(const struct sysargs *a) {
+    (void)a;
+    uint32_t focus=compositor_focused_pid();
+    return focus && current_process && current_process->pid==focus;
 }
 static int64_t sys_key_poll(const struct sysargs *a) {
     (void)a;
@@ -1791,12 +1818,16 @@ static int64_t sys_proc_alive(const struct sysargs *a) {
     return (int64_t)process_alive(pid);
 }
 
-/* win_resize(id, w, h, &out_va) -> id, with the window's NEW shared-pixel
- * mapping base written to *out_va (the old mapping is gone on return). */
+/* win_resize(id, w, h, &out_va) -> id, with the window's shared-pixel
+ * mapping base written to *out_va (a new one if the pages were replaced; the
+ * old mapping is gone on return). EMBK_WIN_RESIZE_LIVE in w: a grip step. */
+#define EMBK_WIN_RESIZE_LIVE (1u << 31)          /* user/lib/embk.h's */
 static int64_t sys_win_resize(const struct sysargs *a) {
     uint64_t cva = 0;
+    uint32_t w = (uint32_t)a->arg[1];
+    int live = (w & EMBK_WIN_RESIZE_LIVE) != 0;
     int64_t rc = compositor_win_resize(current_process, (uint32_t)a->arg[0],
-                                       (uint32_t)a->arg[1], (uint32_t)a->arg[2], &cva);
+                                       w & ~EMBK_WIN_RESIZE_LIVE, (uint32_t)a->arg[2], live, &cva);
     if (rc < 0) return rc;
     if (a->arg[3] && copy_to_user((void *)a->arg[3], &cva, sizeof(cva)) != EMBK_OK)
         return -EMBK_EFAULT;
@@ -1820,6 +1851,7 @@ static int64_t sys_win_create(const struct sysargs *a) {
     int widget      = (a->arg[0] >> 33) & 1;   /* EMBK_WINF_WIDGET */
     int glass       = (a->arg[0] >> 34) & 1;   /* EMBK_WINF_GLASS */
     int translucent = (a->arg[0] >> 35) & 1;   /* EMBK_WINF_TRANSLUCENT */
+    int resizable   = (a->arg[0] >> 36) & 1;   /* EMBK_WINF_RESIZABLE */
     int32_t x = (int32_t)a->arg[2], y = (int32_t)a->arg[3];
     char title[COMP_TITLE_MAX + 1];
     int i = 0;
@@ -1846,6 +1878,7 @@ static int64_t sys_win_create(const struct sysargs *a) {
             ? compositor_win_create_chromeless(current_process, cw, ch, x, y, title, &cva)
             : compositor_win_create_shared(current_process, cw, ch, x, y, title, &cva);
         if (id < 0) return id;
+        if (resizable) compositor_win_set_resizable(pid, (uint32_t)id);
         if (copy_to_user((void *)a->arg[5], &cva, sizeof(cva)) != EMBK_OK) {
             compositor_win_destroy(pid, (uint32_t)id);
             return -EMBK_EFAULT;
@@ -1903,6 +1936,81 @@ static int64_t sys_win_where(const struct sysargs *a) {
     int64_t rc=compositor_win_where((int)current_process->pid,(uint32_t)a->arg[0],&g);
     if(rc)return rc;
     return copy_to_user((void *)(uintptr_t)a->arg[1],&g,sizeof g)?-EMBK_EFAULT:0;
+}
+/* arg 0 = struct embk_comp_stats * (out). Anyone may ask: it says how long
+ * composing takes and why, nothing about what any window shows. */
+static int64_t sys_comp_stats(const struct sysargs *a) {
+    struct embk_comp_stats s;
+    comp_stats_snapshot(&s);
+    return copy_to_user((void *)(uintptr_t)a->arg[0], &s, sizeof s) ? -EMBK_EFAULT : 0;
+}
+/* arg 0 = uint32_t *seq (in/out), arg 1 = timeout ms. Until something an
+ * interface answers happens (gfx/ui_events.h), or the timeout. */
+static int64_t sys_ui_wait(const struct sysargs *a) {
+    uint32_t seq;
+    if (copy_from_user(&seq, (const void *)(uintptr_t)a->arg[0], sizeof seq) != EMBK_OK) return -EMBK_EFAULT;
+    int rc = ui_event_wait(&seq, (uint32_t)a->arg[1]);
+    if (rc > 0 && copy_to_user((void *)(uintptr_t)a->arg[0], &seq, sizeof seq)) return -EMBK_EFAULT;
+    return rc;
+}
+/* arg 0 = struct embk_frame_info * (out, may be 0), arg 1 = timeout ms. */
+static int64_t sys_win_frame(const struct sysargs *a) {
+    struct embk_frame_info fi;
+    int rc = compositor_frame_wait(current_process ? (int)current_process->pid : 0, &fi, (uint32_t)a->arg[1]);
+    if (rc) return rc;
+    if (a->arg[0] && copy_to_user((void *)(uintptr_t)a->arg[0], &fi, sizeof fi)) return -EMBK_EFAULT;
+    return 0;
+}
+/* arg 0 = win id, arg 1 = int32_t (*)[4] rects (content-local x, y, w, h),
+ * arg 2 = how many (at most 4). */
+static int64_t sys_win_drag_regions(const struct sysargs *a) {
+    int32_t rects[4][4];
+    unsigned n = (unsigned)a->arg[2];
+    if (n > 4) return -EMBK_EINVAL;
+    if (n && copy_from_user(rects, (const void *)(uintptr_t)a->arg[1], n * sizeof rects[0]) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return compositor_win_drag_regions(current_process ? (int)current_process->pid : -1,
+                                       (uint32_t)a->arg[0], (const int32_t (*)[4])rects, n);
+}
+/* arg 0 = const struct embk_dock_target *, arg 1 = how many (at most 16). */
+static int64_t sys_dock_targets(const struct sysargs *a) {
+    struct embk_dock_target t[EMBK_DOCK_TARGETS_MAX];
+    unsigned n = (unsigned)a->arg[1];
+    if (n > EMBK_DOCK_TARGETS_MAX) return -EMBK_EINVAL;
+    if (n && copy_from_user(t, (const void *)(uintptr_t)a->arg[0], n * sizeof t[0]) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return compositor_dock_targets(current_process ? (int)current_process->pid : -1, t, n);
+}
+/* LAYERS (user/lib/embk_layer.h). arg 0 = win, 1 = w, 2 = h, 3 = uint64_t *va
+ * (where its pixels are mapped in the caller). */
+static int64_t sys_layer_create(const struct sysargs *a) {
+    uint64_t va = 0;
+    int64_t id = compositor_layer_create(current_process, (uint32_t)a->arg[0], (uint32_t)a->arg[1],
+                                         (uint32_t)a->arg[2], &va);
+    if (id < 0) return id;
+    if (a->arg[3] && copy_to_user((void *)(uintptr_t)a->arg[3], &va, sizeof va)) return -EMBK_EFAULT;
+    return id;
+}
+/* arg 0 = win, 1 = const struct embk_layer_op *, 2 = how many, 3 = flags (EMBK_LS_*).
+ * The ops are copied in before the compositor's lock is taken. */
+static int64_t sys_layer_set(const struct sysargs *a) {
+    _Static_assert(sizeof(struct embk_layer_op) == 52, "the layer op's layout is the ABI");
+    struct embk_layer_op ops[EMBK_LAYER_OPS_MAX];
+    unsigned n = (unsigned)a->arg[2];
+    if (n == 0 || n > EMBK_LAYER_OPS_MAX) return -EMBK_EINVAL;
+    if (copy_from_user(ops, (const void *)(uintptr_t)a->arg[1], n * sizeof ops[0]) != EMBK_OK) return -EMBK_EFAULT;
+    return compositor_layer_set(current_process ? (int)current_process->pid : -1, (uint32_t)a->arg[0],
+                                ops, n, (uint32_t)a->arg[3]);
+}
+/* arg 0 = win, 1 = id, 2 = (x << 32) | y, 3 = (w << 32) | h: the layer's pixels there changed. */
+static int64_t sys_layer_present(const struct sysargs *a) {
+    return compositor_layer_present(current_process ? (int)current_process->pid : -1, (uint32_t)a->arg[0],
+                                    (uint32_t)a->arg[1], (int32_t)(a->arg[2] >> 32), (int32_t)(uint32_t)a->arg[2],
+                                    (int32_t)(a->arg[3] >> 32), (int32_t)(uint32_t)a->arg[3]);
+}
+/* arg 0 = the rate (mHz) this process's motion wants; 0: the display's top. */
+static int64_t sys_win_frame_rate(const struct sysargs *a) {
+    return compositor_frame_rate(current_process ? (int)current_process->pid : 0, (uint32_t)a->arg[0]);
 }
 static int64_t sys_win_place(const struct sysargs *a) {
     return compositor_win_place((int)current_process->pid,(uint32_t)a->arg[0],(int32_t)a->arg[1],(int32_t)a->arg[2]);
@@ -2889,6 +2997,18 @@ static syscall_handler_t syscall_table[] = {
     [SYS_monitor] = sys_monitor,
     [SYS_win_place] = sys_win_place,
     [SYS_win_where] = sys_win_where,
+    [SYS_comp_stats] = sys_comp_stats,
+    [SYS_ui_wait] = sys_ui_wait,
+    [SYS_win_frame] = sys_win_frame,
+    [SYS_win_frame_rate] = sys_win_frame_rate,
+    [SYS_win_drag_regions] = sys_win_drag_regions,
+    [SYS_dock_targets]     = sys_dock_targets,
+    [SYS_layer_create]     = sys_layer_create,
+    [SYS_layer_set]        = sys_layer_set,
+    [SYS_layer_present]    = sys_layer_present,
+    [SYS_key_poll_key] = sys_key_poll_key,
+    [SYS_win_focused] = sys_win_focused,
+    [SYS_win_set_material] = sys_win_set_material,
     [SYS_update] = sys_update,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -3054,7 +3174,7 @@ int64_t syscall_invoke(const struct sysargs *a) {
     if(caller && !session_ui_allowed(caller->pid)) {
         switch(a->nr) {
         case SYS_ui_present:case SYS_ui_present_rect:case SYS_ui_input:
-        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:
+        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:case SYS_key_poll_key:case SYS_win_focused:
         case SYS_win_input:case SYS_screen_read:case SYS_clip_set:case SYS_clip_get:
             return -EMBK_EPERM;
         case SYS_read:if(a->arg[0]==0)return -EMBK_EPERM;break;

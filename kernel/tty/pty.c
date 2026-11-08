@@ -3,32 +3,40 @@
 #include "fs/fd.h"
 #include "include/errno.h"
 #include "include/kstring.h"
+#include "include/kmalloc.h"
 
-#define PTY_MAX 16
-#define PTY_QUEUE 4096
+/* Pairs are allocated as they are opened and freed with their last
+ * reference; PTY_MAX bounds how many are live at once. The output queue is
+ * what a terminal can take from its program between two frames: 32 KiB, so a
+ * program printing fast is not held to a few kilobytes a frame. */
+#define PTY_MAX 64
+#define PTY_QUEUE 4096        /* input records */
+#define PTY_OUTPUT 32768
 #define PTY_LINE 1024
 #define RECORD_END 0x200u
 #define RECORD_EOF 0x100u
 
 struct pty {
-    bool used;
+    unsigned slot;
     unsigned refs[2], busy;           /* descriptor references separate from I/O pins */
     bool hungup[2];                   /* permanent, even if an operation owns a ref */
     uint16_t input[PTY_QUEUE];
-    uint8_t output[PTY_QUEUE], line[PTY_LINE];
+    uint8_t output[PTY_OUTPUT], line[PTY_LINE];
     unsigned in_head, in_tail, in_count, out_head, out_tail, out_count, fill;
     struct wait_queue changed;
     struct embk_terminal_attr attr;
     struct embk_terminal_size size;
     uint32_t foreground;
 };
-static struct pty terminals[PTY_MAX];
+static struct pty *terminals[PTY_MAX];
 
 int pty_create(struct pty **out) {
+    struct pty *p=kcalloc(1,sizeof *p);       /* allocated before the lock is taken */
+    if (!p) return -EMBK_ENOMEM;
     sched_lock();
-    for (unsigned i=0;i<PTY_MAX;i++) if (!terminals[i].used) {
-        struct pty *p=&terminals[i]; memset(p,0,sizeof *p);
-        p->used=true; p->refs[0]=p->refs[1]=1;
+    for (unsigned i=0;i<PTY_MAX;i++) if (!terminals[i]) {
+        terminals[i]=p; p->slot=i;
+        p->refs[0]=p->refs[1]=1;
         p->attr.iflag=EMBK_TIF_ICRNL;
         p->attr.oflag=EMBK_TOF_OPOST|EMBK_TOF_ONLCR;
         p->attr.cflag=EMBK_TCF_CS8;
@@ -39,8 +47,11 @@ int pty_create(struct pty **out) {
         /* Unknown until the emulator measures its actual viewport. */
         *out=p; sched_unlock(); return 0;
     }
-    sched_unlock(); return -EMBK_ENFILE;
+    sched_unlock(); kfree(p); return -EMBK_ENFILE;
 }
+/* The last reference and the last pin are gone. Freeing under the scheduler
+ * lock is safe: the heap serializes on its own lock (see channel.c). */
+static void release_locked(struct pty *p) { terminals[p->slot]=NULL; kfree(p); }
 void pty_ref_locked(struct pty *p,int side) { p->refs[side]++; }
 void pty_unref_locked(struct pty *p,int side) {
     if (--p->refs[side]==0) {
@@ -48,22 +59,22 @@ void pty_unref_locked(struct pty *p,int side) {
         if (!side && p->foreground) (void)process_cancel_locked(p->foreground);
         wait_queue_wake_all(&p->changed);
     }
-    if (!p->refs[0] && !p->refs[1] && !p->busy) p->used=false;
+    if (!p->refs[0] && !p->refs[1] && !p->busy) release_locked(p);
 }
 void pty_pin_locked(struct pty *p) { p->busy++; }
 void pty_unpin_locked(struct pty *p) {
-    if (--p->busy==0 && !p->refs[0] && !p->refs[1]) p->used=false;
+    if (--p->busy==0 && !p->refs[0] && !p->refs[1]) release_locked(p);
 }
 unsigned pty_live_count(void) {
     unsigned n=0; sched_lock();
-    for (unsigned i=0;i<PTY_MAX;i++) n+=terminals[i].used;
+    for (unsigned i=0;i<PTY_MAX;i++) n+=terminals[i]!=NULL;
     sched_unlock(); return n;
 }
 static void input(struct pty *p,uint16_t c) {
     p->input[p->in_head]=c; p->in_head=(p->in_head+1)%PTY_QUEUE; p->in_count++;
 }
 static void output(struct pty *p,uint8_t c) {
-    p->output[p->out_head]=c; p->out_head=(p->out_head+1)%PTY_QUEUE; p->out_count++;
+    p->output[p->out_head]=c; p->out_head=(p->out_head+1)%PTY_OUTPUT; p->out_count++;
 }
 static void echo(struct pty *p,uint8_t c) {
     if (c=='\n' && (p->attr.oflag&(EMBK_TOF_OPOST|EMBK_TOF_ONLCR))==(EMBK_TOF_OPOST|EMBK_TOF_ONLCR)) output(p,'\r');
@@ -102,7 +113,7 @@ int pty_read(struct pty *p,int side,void *buf,size_t len,size_t *out,bool nonblo
             if (c&RECORD_END) break;
         } else {
             dst[(*out)++]=p->output[p->out_tail];
-            p->out_tail=(p->out_tail+1)%PTY_QUEUE; p->out_count--;
+            p->out_tail=(p->out_tail+1)%PTY_OUTPUT; p->out_count--;
         }
     }
     wait_queue_wake_all(&p->changed); sched_unlock(); return 0;
@@ -128,7 +139,7 @@ int pty_write(struct pty *p,int side,const void *buf,size_t len,size_t *out,bool
             else if (eof) need_in=p->fill?p->fill:1;
             if (do_echo && !eof) need_out=kill?2:erase?3:2;
         }
-        if (PTY_QUEUE-p->in_count<need_in || PTY_QUEUE-p->out_count<need_out) {
+        if (PTY_QUEUE-p->in_count<need_in || PTY_OUTPUT-p->out_count<need_out) {
             if (*out) break; /* partial write; never block after making progress */
             int rc=wait_changed(p,nonblock); if (rc) return rc;
             continue;
@@ -175,7 +186,7 @@ int pty_poll(struct pty *p,int side,int events) {
     sched_lock(); int ready=0;
     if ((side?p->in_count:p->out_count) || p->hungup[!side]) ready|=events&POLLIN;
     if (p->hungup[!side]) ready|=POLLHUP;
-    else if (side?p->out_count<PTY_QUEUE-1:(PTY_QUEUE-p->in_count>=PTY_LINE && PTY_QUEUE-p->out_count>=4)) ready|=events&POLLOUT;
+    else if (side?p->out_count<PTY_OUTPUT-1:(PTY_QUEUE-p->in_count>=PTY_LINE && PTY_OUTPUT-p->out_count>=4)) ready|=events&POLLOUT;
     sched_unlock(); return ready;
 }
 int pty_control(struct pty *p,int side,unsigned op,void *data) {

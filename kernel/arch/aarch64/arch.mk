@@ -153,6 +153,11 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/ipc/pipe.c \
                   kernel/gfx/surface.c \
                   kernel/gfx/compositor.c \
+                  kernel/gfx/comp_stats.c \
+                  kernel/gfx/ui_events.c \
+                  kernel/gfx/frameclock.c \
+                  kernel/gfx/backdrop.c \
+                  kernel/gfx/pix.c \
                   kernel/kworker/kworker.c \
                   kernel/tty/tty.c kernel/tty/pty.c \
                   kernel/acpi/acpi.c \
@@ -183,6 +188,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/input/virtio_input.c \
                   kernel/drivers/input/keyboard.c \
                   kernel/drivers/input/mouse.c \
+                  kernel/drivers/input/pointer_accel.c \
+                  kernel/drivers/input/gesture.c \
                   kernel/drivers/video/framebuffer.c \
                   kernel/drivers/video/console.c \
                   kernel/drivers/video/font_8x16.c \
@@ -264,8 +271,16 @@ endif
 # kernel as compile-time defines, and a prerequisite list of source files alone
 # would rebuild nothing when they change -- so `make FB_W=1280` would silently
 # boot the OLD cap. The stamp's mtime moves only when the pair actually changes.
-$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_KBUILD)
-	$(AARCH64_CC) $(ARM_CFLAGS) $(ARM_BOARD_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
+# The pixel loops -O2, as on x86 (the Makefile's KERNEL_FAST_SRC says why);
+# per board, because a board's defines reach them too.
+ARM_FAST_SRC := $(filter kernel/gfx/pix.c kernel/drivers/video/framebuffer.c kernel/gfx/backdrop.c,$(ARM_SHARED_SRC))
+ARM_FAST_OBJ := $(patsubst %.c,$(ARM_KBUILD)/kfast/%.o,$(ARM_FAST_SRC))
+$(ARM_KBUILD)/kfast/%.o: %.c $(FB_STAMP) $(ARM_HDRS)
+	@mkdir -p $(dir $@)
+	$(AARCH64_CC) $(ARM_CFLAGS) $(filter-out -Wl%,$(ARM_BOARD_CFLAGS)) -O2 -c $< -o $@
+
+$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_FAST_OBJ) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_KBUILD)
+	$(AARCH64_CC) $(ARM_CFLAGS) $(ARM_BOARD_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(filter-out $(ARM_FAST_SRC),$(ARM_SHARED_SRC)) $(ARM_FAST_OBJ)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
 # -- it exists because a real ARM board loads a headerless blob at a fixed
@@ -330,7 +345,7 @@ ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn l
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \
                     $(if $(HAVE_QJS),js,) \
-                    $(if $(HAVE_ZLIB_ARM),gitclone gitpush,)
+                    $(if $(HAVE_ZLIB_ARM),gitclone gitpush gitstatus,)
 
 # Freestanding: own _start, no libc at all (-T user.ld).
 ARM_PLAIN_PROGS  ?= init primtest
@@ -395,7 +410,11 @@ HAVE_ZLIB_ARM  := $(if $(wildcard $(ZLIB_ARM_A)),1,)
 ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
                  shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
                  shell/eval/exec.c \
-                 shell/builtins/builtins.c shell/hist/hist.c \
+                 shell/builtins/builtins.c shell/prompt/prompt.c shell/hist/hist.c \
+                 shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c \
+                 shell/prompt/p10k_import.c shell/prompt/icons.c shell/prompt/colors.c shell/prompt/prompt_os.c \
+                 shell/prompt/wizard.c shell/prompt/wizard_os.c \
+                 shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c shell/complete/highlight.c \
                  shell/eval/eval_extern.c shell/builtins/builtins_os.c
 ARM_SHELL_SDK := shell/value/value.c shell/wire/wire.c shell/sval/sval.c
 
@@ -428,8 +447,10 @@ ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
                  $(wildcard user/audio/mp3/*.c)) \
                user/audio/resample.c
 
-ARM_XSRC_term     := user/terminal/vt.c
-$(ARM_USER)/term.o: user/terminal/vt.h
+ARM_XSRC_term     := user/terminal/vt_grid.c user/terminal/vt_parse.c user/terminal/vt_keys.c shell/edit/wcwidth.c \
+                     user/terminal/render.c user/terminal/glyphs.c user/terminal/screentext.c \
+                     user/terminal/profile.c user/terminal/profile_store.c
+$(ARM_USER)/term.o: user/terminal/vt.h user/terminal/render.h user/terminal/profile_store.h
 
 ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \
                      user/photos/album.c user/web/png.c user/web/jpeg.c \
@@ -503,6 +524,12 @@ ARM_INC_gitclone  := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
 ARM_INC_gitpush   := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
 ARM_EXTRAOBJ_gitclone := $(ZLIB_ARM_A)
 ARM_EXTRAOBJ_gitpush  := $(ZLIB_ARM_A)
+# gitstatus: the prompt's git status daemon -- the repository readers and sha1.
+ARM_XSRC_gitstatus := user/gitstatus/gs_util.c user/gitstatus/gs_odb.c user/gitstatus/gs_index.c \
+                      user/gitstatus/gs_ignore.c user/gitstatus/gs_status.c user/git/sha1.c
+ARM_INC_gitstatus  := -DEMBLINK_TARGET -Iuser/gitstatus -Iuser/git -I$(ZLIB_ARM_BUILD)/include
+ARM_EXTRAOBJ_gitstatus := $(ZLIB_ARM_A)
+ARM_MAIN_gitstatus := user/gitstatus/gitstatus.c
 
 ARM_MAIN_shell    := shell/main.c
 ARM_MAIN_sysinfo  := shell/tools/sysinfo.c
@@ -570,6 +597,15 @@ ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
 
 $(ARM_USER):
 	mkdir -p $(ARM_USER)
+
+# HEADER DEPENDENCIES. Every compile in this directory writes its own
+# (NEWLIB_CFLAGS: -MMD -MP -MF $@.d), and until this line only the shell's
+# were read back. So a header change rebuilt nothing that merely included it:
+# when struct scene_renderer grew, libembk's renderer was rebuilt and the apps
+# that keep one on their stack were not, and its new fields landed past the
+# end of their old, smaller copy -- every window on arm64 drew its background
+# and nothing else, while x86 (whose rules read theirs) was fine.
+-include $(wildcard $(ARM_USER)/*.o.d)
 
 # The retargeting layer, once.
 $(ARM_USER)/crt0.o: user/lib/crt0.c | $(ARM_USER)
@@ -817,7 +853,7 @@ $(ARM_KBUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_KBUILD)
 	 else echo "  (embdbg tool absent -> no kernel panic symbols on aarch64)"; : > $@; fi
 
 ARM_ROOTFS_INPUTS := tools/embkfs_mkfs/mkfs_arm64.py tools/embkfs_mkfs/mkfs_embkfs.py \
-                     tools/embkfs_mkfs/layout.py \
+                     tools/embkfs_mkfs/layout.py $(IMAGE_FONT_INPUTS) \
                      $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app)
 $(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) $(ARM_KBUILD)/kernel.embdbg | $(ARM_KBUILD)
 	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)

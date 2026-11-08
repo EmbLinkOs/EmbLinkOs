@@ -5,13 +5,13 @@ A fresh disposable UEFI/NVMe image, actual account and confined applications.
 Captures retain original pixels. Build binaries before starting this test.
 """
 from pathlib import Path
-import json,shutil,tempfile,time
+import os,json,shutil,tempfile,time
 from workspace_smoke import Desktop
 from recovery_smoke import ROOT
 from native_ui import NativeUI
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='contour-',dir='/workspace/.setup'))
+    out=Path(tempfile.mkdtemp(prefix='contour-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None))
     print(f'Artifacts: {out}',flush=True)
     disk=out/'desktop.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop(out/'first',disk)

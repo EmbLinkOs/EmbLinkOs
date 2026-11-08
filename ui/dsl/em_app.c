@@ -28,12 +28,20 @@
 #include "theme.h"
 #include "scene_render.h"
 #include "font.h"
+#include "em_prof.h"
 
 static int g_app_exit_requested;
 static int g_app_exit_code;
 static int (*g_em_close_hook)(void);
-static int g_key_modifiers;
+static int g_key_modifiers,g_key_code,g_key_flags,g_key_only_wanted;
+static int g_close_reason;      /* EM_CLOSE_*: why the window is being closed */
+int em_close_reason(void) { return g_close_reason ? g_close_reason : em_window_closed() ? EM_CLOSE_BUTTON : EM_CLOSE_OTHER; }
 int em_key_modifiers(void) { return g_key_modifiers; }
+int em_key_code(void) { return g_key_code; }
+int em_key_flags(void) { return g_key_flags; }
+static uint32_t g_pointer_buttons;
+int em_pointer_buttons(void) { return (int)g_pointer_buttons; }
+void em_key_hook_wants_key_only(int on) { g_key_only_wanted=on; }
 void em_set_close_hook(int (*fn)(void)) { g_em_close_hook=fn; }
 static float g_viewport_w;   /* mirrored into em.c via em_set_viewport */
 static int   g_blur_rect[4] = {0,0,0,0};   /* window-local frost rect (w<=0 = none) */
@@ -47,6 +55,21 @@ void em_window_blur_rect(int x, int y, int w, int h) {
     g_blur_rect[0]=x; g_blur_rect[1]=y; g_blur_rect[2]=w; g_blur_rect[3]=h;
     g_blur_dirty = 1;
 }
+/* A window that shows through (em_window_material): wanted, and what the
+ * compositor was last told. A change clears the canvas to transparent (or
+ * back) and repaints all of it. */
+static int   g_mat_alpha, g_mat_blur, g_mat_told = -1, g_mat_full;
+void em_window_material(bool see_through, int blur) {
+    if (blur < 0) blur = 0;
+    if (blur > EMBK_WIN_BLUR_MAX) blur = EMBK_WIN_BLUR_MAX;
+    if (!see_through) blur = 0;
+    if (g_mat_alpha == (int)see_through && g_mat_blur == blur) return;
+    if (g_mat_alpha != (int)see_through) g_mat_full = 1;
+    g_mat_alpha = see_through; g_mat_blur = blur;
+    em_window_set_clear(see_through);
+    em_request_frame();
+}
+bool em_window_see_through(void) { return g_mat_alpha != 0; }
 static float g_viewport_h;
 
 void em_app_request_exit(int code) {
@@ -75,7 +98,14 @@ static uint8_t *emapp_load(const char *path, size_t *out_len) {
     return buf;
 }
 
-static void emapp_mover(int win, int32_t x, int32_t y) { embk_win_move(win, x, y); }
+/* Move the window, then believe the compositor about where it went: it keeps a
+ * window clear of the bar and the dock, and a drag that went on believing its
+ * own number would keep adding the part it was refused (em_window_drag_). */
+static void emapp_mover(int win, int32_t x, int32_t y) {
+    embk_win_move(win, x, y);
+    struct embk_win_geometry g;
+    if (embk_win_where(win, &g) == 0) em_window_bind(win, g.x, g.y);
+}
 
 /* --- terminal-shaped runtime hooks (V8; see em.h) ------------------------ */
 static int  (*g_em_key_hook)(int ch)  = 0;
@@ -263,7 +293,7 @@ static void appearance_start(const struct oscfg *initial) {
     /* Long-lived services run several windows sequentially in one process. */
     if(!g_appearance_worker_started && embk_thread_create(appearance_worker,0)>=0)g_appearance_worker_started=1;
 }
-static int g_shell_bottom,g_shell_height=34,g_follow_display_width;
+static int g_shell_bottom,g_shell_height=34,g_shell_band,g_follow_display_width;
 
 /* THE MONITORS. The desktop is one surface over every monitor
  * (embk_monitor.h); an app places, maximizes and tiles on the monitor its
@@ -325,12 +355,163 @@ int em_output_at(int px,int py,int *x,int *y,int *w,int *h) {
     return o.primary;
 }
 void em_app_follow_display_width(int enabled){g_follow_display_width=!!enabled;}
-void em_shell_band(int bottom,int height){g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
+void em_shell_band(int bottom,int height){g_shell_band=1;g_shell_bottom=!!bottom;g_shell_height=height<28?28:height>44?44:height;}
 static uint32_t *resize_render_buffer(uint32_t *old,int w,int h) {
     if(!old)return NULL;
     uint32_t *next=realloc(old,(size_t)w*h*4);
     if(!next)free(old); /* Direct rendering is safer than an undersized buffer. */
     return next;
+}
+
+
+/* Hand the compositor what this frame changed, and nothing else.
+ *
+ * After a full repaint, the whole window. Otherwise the bounding box of the
+ * renderer's dirty rects, and of a scroll blit's region (it moved pixels the
+ * rects do not name). And when NOTHING is dirty, nothing: a frame is built on
+ * every hover, refresh tick and drag step, and this used to present the whole
+ * window whenever such a frame changed no pixel -- a full compose of the
+ * window, many times a second, for nothing (docs/DESKTOP_PERFORMANCE.md). The
+ * renderer reports overflow as r->full, so an empty list means unchanged. */
+
+
+/* THE DRAG ZONES, TO THE COMPOSITOR. Whenever the laid-out title bars move or
+ * change, the compositor is told where they are and drags the window by them
+ * itself -- in the frame the pointer moves, with no round trip through this
+ * loop, and even while this app is busy. None while a modal covers the
+ * window: its scrim takes those presses. A kernel without the call leaves
+ * the toolkit dragging, as before. */
+static void declare_drag_zones(int win) {
+    static int32_t last[4][4];
+    static int last_n = -1;
+    int32_t now[4][4];
+    int n = em_overlay_active() ? 0 : em_window_drag_rects(now, 4);
+    if (n == last_n && !memcmp(now, last, (size_t)n * sizeof now[0])) return;
+    /* the compositor drags only by zones it was given: with none -- a modal
+     * up, or no bar laid out -- the toolkit keeps the drag it always had */
+    int taken = embk_win_drag_regions(win, (const int32_t (*)[4])now, (unsigned)n);
+    em_window_set_compositor_drag(n > 0 && taken == n);
+    memcpy(last, now, (size_t)n * sizeof now[0]);
+    last_n = n;                  /* asked once per change, whatever the answer */
+}
+
+/* THE TWO WAITS between frames (docs/DESKTOP_PERFORMANCE.md). Idle: until a UI
+ * event or `ms`. In motion: until the compositor's next frame. Each falls back
+ * to sleeping on a kernel without them. */
+static uint32_t g_ui_seq;
+void em_wait_input(int ms) {
+    if (ms < 0) ms = 0;
+    if (embk_ui_wait(&g_ui_seq, (uint32_t)ms) < 0) embk_sleep_ms(ms < 5 ? (uint32_t)ms : 5);
+}
+void em_wait_frame(int pace) {
+    if (embk_win_frame(0, 100) < 0) embk_sleep_ms((uint32_t)pace);
+}
+
+/* what an application's frames cost it, while `perf apps on` holds (em_prof.h) */
+static struct em_prof g_prof;
+
+/* Hands the frame's changes to the compositor; returns how many pixels. */
+static uint64_t present_changes(int win, uint32_t *px, const uint32_t *back, int winw, int winh,
+                                const struct scene_renderer *r, bool full) {
+    if (full || r->full) {
+        if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
+        embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
+        return (uint64_t)winw * (uint64_t)winh;
+    }
+    int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
+    if (r->has_scroll_present) {
+        x0 = (int)r->sp_x; y0 = (int)r->sp_y;
+        x1 = (int)(r->sp_x + r->sp_w) + 1;
+        y1 = (int)(r->sp_y + r->sp_h) + 1;
+    }
+    for (int i = 0; i < r->n_dirty; i++) {
+        int a = (int)r->dirty[i].x, b = (int)r->dirty[i].y;
+        int c = (int)(r->dirty[i].x + r->dirty[i].w) + 1, d = (int)(r->dirty[i].y + r->dirty[i].h) + 1;
+        if (a < x0) x0 = a;
+        if (b < y0) y0 = b;
+        if (c > x1) x1 = c;
+        if (d > y1) y1 = d;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > winw) x1 = winw;
+    if (y1 > winh) y1 = winh;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    /* only the band that changed crosses over */
+    if (back)
+        for (int y = y0; y < y1; y++)
+            memcpy(px + (size_t)y * winw + x0, back + (size_t)y * winw + x0, (size_t)(x1 - x0) * 4);
+    embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
+    return (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+}
+
+/* ---- LAYERS: promoted subtrees, handed to the compositor ---------------
+ * The renderer paints a menu or a tooltip once into a layer of the window
+ * (scene_layer_host) and these hand it on (user/lib/embk_layer.h): the
+ * compositor brings it in, moves it and takes it away on its own frame clock,
+ * and this application does not draw a frame of it. */
+static int g_lh_win;
+static uint32_t lh_create(void *ctx, uint32_t w, uint32_t h, uint32_t **px) {
+    (void)ctx;
+    uint64_t va = 0;
+    int64_t id = embk_layer_create(g_lh_win, w, h, &va);
+    if (id <= 0 || !va) return 0;
+    *px = (uint32_t *)(uintptr_t)va;
+    return (uint32_t)id;
+}
+static void lh_present(void *ctx, uint32_t id, int x, int y, int w, int h) {
+    (void)ctx;
+    embk_layer_present(g_lh_win, id, x, y, w, h);
+}
+static void lh_op(struct embk_layer_op *op, uint32_t id, const struct scene_layer_state *s) {
+    memset(op, 0, sizeof *op);
+    op->id = id; op->set = EMBK_LP_POS | EMBK_LP_OPACITY | EMBK_LP_SCALE;
+    op->x = s->x; op->y = s->y; op->opacity = s->opacity; op->scale_milli = s->scale_milli;
+    op->anchor_x_milli = s->anchor_x_milli; op->anchor_y_milli = s->anchor_y_milli;
+}
+static void lh_go(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
+                  uint16_t response_ms, uint16_t damping_milli, uint16_t delay_ms, int destroy, int at_present) {
+    (void)ctx;
+    struct embk_layer_op op[2]; uint32_t n = 0;
+    if (from) { lh_op(&op[n], id, from); op[n].snap = op[n].set; n++; }
+    lh_op(&op[n], id, to);
+    if (!response_ms) op[n].snap = op[n].set;
+    op[n].move.response_ms = op[n].fade.response_ms = op[n].grow.response_ms = response_ms;
+    op[n].move.damping_milli = op[n].fade.damping_milli = op[n].grow.damping_milli = damping_milli;
+    op[n].delay_ms = delay_ms;
+    if (destroy) op[n].op = EMBK_LOP_DESTROY;
+    n++;
+    embk_layer_set(g_lh_win, op, n, at_present ? EMBK_LS_AT_PRESENT : 0);
+}
+static void lh_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h, int fill) {
+    (void)ctx;
+    struct embk_layer_op op; memset(&op, 0, sizeof op);
+    op.id = id; op.set = EMBK_LP_LOOK;
+    op.radius = radius; op.material = glass ? EMBK_LM_BLUR : EMBK_LM_NONE;
+    op.mat_x = (int16_t)x; op.mat_y = (int16_t)y; op.mat_w = (uint16_t)w; op.mat_h = (uint16_t)h;
+    op.flags = EMBK_LF_HIT | (fill ? EMBK_LF_FILL : 0);   /* a menu past the window's edge takes the pointer */
+    embk_layer_set(g_lh_win, &op, 1, 0);
+}
+static const struct scene_layer_host g_layer_host = { 0, lh_create, lh_present, lh_go, lh_look };
+/* Can this window have layers? The kernel says by giving one (a pixel, let go
+ * at once). A window that shows through can too: a layer's glass is frosted by
+ * the compositor, from what is really behind it (lh_look). */
+static int layers_probe(int win, int shows_through) {
+    (void)shows_through;
+    uint64_t va = 0;
+    int64_t id = embk_layer_create(win, 1, 1, &va);
+    if (id <= 0) return 0;
+    struct embk_layer_op op; memset(&op, 0, sizeof op);
+    op.id = (uint32_t)id; op.op = EMBK_LOP_DESTROY;
+    embk_layer_set(win, &op, 1, 0);
+    return 1;
+}
+
+/* The same for a program with its own loop (the desktop): the layer host for
+ * `win`, or NULL when the window cannot have layers. One window a process. */
+const struct scene_layer_host *em_layers_attach(int win, int shows_through) {
+    g_lh_win = win;
+    return layers_probe(win, shows_through) ? &g_layer_host : 0;
 }
 
 int em_app_run(const EmApp *app) {
@@ -418,9 +599,10 @@ int em_app_run(const EmApp *app) {
     em_set_viewport(g_viewport_w, g_viewport_h);
 
     uint32_t *px = 0;
-    uint64_t wflags = translucent ? EMBK_WINF_TRANSLUCENT
+    uint64_t wflags = (translucent ? EMBK_WINF_TRANSLUCENT
                     : glass       ? EMBK_WINF_GLASS
-                    : chromeless  ? EMBK_WINF_CHROMELESS : 0;
+                    : chromeless  ? EMBK_WINF_CHROMELESS : 0)
+                    | (app->resize == Resizable ? EMBK_WINF_RESIZABLE : 0);   /* it tiles (the snap below) */
     int win = embk_win_create_shared_ex((uint32_t)winw, (uint32_t)winh, wx, wy, title,
                                         wflags, (void **)&px);
     if (win < 0 || !px) {
@@ -447,6 +629,8 @@ int em_app_run(const EmApp *app) {
      * was. Counting frames would not do -- this loop skips them when nothing
      * moves. */
     ui_clock_provider(embk_uptime_ms);
+    /* ...and, for the scroll views' glide, the next frame and the time */
+    ui_kit_motion(em_request_frame, embk_uptime_ms);
     /* ...and the modifier keys, for shift-click. A click carries no byte, so
      * unlike Shift+Left -- which the driver decides before sending -- the kit
      * has to ask what was held. */
@@ -476,6 +660,9 @@ int em_app_run(const EmApp *app) {
     rt.clear_dirty = translucent;
     if (back) memcpy(back, px, (size_t)winw * (size_t)winh * 4);
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    /* menus and tooltips the compositor moves, where it can */
+    g_lh_win = win;
+    if (layers_probe(win, translucent || g_mat_alpha)) { scene_render_set_layer_host(&r, &g_layer_host); em_set_layers(1); }
     { char b[64]; snprintf(b, sizeof b, "%s: interactive loop running\n", title); embk_puts(1, b); }
 
     int pace = app->pace_ms > 0 ? app->pace_ms : 10;
@@ -498,6 +685,7 @@ int em_app_run(const EmApp *app) {
     uint64_t screen_next=0;
     int display_pending=0;
     struct cadence cad; memset(&cad, 0, sizeof cad);
+    int built_motion = 0;
 
     for (;;) {
         /* THE WHOLE ACTIVE PART OF AN ITERATION, IN CPU RATHER THAN WALL TIME.
@@ -520,9 +708,17 @@ int em_app_run(const EmApp *app) {
                                                  * the terminal's pipe poll */
         struct embk_win_input in;
         embk_win_input(&in);
+        g_pointer_buttons=in.focused?in.buttons:0;
 
         if(em_now_ms()>=screen_next) {
             screen_next=em_now_ms()+200;uint32_t nsw=0,nsh=0;embk_screen_size(&nsw,&nsh);
+            /* THE COMPOSITOR'S EFFECTS TIER, followed here: glass draws its tint
+             * while frames run long (scene_render_set_reduced) */
+            { static int fx_tick; struct embk_comp_stats cs;
+              if (++fx_tick % 3 == 0 && !embk_comp_stats(&cs) && cs.version >= 5) {
+                  if (scene_render_set_reduced((int)cs.effects)) { scene_render_invalidate(&r); em_request_frame(); }
+                  em_prof_switch(&g_prof, cs.version >= 6 && cs.app_profile, title);
+              } }
             struct embk_display_layout was=g_dl;int was_ok=g_dl_ok;
             outputs_refresh();
             int layout_moved=g_dl_ok && g_dl.generation!=g_dl_seen;
@@ -565,12 +761,12 @@ int em_app_run(const EmApp *app) {
                     if(nh>P.h)nh=P.h;
                     uint32_t *npx=NULL;
                     if(embk_win_resize(win,nw,nh,(void **)&npx)>=0 && npx) {
-                        px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);
+                        px=npx;winw=nw;winh=nh;back=resize_render_buffer(back,nw,nh);g_mat_full=1;
                         rt.pixels=back?back:px;rt.width=nw;rt.height=nh;rt.stride=nw*4;
                         g_viewport_w=nw;g_viewport_h=nh;em_set_viewport(nw,nh);
                         int ny=P.y+(g_follow_display_width && g_shell_bottom && !menu_expanded?P.h-nh:0);
                         embk_win_place(win,P.x,ny);if(chromeless)em_window_bind(win,P.x,ny);
-                        scene_render_destroy(&r);scene_render_init(&r,cpu_backend_get());em_structure_changed();em_request_frame();
+                        scene_render_invalidate(&r);em_structure_changed();em_request_frame();
                     }else display_pending=1;
                 }else geometry_pending=1;
             }
@@ -608,7 +804,8 @@ int em_app_run(const EmApp *app) {
          * An app that wants to ask "save first?" installs a close hook.
          * Acknowledge immediately so drawing its prompt cannot race the
          * compositor's grace timeout. Apps without a hook retain that backstop. */
-        if (in.win == EMBK_WIN_ACTION_CLOSE) {
+        if (in.win == EMBK_WIN_ACTION_CLOSE || in.win == EMBK_WIN_ACTION_QUIT) {
+            g_close_reason = in.win == EMBK_WIN_ACTION_QUIT ? EM_CLOSE_QUIT : EM_CLOSE_REQUEST;
             if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
             em_app_request_exit(0);
         }
@@ -643,6 +840,13 @@ int em_app_run(const EmApp *app) {
          * which to notice -- an idle app builds none, and the drop would sit
          * unread while the drag looked like it had done nothing. */
         if (in.win == EMBK_WIN_ACTION_DROP) em_request_frame();
+        /* the compositor dragged us by a declared zone and the button is up:
+         * learn where we are, and let the snap below look at it */
+        if (in.win == EMBK_WIN_ACTION_MOVED) {
+            struct embk_win_geometry g;
+            if (embk_win_where(win, &g) == 0) em_window_bind(win, g.x, g.y);
+            drag_pending = 1; em_request_frame();
+        }
 
         if (!have_want && in.win == EMBK_WIN_ACTION_MAXIMIZE) {
             /* The kernel chrome's zoom button is a TOGGLE, because it has no
@@ -704,7 +908,7 @@ int em_app_run(const EmApp *app) {
                 if(passive_layout)embk_win_place(win,nx,ny);else embk_win_move(win,nx,ny);
                 if(chromeless)em_window_bind(win,nx,ny);
                 wx_now = nx; wy_now = ny;
-                scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                scene_render_invalidate(&r);
                 em_request_frame();
                 layout_now = want;
 
@@ -714,8 +918,11 @@ int em_app_run(const EmApp *app) {
         /* Translucent menu bar: a dropdown can't paint outside its window, so
          * grow the (thin) bar window tall enough to show the open dropdown, then
          * shrink back on close. The extra height is fully transparent, so the
-         * bar still reads as a thin strip; only the dropdown paints into it. */
-        if (translucent) {
+         * bar still reads as a thin strip; only the dropdown paints into it.
+         * ONLY A BAR (em_shell_band): the banners are translucent too, and
+         * this squeezed their window to a bar's 34 px -- a banner showed its
+         * top 24 px. */
+        if (translucent && g_shell_band) {
             int want = em_menu_any_open();
             /* Chrome normally leaves keys with the app. An open dropdown
              * borrows them until dismissal, including when resize fails. */
@@ -739,7 +946,12 @@ int em_app_run(const EmApp *app) {
                         and the dismiss click sailed under it */
                     rt.pixels = back ? back : px;
                     rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
-                    scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                    scene_render_invalidate(&r);
+                    /* ALL OF IT, cleared: what realloc gave the new rows is an
+                     * old frame's pixels (the screen went grey below the bar
+                     * when a menu on a layer opened -- no structural frame
+                     * clears it any more) */
+                    g_mat_full = 1;
                     em_request_frame();
                     menu_expanded = expanded;
                     em_window_move_to(P.x,P.y+(g_shell_bottom && !want?P.h-nh:0));
@@ -752,9 +964,21 @@ int em_app_run(const EmApp *app) {
                                g_blur_rect[2], g_blur_rect[3]);
             g_blur_dirty = 0;
         }
+        if (g_mat_told != (g_mat_alpha << 8 | g_mat_blur)) {
+            if (embk_win_set_material(win, g_mat_alpha, g_mat_blur) == 0 || !g_mat_alpha)
+                g_mat_told = g_mat_alpha << 8 | g_mat_blur;
+            else g_mat_alpha = g_mat_blur = 0, g_mat_told = 0, g_mat_full = 1, em_window_set_clear(0);   /* refused: opaque, as it is */
+        }
         int had_key = 0;
-        for (int input; (input = embk_key_poll_input()) > 0; ) {
-            int c=input&255;g_key_modifiers=(input>>8)&255;
+        for (int64_t input; (input = embk_key_poll_key()) > 0; ) {
+            int c=(int)(input&255);g_key_modifiers=(int)((input>>8)&255);
+            g_key_code=(int)((input>>16)&0xffff);g_key_flags=(int)((input>>32)&255);
+            /* A key with no character (F5, Insert) reaches only a hook that
+             * asked for one; to everything else it is as if never pressed. */
+            if (g_key_flags&EMBK_KEYF_ONLY) {
+                if (g_em_key_hook && g_key_only_wanted && !ui_focus_scope_active() && g_em_key_hook(EM_KEY_ONLY|g_key_code)) had_key=1;
+                continue;
+            }
             /* Escape first dismisses a menu; it must not quit the application
              * (especially the system bar) that owns an open dropdown. */
             if (em_menu_key(c)) {had_key=1;continue;}
@@ -782,14 +1006,13 @@ int em_app_run(const EmApp *app) {
         prev_in = in;
 
         /* --- retained updates: skip ALL ui work on untouched frames --------- *
-         * em_overlay_active() MUST be a build trigger: a modal's scrim-dismiss
+         * em_overlay_settling() MUST be a build trigger: a modal's scrim-dismiss
          * is debounced for a few consecutive shown frames (em.c's g_ov_frames
          * >= 3, to swallow the click that opened it). Without this, a retained
          * loop only builds on input, so the debounce counter never advances and
-         * the scrim-dismiss never fires (it'd take repeated clicks). Keeping
-         * frames coming while a modal is up costs nothing -- modals are
-         * transient -- and matches the always-build loop the modal was designed
-         * against. */
+         * the scrim-dismiss never fires (it'd take repeated clicks). Only until
+         * it has: a modal left up -- a sheet asking a question -- used to build
+         * every frame the display showed for as long as it was there. */
         int win_moved = em_window_moved();
         if(win_moved && (in.buttons&EMBK_MOUSE_LEFT))drag_pending=1;   /* read-and-clear (drag/snap last frame) */
         /* refresh_ms was honoured for WIDGETS only, so an application whose
@@ -806,34 +1029,31 @@ int em_app_run(const EmApp *app) {
         int rms = g_refresh_override >= 0 ? g_refresh_override : app->refresh_ms;
         int app_tick = rms > 0 && (em_now_ms() - last_app_tick) >= (uint64_t)rms;
         if (app_tick) last_app_tick = em_now_ms();
-        int build = first || input_edge || em_take_frame_request() || app_tick ||
+        int build = first || input_edge || em_take_frame_request() || app_tick || em_take_wake(em_now_ms()) ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
-                    em_overlay_active() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
+                    em_overlay_settling() || win_moved || ui_keyboard_pending() || ui_focus_needs_frame();
         if (!build) {
+            em_prof_flush(&g_prof, title);          /* a run of frames ends at the wait */
             cad_idle_tick(&cad);
-            /* SAMPLE THE POINTER WHILE IDLING, in slices, rather than sleeping
-             * through it. A frame here can be far apart from the next under an
-             * emulator, and a press and release that both happen in the gap
-             * were simply never seen: the click did not arrive late, it did not
-             * arrive. Feeding the toolkit during the wait turns those into real
-             * press edges, which it counts. */
-            for (int slept = 0; slept < pace; slept += 5) {
-                embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
-                struct embk_win_input pin;
-                embk_win_input(&pin);
-                if (pin.win == EMBK_WIN_ACTION_CLOSE) {
-                    if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
-                    em_app_request_exit(0); break;
-                }
-                if (pin.win == EMBK_WIN_ACTION_DROP || pin.wheel) em_request_frame();
-                ui_pointer_at_time(pin.when);
-                em_feed_pointer((float)pin.x, (float)pin.y,
-                                pin.buttons & EMBK_MOUSE_LEFT,
-                                pin.buttons & EMBK_MOUSE_RIGHT,
-                                pin.wheel, pin.focused);
-                if ((pin.buttons & EMBK_MOUSE_LEFT) != (in.buttons & EMBK_MOUSE_LEFT))
-                    { em_request_frame(); break; }
+            /* NOTHING TO DRAW: WAIT FOR SOMETHING TO ANSWER. This used to sample
+             * the pointer every 5 ms -- six still windows woke the machine twelve
+             * hundred times a second to learn nothing had happened. It waits for
+             * a UI event now (a key, the pointer over or clicking this window,
+             * focus, a close request), or for this loop's own next job: the
+             * display re-check, a refresh tick, or -- with an idle hook, the
+             * terminal's pipes -- the pace. A press and release in the gap are
+             * still both seen: the compositor queues presses and replays them
+             * one per poll. */
+            uint64_t now = em_now_ms();
+            int64_t wait = screen_next > now ? (int64_t)(screen_next - now) : 0;
+            if (g_em_idle_hook && wait > pace) wait = pace;
+            if (rms > 0) {
+                uint64_t due = last_app_tick + (uint64_t)rms;
+                int64_t left = due > now ? (int64_t)(due - now) : 0;
+                if (left < wait) wait = left;
             }
+            wait = em_wake_wait(now, (int)wait);     /* a tooltip due, a toast leaving */
+            em_wait_input((int)wait);
             continue;
         }
 
@@ -844,26 +1064,44 @@ int em_app_run(const EmApp *app) {
 
         /* full clear+repaint on structural frames (epoch bump / first), and while
          * a close pull animates (the fade/slide moves the whole window, which the
-         * dirty-rect present would otherwise ghost). */
+         * dirty-rect present would otherwise ghost).
+         *
+         * NOT when the window moved. Its pixels are the same wherever it is: the
+         * compositor holds them and composes them at the new place, and a blur
+         * in here samples this canvas, not the desktop. A move still builds a
+         * frame, for whatever follows the window; repainting all of it on every
+         * step of a drag presented 647 thousand pixels a step for nothing
+         * (docs/DESKTOP_PERFORMANCE.md). */
         bool force_full = false;
-        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || win_moved) {
+        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || g_mat_full) {
             const struct ui_theme *t = ui_theme();
-            /* translucent windows clear to fully TRANSPARENT so their empty
-             * canvas reveals the desktop; opaque/glass windows clear to bg. */
-            uint32_t bg = translucent ? 0x00000000u
+            g_mat_full = 0;
+            /* translucent windows -- and one that shows through -- clear to
+             * fully TRANSPARENT so their empty canvas reveals the desktop;
+             * opaque/glass windows clear to bg. */
+            uint32_t bg = translucent || g_mat_alpha ? 0x00000000u
                         : (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
             uint32_t *clr = back ? back : px;
             for (int i = 0; i < winw * winh; i++) clr[i] = bg;
-            scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+            /* everything painted again -- the layers kept: a menu that is open
+             * stays open, not out and in again */
+            scene_render_invalidate(&r);
             prev_epoch = em_ui_epoch();
             force_full = true;
         }
 
+        uint64_t pf0 = em_prof_now(&g_prof);
         ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
+        uint64_t pf1 = em_prof_now(&g_prof);
         ui_run_layout((float)winw, (float)winh);
         if (g_em_post_layout) g_em_post_layout();
+        if (chromeless) declare_drag_zones(win);
+        uint64_t pf2 = em_prof_now(&g_prof);
+        rt.clear_dirty = translucent || g_mat_alpha;     /* the material can change at any time */
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        if (r.wants_frame) em_request_frame();      /* a layer settling into place */
+        uint64_t pf3 = em_prof_now(&g_prof);
 
         /* Park, don't quit: the app keeps running with no pixels on screen
          * until its dock icon calls win_restore. Checked before the close
@@ -881,6 +1119,7 @@ int em_app_run(const EmApp *app) {
             em_request_frame();
             closing = 0;
         }
+        if (!closing) g_close_reason = 0;
         if (closing) {
             /* Give the reservation back before leaving. The thread dying would
              * do it too, but em_app_run RETURNS -- an app that goes on to do
@@ -892,38 +1131,12 @@ int em_app_run(const EmApp *app) {
             return g_app_exit_requested ? g_app_exit_code : 0;
         }
 
-        if (force_full || r.full || r.n_dirty == 0) {
-            if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
-            embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
-        } else {
-            int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
-            /* a scroll blit moved pixels the dirty rects do not cover: the
-             * whole blitted region must reach the compositor */
-            if (r.has_scroll_present) {
-                x0 = (int)r.sp_x; y0 = (int)r.sp_y;
-                x1 = (int)(r.sp_x + r.sp_w) + 1;
-                y1 = (int)(r.sp_y + r.sp_h) + 1;
-            }
-            for (int i = 0; i < r.n_dirty; i++) {
-                int a = (int)r.dirty[i].x, b = (int)r.dirty[i].y;
-                int c = (int)(r.dirty[i].x + r.dirty[i].w) + 1, d = (int)(r.dirty[i].y + r.dirty[i].h) + 1;
-                if (a < x0) x0 = a;
-                if (b < y0) y0 = b;
-                if (c > x1) x1 = c;
-                if (d > y1) y1 = d;
-            }
-            if (x0 < 0) x0 = 0;
-            if (y0 < 0) y0 = 0;
-            if (x1 > winw) x1 = winw;
-            if (y1 > winh) y1 = winh;
-            if (x1 > x0 && y1 > y0) {
-                /* only the band that changed crosses over */
-                if (back)
-                    for (int y = y0; y < y1; y++)
-                        memcpy(px + (size_t)y * winw + x0, back + (size_t)y * winw + x0,
-                               (size_t)(x1 - x0) * 4);
-                embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
-            }
+        uint64_t pf_px = present_changes(win, px, back, winw, winh, &r, force_full);
+        scene_render_after_present(&r);            /* layers taken back into those pixels: now */
+        if (g_prof.on) {
+            uint64_t pf4 = embk_thread_cpu_ns();
+            em_prof_frame(&g_prof, pf1 - pf0, pf2 - pf1, pf3 - pf2, pf4 - pf3, force_full || r.full, pf_px);
+            if (g_prof.n >= 60) em_prof_flush(&g_prof, title);
         }
 
         /* The frame is on screen. What it COST is the budget estimate -- see
@@ -936,19 +1149,35 @@ int em_app_run(const EmApp *app) {
             char b[96]; snprintf(b, sizeof b, "%s: first frame presented (+%lums)\n", title,
                                  (unsigned long)(embk_uptime_ms() - t0)); embk_puts(1, b);
         }
+        /* Input while a modal is up: a frame after it, where what it did -- a
+         * button that dismissed it -- takes shape, and focus goes back. */
+        if (input_edge && em_overlay_active()) em_request_frame();
+        built_motion = em_frame_requested() || em_nav_transitioning() || em_overlay_settling() ||
+                       em_window_pulling();
 
-        /* grip released with a real delta -> re-back the window at the new
-         * size; the old pixel pointer dies inside embk_win_resize. */
-        int dw = 0, dh = 0;
-        if (em_window_take_resize(&dw, &dh)) {
-            int nw = winw + dw, nh = winh + dh;
+        /* THE GRIP, AS IT IS DRAGGED: the window takes the size the drag says
+         * -- the size it had when grabbed, plus how far the pointer has gone
+         * -- each frame that changes it, and is drawn at it before the next.
+         * The compositor resizes in place while that fits the window's pages,
+         * so the pixel pointer usually comes back the same; when it does not,
+         * the old one died inside the call. */
+        int dw = 0, dh = 0, how;
+        static int rz_base_w, rz_base_h, rz_changed;
+        if ((how = em_window_take_resize(&dw, &dh)) != 0) {
+            if (how & EM_RESIZE_FIRST) { rz_base_w = winw; rz_base_h = winh; rz_changed = 0; }
+            int nw = rz_base_w + dw, nh = rz_base_h + dh;
             if(nw<minw)nw=minw;
             if(nh<minh)nh=minh;
             struct em_out O=out_at(wx_now+winw/2,wy_now+winh/2,sw,sh);   /* no bigger than its monitor */
             if (O.w && nw > O.w) nw = O.w;
             if (O.h && nh > O.h) nh = O.h;
             uint32_t *npx = 0;
-            if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
+            if ((how & EM_RESIZE_DONE) && rz_changed && nw == winw && nh == winh) {
+                char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
+            }
+            if ((nw != winw || nh != winh) &&
+                embk_win_resize_live(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
+                rz_changed = 1;
                 px = npx; winw = nw; winh = nh;
                 if (layout_now == EmWinNormal) { normal_w = nw; normal_h = nh; }   /* the size the person chose */
                 g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
@@ -964,17 +1193,25 @@ int em_app_run(const EmApp *app) {
                             | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
                 uint32_t *clr = back ? back : px;
                 for (int i = 0; i < winw * winh; i++) clr[i] = bg;
-                scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                scene_render_invalidate(&r);
                 ui_frame_begin(); em_new_frame(); app->view(); em_flush(); em_tooltip_host();ui_frame_end();
                 ui_run_layout((float)winw, (float)winh);
                 if (g_em_post_layout) g_em_post_layout();
                 scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
                 if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
                 embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
-                char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
+                if (how & EM_RESIZE_DONE) {
+                    char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
+                }
             }
         }
-        embk_sleep_ms(pace);
+        /* THE NEXT FRAME, ON THE COMPOSITOR'S BEAT. Something is moving -- a
+         * frame was asked for, a page fades, a modal debounces, the window is
+         * being pulled -- so wait for the compositor's next frame rather than
+         * sleeping a guess at one: the motion lands on the frames that show
+         * it. Nothing moving: straight back to the top, where an idle loop
+         * waits for input. */
+        if (built_motion) em_wait_frame(pace);
     }
 }
 
@@ -1042,6 +1279,7 @@ int em_widget_run(const EmWidget *wg) {
     for (;;) {
         struct embk_win_input in;
         embk_win_input(&in);
+        g_pointer_buttons=in.focused?in.buttons:0;
         int input_edge = in.focused != prev_in.focused ||
                          (in.focused && (in.x != prev_in.x || in.y != prev_in.y ||
                                          in.buttons != prev_in.buttons));
@@ -1055,15 +1293,28 @@ int em_widget_run(const EmWidget *wg) {
         if(memcmp(&next,&widget_appearance,sizeof next)) {
             widget_appearance=next;oscfg_apply_appearance(&next);em_structure_changed();em_request_frame();
         }
-        int build = first || input_edge || tick || em_take_frame_request() ||
+        int build = first || input_edge || tick || em_take_frame_request() || em_take_wake(now) ||
                     em_ui_epoch() != prev_epoch;
-        if (!build) { cad_idle_tick(&cad); embk_sleep_ms(pace); continue; }
+        if (!build) {
+            /* nothing to draw: wait for input, or the next refresh tick (a
+             * clock); a widget with neither waits a second at a time */
+            cad_idle_tick(&cad);
+            int64_t wait = 1000;
+            if (wg->refresh_ms > 0) {
+                uint64_t due = last_tick + (uint64_t)wg->refresh_ms;
+                wait = due > now ? (int64_t)(due - now) : 0;
+            }
+            em_wait_input(em_wake_wait(now, (int)wait));
+            continue;
+        }
         if (tick) last_tick = now;
 
         ui_pointer_at_time(in.when);   /* when it HAPPENED, not when we noticed */
         if (in.focused) ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
         else            ui_pointer(-100.0f, -100.0f, false);
 
+        /* repainted whole below: presented whole */
+        bool whole = glass || first || em_ui_epoch() != prev_epoch;
         if (glass) {
             /* a glass widget renders a translucent tint the compositor lays over
              * the blurred aurora -- clear to TRANSPARENT + full-render every build
@@ -1086,27 +1337,12 @@ int em_widget_run(const EmWidget *wg) {
         ui_frame_begin(); em_new_frame(); wg->view(); em_flush();em_tooltip_host();ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
-        if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
-        embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
+        present_changes(win, px, back, winw, winh, &r, whole);
         cad_frame(&cad, pace, (embk_thread_cpu_ns() - frame_c0) / 1000000u, title);
 
         if (first) { first = 0; char b[64]; snprintf(b, sizeof b, "%s: widget first frame\n", title); embk_puts(1, b); }
-        /* The same slicing as the idle path above, and for the same reason:
-         * this sleep sits between two rendered frames, which is exactly where a
-         * fast second or third click lands. Sleeping through it loses the press
-         * entirely -- a double click arrives as one. */
-        for (int slept = 0; slept < pace; slept += 5) {
-            embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
-            struct embk_win_input pin;
-            embk_win_input(&pin);
-            if(pin.wheel)em_request_frame();
-            ui_pointer_at_time(pin.when);
-            em_feed_pointer((float)pin.x, (float)pin.y,
-                            pin.buttons & EMBK_MOUSE_LEFT,
-                            pin.buttons & EMBK_MOUSE_RIGHT,
-                            pin.wheel, pin.focused);
-            if ((pin.buttons & EMBK_MOUSE_LEFT) != (in.buttons & EMBK_MOUSE_LEFT))
-                { em_request_frame(); break; }
-        }
+        /* motion on the compositor's beat, as em_app_run; otherwise back to
+         * the top, which waits for input or the next refresh */
+        if (em_frame_requested()) em_wait_frame(pace);
     }
 }

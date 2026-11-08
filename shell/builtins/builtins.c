@@ -5,6 +5,8 @@
  * ========================================================================== */
 #include "builtins/builtins.h"
 #include "hist/hist.h"
+#include "prompt/prompt.h"
+#include "prompt/wizard_os.h"
 #include "sval/sval.h"
 #include <stdlib.h>
 #include <string.h>
@@ -911,6 +913,10 @@ static struct value bi_help(const struct command *cmd, struct value input,
         { "let x = <expr>",   "bind a variable ($x)" },
         { "assert <cond> [msg]", "stop the program unless the condition is true" },
         { "source <file>",    "run a file's program here: its lets and defs stay" },
+        { "prompt",           "the prompt's options, as a table (~/.config/shell/rc.esh sets them)" },
+        { "prompt set K V...", "set an option (prompt set right status duration time)" },
+        { "prompt get/unset K", "read / forget an option; prompt reset forgets them all" },
+        { "prompt configure", "Powerlevel10k's wizard: answer questions, get a prompt" },
         { "cmd out> f / out>> f", "a command's output to a file (replace / append)" },
         { "cmd err> f / out+err> f", "its errors, or both, to a file" },
         { "cmd in< f",        "a file as the command's input" },
@@ -927,36 +933,217 @@ static struct value bi_help(const struct command *cmd, struct value input,
 }
 
 /* -------------------------------------------------------------------------
+ * prompt -- the interactive prompt's options (shell/prompt/prompt.h).
+ *
+ *   prompt                    -> table {key, value}
+ *   prompt set KEY VALUE...   -> set; several values are one, space-separated
+ *   prompt get KEY            -> its value, or null
+ *   prompt unset KEY          -> forget it
+ *   prompt reset              -> forget every option
+ *   prompt style [NAME]       -> Powerlevel10k's style NAME as the base (plain: none);
+ *                                alone, the base's name
+ *   prompt import-p10k FILE   -> a ~/.p10k.zsh as the base -> {parameters, ignored}
+ *   prompt configure          -> Powerlevel10k's wizard: questions, then the
+ *                                configuration written and loaded
+ *
+ * Keys and words are taken as written (`prompt set right status time`);
+ * a quoted string or a number is its value (`prompt set char "❯"`).
+ * ------------------------------------------------------------------------- */
+static bool prompt_value(const struct command *cmd, size_t from, struct scope *env, char *out, size_t cap,
+                         struct value *error) {
+    out[0] = 0;
+    size_t n = 0, after_number = 0;   /* where the last argument, a number, ended: 12h lexes as 12, h */
+    for (size_t i = from; i < cmd->nargs; i++) {
+        char num[32];
+        const struct expr *e = cmd->args[i];
+        bool glued = i > from && after_number && e->line == cmd->args[i - 1]->line && e->col == after_number;
+        after_number = 0;
+        if (e->kind == EXPR_LITERAL && e->u.literal.type == VAL_INT)
+            after_number = e->col + (size_t)snprintf(num, sizeof num, "%lld", (long long)e->u.literal.u.i);
+        const char *word = expr_as_word(cmd->args[i]);
+        size_t k = word ? strlen(word) : 0;
+        struct value v = value_null();
+        if (!word) {
+            v = expr_eval(cmd->args[i], env);
+            if (v.type == VAL_ERROR) { *error = v; return false; }
+            if (v.type == VAL_STRING) { word = v.u.s.bytes; k = v.u.s.len; }
+            else if (v.type == VAL_INT) { snprintf(num, sizeof num, "%lld", (long long)v.u.i); word = num; k = strlen(num); }
+            else { value_free(&v); *error = value_error("prompt set: a value is a word, a string or a number"); return false; }
+        }
+        if (n + (n ? 1 : 0) + k >= cap || memchr(word, 0, k)) {
+            value_free(&v); *error = value_error("prompt set: the value is too long"); return false;
+        }
+        if (n && !glued) out[n++] = ' ';
+        memcpy(out + n, word, k);
+        n += k;
+        out[n] = 0;
+        value_free(&v);
+    }
+    return true;
+}
+
+/* A configuration file read and loaded as the prompt's Powerlevel10k base. */
+static struct value prompt_load(const char *path, const char *source, const char *who) {
+    struct value text = shell_read_file(path, who);
+    if (text.type == VAL_ERROR) return text;
+    if (text.type != VAL_STRING) { value_free(&text); return value_error("prompt: not a text file"); }
+    struct p10k_import rep;
+    bool ok = prompt_p10k_load(source, text.u.s.bytes, &rep);
+    value_free(&text);
+    if (!ok) {
+        char msg[400];
+        snprintf(msg, sizeof msg, "%s: %s: %s", who, path, rep.error);
+        return value_error(msg);
+    }
+    struct value r = value_record();
+    value_record_set(&r, "parameters", value_int(rep.set));
+    struct value ignored = value_list();
+    for (const char *p = rep.ignored; *p;) {
+        size_t n = strcspn(p, " ");
+        if (n) value_list_push(&ignored, value_string_n(p, n));
+        p += n;
+        while (*p == ' ') p++;
+    }
+    value_record_set(&r, "ignored", ignored);
+    return r;
+}
+
+/* prompt style [NAME] / prompt import-p10k FILE: Powerlevel10k as the base.
+ * A style is one of the configurations p10k configure starts from, installed
+ * in /system/share/powerlevel10k (PROMPT_STYLES elsewhere); `plain` is the
+ * prompt without one. */
+static struct value prompt_p10k(const struct command *cmd, const char *sub, struct scope *env) {
+    char arg[256] = "";
+    if (cmd->nargs > 1) {
+        const char *w = expr_as_word(cmd->args[1]);
+        if (w) snprintf(arg, sizeof arg, "%s", w);
+        else {
+            struct value v = expr_eval(cmd->args[1], env);
+            if (v.type == VAL_STRING && v.u.s.len < sizeof arg && !memchr(v.u.s.bytes, 0, v.u.s.len)) {
+                memcpy(arg, v.u.s.bytes, v.u.s.len);
+                arg[v.u.s.len] = 0;
+            }
+            value_free(&v);
+            if (!arg[0]) return value_error("prompt: a name or a path is a word or a string");
+        }
+    }
+    if (!strcmp(sub, "style")) {
+        static const char *const styles[] = { "lean", "lean-8colors", "classic", "rainbow", "pure" };
+        if (cmd->nargs == 1) return value_string(prompt_p10k_source() ? prompt_p10k_source() : "plain");
+        if (cmd->nargs != 2) return value_error("prompt style: prompt style NAME (lean, lean-8colors, classic, rainbow, pure, plain)");
+        if (!strcmp(arg, "plain")) { prompt_p10k_drop(); return value_null(); }
+        for (size_t i = 0; i < sizeof styles / sizeof *styles; i++) {
+            if (strcmp(arg, styles[i])) continue;
+            const char *dir = getenv("PROMPT_STYLES");
+            char path[320];
+            snprintf(path, sizeof path, "%s/p10k-%s.zsh", dir && dir[0] ? dir : "/system/share/powerlevel10k", arg);
+            struct value r = prompt_load(path, arg, "prompt style");
+            if (r.type == VAL_ERROR) return r;
+            value_free(&r);
+            return value_null();
+        }
+        return value_error("prompt style: lean, lean-8colors, classic, rainbow, pure or plain");
+    }
+    /* import-p10k: a person's own ~/.p10k.zsh (~ is the home) */
+    if (cmd->nargs != 2) return value_error("prompt import-p10k: prompt import-p10k FILE");
+    char file[320], path[320];
+    const char *home = getenv("HOME");
+    if ((arg[0] == '~' && (!arg[1] || arg[1] == '/')) && home)
+        snprintf(file, sizeof file, "%s%s", strcmp(home, "/") ? home : "", arg + 1);
+    else snprintf(file, sizeof file, "%s", arg);
+    shell_path_resolve(file, path, sizeof path);
+    return prompt_load(path, path, "prompt import-p10k");
+}
+
+static struct value bi_prompt(const struct command *cmd, struct value input, struct scope *env) {
+    value_free(&input);
+    static const char usage[] = "prompt: usage: prompt | prompt set KEY VALUE... | prompt get KEY | prompt unset KEY | "
+                                "prompt reset | prompt style [NAME] | prompt import-p10k FILE | prompt configure";
+    if (cmd->nargs == 0) {
+        struct value out = value_table();
+        for (size_t i = 0; i < prompt_opt_count(); i++) {
+            struct value r = value_record();
+            value_record_set(&r, "key", value_string(prompt_opt_key(i)));
+            value_record_set(&r, "value", value_string(prompt_opt_value(i)));
+            value_table_push_row(&out, r);
+        }
+        return out;
+    }
+    const char *sub = expr_as_word(cmd->args[0]);
+    const char *key = cmd->nargs > 1 ? expr_as_word(cmd->args[1]) : NULL;
+    char quoted[PROMPT_KEY_MAX + 1];
+    if (cmd->nargs > 1 && !key) {                    /* a key may be quoted too */
+        struct value k = expr_eval(cmd->args[1], env);
+        if (k.type == VAL_STRING && k.u.s.len < sizeof quoted && !memchr(k.u.s.bytes, 0, k.u.s.len)) {
+            memcpy(quoted, k.u.s.bytes, k.u.s.len);
+            quoted[k.u.s.len] = 0;
+            key = quoted;
+        }
+        value_free(&k);
+    }
+    if (!sub) return value_error(usage);
+    if (!strcmp(sub, "style") || !strcmp(sub, "import-p10k")) return prompt_p10k(cmd, sub, env);
+    if (!strcmp(sub, "reset") && cmd->nargs == 1) { prompt_opt_reset(); return value_null(); }
+    if (!strcmp(sub, "configure") && cmd->nargs == 1) {
+        char err[200];
+        return wizard_os_run(true, err, sizeof err) < 0 ? value_error(err) : value_null();
+    }
+    if (!key) return value_error(usage);
+    if (!prompt_key_valid(key)) return value_error("prompt: a key is lower-case words joined by dots (dir.anchor.fg)");
+    if (!strcmp(sub, "set")) {
+        if (cmd->nargs < 3) return value_error("prompt set: needs KEY and VALUE");
+        char value[PROMPT_VALUE_MAX];
+        struct value error;
+        if (!prompt_value(cmd, 2, env, value, sizeof value, &error)) return error;
+        if (!prompt_opt_set(key, value)) return value_error("prompt set: too many options");
+        return value_null();
+    }
+    if (!strcmp(sub, "get") && cmd->nargs == 2) {
+        const char *v = prompt_opt(key);
+        return v ? value_string(v) : value_null();
+    }
+    if (!strcmp(sub, "unset") && cmd->nargs == 2) { (void)prompt_opt_unset(key); return value_null(); }
+    return value_error(usage);
+}
+
+/* -------------------------------------------------------------------------
  * Registry: the PURE half; builtin_lookup_os() (builtins_os.c / host stub)
  * carries everything that needs a syscall.
  * ------------------------------------------------------------------------- */
+static const struct { const char *name; builtin_fn fn; } g_pure[] = {
+    { "echo",    bi_echo    },
+    { "assert",  bi_assert  },
+    { "where",   bi_where   },
+    { "select",  bi_select  },
+    { "sort-by", bi_sort_by },
+    { "first",   bi_first   },
+    { "head",    bi_first   },   /* the standard name, same stage */
+    { "last",    bi_last    },
+    { "tail",    bi_last    },
+    { "reverse", bi_reverse },
+    { "get",     bi_get     },
+    { "count",   bi_count   },
+    { "wc",      bi_wc      },
+    { "history", bi_history },
+    { "help",    bi_help    },
+    { "sum",     bi_sum     }, { "avg",     bi_avg     },
+    { "min",     bi_min     }, { "max",     bi_max     },
+    { "range",   bi_range   }, { "skip",    bi_skip    },
+    { "uniq",    bi_uniq    },
+    { "split",   bi_split   }, { "join",    bi_join    },
+    { "lines",   bi_lines   }, { "trim",    bi_trim    },
+    { "upper",   bi_upper   }, { "lower",   bi_lower   },
+    { "replace", bi_replace },
+    { "prompt",  bi_prompt  },
+};
+
 builtin_fn builtin_lookup(const char *name) {
-    static const struct { const char *name; builtin_fn fn; } tab[] = {
-        { "echo",    bi_echo    },
-        { "assert",  bi_assert  },
-        { "where",   bi_where   },
-        { "select",  bi_select  },
-        { "sort-by", bi_sort_by },
-        { "first",   bi_first   },
-        { "head",    bi_first   },   /* the standard name, same stage */
-        { "last",    bi_last    },
-        { "tail",    bi_last    },
-        { "reverse", bi_reverse },
-        { "get",     bi_get     },
-        { "count",   bi_count   },
-        { "wc",      bi_wc      },
-        { "history", bi_history },
-        { "help",    bi_help    },
-        { "sum",     bi_sum     }, { "avg",     bi_avg     },
-        { "min",     bi_min     }, { "max",     bi_max     },
-        { "range",   bi_range   }, { "skip",    bi_skip    },
-        { "uniq",    bi_uniq    },
-        { "split",   bi_split   }, { "join",    bi_join    },
-        { "lines",   bi_lines   }, { "trim",    bi_trim    },
-        { "upper",   bi_upper   }, { "lower",   bi_lower   },
-        { "replace", bi_replace },
-    };
-    for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
-        if (strcmp(tab[i].name, name) == 0) return tab[i].fn;
+    for (size_t i = 0; i < sizeof g_pure / sizeof g_pure[0]; i++)
+        if (strcmp(g_pure[i].name, name) == 0) return g_pure[i].fn;
     return builtin_lookup_os(name);
+}
+
+const char *builtin_name(size_t i) {
+    if (i < sizeof g_pure / sizeof g_pure[0]) return g_pure[i].name;
+    return builtin_os_name(i - sizeof g_pure / sizeof g_pure[0]);
 }

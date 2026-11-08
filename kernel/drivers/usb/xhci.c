@@ -228,7 +228,7 @@ struct xhci_runtime_state {
     uint16_t intin_mps[XHCI_MAX_SLOTS_TRACKED];      // max packet size (report length)
     bool     intin_active[XHCI_MAX_SLOTS_TRACKED];   // true after Configure Endpoint
     uint8_t  intin_kind[XHCI_MAX_SLOTS_TRACKED];     // USB_HID_PROTO_KBD / _MOUSE
-    uint8_t  prev_keys[XHCI_MAX_SLOTS_TRACKED][6];   // last report's keycodes (edge detect)
+    uint8_t  prev_report[XHCI_MAX_SLOTS_TRACKED][8]; // last boot-keyboard report (edges)
     // Distinct receive buffers cycled across the interrupt-IN ring. head = next
     // buffer to arm, tail = next completed buffer to read (both mod NUM_BUFS).
     uint8_t  intin_buf_head[XHCI_MAX_SLOTS_TRACKED];
@@ -1338,55 +1338,6 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
 }
 
 // --------------------------------------------------------------------------
-// USB HID boot-keyboard usage-to-ASCII translation table.
-// Index = HID Usage ID (see USB HID Usage Tables §10).  Only the printable
-// subset used by a standard 104-key US-QWERTY layout is covered here.
-// --------------------------------------------------------------------------
-static const char g_hid_usage_to_ascii[256] = {
-    0,    0,    0,    0,    'a',  'b',  'c',  'd',  // 00-07
-    'e',  'f',  'g',  'h',  'i',  'j',  'k',  'l',  // 08-0F
-    'm',  'n',  'o',  'p',  'q',  'r',  's',  't',  // 10-17
-    'u',  'v',  'w',  'x',  'y',  'z',  '1',  '2',  // 18-1F
-    '3',  '4',  '5',  '6',  '7',  '8',  '9',  '0',  // 20-27
-    '\n', 0x1B, '\b', '\t', ' ',  '-',  '=',  '[',  // 28-2F  Enter/Esc/BS/Tab/Space
-    ']',  '\\', 0,    ';',  '\'', '`',  ',',  '.',  // 30-37
-    '/',  0,    0,    0,    0,    0,    0,    0,    // 38-3F  CapsLock, F-keys
-    0,    0,    0,    0,    0,    0,    0,    0,    // 40-47
-    0,    0,    0,    0,    0,    0,    0,    0,    // 48-4F  arrows/ins/del -> hid_nav_key()
-    0,    0,    0,    0,    '/',  '*',  '-',  '+',  // 50-57  arrows -> hid_nav_key(); numpad
-    '\n', '1',  '2',  '3',  '4',  '5',  '6',  '7',  // 58-5F  numpad
-    '8',  '9',  '0',  '.', /* rest zero */
-};
-
-// --------------------------------------------------------------------------
-// The HID navigation cluster (usages 0x4A-0x52), mapped to the same private
-// EK_* codes the PS/2 driver emits for its 0xE0-prefixed scancodes -- so the
-// shell's Up/Down history recall and the terminal's PgUp/PgDn scrollback work
-// identically on a USB keyboard. Until this existed the whole cluster was
-// zero in the table above ("arrows/ins/del/…"), i.e. USB keyboards had NO
-// arrows -- harmless until those features shipped.
-//
-// Kept OUT of g_hid_usage_to_ascii deliberately: that table's values get run
-// through the shift mapping below, and a navigation code must never be
-// shifted. Same split the PS/2 driver uses (extended branch vs ascii table).
-// Insert (0x49) is omitted -- there is no EK_ for it yet.
-// --------------------------------------------------------------------------
-static char hid_nav_key(uint8_t usage) {
-    switch (usage) {
-    case 0x4A: return EK_HOME;
-    case 0x4B: return EK_PGUP;
-    case 0x4C: return EK_DEL;     // "Delete Forward"
-    case 0x4D: return EK_END;
-    case 0x4E: return EK_PGDN;
-    case 0x4F: return EK_RIGHT;
-    case 0x50: return EK_LEFT;
-    case 0x51: return EK_DOWN;
-    case 0x52: return EK_UP;
-    default:   return 0;
-    }
-}
-
-// --------------------------------------------------------------------------
 // Interrupt-IN endpoint ring helper — mirrors xhci_ep0_enqueue_trb but
 // targets the per-slot intin_ring rather than the EP0 ring.
 // --------------------------------------------------------------------------
@@ -1602,8 +1553,8 @@ static void xhci_intin_post_buffers(struct xhci_runtime_state *rt,
 //   report[0]    = modifier bitmap (Shift/Ctrl/Alt/GUI)
 //   report[1]    = reserved
 //   report[2..7] = up to 6 concurrent key usages (0 = none)
-// rt->prev_keys[idx] holds the previous report's keys so each key is emitted
-// only on its press edge, not repeatedly while held. `rep_buf` is the specific
+// rt->prev_report[idx] holds the previous report, so presses and releases are
+// the edges between two reports. `rep_buf` is the specific
 // receive buffer the completed TRB DMA'd into.
 // --------------------------------------------------------------------------
 /* HID reports taken, by kind: "the device is configured" and "reports are
@@ -1632,61 +1583,9 @@ static void xhci_process_hid_report(struct xhci_runtime_state *rt, uint32_t idx,
     }
 
     g_hid_kbd_reports++;
-    bool shift = (rep_buf[0] & 0x22U) != 0; // LeftShift(0x02)|RightShift(0x20)
-
-    for (uint32_t k = 2; k < 8; k++) {
-        uint8_t usage = rep_buf[k];
-        if (usage == 0) { continue; }
-
-        // Skip keycodes already held in the previous report (no auto-repeat).
-        bool already = false;
-        for (uint32_t p = 0; p < 6; p++) {
-            if (rt->prev_keys[idx][p] == usage) { already = true; break; }
-        }
-        if (already) { continue; }
-
-        /* Navigation cluster FIRST: never shift-mapped (see hid_nav_key). */
-        char nav = hid_nav_key(usage);
-        if (nav != 0) { keyboard_inject_char(nav); continue; }
-
-        char ch = g_hid_usage_to_ascii[usage];
-        if (ch == 0) { continue; }
-
-        // Apply shift: uppercase letters, shifted symbols.
-        if (shift) {
-            if (ch >= 'a' && ch <= 'z') {
-                ch = (char)(ch - 32); // to uppercase
-            } else {
-                // Common shifted symbols on US QWERTY.
-                const char shifted[] = ")!@#$%^&*(";
-                if (ch >= '0' && ch <= '9') {
-                    ch = shifted[ch - '0'];
-                } else {
-                    switch (ch) {
-                    case '-': ch = '_'; break;
-                    case '=': ch = '+'; break;
-                    case '[': ch = '{'; break;
-                    case ']': ch = '}'; break;
-                    case '\\': ch = '|'; break;
-                    case ';': ch = ':'; break;
-                    case '\'': ch = '"'; break;
-                    case '`': ch = '~'; break;
-                    case ',': ch = '<'; break;
-                    case '.': ch = '>'; break;
-                    case '/': ch = '?'; break;
-                    default:  break;
-                    }
-                }
-            }
-        }
-
-        keyboard_inject_char(ch);
-    }
-
-    // Remember this report's keycodes for next-report edge detection.
-    for (uint32_t k = 0; k < 6; k++) {
-        rt->prev_keys[idx][k] = rep_buf[k + 2U];
-    }
+    /* Presses and releases, modifiers included, through the same decoding
+     * every keyboard uses (keyboard_hid_boot_report). */
+    keyboard_hid_boot_report(rt->prev_report[idx], rep_buf, 8);
 }
 
 // --------------------------------------------------------------------------
@@ -2927,6 +2826,11 @@ static void xhci_teardown_slot(struct xhci_runtime_state *rt, uint8_t slot) {
     /* NOTHING MAY BE ARMED ON A RING WHOSE DEVICE IS GONE. The interrupt-IN
      * poll walks every slot marked active; one left set is a poll that reads
      * a buffer the controller will never fill again. */
+    /* A keyboard unplugged with Ctrl down must not leave Ctrl held. */
+    if (rt->intin_active[sidx] && rt->intin_kind[sidx] != USB_HID_PROTO_MOUSE) {
+        static const uint8_t none[8];
+        keyboard_hid_boot_report(rt->prev_report[sidx], none, 8);
+    }
     rt->intin_active[sidx] = false;
     rt->msc_active[sidx] = false;
     rt->slot_active[sidx] = 0;

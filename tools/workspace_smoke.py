@@ -18,8 +18,8 @@ from lock_test import keyname
 import shell_shot as S
 
 class Desktop:
-    def __init__(self,out,disk,graphics="virtio",cpu_compose=False):
-        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics,cpu_compose=cpu_compose)
+    def __init__(self,out,disk,graphics="virtio",cpu_compose=False,extra=()):
+        self.out=out;self.g=Guest(out,disk,boot_nvme=True,resolution=(1280,800),graphics=graphics,cpu_compose=cpu_compose,extra=extra)
         self.sock=out/'gdb.sock';self.symbols={}
     def login(self,setup=False):
         g=self.g
@@ -71,7 +71,14 @@ print('RESULT '+json.dumps({'windows':rows,'mouse':[x,y]}))''')
         if app not in self.symbols:
             p=subprocess.run([os.environ.get('EMBLINK_NM','x86_64-elf-nm'),'-S','--defined-only',str(ROOT/f'build/{app}.elf')],capture_output=True,text=True,check=True)
             # nm has address, size, type, name; retain local app symbols too.
-            self.symbols[app]={line.split()[3]:int(line.split()[0],16) for line in p.stdout.splitlines() if len(line.split())==4}
+            # A static can share its name with one in the C library (EmbCC's
+            # exit.c has a g_status, as the Editor does): the app's objects
+            # link before the library's, so the lowest address is the app's.
+            table={}
+            for line in p.stdout.splitlines():
+                f=line.split()
+                if len(f)==4:table[f[3]]=min(table.get(f[3],1<<64),int(f[0],16))
+            self.symbols[app]=table
         address=self.symbols[app][symbol]+offset
         return bytes.fromhex(self.debug(f'''import gdb,json
 ps=gdb.parse_and_eval("'kernel/process/process.c'::process_table")
@@ -90,7 +97,7 @@ va={address};left={length};data=bytearray()
 while left:
     n=min(left,4096-(va&4095));data.extend(inf.read_memory(base+phys(va),n));left-=n;va+=n
 print('RESULT '+json.dumps(data.hex()))'''))
-    def click(self,x,y):
+    def hover(self,x,y):
         end=time.monotonic()+30
         while True:
             ax,ay=self.state()['mouse']
@@ -98,12 +105,19 @@ print('RESULT '+json.dumps(data.hex()))'''))
             if time.monotonic()>end:raise TimeoutError('pointer')
             dx=max(-40,min(40,x-ax));dy=max(-40,min(40,y-ay))
             self.g.qmp.cmd('human-monitor-command',**{'command-line':f'mouse_move {dx} {dy}'});self.g.pump(.08)
+    def click(self,x,y):
+        self.hover(x,y)
         self.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});self.g.pump(.8)
         self.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'});self.g.pump(1)
     def snap(self,name):
         self.g.pump(1);p=self.out.parent/(name+'.ppm');self.g.qmp.screendump(str(p));print('Capture: '+name,flush=True);return p
     def launch(self,name,title):
-        self.key('meta_l-spc');self.g.pump(2)
+        # TYPE ONLY ONCE THE LAUNCHER IS UP. The desktop drops keys while it is
+        # not (they are nobody's), and a fixed two-second wait raced it: right
+        # after login the desktop takes longer than that to answer, so "Term"
+        # was thrown away and Return launched the first app instead.
+        opened=len(self.g.seen);self.key('meta_l-spc')
+        self.g.wait(b'home: launcher OPEN',start=opened);self.g.pump(.5)
         start=len(self.g.seen);self.type(name+'\n');w=self.wait_window(title)
         self.g.wait((title+': first frame presented').encode(),start=start)
         self.g.pump(1);return w

@@ -3,13 +3,13 @@
 Use a normal development build with its normal package fixture signing key.
 """
 from pathlib import Path
-import subprocess,sys,tempfile
+import os,subprocess,sys,tempfile
 from recovery_smoke import Guest,ROOT
 sys.path[:0]=[str(ROOT/'tools/update'),str(ROOT/'tools/embkfs_mkfs')]
 import mkfs_embkfs as mkfs
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='update-legacy-apps-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='update-legacy-apps-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     objects=[o for o in mkfs.discover_userland_objects() if (o[0] in (b'data',b'etc',b'home') or o[0].startswith((b'data/',b'etc/',b'home/'))) and o[0]!=b'data/apps' and not o[0].startswith(b'data/apps/')]
     for name in (b'data/apps',b'data/apps/pkgprobe'):
         objects.append((name,mkfs.L.DT_DIR,mkfs.L.S_IFDIR|0o755,b''))

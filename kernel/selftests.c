@@ -6697,6 +6697,52 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* The C++ standard library past cxxdemo's floor: exceptions through the
+     * unwinder, streams, containers, std::thread, std::filesystem. Built
+     * only under LIBC=emblibc, by EmbCC (user/tests/cxxlib); without it on
+     * the image this is a SKIP, as test cxx is without a C++ toolchain. */
+    if (strcmp(cmd, "test cxxlib") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test cxxlib: VFS not registered\n");
+            return 1;
+        }
+        struct vfs_stat st;
+        if (vfs_stat("/data/apps/cxxlib/cxxlib.elf", &st) != EMBK_OK) {
+            kprintf("\n[cmd] test cxxlib: SKIP -- cxxlib.elf not on the image "
+                    "(built under LIBC=emblibc)\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/cxxlib/cxxlib.elf", NULL };
+        int pid = process_create("/data/apps/cxxlib/cxxlib.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test cxxlib: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* POSIX threads on EmbCC's C library: tests/exec/posix-threads.c from
+     * the EmbCC tree -- the program glibc and that library both pass on
+     * Linux -- which exits 42 when every check holds. Built under
+     * LIBC=emblibc; without it on the image this is a SKIP. */
+    if (strcmp(cmd, "test pthreads") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test pthreads: VFS not registered\n");
+            return 1;
+        }
+        struct vfs_stat st;
+        if (vfs_stat("/data/apps/pthreadprobe/pthreadprobe.elf", &st) != EMBK_OK) {
+            kprintf("\n[cmd] test pthreads: SKIP -- pthreadprobe.elf not on the "
+                    "image (built under LIBC=emblibc)\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/pthreadprobe/pthreadprobe.elf", NULL };
+        int pid = process_create("/data/apps/pthreadprobe/pthreadprobe.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test pthreads: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 42) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* The POSIX layer in user/lib/syscalls.c. posixdemo.elf self-checks the
      * things that break quietly rather than loudly: opendir()'s grow-and-retry
      * loop against a >64-entry directory (the kernel's readdir truncates
@@ -8599,7 +8645,7 @@ int selftests_handle_command(const char *cmd)
 
 /* V2 -- THE SHELL REBUILDS THE SHELL, and the FIRST ADOPTION EVENT
  * (docs/BUILD.md §3). Four movements:
- *   (1) BUILD: EmbBuild walks /data/src/shell/build.ebm -- eleven TCC
+ *   (1) BUILD: EmbBuild walks /data/src/shell/build.ebm -- fifteen TCC
  *       compiles and a link, STAGED ONLY (the manifest has no install
  *       stanza; /system/bin is sealed and EmbBuild will not cross it).
  *   (2) VERIFY THE STAGED ARTIFACT: the TCC-built shell runs the shell-test
@@ -8616,7 +8662,10 @@ int selftests_handle_command(const char *cmd)
  *       system built for itself. */
     if (strcmp(cmd, "test embbuild shell") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild shell: VFS not registered\n"); return 1; }
-        static char cap[4096];
+        /* Room for every unit's compiler chatter: the verdict is the LAST
+         * line, and sixteen tcc runs overflowed 4 KiB before reaching it (there are
+         * twenty-three now). */
+        static char cap[65536];
         int ok = 1, rc;
         char *bb = "/data/apps/embbuild/embbuild.elf";
         static const char *oracle[3] = {
@@ -8629,7 +8678,7 @@ int selftests_handle_command(const char *cmd)
         kprintf("[v2] (1) building the shell from /data/src/shell\n");
         char *a1[] = { bb, "/data/src/shell/build.ebm", NULL };
         rc = emb_run_cap(bb, a1, 2, cap, sizeof cap);
-        if (rc != 0 || !emb_find(cap, "12 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }
+        if (rc != 0 || !emb_find(cap, "27 ran, 0 up_to_date")) { kprintf("[v2] (1) FAIL rc=%d\n", rc); ok = 0; }   /* 26 units + the link */
 
         /* (2) verify the staged shell BEFORE adoption */
         if (ok) {
@@ -9195,6 +9244,10 @@ int selftests_handle_command(const char *cmd)
     if(!strcmp(cmd,"test input snapshot")) {
         kprintf("[cmd] test input snapshot: queued Ctrl+S and Up retain distinct modifiers: %s\n",
                 keyboard_input_snapshot_selftest()?"OK":"FAIL");return 1;
+    }
+    if(!strcmp(cmd,"test kbd ring")) {
+        kprintf("[cmd] test kbd ring: keys keep their identity in order with the text: %s\n",
+                keyboard_key_ring_selftest()?"OK":"FAIL");return 1;
     }
     if(!strcmp(cmd,"test document sync")) {document_sync_test();return 1;}
     const char *device_mode=NULL;
@@ -10150,6 +10203,8 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[deadline] one 16 ms periodic thread, 150 periods, 6 threads\n");
         kprintf("           that never sleep. Exit code is the WORST lateness\n");
         kprintf("           in ms (capped at 250).\n");
+        kprintf("           %u permille reserved before it, %u of it by applications\n",
+                sched_reserved_permille(), sched_reserved_permille_user());
 
         kprintf("\n--- policy: round-robin ---\n");
         sched_policy_set(rr);
@@ -10239,10 +10294,12 @@ int selftests_handle_command(const char *cmd)
                     "   contend, so this comparison is not evidence)\n", worst_rr);
         }
 
-        kprintf("  reserved after both runs: %u permille (0 expected: the\n"
-                "  declaration dies with the thread)\n",
-                sched_reserved_permille());
-        if (sched_reserved_permille() != 0) {
+        /* ring 3's: the compositor's frame thread reserves for itself while
+         * frames keep coming, and it is not the test's to free */
+        kprintf("  reserved by applications after both runs: %u permille (0\n"
+                "  expected: the declaration dies with the thread)\n",
+                sched_reserved_permille_user());
+        if (sched_reserved_permille_user() != 0) {
             kprintf("  [FAIL] a reservation outlived its thread\n");
             ok = 0;
         }

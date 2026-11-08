@@ -18,7 +18,9 @@
 #include "drivers/input/keyboard.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
+#include "drivers/input/i8042.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick() -- cursor/focus/drag */
+#include "gfx/comp_stats.h"   /* the serial `perf` command */
 #include "drivers/timer/timer.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/rtc.h"
@@ -1784,6 +1786,8 @@ static void kernel_handle_line_command(const char *cmd)
         kprintf("Recovery commands: recovery check, recovery report, install list, install plan <disk>, poweroff, reboot\n");return;
     }
     if(wifi_command(cmd))return;
+    if(comp_stats_command(cmd))return;
+    if(pointer_command(cmd))return;
 
     if (shell_handle_process_command(cmd))
         return;
@@ -2232,12 +2236,16 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     }
 
     kworker_init();
+    /* The compositor's frame thread: from here on a paint is damage, composed
+     * once a frame (gfx/compositor.c, "the frame clock"). */
+    compositor_start();
 
     /* The page cache's writeback thread. AFTER the scheduler (it is a kthread
      * and takes a sleeping lock) and after the filesystem is mounted -- from
      * this point a write() lands in memory and this thread is what bounds how
      * long it stays there. See mm/vm_object.h. */
     vmo_writeback_init();
+    i8042_watch_start();      /* a PS/2 byte a lost interrupt left behind is delivered, not a dead device */
 
     /* Power: idle residency starts being counted the moment the idle threads
      * exist, and shutdown/reboot become available. After the page cache
@@ -2383,7 +2391,12 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             else if(sk>=SYSKEY_MOVE_SPACE_1 && sk<SYSKEY_MOVE_SPACE_1+6)compositor_workspace_key(sk-SYSKEY_MOVE_SPACE_1,1);
             else if(sk==SYSKEY_SPACE_PREVIOUS || sk==SYSKEY_SPACE_NEXT)compositor_workspace_key(sk==SYSKEY_SPACE_PREVIOUS?-1:-2,0);
             else if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_PERF_HUD) compositor_hud_toggle();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
+            else if (sk == SYSKEY_MINIMIZE) compositor_minimize_front();
+            else if (sk == SYSKEY_OVERVIEW) compositor_overview_toggle(0);
+            else if (sk >= SYSKEY_OVERVIEW_LEFT && sk <= SYSKEY_OVERVIEW_PICK)
+                compositor_overview_key(sk == SYSKEY_OVERVIEW_PICK ? 0 : sk - SYSKEY_OVERVIEW_LEFT + 1);
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
                 if (pid) process_kill((uint32_t)pid);
@@ -2394,6 +2407,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         update_service_health(compositor_desktop_healthy());
         session_refresh_screen();
         compositor_anim_tick();
+        compositor_hud_tick();
         if(boot_recovery_mode())fb_present();
         // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
         // to userspace now (the launcher, and the shell that reads fd 0); the

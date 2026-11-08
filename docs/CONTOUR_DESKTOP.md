@@ -43,7 +43,7 @@ application-specific interaction coverage.
 | Terminal | Shared chrome and scoped monospace transcript; native search/launch/capture passes |
 | Editor and Note++ | Shared chrome, code/document palettes and metrics; three-boot save/dirty-close/recovery/reopen workflow passes |
 | Calculator, Monitor, Photos and Music | Shared native chrome/tokens and usable minimum sizes; native launch/close/captures pass; Calculator arithmetic checked |
-| Notification history and banners | Aligned history/empty state and banner work-area placement; history launch/close verified; banner edge combinations not separately exercised |
+| Notification history and banners | Aligned history/empty state and banner work-area placement; history launch/close verified; banners in motion (in, stack, out, hold, spring home, flick) checked from captures on x86; banner edge combinations not separately exercised |
 | Login, setup and lock | Shared default/session styling; authenticated setup/login, themed lock, blocked workspace shortcuts and password unlock pass |
 | Clock widget and examples | Shared runtime appearance and real wall clock/date/uptime; clock source compile checked; example galleries not individually guest-tested |
 | Vellum / NetSurf | Shared native toolkit/chrome; browser engine and content development remain with the user |
@@ -73,7 +73,10 @@ shortcut modifier and power policy intact. Custom surface hues are adapted to th
 interactive accent tones are adjusted for readable text and selection contrast.
 
 The versioned `desktop_control` ABI (147) shares insets, palette, corner/shadow,
-cursor, material, shortcut and workspace preferences with the compositor. GPU
+cursor, material, effects, shortcut and workspace preferences with the compositor.
+Effects (Settings > Appearance) is Automatic, Full or Reduced: the compositor
+steps blur and the wide shadow layer down when frames run long, unless held
+([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md#the-effects-governor-p3)). GPU
 capability is required; only the process owning the desktop layer may publish
 its configuration. Queries and workspace requests cannot bypass session locks.
 Flags in existing window snapshots encode the workspace in bits 8–15 without
@@ -94,9 +97,11 @@ initiating controls; menu arrows/Home/End/Escape retain slider and text-field
 editing keys. See [KEYBOARD_FOCUS.md](KEYBOARD_FOCUS.md) for contracts and limits.
 Assistive-technology semantics and arbitrary shortcut recording remain further
 work. System shortcuts offer Super or Ctrl+Alt as their modifier:
-Space opens the library, Tab cycles windows, W closes, Q quits, 1–6 selects a
-workspace, Shift+1–6 moves a window, and [ / ] walks spaces. Editing shortcuts
-retain their existing meanings.
+Space opens the library, Tab cycles windows, W closes, Q quits, M minimises
+into the dock, Up shows every window of the space at once (the overview), 1–6 selects a
+workspace, Shift+1–6 moves a window, and [ / ] walks spaces; Shift+P shows what
+composing costs ([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)). Editing
+shortcuts retain their existing meanings.
 
 Scaling applies to shared type, control and spacing metrics; it is not a new
 fractional display compositor. Application minimum sizes and bounded scrolling
@@ -166,3 +171,97 @@ applications and the toolkit are rebuilt together.
 The shared motion timing token drives menus, page transitions and toast fades.
 Reduced motion presents toasts without a fade/slide and keeps indeterminate dots
 static. No animation is required for a control to communicate its state.
+
+### Motion on springs
+
+Everything that moves -- in the compositor and in the toolkit -- moves on one
+damped spring (`ui/motion/spring.h`): integers only, so the kernel and the
+toolkit run the same code, integrated in fixed 1/960 s substeps from the
+spring's own origin, so 60 Hz, 120 Hz and a ragged emulator see one trajectory
+(`make spring-test`). A spring has a position and a velocity, so any motion can
+be turned around mid-way from where it is, at the speed it has.
+
+| Token | Response, damping | Used by |
+|---|---|---|
+| snappy | 250 ms, 0.9 | the close pull's spring back, the toast, the dock's plate |
+| smooth | 350 ms, 1.0 | a window's flight to and from the dock; the workspace slide; banners |
+| bouncy | 450 ms, 0.7 | the dock's launch hop |
+| (open) | 240 ms, 0.9 | a window opening |
+| (close) | 200 ms, 1.0 | a window closing: decisive, never overshooting |
+| (zoom) | 300 ms, 1.0 | a window flying to a new frame: filled, halved, back |
+| (scroll) | 180 ms, 1.0 | the wheel's glide |
+
+- **Windows.** A window in motion is drawn as a ghost whose rectangle is four
+  springs; any number fly at once. Minimised, a window flies into its own app's
+  dock tile (the desktop publishes the tiles), staying opaque until the last
+  tenth of the trip; clicked back mid-flight it turns around. A window opening
+  or coming back takes clicks and keys at its real place while its ghost is in
+  the air, and a window in the air keeps its rounded corners and its shadow
+  (fading with it). GUI+M minimises the front window. `perf slowmo N` slows every window
+  motion N times; `tools/motion_smoke.py` watches them in flight.
+- **Zoom.** A double click where a window is dragged by -- its bar -- zooms
+  it, as on the Mac: it fills the work area, or goes back. Any big change of
+  a window's size at once (filling, a half of the screen, a layout, going
+  back) flies: what the window looked like stays where it was until the app
+  has drawn at its new size, then it flies to the new frame on a spring,
+  drawn from the new pixels. The corner grip resizes as it is dragged: the
+  window is the size the hand says, drawn at it, frame by frame, and never
+  flies (`tools/resize_smoke.py`). Dragged against an edge, a window that will tile shows where
+  before it is let go: a wash of the accent grows out of it on a spring
+  toward the half (or, at the top, all) of the work area it will take, under
+  the window, and the target's outline is drawn over it, since a big window
+  covers most of its own wash.
+- **The overview.** GUI+Up flies every window of the space, on springs, to a
+  place of its own in a grid over the dimmed desktop -- each the window
+  itself, scaled, live (an app drawing while it is up is seen drawing), with
+  its corners and shadow, and each in the cell nearest where it stands. The
+  pointer and the keys are the overview's while it is up: the window under
+  the pointer, or the one the arrows move to, is ringed (a rounded band
+  hugging it), a click or Return brings it in front as they all fly home,
+  and a click elsewhere, Esc or GUI+Up again sends them home as they were.
+  GUI+Up while they fly home turns them back. Still, it composes nothing.
+- **Workspaces.** Changing space slides: the space being left goes off one
+  side while the next comes in from the other -- leftwards going up the
+  spaces, as on the Mac -- whether the change came from the keys, the top
+  bar's Space menu or the dock (an app whose window is on another space). Each window is drawn as
+  itself, shadow, corners and material, wherever its four springs have got
+  to, so it lands without a seam; a translucent window carries the blur it
+  kept rather than blurring again under itself as it moves. Switched back
+  mid-slide, the windows turn round in flight. The windows coming in take
+  clicks and keys at their real places from the start. Reduced motion
+  changes space at once. With several monitors the desktop slides as one
+  strip.
+- **Three fingers.** On a touchscreen, three fingers moving sideways put the
+  space shown and the next one side by side under the hand, following it one
+  to one. Lifted past a third of the screen, or flicked, the next space is
+  taken and the windows carry on at the speed the hand had; otherwise both
+  spring back. Past the first or the last space the hand meets a rubber band
+  (wrapping round is the keys' preference). Three fingers up open the overview
+  and down close it. Once two fingers are down the pointer neither moves nor
+  presses until every finger has lifted (`tools/gesture_smoke.py`).
+- **The dock.** Its icons still never move under the aim and never swell.
+  The pointer's plate is one plate that glides from tile to tile on a spring
+  as the pointer runs along the dock, fading at its ends; the icon button
+  inside does not light a second one (`em_quiet_hover`). The one time an
+  icon moves is after the click: it hops while its app starts, until the
+  app's window is up (at most four seconds), and settles where it was
+  (`tools/dock_motion_smoke.py`).
+- **Notifications.** A banner slides in from the screen's edge, newest on
+  top; the ones already up glide down to make room and up again when one
+  goes. It leaves the way it came: when its six seconds are up (they do not
+  run while the pointer is on it), when it is clicked, or when it is thrown
+  -- dragged sideways it follows the hand, and let go far or fast enough it
+  flies off at the speed it was thrown; otherwise it springs home
+  (`em_spring_throw` hands a drag's place and speed to a spring;
+  `tools/banner_motion_smoke.py`).
+- **Scrolling.** A notch of the wheel moves where a view is going and the view
+  glides there; notches 40 ms apart count three times. Pushed past an edge, the
+  content gives (Apple's rubber-band curve) and springs back once the wheel is
+  still.
+- **The pointer.** Relative motion follows an acceleration curve: 1:1 while
+  aiming, up to three times across a sweep (`make pointer-accel-test`).
+- **The toolkit.** Page navigation, the menu drop-in, the toast and
+  `em_animate` run on the same springs, on the toolkit's clock. A menu grows
+  out of the corner it opens from as it fades in, and the library zooms in
+  from a little smaller (`ui_set_scale`: a group drawn smaller toward an
+  anchor).

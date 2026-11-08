@@ -25,9 +25,10 @@ void sc_draw(const struct sc_surface *t, const struct gpu_rect *clip, const stru
              const struct gpu_draw *d);
 void sc_shadow(const struct sc_surface *t, const struct gpu_rect *clip, const struct gpu_rect *frame,
                const struct gpu_rect *cover, uint32_t radius, uint32_t width, uint32_t peak);
-/* `scratch` holds r's pixels once (r->w * r->h words). */
+/* `scratch` holds r's pixels once (r->w * r->h words); `sat` saturates the
+ * result (256ths, as pix_saturate_row; 0: not). */
 void sc_blur(const struct sc_surface *t, const struct gpu_rect *clip, const struct gpu_rect *r, uint32_t radius,
-             const struct gpu_rect *frame, uint32_t corner, uint32_t *scratch);
+             const struct gpu_rect *frame, uint32_t corner, uint32_t *scratch, uint32_t sat);
 
 /* A rectangle's intersection with another; 0 when nothing is left. */
 int sc_intersect(struct gpu_rect *a, const struct gpu_rect *b);

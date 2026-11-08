@@ -1,0 +1,808 @@
+# Desktop performance
+
+What composing the desktop costs, as the compositor measures it, and how each
+change moved the numbers. The plan these measurements serve takes the desktop
+to a frame clock with adaptive 60–120 Hz, spring motion, materials and better
+type; its open items are in [TODO.md](TODO.md#fluid-desktop-frame-clock-motion-materials-type-2026-10-26).
+
+## Reading the numbers
+
+A **compose** is one repaint of a screen region from the window stack and its
+presentation: from the first pixel drawn to the copy to the scanout (or the
+GPU's flush). The compositor charges each compose to the **cause** that asked
+for it:
+
+| Cause | What asked |
+|---|---|
+| present | an application presented new pixels |
+| move | a window was moved, placed or resized by request |
+| pointer | the cursor moved, a click raised a window, a kernel title bar was dragged |
+| anim | window motion: open, minimise, restore, close |
+| other | create, destroy, focus, workspaces, displays |
+
+The **pointer latency** is the time from the mouse driver noticing a motion to
+the compose that drew the cursor there -- or, where the pointer is on a cursor
+plane (virtio-gpu), to the plane being moved. It is what software can observe;
+photons need a camera.
+
+A **frame** is one turn of the compositor's frame thread (P1): it composes
+whatever damage is waiting, which may be none -- a pointer frame on a cursor
+plane composes nothing. Frames carry the clock's own numbers:
+
+| Number | What it is |
+|---|---|
+| beat | the interval between frames finishing: the period, when the clock keeps it |
+| late | how late the frame thread began a frame that was due on the beat |
+| lead | how early the kernel wakes it to cover its timer's lateness, spun out to the instant |
+| rate | the rate composed at: now, and the fastest since the counters started |
+
+Three ways to read it:
+
+- **GUI+Shift+P** shows an overlay at the top right of the primary display,
+  refreshed twice a second: the renderer, size, rate and the display's top
+  rate; frames in the last second and the beat (median, 95th percentile);
+  compose time (median, 95th percentile, worst of the last 512); pointer
+  latency; composes per cause since the counters started. Its own repaints are
+  left out of what it reports.
+- The serial console's `perf` prints the same as `key=value` integers, then the
+  busiest presenting windows; `perf reset` starts the counters again; `perf hud`
+  toggles the overlay. `perf display 120` (or `48-120`, or `auto`) tells the
+  frame clock the display is a fixed 120 Hz one (a VRR one, the real one);
+  `perf beat N` keeps the beat for N seconds composing nothing; `perf cursor
+  hw|sw` puts the pointer on the cursor plane or draws it; `perf windows` lists
+  the window stack, the dock's tiles and every ghost in flight; `perf effects
+  auto|full|reduced` holds the effects tier (below); `perf slowmo N`
+  slows the compositor's motions N times; `perf notice TITLE` posts a system
+  notice, which comes up as a banner (x86: arm64 has no system notices).
+- `embk_comp_stats()` (`user/lib/embk_comp_stats.h`) hands any program the
+  snapshot. It says how long composing takes and why, never what a window shows.
+
+`tools/perf_smoke.py` boots a disposable copy of `uefi-usb.img`, makes an
+account, logs in and measures nine scenes: ten idle seconds, the pointer swept
+across the desktop, the Settings window dragged by its title and back, the
+launcher opened and dismissed, a Terminal opened from the dock and closed
+with GUI+W, the same drag on a simulated 120 Hz display and on a 48-120 Hz VRR
+one, and three seconds of the beat alone at 60 and at 120 Hz. A drag must
+follow the hand and bring the window back where it started. It writes
+`perf.json` and a capture with the overlay; `--beat` measures only the beat,
+and `--arch aarch64` runs the same on arm64 under HVF.
+
+```sh
+make FB_W=1280 FB_H=800 STAGED_APPS="build/cxxdemo.elf build/embcc.elf build/embld.elf" uefi-usb.img
+EMBLINK_OVMF_DIR=<ovmf> EMBLINK_GDB=x86_64-elf-gdb python3 tools/perf_smoke.py --label <name>
+```
+
+Times measured under TCG are the emulator's. They compare one build with
+another on the same host; they say nothing about a machine. The counts (how
+many composes, of how many pixels, why, and how many covered the whole screen)
+are the same anywhere.
+
+## Baseline (241cb9d)
+
+QEMU x86_64 under TCG on an Apple M5 host, 2 CPUs, UEFI, virtio-vga at
+1280 × 800. The CPU composes, and the kernel is built `-O0` without SSE.
+
+| Scene | Composes | Per second | Pixels | Full screen | Compose p50 | Compose p95 | Pointer p95 |
+|---|---|---|---|---|---|---|---|
+| Idle, 10 s | 104 | 10.1 | 2.9 Mpx | 0 | 6.0 ms | 15.4 ms | — |
+| Pointer sweep | 929 | 19.5 | 14.5 Mpx | 0 | 5.9 ms | 15.3 ms | 18.6 ms |
+| Drag Settings | 97 | 10.8 | 20.2 Mpx | 0 | 8.2 ms | 221.9 ms | 308.0 ms |
+| Launcher | 29 | 3.6 | 10.9 Mpx | 3 | 16.7 ms | 279.4 ms | — |
+| Terminal open + close | 100 | 4.9 | 24.8 Mpx | 3 | 15.4 ms | 287.6 ms | 211.4 ms |
+
+What it says:
+
+- **An idle desktop is not idle.** With nothing changing, the desktop process
+  presented 84 times in ten seconds (about 26 thousand pixels each), and the
+  top bar 20 times (38 thousand each). That is a compose every 100 ms for
+  nothing.
+- **A drag re-presents the whole window on every move.** The Settings window
+  moved itself 10 times and presented 18 times, each time all 647 thousand of
+  its pixels. That is where the 222 ms composes and the 308 ms pointer latency
+  come from.
+- **Window motion is one frame here.** Opening and closing a Terminal produced
+  a single animation compose: the 170 ms open and 150 ms close are shorter than
+  one compose under TCG, so the motion jumps to its end.
+- **Composing is slow per pixel.** On the host, the compositor's own blend loop
+  takes 11.4 ms for a 1280 × 800 screen as the kernel builds it (`-O0`), and
+  0.7 ms at `-O2` with two channels per multiply. Its box blur takes 28 ms.
+  Every number in the table above carries that factor.
+
+**Correction.** The 0.7 ms quoted above for the blend at `-O2` was measured with
+the host compiler vectorising the loop (NEON on the M5). The kernel is built
+without SSE or NEON and can never do that. Scalar, as the kernel builds it
+(`make pix-bench`), the blend goes from 11.6 ms to 2.4 ms and the box blur from
+17.2 ms to 4.5 ms. The real gain is five times, not sixteen.
+
+## After P0 (ec0718b)
+
+What changed:
+
+- **The pixel loops** (`kernel/gfx/pix.c`) are compiled `-O2` with
+  `framebuffer.c`, `backdrop.c` and `soft_compose.c`; the rest of the kernel
+  stays `-O0`. They are bit-exact with the old ones (`make pix-test`).
+- **Nothing dirty is presented as nothing.** `em_app_run`, widgets and the
+  desktop presented their whole window whenever a frame they built changed no
+  pixel.
+- **A glass box and an idle menu button are no longer dirty on every frame.**
+  Each set a property twice per frame (`make em-test` covers both).
+- **A moved window is not repainted whole.** Its pixels do not change when it
+  moves.
+- **Shortcuts work on arm64.** System shortcuts and GUI commands are decided
+  for every keyboard, not only PS/2.
+- **The arm64 kernel reads `perf`**, and `tools/perf_smoke.py --arch aarch64`
+  measures the same scenes under HVF.
+
+### x86 under TCG, against the baseline
+
+| Scene | Composes | Pixels | App presents | Compose p95 | Pointer p95 |
+|---|---|---|---|---|---|
+| Idle, 10 s | 104 → **0** | 2.9 → 0 Mpx | 104 → 0 | 15.4 ms → — | — |
+| Pointer sweep | 929 → 453 | 14.5 → 1.1 Mpx | 477 → 1 | 15.3 → 0.3 ms | 18.6 → 0.7 ms |
+| Drag Settings | 97 → 184 | 20.2 → 79.8 Mpx | 54 → 1 | 221.9 → 23.8 ms | 308.0 → 23.8 ms |
+| Launcher | 29 → 6 | 10.9 → 5.5 Mpx | 25 → 2 | 279.4 → 31.4 ms | — |
+| Terminal open + close | 100 → 44 | 24.8 → 10.6 Mpx | 88 → 16 | 287.6 → 32.9 ms | 211.4 → 14.1 ms |
+
+Reading the drag row:
+
+- The window now follows the pointer more often in the same time: 111 move
+  composes against 10. Each one recomposes the window's old and new
+  footprints, about 0.7 Mpx.
+- Its median compose time rose for a different reason: the small idle presents
+  that used to pad the median are gone.
+
+### arm64 under HVF: a real core composing
+
+QEMU virt under HVF on the same Apple M5 host, 4 CPUs, virtio-gpu at
+1280 × 800, CPU composition. The guest runs on the host's own core, so these
+are the times of a real CPU, not an emulator's.
+
+| Scene | Composes | Per second | Compose p50 | Compose p95 | Pointer p95 | Window motion |
+|---|---|---|---|---|---|---|
+| Idle, 10 s | 0 | 0 | — | — | — | — |
+| Pointer sweep | 453 | 9.6 | 0.05 ms | 0.12 ms | 0.10 ms | — |
+| Drag Settings | 462 | 55.2 | 1.97 ms | 2.33 ms | 1.89 ms | — |
+| Launcher | 10 (8 full screen) | 1.3 | 2.23 ms | 2.46 ms | — | — |
+| Terminal open + close | 51 | 6.0 | 2.73 ms | 3.07 ms | 0.23 ms | 31 frames |
+
+What it says about the frame budget:
+
+- **A full 1280 × 800 compose takes about 2.2 ms on one M5 core.** That is a
+  fast core.
+- **At 1920 × 1080 on a typical laptop core, the same compose would take about
+  9–13 ms.** That estimate scales by pixels (×2) and by core speed (×2–3); it
+  is not a measurement. That fits within 60 Hz (16.7 ms) and does not fit
+  within 120 Hz (8.3 ms).
+- **What P1 has to do next:**
+  - compose only the damage, with one compose per frame on a frame clock;
+  - make window drags and the cursor cheap, so motion never needs a full
+    compose;
+  - let the rate governor hold an even 60 Hz where 120 Hz will not fit.
+- **The open and close motions run at about 100 frames a second here, 31
+  frames in all.** Under TCG they show 4. The motion itself was never the
+  problem; the emulator was.
+
+The arm64 desktop's text layout is wrong in these captures, and it is the same
+before this work: see TODO.md.
+
+## After P1 (3641c51)
+
+What changed:
+
+- **A frame clock.** A kernel thread composes once a frame: presents, moves
+  and the pointer record damage (up to 16 rectangles), and the thread composes
+  what is waiting, on the beat while something moves and at once when the
+  desktop has been still. The beat is phase-locked, so it does not drift by
+  each frame's cost.
+- **Applications wait instead of sleeping.** An app with nothing to draw blocks
+  until input or a window event concerns it; an animating one waits for the
+  compositor's next frame (`em_wait_input`, `em_wait_frame`; syscalls 161 and
+  162). Nothing polls every 5 ms any more.
+- **The rate adapts.** Motion under a hand gets the display's top rate; an app
+  that asks for a rate (syscall 163) gets the slowest whole fraction of the
+  refresh at or above it, or exactly that rate on a VRR display; everything
+  else gets 60. A governor holds the rate to what a frame's cost allows (three
+  quarters of the period), and the Efficiency profile holds it to 60. The
+  policy is one pure function (`kernel/gfx/frameclock.c`, `make
+  frameclock-test`). No display here reports 120 Hz or VRR, so `perf display`
+  simulates both.
+- **The pointer is on virtio-gpu's cursor plane.** Moving it composes nothing.
+- **The compositor drags windows.** An app declares the regions it is dragged
+  by (syscall 164); the compositor moves the window in the frame the pointer
+  moves, with no round trip to the app and no re-render. The toolkit declares
+  its title bars.
+- **The beat lands on the nanosecond.** The frame thread sleeps to an instant,
+  not a millisecond, and the sleeping core's timer is armed for it. The kernel
+  also learns how late its timer is: under HVF the interrupt came 0.9 ms late
+  on average and 2.2 ms at worst, because the host coalesces the timer that
+  wakes an idle vCPU, while the kernel then took 25 µs to run the thread. A
+  precise sleeper is woken that much early and spins out the rest -- the lead.
+  On hardware with an exact timer it settles at microseconds.
+- **The frame thread reserves only what it uses.** It holds a deadline
+  reservation sized to its frames' cost (half again, plus the lead), and only
+  while frames keep coming. At first it took half of every period from boot:
+  500 of the 700 permille the machine admits, held on a still desktop, and
+  `test-arm64-boot`'s deadline check failed because the test's periodic thread
+  was refused.
+
+### x86 under TCG, against P0
+
+| Scene | Composes | Pixels | Compose p95 | Pointer p95 |
+|---|---|---|---|---|
+| Idle, 10 s | 0 → 1 | 0 → 0.03 Mpx | — | — |
+| Pointer sweep | 453 → **0** | 1.1 → 0 Mpx | 0.3 ms → — | 0.7 → 0.02 ms |
+| Drag Settings | 184 → **57** | 79.8 → 39.6 Mpx | 23.8 → 24.7 ms | 23.8 → 0.02 ms |
+| Launcher | 6 → 3 | 5.5 → 3.1 Mpx | 31.4 → 30.9 ms | — |
+| Terminal open + close | 44 → 19 | 10.6 → 8.1 Mpx | 32.9 → 208.5 ms | 14.1 → 0.01 ms |
+
+Reading it:
+
+- **The one idle compose is an application's present** (the top bar's clock
+  turning a minute in the window), not the compositor's.
+- **A drag is one compose per pointer step.** 55 steps, 55 pointer composes,
+  and the dragged app presented nothing (two presents in the scene are other
+  windows).
+- **The open + close p95 is an animation frame.** P1 composes three frames
+  of the window's motion where P0 managed one under TCG, each about 90 ms
+  here and the slowest 208 ms: the moving window and everything under it.
+  arm64 composes the same frames in under 3 ms (below). P2 replaces this
+  motion.
+
+### arm64 under HVF, against P0
+
+| Scene | Composes | Compose p50 | Compose p95 | Pointer p95 | Frames |
+|---|---|---|---|---|---|
+| Idle, 10 s | 0 → 1 | — | — | — | 0 → 1 |
+| Pointer sweep | 453 → **0** | 0.05 ms → — | 0.12 ms → — | 0.10 → 0.03 ms | 452 |
+| Drag Settings | 462 → **57** | 1.97 → 2.08 ms | 2.33 → 4.90 ms | 1.89 → 0.02 ms | 60 |
+| Launcher | 10 → 8 | 2.23 → 2.25 ms | 2.46 → 2.61 ms | — | 13 |
+| Terminal open + close | 51 → 23 | 2.73 → 2.43 ms | 3.07 → 2.99 ms | 0.23 → 0.01 ms | 41 |
+
+### The beat
+
+Three seconds of frames on the clock alone (`perf beat 3`), and the drag at a
+simulated rate. Interval median and 95th percentile; the target is a p95 within
+1 ms of the period.
+
+| | Rate | Beat p50 | Beat p95 | Late p95 | Lead |
+|---|---|---|---|---|---|
+| arm64 HVF, beat | 60 Hz | 16.67 ms | 16.98 ms | 0.31 ms | 1.4 ms |
+| arm64 HVF, beat | 120 Hz | 8.33 ms | 8.84 ms | 0.51 ms | 1.4 ms |
+| arm64 HVF, drag | 120 Hz | 8.48 ms | 9.56 ms | 1.02 ms | 1.0 ms |
+| arm64 HVF, drag | VRR 48-120 | 8.32 ms | 8.95 ms | 0.64 ms | 1.3 ms |
+| x86 TCG, beat | 60 Hz | 16.66 ms | 20.37 ms | 4.33 ms | 3.0 ms |
+| x86 TCG, beat | 120 Hz | 8.34 ms | 9.50 ms | 1.21 ms | 2.9 ms |
+
+How the 120 Hz beat got there under HVF (p95 of the interval, one run or the
+range over several):
+
+| Step | p95 |
+|---|---|
+| Nanosecond sleeps, the timer armed for them at a core's next re-arm | 11.45 ms |
+| The sleeping core's timer armed for the instant at once | 9.63–10.70 ms |
+| The timer's lateness learned and spun out | 8.80–8.94 ms |
+
+The beat was first measured with nanosecond sleeps; the millisecond clock
+before them was not measured this way.
+
+What it says:
+
+- **On a real core the clock keeps 60 and 120 within the target.** Beat medians
+  are the period to the hundredth of a millisecond.
+- **The lead is what that costs: about 1.4 ms spun per frame under HVF**, 17%
+  of a core at 120 Hz while something moves, and nothing while the desktop is
+  still. On hardware whose timer fires when armed it is microseconds.
+- **TCG's timer is later than the lead may cover** (it may spin at most 3 ms),
+  so its 60 Hz p95 stays 3.7 ms off. TCG times are the emulator's.
+- **A drag's beat is the hand's.** The drag's composes follow the pointer's
+  steps, so its interval is the input rate's wherever that is slower than the
+  display.
+
+## Motion (P2): what it costs
+
+P2 put window motion, scrolling and the toolkit on springs
+([CONTOUR_DESKTOP.md](CONTOUR_DESKTOP.md#motion-on-springs)). What that adds to a frame:
+
+- **Springs themselves: nothing measurable.** Integer arithmetic, 960 substeps
+  a second of motion per spring, a few multiplies each.
+- **A window in flight composes its ghost and what is under it, every frame it
+  moves.** Open and close: 11-12 motion frames under HVF against P1's 8, at
+  about the cost of a compose of the same area; they land within half a pixel
+  rather than crawling the last one.
+- **The ghost is filtered (bilinear) while the frame can afford it**: 1.15 ms
+  against 0.19 ms nearest for a 980 x 660 window at 88% on an M5 core, scalar
+  (`make pix-bench`) -- six times. The compositor filters only while the last
+  frame cost under half its period, so under TCG (23 ms frames) ghosts stay
+  nearest and under HVF they are filtered.
+- **A notch of the wheel is a glide**: 19 frames of the scrolled view under HVF
+  where it was one, each a present of what moved.
+
+
+## The effects governor (P3)
+
+What a frame can afford decides what it draws. The compositor has two
+effects tiers:
+
+| Tier | Materials | Shadows |
+|---|---|---|
+| Full | a window or bar that shows through blurs what is behind it | key and ambient layers |
+| Reduced | a flat tint of the desktop's own colour behind it, no blur to compute; an app's own glass (the library, menus) its tint made whole | the tight ambient layer alone |
+
+The rate governor (P1) and this one share their measure, what frames cost,
+but effects are judged against a **60 Hz frame**, not the period of the
+moment: the rate governor stretches that when frames are dear, and effects
+judged by it would come back exactly when the rate had given way. Effects
+give way first; the rate only once even reduced effects cannot keep 60.
+
+- **Down** when the cost of frames that compose, averaged (a quarter each),
+  stays over half a 60 Hz frame for 150 ms: a drag of something heavy, not one
+  dear frame (an app's first, a big ghost), which would change every shadow
+  on the screen for nothing. A frame that composes nothing (the hand between
+  two reports) does not count; a quarter of a second of stillness ends a run.
+- **Up** once frames cost under a quarter of a 60 Hz frame and the reduced
+  tier has held for a while: two seconds, doubled (to sixteen) each time full
+  effects come back only to be too much again at once.
+- A change repaints the screen, itself a heavy frame, which the half second
+  after a change does not count.
+- **Settings > Appearance > Effects** holds it: Automatic, Full or Reduced
+  (`EMBK_DESKTOP_EFFECTS_*`); `perf effects auto|full|reduced` from the
+  console. `perf` reports `effects` (0 full, 1 reduced), `effects_mode` and
+  `effects_steps`; the overlay says `-fx` while reduced.
+
+Observed: under HVF the whole of `tools/motion_smoke.py` -- opens, flights,
+zooms, slides -- never leaves the full tier. Under TCG, where dragging
+Settings costs 11-20 ms a frame, `tools/effects_smoke.py` sees it step down
+during the drag and back up once the hand is still (fourteen steps over the
+run, most of them app launches), and holds either tier when told to.
+
+## The toolkit's own frame: the library's entrance
+
+The compositor's numbers above say nothing about what an app pays to draw its
+frame. The library (GUI+Space) comes in on a spring over a dimming scrim, so
+every frame of its entrance repaints the whole desktop in the desktop's own
+process. Measured there, on one M5 core under HVF (`embk_thread_cpu_ns` around
+`scene_render_frame`):
+
+| | Render per frame | Frames shown in its entrance |
+|---|---|---|
+| Before | 43-66 ms | 5 |
+| After | 17 ms | 52 (captures 10 ms apart) |
+
+Where it went, and what changed:
+
+- **The wallpaper is a full-screen linear gradient**, and a gradient pixel cost
+  two trig calls, a search of its stops and a float blend. Now an opaque
+  gradient's colour comes from a 512-entry table along it, `t` steps along
+  each row, and a 4 x 4 ordered dither spends the table's extra bits so wide
+  dark sweeps do not band. It was also projected from the rect's corner rather
+  than its centre, so every gradient showed only the second half of its stops;
+  the wallpaper now shows all of its own.
+- **The sheet's glass re-blurred 720 x 536 pixels a frame** (it fades over a
+  scrim that changes under it). The box blur divided four times a sample and
+  walked columns a row's stride apart; it now multiplies by a reciprocal and
+  runs the vertical pass row by row with a sum per column. From a radius of 6
+  it blurs at half resolution (averaged down 2 x 2, half the radius, filtered
+  back up), which does not show at that radius; the interior is written back
+  without a coverage test, and the backdrop is read a row at a time.
+- What remains: rect fills (the scrim and wallpaper among them) about 5 ms,
+  the blur about 6, drawing the scaled sheet about 4, shadows about 1.
+
+## The toolkit's own frame: a page scrolling
+
+Settings scrolled by the wheel, 24 notches over its pane, measured the same way
+(`embk_thread_cpu_ns` around `scene_render_frame`, batches of 30 frames, one
+M5 core under HVF):
+
+| | Render per frame (batch averages) | Worst frame |
+|---|---|---|
+| Before | 2.85-3.84 ms | 8.7 ms |
+| After | 0.44-1.23 ms | 2.9 ms |
+
+The renderer has had a scroll blit for a long time -- copy the rows the view
+already has, paint the strip the move uncovered -- and on a page like Settings
+it was almost never taken. Three things stood in the way, and one more made it
+dear when it was:
+
+- **The scroll bar's thumb.** The blit wanted every move in the frame to be the
+  same one, and the thumb moves the other way, a fraction as far. Every page
+  with a bar -- every page that scrolls -- vetoed itself. The scroll's delta is
+  now the one most of the moves share; a node that moved another way is held to
+  what a content change is held to (it must lie outside the blitted region) and
+  repaints as its own rect.
+- **Fractional moves.** A glide sits between pixels, and so does the last step,
+  clamped to the end of the page. No copy can reproduce a move of 73.8 px, and
+  copying by 74 left every glyph in the view 0.2 px off. A scroll view now
+  shifts its content by whole pixels (`ui_set_scroll_offset`; its spring keeps
+  its fractional state), and the blit refuses a fractional move outright.
+- **Two edge blends in one rect.** A rect's side columns took a gamma blend
+  when it lay wholly inside its clips and its top and bottom rows a plain one,
+  and every pixel took the plain one once it did not. So a row drew its edges
+  differently the moment it slid under the clip's edge -- a picture that
+  depends on where the clip is cannot be scrolled by copying. And the gamma
+  blend linearised the paint's alpha as well, so a translucent row had a
+  lighter one-pixel seam down both sides. Now there is one: the paint over the
+  ground in sRGB, as the interior is, and only coverage in linear light.
+- **The dirty bounding box.** Taken, the blit was dearer than painting it all
+  (4.1 ms against 1.6 on the host): every primitive was clamped to the box
+  around the dirty rects, and a strip at the bottom of a view plus a band at
+  its top is the whole view, so the page's background walked every pixel of it
+  through the per-pixel test and the exact edge path for nothing. Rects now
+  walk, row by row, only the spans of the dirty rects that cross it (merged, so
+  a translucent fill is never blended twice where two rects overlap).
+
+`make kit-test` scrolls a page under a bar for 420 frames on a fake clock --
+down, at rest against the end, back up -- and holds every frame that moved to
+the blit and every frame to what painting it from nothing gives (a corner pixel
+may round one level the other way; float geometry at positions a whole pixel
+apart). On the renderer before this, 24 of its 244 moves were blitted and those
+left 144,850 pixels wrong. `tools/scroll_smoke.py` scrolls Settings down and
+back on a real desktop and requires the pane to come back the same picture.
+The browser's own scroll-blit check (`make web-corpus`) said "the blit path was
+never exercised" on three corpus pages; it passes on all three now.
+
+## What the applications pay for motion (P7 M0)
+
+Everything above is the compositor's side. The other half is what an
+application spends drawing its own motion, and that is what P7 (layers) is
+for: today every menu, tooltip and the library is repainted by its app, frame
+by frame. `perf apps on` on the serial console makes every toolkit runtime say
+what each run of frames cost it (`ui/dsl/em_prof.h`: thread CPU time for
+building, layout, painting and presenting, the frames that repainted
+everything, the pixels handed over); `tools/app_prof_smoke.py` plays the
+motions and sums them. arm64 under HVF, one M5 core:
+
+| Scene | App | Frames | Full repaints | Paint (avg / worst) | Pixels presented |
+|---|---|---|---|---|---|
+| Top-bar menu, open and Esc | TopBar | 41 | 25 | 1.14 / 2.80 ms | 24.0 M |
+| Files context menu, open and Esc | Files | 29 | 19 | 1.22 / 2.18 ms | 11.6 M |
+| Close-button tooltip | Settings | 46 | 2 | 0.13 / 2.50 ms | 1.3 M |
+| The library, in and out | Desktop | 58 | 23 | 5.12 / 18.4 ms | 23.6 M |
+| A glide along the dock | Desktop | 216 | 2 | 0.48 / 6.28 ms | 4.2 M |
+| Eight notches down and back | Settings | 161 | 0 | 0.56 / 1.22 ms | 58.5 M |
+
+A small menu costs its app two dozen whole-window repaints, because opening
+and closing one changes the structure (every structural change repaints the
+window) and the drop-in is an opacity-and-scale group that re-renders its whole
+subtree into scratch every frame. The top bar's window is a tall transparent
+canvas that holds its dropdowns, so each of those repaints is most of a
+screen. The library repaints the whole desktop for a third of its frames. The
+desktop also builds a frame in every scene (about 35 a scene, 60 us each, no
+pixels) -- the clock and the dock's hover checks; cheap, but not nothing.
+
+### M1: groups keep their pixels, and a moving group is not the whole window
+
+Three changes in the toolkit's renderer (`ui/backend/scene_render.c`):
+
+- **A group's children were culled against the wrong coordinates.** Inside an
+  opacity or scale group the subtree is painted into a buffer of its own, and
+  each child's footprint -- in that buffer's coordinates -- was tested against
+  the frame's dirty rects, which are the window's. On any frame that was not a
+  full repaint, a group away from the window's origin lost the children that
+  test missed. It hid behind the next item, which made nearly every animating
+  frame a full repaint. A group's buffer is now painted whole (`no_cull`), and
+  footprints are tested in the window's coordinates (`make backend-test` T17).
+- **At the 16-rect cap the dirty rects merge** into the rect that grows least,
+  where they used to give up and repaint everything. A group moving is every
+  one of its children moving, each adding its old place and its new one (T19).
+- **A group keeps its flattened pixels** (`struct group_cache`): while nothing
+  inside it changes but its opacity, its scale and where it stands by whole
+  pixels, a frame composites the kept buffer instead of painting the subtree.
+  Glass inside a group is not kept -- what it shows depends on what is behind
+  it. `dirty_look` tells a node's look changing from its compositing changing;
+  `scene_set_corner_radius` is a real setter now (the declare layer wrote the
+  field and marked it a move). T18: a group fading, growing and moving for 21
+  frames is painted twice and composited 19 times, every frame equal to
+  painting it whole.
+
+The same scenes, arm64 under HVF:
+
+| Scene | App | Full repaints (M0 -> M1) | Pixels presented | Paint avg |
+|---|---|---|---|---|
+| Top-bar menu | TopBar | 25 -> 2 | 24.0 M -> 4.1 M | 1.14 -> 0.93 ms |
+| Files context menu | Files | 19 -> 1 | 11.6 M -> 1.8 M | 1.22 -> 0.88 ms |
+| The library | Desktop | 23 -> 9 | 23.6 M -> 32.8 M | 5.12 -> 4.06 ms |
+
+(The M1 run was a noisier machine: an idle desktop frame built in 80-90 us
+against 50-60 in M0, so the paint times flatter M0.) The menus still paint
+about 0.9 ms a frame: their drop-in is glass, which blurs what is behind it and
+so cannot be kept -- that is what the compositor's layers are for (M3, M4).
+The library presents more pixels for fewer full repaints: home presents one
+bounding rect of its dirty rects, and merged rects around a near-full-screen
+sheet bound most of the screen. It is M6's.
+
+### M2: the compositor draws a picture with its own alpha
+
+A window's pixels are opaque to the compositor -- the alpha they carry is
+ignored, which is why only opaque windows ever flew. A layer is a menu or a
+toast, whose rounded corners and soft edges ARE its alpha. `pix_scale_over_row`
+filters all four premultiplied channels between texel centres, fades them and
+composites over; `fb_blit_scaled_over` walks it (and `pix_over_fade_row` at
+the picture's own size). Each step rounds to the nearest level, and
+`make pix-test` holds the row against exact arithmetic beside soft_compose.c's
+`sc_draw`, the virgl shaders' letter: both are 3.03 levels from exact at
+worst, the quantised filter position's floor, and within 4 of each other.
+`make pix-bench`, one M5 core, scalar as the kernel is built:
+
+| A 260 x 400 layer at 94 %, opacity 0.6 | Time |
+|---|---|
+| Filtered | 0.52 ms |
+| Nearest (the governor's choice when frames are dear) | 0.28 ms |
+| At its own size, where every motion lands | 0.23 ms |
+
+### M3: layers -- the compositor moves a piece of a window by itself
+
+`user/lib/embk_layer.h`, syscalls 166-168. An application paints a piece of its
+interface once into a layer of its window (`embk_layer_create`: pages mapped
+into it, as a shared window's are), says where the layer goes and how --
+position, opacity and scale, each on a spring, from where to where, in one
+`embk_layer_set` held for the layer's next `embk_layer_present` -- and goes
+back to sleep. The compositor's frame thread steps the springs, damages old and
+new places and draws the layer just above its window's content
+(`fb_blit_scaled_over` on the CPU, a non-opaque draw on virgl and Intel), at
+the display's rate. A layer may reach outside its window; the pointer over its
+opaque pixels goes to the window, at window coordinates that may then be
+negative or past its size. A finished layer is parked with its pages and the
+window's next layer that fits takes them back.
+
+`tools/layer_smoke.py` runs `user/tests/layerdemo`, an app that paints a
+window and a card once and then sends the card in and out every 1.5 s with
+one call, sleeping in between. arm64 under HVF:
+
+| | |
+|---|---|
+| Caught part-way, the app asleep | opacity 138, scale 0.972 |
+| Frames while it moved | 122; interval p50 16.67 ms, p95 18.26 ms on a 16.67 ms beat |
+| The app's presents meanwhile | 0 |
+| A click on the card, below the window | reached the app |
+| The app ends | its layer is gone |
+
+The same passes on x86 under TCG and composed by virgl in the Lima VM, and
+`tests/drivers/compose_checks.h` holds both GPU backends to a scaled, faded
+picture keeping its own alpha.
+
+### M4: menus and tooltips on layers
+
+A subtree can be PROMOTED (`ui_set_promoted`, `scene_node.promoted`): where the
+application runtime has layers, the renderer leaves it out of the window and
+paints it once into a layer -- its shadow in it, and its glass frosted from the
+window behind it -- with an appear motion and a disappear motion the
+compositor plays. EmUI promotes its menus, context menus and tooltips; the
+menu panel is built at rest and every frame of its drop-in is the
+compositor's. Once the subtree is gone the layer still leaves, so menus and
+tooltips now fade OUT as well (before, a menu vanished and a tooltip popped).
+The runtime (`em_app.c`) hands the layers to the compositor, only for windows
+that do not show through (their glass would frost nothing), and keeps them
+across its structural repaints. Two things it took:
+
+- **A blend for edges over transparency.** `blend_cov` blended coverage in
+  linear light against what was there -- over a transparent buffer, a colour
+  boosted past its own alpha, which composited a bright fringe round every
+  rounded edge painted into a layer or an opacity group. Over a transparent
+  destination coverage is now plain alpha, as Core Animation's layers have it.
+- **Settling before arriving.** A menu measures its place against the frame
+  before, so its first frame stands somewhere else; a layer sent in from there
+  and then told where it is would jump and lose its arrival. A promoted
+  subtree waits, unpainted, until it stands still two frames running.
+
+`make backend-test` T20 holds the contract with a fake host (painted once, the
+window under it untouched, the layer over the window equal to painting it in
+place away from its outline, a frame with no change asking nothing, a move
+moving without repainting, a change repainting without moving, a leave
+leaving). `tools/layer_menu_smoke.py` opens Files' context menu: caught
+arriving at opacity 130 and scale 0.971, Files building 6-9 frames for it, Esc
+and the layer leaves after the toolkit has forgotten it. The same scenes as
+M0, arm64 under HVF:
+
+| Scene | App | Frames (M0 -> M4) | Full repaints | Pixels presented |
+|---|---|---|---|---|
+| Files context menu | Files | 29 -> 9 | 19 -> 1 | 11.6 M -> 1.2 M |
+| Close-button tooltip | Settings | 46 -> 46 | 2 -> 0 | 1.3 M -> 0 |
+
+The menu's one full repaint is its opening, which EmUI marks a structural
+change (the epoch); the menu is no longer in the window, but the window is
+repainted once anyway. The tooltip's frames are the hover the app watches for
+its delay; none of them paints. The top bar's menus are not promoted: the bar
+is a window that shows through, and their glass must frost the desktop under
+it, which needs a layer material in the compositor (M3's open item).
+
+### M5: sheets arrive, and what paints nothing marks nothing
+
+- **Sheets.** On layers an EmUI dialog arrives from 0.95 of its size about
+  its middle and 8 px low as it fades in, on a slightly springy curve, and
+  sinks back out when dismissed; the scrim behind it dims at once, as before.
+  Without layers it appears where it stands, as it always did.
+- **A menu opening is an ordinary frame.** EmUI marked menus opening and
+  closing as structural changes, which the runtime answers with a repaint of
+  the whole window; on layers the menu is not in the window, and they no
+  longer are.
+- **A node that paints nothing stains nothing.** A group, or a box with no
+  fill, border, shadow or glass that does not clip, used to mark its whole
+  area when it came, went or moved -- a menu's window-sized transparent scrim
+  opening repainted the window. Its children mark their own changes; when its
+  opacity or scale changes (`dirty_comp`), its subtree's footprint is marked,
+  for every pixel of it is new. `make backend-test` T21.
+
+Files' context menu on arm64 under HVF, opened and dismissed in an open
+window: 0 full repaints (M0: 19) and 0.79 M pixels presented (M0: 11.6 M), the
+rest being the hover the pointer crossing its rows draws.
+
+### M6: the library on layers
+
+The desktop (`home.c`, which runs its own loop) takes the same layer host as
+every EmUI app (`em_layers_attach`), so its menus and tooltips are layers too,
+and the library is two: the dimming, a screen-sized layer that fades, and the
+glass sheet over it, which rises from 0.94 of its size and 12 px low as it
+fades in. Both are painted once and leave on the compositor's springs; the
+library is built at rest, as one piece -- its tiles no longer stagger in (each
+would be a layer of its own) -- and closes in the toolkit at once. The
+compositor stacks a window's layers in the order they were made, whatever
+slot they took. On layers opening the library is no longer a structural repaint
+of the desktop's window either.
+
+`tools/layer_library_smoke.py`: both layers there and at rest, the sheet
+caught arriving, a name typed and Return still launches the application, Esc
+and both leave. arm64 under HVF:
+
+| The library, in and out | M0 | M6 |
+|---|---|---|
+| Desktop frames | 58 | 39 |
+| Full repaints | 23 | 4 |
+| Paint, average | 5.12 ms | 1.01 ms |
+| Pixels presented | 23.6 M | 4.1 M |
+
+What remains: the library's first frame paints the sheet's glass and the
+screen-sized dimming into their layers (its worst frame, 13.7 ms), and the
+search field's blinking caret repaints the whole sheet layer each blink. The
+compositor now composites a screen-sized translucent layer each frame of the
+fade -- on the GPU nothing, on the CPU about a millisecond a megapixel on an
+M5 core.
+
+### Glass on layers: the compositor frosts what is really behind
+
+A layer can now have a MATERIAL (`EMBK_LM_BLUR`, with the box of the layer it
+covers -- the glass panel, not the shadow painted round it -- and the radius
+that rounds it). Drawing the layer, the compositor blurs the screen as composed
+so far under that box, keeps the sharp backdrop outside its rounded corners,
+fades the frost with the layer, then lays the layer's pixels over it; on the
+GPU, its blur primitive with the radius. A repaint that touches a material
+layer covers its box whole (`region_grow_layers`). The toolkit paints a
+promoted glass root's tint alone and asks for the material (the host's
+`look`), so a menu frosts what is behind it on the screen -- another window
+too -- not only its own window's pixels, and a window that shows through can
+have layers at last: the top bar's menus are layers now.
+
+| Top-bar menu, open and Esc (arm64 under HVF) | M0 | Now |
+|---|---|---|
+| TopBar frames | 41 | 22 |
+| Full repaints | 25 | 0 |
+| Pixels presented | 24.0 M | 0.4 M |
+
+### A change inside a layer repaints only what it changed
+
+A promoted subtree used to be painted whole into its layer whenever anything in
+it changed -- a hover moving down a menu repainted the menu, the library's
+blinking caret repainted the whole sheet. The renderer now keeps where each of
+its nodes painted last; with the same nodes in it, the old and new places of
+those that changed are cleared and painted again (clipped to them, up to 16
+rects merged) and presented alone. A new shape, a group inside changing how it
+composites, or baked glass under a changed window repaint it whole as before.
+`make backend-test` T23: a hover and a move inside a 24-row menu are partial
+repaints, and the layer then equals painting it whole. arm64 under HVF, paint
+a frame: the top bar's menu 0.37 -> 0.17 ms, Files' context menu 0.41 -> 0.20,
+the library 1.01 -> 0.74.
+
+### A dimming is a fill
+
+A layer can be a FILL (`EMBK_LF_FILL`): one pixel, its colour, standing as
+large as it says. The compositor draws it as a uniform blend of that colour
+over its rect (on the GPU a one-pixel image stretched), so the library's
+dimming is no longer a 4 MB picture of one colour, painted in the desktop's
+first frame of it and presented. The renderer makes a fill of any promoted box
+of one colour with nothing in it (backend-test T24). The library on arm64
+under HVF: paint 0.74 -> 0.15 ms a frame, the dearest frame 10.5 -> 5.2 ms,
+the desktop's full repaints 4 -> 0 and the pixels it presents 4.1 M -> 0.
+
+### A wake at a time: toasts on layers, and a tooltip's delay
+
+Something that changes on a clock but not between -- a tooltip due 600 ms
+after the pointer stops, a toast due to leave 2.5 s after it rose -- asked
+for a frame every frame until then, so the app built sixty frames a second to
+learn nothing. `em_wake_at(ms)` asks instead for one frame at that time: the
+runtime's idle wait (em_app, the widget runtime and the desktop's loop) sleeps
+no later than the soonest wake. A toast on layers is promoted, built once at
+rest, and woken when its time is up -- the frame that stops building it, so
+the compositor sinks it out (em-test). Files raises one for Copy and Move to
+Trash; `tools/layer_menu_smoke.py` copies a file: Files builds 2 frames while
+"Copied" stays, where it built one a frame. The close button's tooltip in
+Settings (arm64 under HVF, `tools/app_prof_smoke.py`): 46 frames -> 12.
+
+### A layer inside a layer: the sheet's dimming fades
+
+A sheet arrived on its spring over a dimming that was simply there: the scrim
+was the window's pixels, and promoting it would have taken the sheet into its
+window-sized layer, since a promoted subtree's descendants were its pixels. A
+promoted node inside another is now a layer of its own, made after the one
+round it (a window's layers stack in the order they were made) and left out of
+its pixels, footprint, signature and damage. So the dimming is a fill layer --
+one colour, the window's size, though the sheet is inside it -- that fades in
+and out on its own motion while the sheet rises and sinks on its own, and a
+change in the sheet does not touch it. A layer round others made again (the
+window resized) makes them again above it, where they stood, with no second
+arrival. `make backend-test` T25; `tools/layer_menu_smoke.py` opens Move to
+Trash's sheet in Files on arm64: the dimming a 1000 x 600 layer under the
+sheet's 436 x 242, caught fading in and out.
+
+That smoke found a bug the menus had worked around by hand: a promotion
+outlived its declaration. An unkeyed overlay's instance, met again as the row
+after it once the overlay had gone, stayed promoted, and Files' status line
+became two layers nobody asked for. A box is a layer now only in a frame that
+says so (`make declare-test` T10).
+
+### The library's rows, a beat apart, on the compositor's clock
+
+The library's tiles used to rise in one after another, each offset by the
+desktop on every frame of the entrance; on layers the sheet was one picture
+and they came in together. A layer's springs can wait now (`delay_ms` in the
+op, the reserved field it replaces: old clients say 0), and the library is
+built as rows, each a layer of its own over the sheet's (a layer inside a
+layer, above) while it arrives: the first 40 ms after the sheet, each next one
+45 ms after that, 16 px up as it fades in. A layer is not clipped by the
+scroller, so only rows wholly in view, and only for the entrance: two seconds,
+or until the list scrolls -- then a wake, and they are the sheet's pixels
+again. The columns are said outright (each row's grid would size its own).
+`tools/layer_library_smoke.py` slowed by four on arm64 under HVF: two rows
+caught at once at alpha 155 and 73, and the library still launches what is
+typed. The desktop now honours the renderer's request for a settling frame
+(`wants_frame`), which it had never read.
+
+### Vibrancy on the GPU, and once on the CPU
+
+The GPU's blur primitive saturates its last pass (`sat`, in 256ths:
+PIX_VIBRANCY) -- in the blur shader on virgl, in `sc_blur` on Intel -- so the
+windows' glass and materials, the translucent bars and the layers' frost are
+saturated on the GPU as they are on the CPU. Compose check 7c (a block of one
+colour blurred, against pix_saturate_row's arithmetic, within 3) passes on
+virglrenderer and on the Intel engine model. On the CPU a layer's frost had
+been saturated TWICE since its vibrancy went in: `fb_blur_region` already
+saturates, and the extra pass (1.7 x 1.7, nearly 2.9) is gone.
+
+### A layer's frost, kept
+
+A glass layer at rest blurred what was under it on every repaint that touched
+it -- a hover moving down the top bar's menu, its caret -- though what it
+stands on had not changed. Its frost is kept now as a window material's is: a
+repaint reads what is behind the material box, compares it with what was there
+(`fr_sharp`), and lays the kept blur back when nothing changed; when something
+did, it is blurred again whole (the same box blur and saturation, so it looks
+as it did) and the rest of the box is shown in the same frame. A repaint no
+longer has to cover the whole box while the frost is kept. CPU only (the GPU
+blurs as it draws); not while the layer moves or fades. `perf windows` counts
+them (`perf: frost made= kept=`); `tools/layer_menu_smoke.py` on arm64: a
+hover down five rows of the top bar's menu blurred 0 times and laid the frost
+back 13.
+
+### The close pull, moved by the compositor
+
+Pulling a window's close grip repainted the whole window on every frame of
+the drag and of the spring back (em_app forced full repaints while
+`em_window_pulling`). On layers the content is a layer while it is pulled:
+promoted where it already stands (an appear motion that changes nothing is a
+layer the same frame, with no settling), moved and faded by the drag, and let
+go short, sent home on a spring the compositor plays (`ui_set_layer_spring`);
+a wake then takes it back into the window -- whose pixels are presented first,
+the layer let go after (`scene_render_after_present`), so no frame shows
+neither. Pulled past the threshold, the content goes back into the window and
+is presented before it closes, so the window flies away with its picture.
+`tools/layer_pull_smoke.py` (v7demo, arm64 under HVF): the content a 560 x
+460 layer 12 px toward the hand at alpha 161; let go, caught at 371 on its way
+home to 360, the app presenting twice for all of it; pulled on, it closes.
+(No syscall 169: a window's content is a layer like any other.)
+
+### A bar's window grown for its menus, cleared
+
+Opening the top bar's menu grows its window to the screen (its dismiss surface
+catches a click anywhere). That grown window was cleared by the structural
+frame a menu opening used to be; on layers it is an ordinary frame, and the
+new rows kept what `realloc` gave them -- an old frame, grey, over the whole
+screen below the bar while a menu was open (gallery 234 shows it). A resize of
+that window is a full, cleared repaint again.

@@ -12,6 +12,8 @@
 #include "kit.h"
 #include "font.h"
 #include "testfont.h"
+#include "backend.h"
+#include "scene_render.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -177,6 +179,59 @@ static void scroll_wrapped(float *sc) {
     struct instance_handle content=ui_open();
     wrapped_last=ui_next_sibling(ui_first_child(content));
     ui_end_stack();ui_scroll_end();ui_frame_end();ui_run_layout(140,80);
+}
+
+/* ONE FRAME of a 100 px view over 400 px of rows, the pointer over it and
+ * `notches` of wheel fed first -- at time g_ms. */
+static int g_frames_asked;
+static void ask_frame(void) { g_frames_asked++; }
+static uint64_t motion_clock(void) { return g_ms; }
+static void glide_frame(float *sc, float notches) {
+    ui_pointer(200, 50, false);
+    if (notches != 0.0f) ui_wheel(notches);
+    ui_frame_begin();
+    ui_scroll_begin(0x5C403, 100, sc);
+    for (int i = 0; i < 20; i++) {
+        ui_box_begin((uint64_t)(i + 1));
+        ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                    (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 20 });
+        ui_box_end();
+    }
+    ui_scroll_end();
+    ui_frame_end();
+    ui_run_layout(400, 300);
+}
+/* frames every 8 ms for `ms`: what a 120 Hz loop asked by the view does */
+static void glide_for(float *sc, unsigned ms) {
+    for (unsigned t = 0; t < ms; t += 8) { g_ms += 8; glide_frame(sc, 0); }
+}
+
+/* A page that scrolls under a bar: rows of rounded, coloured boxes with a line
+ * of text each, on a ground, at a height that is not a whole number of
+ * pixels -- the shape of every settings pane and document view. */
+static void blit_page(float *sc, float notches) {
+    ui_pointer(150, 100, false);
+    if (notches != 0.0f) ui_wheel(notches);
+    ui_frame_begin();
+    ui_box_begin(0xB117);          /* a window's ground: it covers the whole surface */
+    ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 400 },
+                (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 300 });
+    ui_set_paint((struct paint){ .kind = PAINT_SOLID, .solid = { 0.11f, 0.12f, 0.13f, 1 } });
+    ui_scroll_begin(0xB118, 200, sc);
+    for (int i = 0; i < 30; i++) {
+        ui_box_begin((uint64_t)(0xB200 + i));
+        ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                    (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 23.3f });
+        ui_set_corner_radius(5);
+        ui_set_paint((struct paint){ .kind = PAINT_SOLID,
+                     .solid = { 0.2f + 0.02f * (float)(i % 7), 0.3f, 0.5f - 0.03f * (float)(i % 5), 0.8f } });
+        ui_text("row %d", i);
+        ui_box_end();
+    }
+    ui_scroll_end();
+    ui_box_end();
+    ui_frame_end();
+    ui_run_layout(400, 300);
 }
 
 static float nav_scroll;
@@ -671,6 +726,122 @@ int main(void) {
         sc=100000;scroll_wrapped(&sc);scroll_wrapped(&sc);
         CHECK(ui_rect_of(wrapped_last,&x,&y,&w,&h) && y>=-1 && y+h<=61,
               "scrolling reaches the final control after nested text wraps");
+    }
+
+    /* ---- THE WHEEL GLIDES -----------------------------------------------
+     *
+     * A notch moves where the view is going, and the view follows on a
+     * spring; fast notches go further; past an edge the content gives and
+     * springs back. Driven on a fake clock with the motion hookup the app
+     * runtime installs. */
+    {
+        static float sc;
+        ui_kit_motion(ask_frame, motion_clock);
+        sc = 0; g_ms += 5000;
+        glide_frame(&sc, 0); glide_frame(&sc, 0);          /* measured: the range is known */
+        g_frames_asked = 0;
+        glide_frame(&sc, -1.0f);                            /* one notch down */
+        CHECK(sc >= 0.0f && sc < 10.0f, "a notch does not jump: the first frame has barely moved");
+        CHECK(g_frames_asked > 0, "and the gliding view asks for the next frame");
+        glide_for(&sc, 64);
+        float mid = sc;
+        CHECK(mid > 10.0f && mid < 40.0f, "partway there 64 ms later");
+        glide_for(&sc, 600);
+        CHECK(sc == 40.0f, "and at rest on exactly 40 px, one notch");
+        g_frames_asked = 0;
+        g_ms += 8; glide_frame(&sc, 0);
+        CHECK(g_frames_asked == 0, "at rest it asks for nothing");
+
+        /* fast notches go further than the same notches turned slowly */
+        float slow0 = sc;
+        for (int i = 0; i < 3; i++) { g_ms += 300; glide_frame(&sc, -1.0f); glide_for(&sc, 600); }
+        float slow = sc - slow0;
+        g_ms += 1000; glide_frame(&sc, 0);
+        sc = 0; g_ms += 8; glide_frame(&sc, 0); glide_for(&sc, 600);   /* back to the top, set from outside */
+        CHECK(sc == 0.0f, "an offset set from outside is taken as where the view is");
+        for (int i = 0; i < 3; i++) { g_ms += 20; glide_frame(&sc, -1.0f); }
+        glide_for(&sc, 800);
+        printf("        (three slow notches: %.1f px, three fast: %.1f px)\n", slow, sc);
+        CHECK(slow == 120.0f && sc > slow, "three notches 20 ms apart go further than three turned slowly");
+
+        /* the rubber band at the top: it gives, then springs back */
+        sc = 0; g_ms += 8; glide_frame(&sc, 0); glide_for(&sc, 600);
+        g_ms += 8; glide_frame(&sc, 3.0f);                  /* three notches up, at the top */
+        glide_for(&sc, 64);
+        CHECK(sc < 0.0f && sc > -120.0f, "pushed past the top it gives, less than the push");
+        glide_for(&sc, 1000);
+        CHECK(sc == 0.0f, "and springs back to the edge when the wheel is still");
+
+        /* and at the bottom */
+        sc = 1e6f; g_ms += 8; glide_frame(&sc, 0); glide_frame(&sc, 0);
+        float bottom = sc;
+        CHECK(bottom > 300.0f && bottom < 1000.0f, "an offset past the end, set from outside, is put at the end at once");
+        g_ms += 8; glide_frame(&sc, -3.0f);
+        glide_for(&sc, 64);
+        CHECK(sc > bottom && sc < bottom + 120.0f, "pushed past the bottom it gives too");
+        glide_for(&sc, 1000);
+        CHECK(sc == bottom, "and comes back to the end");
+        ui_kit_motion(NULL, NULL);
+    }
+
+    /* ---- THE SCROLL BLIT -------------------------------------------------
+     *
+     * A scroll moves the pixels it already has and paints only the strip it
+     * uncovers. Two things kept that from ever happening on a real page: the
+     * bar's thumb moves the OTHER way as the content scrolls, and the renderer
+     * wanted every move in the frame to be the same one; and a glide (or the
+     * last step, clamped to the end) sits between pixels, which no copy can
+     * reproduce. So: frames that scroll are blitted, and every frame -- blitted
+     * or not, mid-glide or at rest -- is exactly what painting it from nothing
+     * gives. */
+    {
+        static float sc;
+        static uint32_t px[400 * 300], fresh[400 * 300];
+        struct render_target rt = { px, 400, 300, 400 * 4, 0, 0 };
+        struct render_target ft = { fresh, 400, 300, 400 * 4, 0, 0 };
+        struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+        ui_kit_motion(ask_frame, motion_clock);
+        sc = 0; g_ms += 5000;
+        int moved = 0, blitted = 0, wrong = 0, off_max = 0, at_end = 0;
+        float last = 0;
+        for (int f = 0; f < 420; f++) {
+            /* down a notch every 96 ms, then a rest at the end, then back up */
+            float notch = (f % 12 == 4 && f < 160) ? -1.0f : (f % 12 == 4 && f >= 320) ? 1.0f : 0.0f;
+            g_ms += 8;
+            blit_page(&sc, notch);
+            r.has_scroll_present = 0;
+            scene_render_frame(&r, &SA, ui_scene_of(ui_root()), &rt);
+            /* moved = the content did: it is shifted by whole pixels */
+            if ((long)(sc < 0 ? sc - 0.5f : sc + 0.5f) != (long)(last < 0 ? last - 0.5f : last + 0.5f)) {
+                moved++; blitted += r.has_scroll_present;
+            }
+            if (f == 319 && sc == last && sc > 400.0f) at_end = 1;
+            last = sc;
+            memset(fresh, 0, sizeof fresh);
+            struct scene_renderer r2; scene_render_init(&r2, cpu_backend_get());
+            scene_render_frame(&r2, &SA, ui_scene_of(ui_root()), &ft);
+            scene_render_destroy(&r2);
+            /* the same picture: a corner's distance is float arithmetic on a
+             * position that differs by whole pixels, and its last bit may
+             * round a channel the other way -- one level, never more */
+            int off = 0;
+            for (int i = 0; i < 400 * 300; i++) {
+                if (px[i] == fresh[i]) continue;
+                off++;
+                for (int sh = 0; sh < 32; sh += 8) {
+                    int d = (int)((px[i] >> sh) & 255) - (int)((fresh[i] >> sh) & 255);
+                    if (d > 1 || d < -1) { wrong++; break; }
+                }
+            }
+            if (off > off_max) off_max = off;
+        }
+        scene_render_destroy(&r);
+        ui_kit_motion(NULL, NULL);
+        printf("        (%d frames moved, %d blitted; at most %d pixels in a frame a level off a fresh paint, %d more)\n",
+               moved, blitted, off_max, wrong);
+        CHECK(at_end, "the page was scrolled to its end, where the last step is clamped");
+        CHECK(moved > 40 && blitted * 10 >= moved * 9, "a page under a scroll bar scrolls by moving its pixels");
+        CHECK(wrong == 0 && off_max <= 16, "and every frame, gliding or at rest, is what painting it whole gives");
     }
 
     /* ---- SHIFT-CLICK ----------------------------------------------------

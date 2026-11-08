@@ -266,11 +266,12 @@ static void ic_shadow(const struct gpu_rect *frame, const struct gpu_rect *cover
     sc_shadow(&s, &damage, frame, cover, radius, width, peak);
 }
 
-static void ic_blur(const struct gpu_rect *r, uint32_t radius, const struct gpu_rect *frame, uint32_t corner)
+static void ic_blur(const struct gpu_rect *r, uint32_t radius, const struct gpu_rect *frame, uint32_t corner,
+                    uint32_t sat)
 {
     cpu_turn();
     struct sc_surface s = screen();
-    sc_blur(&s, &damage, r, radius, frame, corner, T.scratch);
+    sc_blur(&s, &damage, r, radius, frame, corner, T.scratch, sat);
 }
 
 /* The damage onto the scanout, and waited for: once end() returns no blit

@@ -1,6 +1,7 @@
 /* A guest-side terminal witness. No mock descriptors or injected kernel state. */
 #include "embk.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <termios.h>
@@ -33,6 +34,30 @@ static int child(const char *mode) {
         if (memcmp(bytes,expected,sizeof bytes)) return 32;
         printf("Raw key sequence verified.\r\n"); return 0;
     }
+    if (!strcmp(mode,"--identity")) {
+        /* Keys whose bytes say WHICH key: before the kernel queue carried key
+         * identity, Ctrl+Up was Ctrl+S and F5 never arrived at all. */
+        static const struct { const char *name, *want; } keys[] = {
+            {"F5","\033[15~"},{"Ctrl+Up","\033[1;5A"},{"Shift+F3","\033[1;2R"},{"Alt+x","\033x"},
+            {"Insert","\033[2~"},{"Ctrl+Left","\033[1;5D"},{"Backspace","\177"},{"Ctrl+Backspace","\b"},
+            {"Keypad 5 (application)","\033Ou"},{"Keypad Enter (application)","\033OM"},
+        };
+        cfmakeraw(&t); if (tcsetattr(0,TCSANOW,&t)) return 35;
+        printf("Key identity check: F5, Ctrl+Up, Shift+F3, Alt+x, Insert, Ctrl+Left, Backspace, Ctrl+Backspace.\r\n");
+        printf("%-28s %-22s %s\r\n","Key","Terminal sent","");fflush(stdout);
+        for (unsigned i=0;i<sizeof keys/sizeof keys[0];i++) {
+            if (i==8) {printf("\033=Keypad check: Num Lock, keypad 5, keypad Enter.\r\n");fflush(stdout);}
+            size_t want=strlen(keys[i].want),got=0;unsigned char bytes[16];
+            while (got<want) {ssize_t n=read(0,bytes+got,want-got);if(n<=0)return 36;got+=(size_t)n;}
+            char shown[64];size_t k=0;
+            for (size_t j=0;j<got && k+5<sizeof shown;j++)
+                k+=(size_t)snprintf(shown+k,sizeof shown-k,bytes[j]==27?"ESC ":bytes[j]<32 || bytes[j]==127?"0x%02x ":"%c ",bytes[j]);
+            bool ok=!memcmp(bytes,keys[i].want,want);
+            printf("%-28s %-22s %s\r\n",keys[i].name,shown,ok?"ok":"WRONG");fflush(stdout);
+            if (!ok) return 37;
+        }
+        printf("\033>Key identity verified.\r\n");return 0;
+    }
     if (!strcmp(mode,"--echo")) {
         cfmakeraw(&t); if (tcsetattr(0,TCSANOW,&t)) return 23;
         if (write(1,"ready",5)!=5) return 24;
@@ -49,6 +74,15 @@ static int child(const char *mode) {
     if (!strcmp(mode,"--hangup")) {
         if (write(1,"ready",5)!=5) return 27;
         unsigned char c; return read(0,&c,1)==0?0:28;
+    }
+    if (!strcmp(mode,"--hold")) {
+        /* as many pairs as this process's descriptors reach, held until the
+         * hangup; the count follows "ready" as two digits */
+        int p[2],held=0; char msg[8];
+        while (held<99 && embk_openpty(p)==0) held++;
+        snprintf(msg,sizeof msg,"ready%02d",held);
+        if (write(1,msg,7)!=7) return 38;
+        unsigned char c; return read(0,&c,1)==0?0:39;
     }
     return 29;
 }
@@ -142,18 +176,31 @@ static int selftest(void) {
     CHECK(write(a[0],large,sizeof large)==sizeof large);
     CHECK(write(a[0],"x",1)==-1 && errno==EAGAIN);
     CHECK(read(a[1],copy,sizeof copy)==sizeof copy && !memcmp(copy,large,sizeof copy));
-    CHECK(write(a[1],large,sizeof large)==sizeof large);
+    for (int i=0;i<8;i++) CHECK(write(a[1],large,sizeof large)==sizeof large);   /* output queues 32 KiB */
     CHECK(write(a[1],"x",1)==-1 && errno==EAGAIN);
-    CHECK(read(a[0],copy,sizeof copy)==sizeof copy && !memcmp(copy,large,sizeof copy));
+    for (int i=0;i<8;i++) CHECK(read(a[0],copy,sizeof copy)==sizeof copy && !memcmp(copy,large,sizeof copy));
     CHECK(tcgetattr(a[1],&t)==0); t.c_lflag=ICANON;
     CHECK(tcsetattr(a[1],TCSANOW,&t)==0 && write(a[0],"discard",7)==7);
     cfmakeraw(&t); CHECK(tcsetattr(a[1],TCSAFLUSH,&t)==0);
     CHECK(read(a[1],buf,1)==-1 && errno==EAGAIN);
     close(a[0]); close(a[1]);
-    int pairs[16][2],count=0;
-    while (count<16 && embk_openpty(pairs[count])==0) count++;
-    CHECK(count==16 && embk_openpty(a)==-23);
+    /* 64 pairs in the system, less whatever terminals are open elsewhere. One
+     * process's 64 descriptors hold about 30, so two children hold theirs
+     * first; then the next is refused for the system, not the process, and
+     * freed ones open again */
+    int holder[2][2],held=2,pairs[32][2],count=0; long hold[2];
+    for (int i=0;i<2;i++) {
+        char msg[8]={0}; ssize_t got=0;
+        CHECK(embk_openpty(holder[i])==0);
+        hold[i]=spawn_child(holder[i][1],"--hold"); CHECK(hold[i]>=0); close(holder[i][1]);
+        while (got<7 && readable(holder[i][0])) { ssize_t n=read(holder[i][0],msg+got,(size_t)(7-got)); if (n<=0) break; got+=n; }
+        CHECK(got==7 && !memcmp(msg,"ready",5));
+        held+=(msg[5]-'0')*10+(msg[6]-'0');
+    }
+    while (count<32 && embk_openpty(pairs[count])==0) count++;
+    CHECK(held+count>=48 && embk_openpty(a)==-23);
     for (int i=0;i<count;i++) { close(pairs[i][0]); close(pairs[i][1]); }
+    for (int i=0;i<2;i++) { close(holder[i][0]); CHECK(embk_wait((int)hold[i])==0); }
     CHECK(embk_openpty(a)==0); close(a[0]); close(a[1]);
     printf("ttyprobe: %d/%d checks passed\n",checks-failures,checks); return failures?1:0;
 }
@@ -230,8 +277,165 @@ static int screen_witness(void) {
     if(tcsetattr(0,TCSANOW,&saved))return 42;
     puts("Alternate screen restored.");return 0;
 }
+/* --xterm: what a program sees of the terminal it runs in. A card of what the
+ * screen model draws (attributes, underline styles and colours, the palettes,
+ * truecolour, wide characters and marks, a link), the terminal's answers to
+ * the questions programs ask it -- each checked -- a line long enough to
+ * reflow, and then mouse and focus events as they arrive. q ends it. */
+static size_t reply(char *out,size_t cap) {
+    size_t n=0;
+    for (int waited=0;waited<2000 && n+1<cap;) {
+        if (!(embk_fd_poll(0,EMBK_POLLIN)&EMBK_POLLIN)) {embk_sleep_ms(5);waited+=5;continue;}
+        unsigned char c;if (read(0,&c,1)!=1) break;
+        out[n++]=(char)c;out[n]=0;
+        if (n>=3 && out[0]==27 && out[1]=='[' && c>=0x40 && c<=0x7e) break;
+        if (n>=3 && out[0]==27 && (out[1]=='P' || out[1]==']') && (c==7 || (c=='\\' && out[n-2]==27))) break;
+    }
+    out[n]=0;
+    return n;
+}
+static int verified;
+static void ask(const char *what,const char *query,bool ok_when(const char *),const char *about) {
+    char got[512];
+    printf("%s",query);fflush(stdout);
+    reply(got,sizeof got);
+    bool ok=ok_when(got);verified+=ok;
+    char shown[96];size_t k=0;
+    for (const char *p=got;*p && k+5<sizeof shown;p++) k+=(size_t)snprintf(shown+k,sizeof shown-k,(unsigned char)*p<32?"^%c":"%c",(unsigned char)*p<32?*p+64:*p);
+    printf("  %-22s %s  %s%s\r\n",what,ok?"\033[32mok\033[m":"\033[31mWRONG\033[m",about,ok?"":shown);
+}
+static bool is_da1(const char *s) {return !strcmp(s,"\033[?62;22c");}
+static bool is_da2(const char *s) {return !strcmp(s,"\033[>1;10;0c");}
+static bool is_version(const char *s) {return !strcmp(s,"\033P>|EmbLinkTerminal(1.0)\033\\");}
+static bool is_mode(const char *s) {return !strcmp(s,"\033[?2004;2$y");}
+static bool is_colour(const char *s) {return !strncmp(s,"\033]10;rgb:",9) && strlen(s)==9+14+2;}
+static bool is_tn(const char *s) {
+    const char *want="xterm-256color",*p=strstr(s,"\033P1+r544e=");
+    if (!p) return false;
+    p+=10;
+    for (;*want;want++,p+=2) {
+        unsigned v;
+        if (sscanf(p,"%2x",&v)!=1 || v!=(unsigned char)*want) return false;
+    }
+    return !strcmp(p,"\033\\");
+}
+static struct winsize g_size;
+static bool is_size(const char *s) {
+    char want[32];snprintf(want,sizeof want,"\033[8;%u;%ut",g_size.ws_row,g_size.ws_col);
+    return !strcmp(s,want);
+}
+static int xterm_witness(void) {
+    struct termios saved,t;
+    if (tcgetattr(0,&saved) || ioctl(0,TIOCGWINSZ,&g_size)) {puts("A terminal session is required.");return 60;}
+    t=saved;cfmakeraw(&t);if (tcsetattr(0,TCSANOW,&t)) return 61;
+    const char *term=getenv("TERM"),*colour=getenv("COLORTERM");
+    printf("\033[1;38;2;115;210;188mEmbLink xterm check\033[m  TERM=%s COLORTERM=%s\r\n",term?term:"(unset)",colour?colour:"(unset)");
+    printf("Attributes: \033[1mbold\033[m \033[2mdim\033[m \033[3mitalic\033[m \033[9mstrike\033[m "
+           "\033[7minverse\033[m \033[53moverline\033[m \033[8mhidden\033[m\r\n");
+    printf("Underlines: \033[4msingle\033[m \033[21mdouble\033[m \033[4:3;58:2::255:95:95mcurly\033[m "
+           "\033[4:4;58:5:39mdotted\033[m \033[4:5mdashed\033[m\r\n");
+    printf("16 colours: ");
+    for (int i=0;i<16;i++) printf("\033[48;5;%dm   ",i);
+    printf("\033[m\r\n256 colours:");
+    for (int i=0;i<36;i++) printf("\033[48;5;%dm ",16+i*6);
+    for (int i=0;i<12;i++) printf("\033[48;5;%dm ",232+i*2);
+    printf("\033[m\r\nTruecolour: ");
+    for (int i=0;i<48;i++) printf("\033[48;2;%d;%d;%dm ",255*i/47,96+i*2,255-255*i/47);
+    printf("\033[m\r\nWide, marks: \xe7\x95\x8c\xe9\x9d\xa2 caf\xc3\xa9 e\xcc\x81 \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90 \xce\xa9\r\n");
+    printf("Link:       \033]8;id=docs;https://emblink.invalid/docs\033\\\033[4mEmbLink docs\033[24m\033]8;;\033\\ (OSC 8)\r\n");
+    printf("What the terminal answers:\r\n");
+    verified=0;
+    ask("DA1 (CSI c)","\033[c",is_da1,"a VT220 with ANSI colour");
+    ask("DA2 (CSI > c)","\033[>c",is_da2,"secondary attributes");
+    ask("XTVERSION","\033[>q",is_version,"EmbLinkTerminal(1.0)");
+    ask("DECRQM 2004","\033[?2004$p",is_mode,"bracketed paste: reset");
+    ask("OSC 10 query","\033]10;?\033\\",is_colour,"the default foreground");
+    ask("XTGETTCAP TN","\033P+q544e\033\\",is_tn,"xterm-256color");
+    ask("CSI 18 t","\033[18t",is_size,"rows and columns, as TIOCGWINSZ");
+    printf("Terminal replies verified: %d/7\r\n",verified);
+    printf("Reflow: ");
+    for (int i=0;i<20;i++) printf("<%02d-456789>",i);
+    printf("<END>\r\n");
+    printf("Mouse and focus: click, scroll or switch windows; q quits.\r\n");
+    printf("\033[?1000h\033[?1006h\033[?1004h");fflush(stdout);
+    static const char *const names[3]={"left","middle","right"};
+    char seq[64];unsigned n=0;int state=0;
+    for (;;) {
+        if (embk_cancelled()) break;
+        if (!(embk_fd_poll(0,EMBK_POLLIN)&EMBK_POLLIN)) {embk_sleep_ms(10);continue;}
+        unsigned char c;if (read(0,&c,1)!=1) break;
+        if (state==0) {
+            if (c==27) {state=1;continue;}
+            if (c=='q' || c==3) break;
+            continue;
+        }
+        if (state==1) {state=c=='['?2:0;n=0;continue;}
+        if (n+1<sizeof seq) seq[n++]=(char)c;
+        if (c<0x40 || c>0x7e) continue;
+        seq[n]=0;state=0;
+        int b,x,y;char kind;
+        if (sscanf(seq,"<%d;%d;%d%c",&b,&x,&y,&kind)==4) {
+            if (b&64) printf("Mouse: wheel %s at column %d, row %d\r\n",b&1?"down":"up",x,y);
+            else printf("Mouse: %s %s at column %d, row %d\r\n",names[(b&3)<3?(b&3):0],kind=='M'?"pressed":"released",x,y);
+        } else if (!strcmp(seq,"I")) printf("Focus: regained\r\n");
+        else if (!strcmp(seq,"O")) printf("Focus: lost\r\n");
+        fflush(stdout);
+    }
+    printf("\033[?1004l\033[?1006l\033[?1000l");fflush(stdout);
+    if (tcsetattr(0,TCSANOW,&saved)) return 62;
+    puts("xterm check done.");
+    return verified==7?0:63;
+}
+/* --glyphs: what the renderer draws, written as a program would: the four
+ * faces and the fallback, a Powerlevel10k-style framed prompt (Powerline
+ * segments, Nerd Font icons), frames of every weight, blocks, braille, the
+ * Powerline shapes, underline styles. A sample -- the real prompt engine is
+ * later work (docs/TODO.md). */
+static int glyphs(void) {
+    static const char *const lines[] = {
+        "\033[1mMesloLGS Nerd Font Mono\033[m: regular, \033[1mbold\033[m, \033[3mitalic\033[m, \033[1;3mbold italic\033[m;"
+        " DejaVu after it: \xd4\xb1\xd5\xa2\xd5\xa3 \xe2\x84\xa6 \xe2\x99\xab",
+        "",
+        "\xe2\x95\xad\xe2\x94\x80\033[38;5;31;49m\xee\x82\xb6\033[48;5;31;38;5;254m \xef\x85\xb9 \033[38;5;31;48;5;24m\xee\x82\xb0"
+        "\033[38;5;254m \xef\x81\xbc ~/src/emblink \033[38;5;24;48;5;71m\xee\x82\xb0\033[38;5;16m \xef\x84\xa6 master \033[38;5;94m!2 \033[38;5;16m?1 "
+        "\033[38;5;71;49m\xee\x82\xb0\033[38;5;240m\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+        "\033[38;5;236m\xee\x82\xb2\033[48;5;236;38;5;70m \xe2\x9c\x94 \033[38;5;66m\xee\x82\xb3\033[38;5;66m 3s \xef\x89\x92 \033[38;5;66m\xee\x82\xb3\033[38;5;66m 12:41 \xef\x80\x97 \033[38;5;236;49m\xee\x82\xb4\033[m\xe2\x94\x80\xe2\x95\xae",
+        "\xe2\x95\xb0\xe2\x94\x80 \033[38;5;76m\xe2\x9d\xaf\033[m ls",
+        "",
+        "\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\xac\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90 \xe2\x94\x8f\xe2\x94\x81\xe2\x94\x81\xe2\x94\xb3\xe2\x94\x81\xe2\x94\x81\xe2\x94\x93 \xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\xa6\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97 \xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae  \xe2\x96\x81\xe2\x96\x82\xe2\x96\x83\xe2\x96\x84\xe2\x96\x85\xe2\x96\x86\xe2\x96\x87\xe2\x96\x88 \xe2\x96\x8f\xe2\x96\x8e\xe2\x96\x8d\xe2\x96\x8c\xe2\x96\x8b\xe2\x96\x8a\xe2\x96\x89 \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93\xe2\x96\x88",
+        "\xe2\x94\x82  \xe2\x94\x82  \xe2\x94\x82 \xe2\x94\x83  \xe2\x94\x83  \xe2\x94\x83 \xe2\x95\x91  \xe2\x95\x91  \xe2\x95\x91 \xe2\x94\x82  \xe2\x94\x82  \xe2\x96\x99\xe2\x96\x9b\xe2\x96\x9c\xe2\x96\x9f \xe2\x96\x98\xe2\x96\x9d\xe2\x96\x96\xe2\x96\x97 \xe2\x95\xb1\xe2\x95\xb2\xe2\x95\xb3  \xe2\xa3\x80\xe2\xa3\xa4\xe2\xa3\xb6\xe2\xa3\xbf\xe2\xa3\xb6\xe2\xa3\xa4\xe2\xa3\x80 \xe2\xa1\x87\xe2\xa2\xb8",
+        "\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\xa4 \xe2\x94\xa3\xe2\x94\x81\xe2\x94\x81\xe2\x95\x8b\xe2\x94\x81\xe2\x94\x81\xe2\x94\xab \xe2\x95\xa0\xe2\x95\x90\xe2\x95\x90\xe2\x95\xac\xe2\x95\x90\xe2\x95\x90\xe2\x95\xa3 \xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf  \xe2\x94\x84\xe2\x94\x84\xe2\x94\x84 \xe2\x94\x88\xe2\x94\x88\xe2\x94\x88 \xe2\x95\x8c\xe2\x95\x8c \xe2\x94\x86\xe2\x94\x8a\xe2\x95\x8e",
+        "\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\xb4\xe2\x94\x80\xe2\x94\x80\xe2\x94\x98 \xe2\x94\x97\xe2\x94\x81\xe2\x94\x81\xe2\x94\xbb\xe2\x94\x81\xe2\x94\x81\xe2\x94\x9b \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90\xe2\x95\xa9\xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d         "
+        "\033[34m\xee\x82\xb0\xee\x82\xb1\xee\x82\xb2\xee\x82\xb3 \xee\x82\xb4\xee\x82\xb5\xee\x82\xb6\xee\x82\xb7 \xee\x82\xb8\xee\x82\xba\xee\x82\xbc\xee\x82\xbe\033[m",
+        "",
+        "Icons: \xef\x85\xb9 \xef\x85\xbc \xef\x8c\x83 \xee\x82\xa0 \xef\x84\xa6 \xef\x80\x95 \xef\x81\xbc \xef\x80\x97 \xef\x80\x8c \xef\x80\x8d \xef\x84\x93 \xee\x9c\x98 \xf3\xb0\x80\x81 \xef\x88\x9f \xef\x87\x93",
+        "Lines: \033[4msingle\033[m \033[21mdouble\033[m \033[4:3;58:2::255:95:95mcurly\033[m \033[4:4;58:5:39mdotted\033[m \033[4:5mdashed\033[m"
+        " \033[9mstrike\033[m \033[53moverline\033[m \033[2mdim\033[m \033[7m inverse \033[m \033[5mblink\033[m",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) printf("%s\n", lines[i]);
+    return 0;
+}
+/* Throughput: the emulator drains a 32 KiB PTY queue, so how fast this loop
+ * finishes is how fast the terminal parses and keeps up. Coloured lines, as
+ * real output is; the frame count to compare with is in Terminal's probe. */
+static int bench(const char *megabytes) {
+    unsigned long want=(megabytes?strtoul(megabytes,NULL,10):4)*1024*1024,sent=0;
+    char line[160];unsigned n=0;
+    uint64_t start=embk_uptime_ms();
+    while (sent<want) {
+        int k=snprintf(line,sizeof line,"\033[3%um%06u\033[0m the quick brown fox jumps over the lazy dog \033[1m%08lu\033[0m\n",1+n%7,n,sent);
+        for (int off=0;off<k;) {ssize_t w=write(1,line+off,(size_t)(k-off));if(w<=0)return 50;off+=(int)w;}
+        sent+=(unsigned long)k;n++;
+    }
+    uint64_t ms=embk_uptime_ms()-start;if(!ms)ms=1;
+    printf("Bench: %lu KiB, %u lines in %llu ms = %llu KiB/s\n",sent/1024,n,(unsigned long long)ms,(unsigned long long)(sent/1024*1000/ms));
+    return 0;
+}
 int main(int argc,char **argv) {
+    if (argc>1 && !strcmp(argv[1],"--bench")) return bench(argc>2?argv[2]:NULL);
     if (argc>1 && !strcmp(argv[1],"--screen")) return screen_witness();
+    if (argc>1 && !strcmp(argv[1],"--xterm")) return xterm_witness();
+    if (argc>1 && !strcmp(argv[1],"--glyphs")) return glyphs();
     if (argc>1 && !strcmp(argv[1],"--selftest")) return selftest();
     if (argc>1) return child(argv[1]);
     return interactive();

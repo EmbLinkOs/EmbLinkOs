@@ -49,6 +49,7 @@ def boot(name, scratch, audio=None, tablet=False, nic=None):
     argv = [
         "qemu-system-x86_64", "-cpu", "max",
         "-fw_cfg", "name=opt/emblink/live,string=1",
+        "-fw_cfg", "name=opt/emblink/pointer,string=1",   # aimed by counting: no curve
         "-drive", "format=raw,file=myos.img,if=ide,index=0",
         "-drive", "format=raw,file=%s,if=ide,index=1" % scratch,
         "-vga", "none", "-device", "virtio-vga,xres=1024,yres=768",

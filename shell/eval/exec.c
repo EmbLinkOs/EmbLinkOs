@@ -198,7 +198,22 @@ static bool (*g_interrupted)(void) = NULL;
 
 void exec_set_interrupt_check(bool (*fn)(void)) { g_interrupted = fn; }
 
-static bool interrupted(void) { return g_interrupted && g_interrupted(); }
+/* Whether ^C reached what the shell is running -- its own loops, a builtin
+ * that waits (sleep), or a child it cancelled -- so the line ends with 130. */
+static bool g_hit;
+
+static bool interrupted(void) {
+    bool yes = g_interrupted && g_interrupted();
+    if (yes) g_hit = true;
+    return yes;
+}
+bool exec_interrupt_poll(void) { return interrupted(); }
+void exec_interrupt_note(void) { g_hit = true; }
+bool exec_interrupt_hit(bool clear) {
+    bool was = g_hit;
+    if (clear) g_hit = false;
+    return was;
+}
 
 /* --- the sink and the top scope, set by the driver ------------------------ */
 static value_sink   g_sink     = NULL;

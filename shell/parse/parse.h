@@ -170,6 +170,12 @@ struct stmt *parse(const struct token *toks, size_t ntoks, char *err, size_t err
 struct block *parse_program(const struct token *toks, size_t ntoks,
                             char *err, size_t errcap);
 
+/* True when `src` is a program that is not finished yet rather than wrong:
+ * its first error is at the very end (an open '{' or '(', a trailing '|', a
+ * '$(' not closed) or a string runs off the end. What the line editor asks
+ * before Enter runs a line: an unfinished one gets another line instead. */
+bool program_incomplete(const char *src);
+
 void expr_free(struct expr *e);          /* recursive; NULL-safe */
 void pipeline_free(struct pipeline *p);  /* NULL-safe */
 void stmt_free(struct stmt *s);          /* NULL-safe */

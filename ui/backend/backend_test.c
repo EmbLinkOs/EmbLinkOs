@@ -349,6 +349,723 @@ static void t7_layers(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* T8: an image edited in place repaints and reports only what changed. A
+ * terminal changes a line at a time; repainting and presenting the window
+ * for it is the cost this exists to avoid. */
+static void t8_image_damage(void) {
+    printf("T8 an image's damage is all that repaints:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    static uint32_t img[32 * 32];
+    for (int i = 0; i < 32 * 32; i++) img[i] = 0xff0000ffu;      /* opaque blue */
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle im = scene_create_node(&a, SCENE_NODE_IMAGE, root);
+    scene_set_size(&a, im, 32, 32); scene_set_transform(&a, im, 16,8,0, 0,0,0,1, 1,1,1);
+    scene_set_image(&a, im, img, 32, 32, EMBK_PIXFMT_BGRA8888_PRE);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 20, 12) < 50, "frame 1: the image shows");
+    for (int y = 10; y < 14; y++) for (int x = 4; x < 12; x++) img[y * 32 + x] = 0xffff0000u;   /* red, in place */
+    scene_set_image_damage(&a, im, 4, 10, 8, 4);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(!r.full && r.n_dirty == 1 && r.dirty[0].x == 20 && r.dirty[0].y == 18 && r.dirty[0].w == 8 && r.dirty[0].h == 4,
+          "frame 2: one dirty rect, the damage at the image's place");
+    CHECK(red_at(&rt, 22, 19) > 200, "frame 2: the edited pixels show");
+    scene_set_image_damage(&a, im, 0, 0, 2, 2);
+    scene_set_image_damage(&a, im, 30, 30, 2, 2);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 1 && r.dirty[0].w == 32 && r.dirty[0].h == 32, "two damages in a frame: the rect around both");
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0 && !r.full, "frame 4: nothing said, nothing repainted");
+    static uint32_t other[32 * 32];
+    scene_set_image(&a, im, other, 32, 32, EMBK_PIXFMT_BGRA8888_PRE);
+    scene_set_image_damage(&a, im, 0, 0, 1, 1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty >= 1 && r.dirty[0].w >= 32, "a new buffer is all new, whatever damage is said");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* T9: a node at a FRACTIONAL place leaves no sliver when it moves. Its
+ * anti-aliased edge partly covers the pixel left of its x, and that pixel's
+ * centre lies outside the old footprint's exact rect -- repainted only when
+ * damage is rounded out to whole pixels. A window title that shrank kept one
+ * grey column of its old first letter this way. */
+static void t9_fractional_edge(void) {
+    printf("T9 a fractional edge leaves no sliver:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 64, 64);
+    struct paint grey; grey.kind = PAINT_SOLID; grey.solid = (struct color){0.5f,0.5f,0.5f,1}; grey.n_stops = 0;
+    scene_set_paint(&a, bg, &grey);
+    struct node_handle rect = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, rect, 8, 8); scene_set_transform(&a, rect, 10.6f,10,0, 0,0,0,1, 1,1,1);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, rect, &redp);
+
+    scene_render_frame(&r, &a, root, &rt);
+    int grey_r = red_at(&rt, 4, 14);
+    CHECK(red_at(&rt, 10, 14) > grey_r + 20, "frame 1: the edge partly covers pixel 10");
+    scene_set_transform(&a, rect, 40,10,0, 0,0,0,1, 1,1,1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 10, 14) <= grey_r + 2, "frame 2: pixel 10 restored (no sliver)");
+    int whole = r.n_dirty >= 1;
+    for (int i = 0; i < r.n_dirty; i++)
+        whole = whole && r.dirty[i].x == floorf(r.dirty[i].x) && r.dirty[i].w == floorf(r.dirty[i].w);
+    CHECK(whole, "dirty rects are whole pixels");
+
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* T10: clearing the dirty rects of a canvas that starts transparent (a
+ * window that shows through) when a rect lies past the target's edge. It
+ * cleared (x1 - x0) * 4 bytes of a NEGATIVE width -- most of the address
+ * space -- and the Terminal died opening its Preferences beside the screen. */
+static void t10_clear_outside(void) {
+    printf("T10 clearing a dirty rect past the edge:\n");
+    struct render_target rt = make_target(32, 32);
+    rt.clear_dirty = 1;
+    for (int i = 0; i < 32 * 32; i++) ((uint32_t *)rt.pixels)[i] = 0xff123456u;
+    struct clip_rect d[4] = { { 40, 4, 10, 10, 0 }, { 4, 40, 10, 10, 0 }, { 30.5f, 2, 8, 4, 0 }, { 4, 10, 10, 5, 0 } };
+    const struct render_backend *be = cpu_backend_get();
+    be->begin_frame(&rt, d, 4);
+    be->end_frame(&rt);
+    uint32_t *px = rt.pixels;
+    CHECK(px[2 * 32 + 30] == 0 && px[2 * 32 + 29] == 0xff123456u && px[20 * 32 + 20] == 0xff123456u,
+          "only the part inside is cleared, and nothing past the edge is touched");
+    CHECK(px[10 * 32 + 4] == 0 && px[14 * 32 + 13] == 0 && px[15 * 32 + 8] == 0xff123456u && px[12 * 32 + 14] == 0xff123456u,
+          "a whole-pixel rect clears itself exactly: not the row or column after it");
+    free(rt.pixels);
+}
+
+/* ---- T11: glass inside an opacity group blurs what is behind the group --
+ * A group renders into a scratch target that starts empty; a backdrop blur
+ * that read its own target there blurred nothing, and every glass panel
+ * fading in (a menu, the launcher) lost its frost until the fade ended. */
+static void t11_glass_in_group(void) {
+    printf("T11 glass in an opacity group frosts the real backdrop:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    /* the backdrop: red on the left, blue on the right, a sharp edge at x 32
+     * -- frosted, the pixel beside it is a mix; seen through clear, it is not */
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 32, 64);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, bg, &redp);
+    struct node_handle bg2 = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg2, 32, 64); scene_set_transform(&a, bg2, 32,0,0, 0,0,0,1, 1,1,1);
+    struct paint bluep; bluep.kind = PAINT_SOLID; bluep.solid = (struct color){0,0,1,1}; bluep.n_stops = 0;
+    scene_set_paint(&a, bg2, &bluep);
+    struct node_handle grp = scene_create_node(&a, SCENE_NODE_GROUP, root);
+    scene_set_opacity(&a, grp, 0.99f);              /* a group, near full strength */
+    struct node_handle glass = scene_create_node(&a, SCENE_NODE_RECT, grp);
+    scene_set_size(&a, glass, 32, 32); scene_set_transform(&a, glass, 16,16,0, 0,0,0,1, 1,1,1);
+    struct paint clearp; clearp.kind = PAINT_SOLID; clearp.solid = (struct color){0,0,0,0}; clearp.n_stops = 0;
+    scene_set_paint(&a, glass, &clearp);
+    scene_set_backdrop_blur(&a, glass, 1, 4.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 33, 32) > 30 && blue_at(&rt, 33, 32) > 30,
+          "the glass frosts the edge behind its group -- not an empty blur that shows it sharp");
+    CHECK(r.backdrop == 0, "and the renderer forgets the backdrop once the group is done");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T12: the reduced effects tier draws glass as its tint, unblurred ---- */
+static void t12_reduced_glass(void) {
+    printf("T12 reduced effects: glass is its own tint, whole, with no blur:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 32, 64);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, bg, &redp);
+    struct node_handle glass = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, glass, 32, 32); scene_set_transform(&a, glass, 16,16,0, 0,0,0,1, 1,1,1);
+    struct paint tint; tint.kind = PAINT_SOLID; tint.solid = (struct color){0,0,1,0.5f}; tint.n_stops = 0;
+    scene_set_paint(&a, glass, &tint);
+    scene_set_backdrop_blur(&a, glass, 1, 4.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 30, 32) > 30, "full: the half-clear tint shows the red behind it");
+    CHECK(scene_render_set_reduced(1) == 1 && scene_render_set_reduced(1) == 0, "the tier changes once");
+    scene_render_invalidate(&r);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 30, 32) < 4 && blue_at(&rt, 30, 32) > 250 && red_at(&rt, 33, 32) < 4,
+          "reduced: the tint is whole -- nothing behind shows, blurred or sharp");
+    scene_render_set_reduced(0);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T13: a scaled group draws its flattened subtree smaller, toward its
+ * anchor -- a popover growing out of where it opens ---------------------- */
+static void t13_scaled_group(void) {
+    printf("T13 a scaled group is drawn smaller toward its anchor:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    /* a sized box, as every toolkit box that takes ui_set_scale is: its own
+     * change dirties all it covers */
+    struct node_handle grp = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, grp, 64, 64);
+    struct paint clear; clear.kind = PAINT_SOLID; clear.solid = (struct color){0,0,0,0}; clear.n_stops = 0;
+    scene_set_paint(&a, grp, &clear);
+    struct node_handle box = scene_create_node(&a, SCENE_NODE_RECT, grp);
+    scene_set_size(&a, box, 40, 40); scene_set_transform(&a, box, 12,12,0, 0,0,0,1, 1,1,1);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, box, &redp);
+    scene_set_group_scale(&a, grp, 0.5f, 0.0f, 0.0f);     /* half, toward the top-left */
+    scene_render_frame(&r, &a, root, &rt);
+    /* the group is 64 x 64, so half of it toward the top-left puts the box
+     * (12..52) at 6..26 */
+    CHECK(red_at(&rt, 8, 8) > 200 && red_at(&rt, 24, 24) > 200, "the box is drawn at half, toward the top-left");
+    CHECK(red_at(&rt, 30, 30) < 10 && red_at(&rt, 50, 20) < 10, "and not where it would stand at full size");
+    scene_set_group_scale(&a, grp, 1.0f, 0.0f, 0.0f);     /* grown: all of it */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 50, 50) > 200 && red_at(&rt, 12, 51) > 200, "at full size the whole box is back");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T14: a fade alone repaints -- an opacity that changes with nothing
+ * moving is still new pixels (it was dirty but not content, and nothing was
+ * redrawn until something moved) ---------------------------------------- */
+static void t14_fade_alone(void) {
+    printf("T14 a fade with nothing moving repaints:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(32, 32);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle box = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, box, 32, 32);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, box, &redp);
+    scene_set_opacity(&a, box, 0.2f);
+    scene_render_frame(&r, &a, root, &rt);
+    int faint = red_at(&rt, 16, 16);
+    scene_set_opacity(&a, box, 1.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(faint < 80 && red_at(&rt, 16, 16) > 250, "faded in, the box is drawn whole");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T15: an opaque linear gradient runs its whole range corner to corner
+ * (it was projected from the corner and showed only its second half), and
+ * drawn from its table matches the exact gradient within the dither ------ */
+static void t15_gradient_table(void) {
+    printf("T15 a gradient drawn from its table is the gradient:\n");
+    for (int vertical = 0; vertical < 2; vertical++) {
+        struct scene_arena a; scene_arena_init(&a);
+        struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+        int W = vertical ? 40 : 256, H = vertical ? 256 : 40;
+        struct render_target rt = make_target((uint32_t)W, (uint32_t)H);
+        fill_target(&rt, bgra(0,0,0,255));
+        struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+        struct node_handle box = scene_create_node(&a, SCENE_NODE_RECT, root);
+        scene_set_size(&a, box, (float)W, (float)H);
+        struct paint g; memset(&g, 0, sizeof g);
+        g.kind = PAINT_LINEAR_GRADIENT; g.angle_deg = vertical ? 90.0f : 0.0f; g.n_stops = 2;
+        g.stops[0].offset = 0; g.stops[0].color = (struct color){0,0,0,1};
+        g.stops[1].offset = 1; g.stops[1].color = (struct color){1,0,0,1};
+        scene_set_paint(&a, box, &g);
+        scene_render_frame(&r, &a, root, &rt);
+        int worst = 0, n = vertical ? H : W;
+        for (int k = 2; k < n - 2; k++) {
+            float t = ((k + 0.5f) / (float)n);
+            int want = (int)(t * 255.0f + 0.5f), got = vertical ? red_at(&rt, W / 2, k) : red_at(&rt, k, H / 2);
+            int d = got > want ? got - want : want - got;
+            if (d > worst) worst = d;
+        }
+        CHECK(worst <= 2, vertical ? "down: within two levels of the gradient everywhere" : "across: within two levels of the gradient everywhere");
+        free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+    }
+}
+
+/* ---- T16: a large blur (half resolution from radius 6) still frosts an edge
+ * evenly: a mix at the edge, graded beside it, pure far from it ---------- */
+static void t16_large_blur(void) {
+    printf("T16 a large glass blur, at half resolution, frosts an edge evenly:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(160, 64);
+    fill_target(&rt, bgra(0,0,0,255));
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle l = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, l, 80, 64);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, l, &redp);
+    struct node_handle rr = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, rr, 80, 64); scene_set_transform(&a, rr, 80,0,0, 0,0,0,1, 1,1,1);
+    struct paint bluep; bluep.kind = PAINT_SOLID; bluep.solid = (struct color){0,0,1,1}; bluep.n_stops = 0;
+    scene_set_paint(&a, rr, &bluep);
+    struct node_handle glass = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, glass, 160, 64);
+    struct paint clearp; clearp.kind = PAINT_SOLID; clearp.solid = (struct color){0,0,0,0}; clearp.n_stops = 0;
+    scene_set_paint(&a, glass, &clearp);
+    scene_set_backdrop_blur(&a, glass, 1, 12.0f);
+    scene_render_frame(&r, &a, root, &rt);
+    int edge_r = red_at(&rt, 80, 32), edge_b = blue_at(&rt, 79, 32);
+    CHECK(edge_r > 70 && edge_r < 190 && edge_b > 70 && edge_b < 190, "at the edge, a mix of both");
+    CHECK(red_at(&rt, 70, 32) > red_at(&rt, 80, 32) && red_at(&rt, 80, 32) > red_at(&rt, 90, 32), "graded across it, falling away steadily");
+    CHECK(red_at(&rt, 20, 32) > 230 && blue_at(&rt, 140, 32) > 230, "far from it, each side as it was");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- the group tests' shared scene: a translucent card away from the window
+ * origin, holding a row of boxes -- a menu, as the toolkit builds one ------ */
+struct card { struct node_handle root, grp, box[40]; int n; };
+static struct paint solidp(float r, float g, float b, float a) {
+    struct paint p; memset(&p, 0, sizeof p); p.kind = PAINT_SOLID; p.solid = (struct color){ r, g, b, a }; return p;
+}
+static void card_build(struct scene_arena *a, struct card *c, int n) {
+    c->n = n;
+    c->root = scene_create_node(a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(a, SCENE_NODE_RECT, c->root);
+    scene_set_size(a, ground, 200, 160);
+    struct paint gp = solidp(0.1f, 0.12f, 0.14f, 1); scene_set_paint(a, ground, &gp);
+    c->grp = scene_create_node(a, SCENE_NODE_RECT, c->root);
+    scene_set_size(a, c->grp, 120, 100);
+    scene_set_transform(a, c->grp, 40.5f, 30.25f, 0, 0,0,0,1, 1,1,1);   /* off the origin, between pixels */
+    scene_set_corner_radius(a, c->grp, 8);
+    struct paint cp = solidp(0.9f, 0.9f, 0.95f, 0.9f); scene_set_paint(a, c->grp, &cp);
+    for (int i = 0; i < n; i++) {
+        c->box[i] = scene_create_node(a, SCENE_NODE_RECT, c->grp);
+        scene_set_size(a, c->box[i], 10, 8);
+        scene_set_transform(a, c->box[i], 4.0f + (float)(i % 8) * 14.0f, 6.0f + (float)(i / 8) * 18.0f, 0, 0,0,0,1, 1,1,1);
+        scene_set_corner_radius(a, c->box[i], 2);
+        struct paint bp = solidp(0.2f + 0.1f * (float)(i % 5), 0.3f, 0.7f, 1); scene_set_paint(a, c->box[i], &bp);
+    }
+}
+/* how many pixels of `rt` differ from painting the scene from nothing */
+static int differs_from_fresh(struct scene_arena *a, struct node_handle root, struct render_target *rt) {
+    struct render_target f = make_target((int)rt->width, (int)rt->height);
+    struct scene_renderer r2; scene_render_init(&r2, cpu_backend_get());
+    scene_render_frame(&r2, a, root, &f);
+    int n = 0;
+    for (uint32_t y = 0; y < rt->height; y++)
+        for (uint32_t x = 0; x < rt->width; x++) if (px_at(rt, (int)x, (int)y) != px_at(&f, (int)x, (int)y)) n++;
+    scene_render_destroy(&r2); free(f.pixels);
+    return n;
+}
+
+/* ---- T17: a partial frame of a group away from the origin keeps all of it.
+ * Inside a group's offscreen pass a child's footprint is in the scratch's own
+ * coordinates; it was tested against the frame's dirty rects in the window's,
+ * so on any frame that was not a full repaint the children of a group that
+ * did not sit at the origin were culled, and the group came back without them. */
+static void t17_partial_group(void) {
+    printf("T17 a partial frame of an offset group keeps all its children:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(200, 160);
+    struct card c; card_build(&a, &c, 6);
+    scene_set_opacity(&a, c.grp, 0.6f);
+    scene_render_frame(&r, &a, c.root, &rt);
+    struct paint np = solidp(1, 0.5f, 0, 1); scene_set_paint(&a, c.box[5], &np);   /* one child changes */
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(!r.full, "the change is a partial frame");
+    CHECK(differs_from_fresh(&a, c.root, &rt) == 0, "and it is what painting it all gives: no child culled");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T18: a group that fades, moves and shrinks is the same picture, frame by
+ * frame, as painting it from nothing -- whether its flattened pixels were kept
+ * or remade, and with a child changing halfway ---------------------------- */
+static void t18_group_motion(void) {
+    printf("T18 a group fading, moving and growing is right every frame:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(200, 160);
+    struct card c; card_build(&a, &c, 12);
+    int wrong = 0;
+    for (int f = 0; f <= 20; f++) {
+        float t = (float)f / 20.0f;
+        scene_set_opacity(&a, c.grp, 0.05f + 0.9f * t);
+        scene_set_group_scale(&a, c.grp, 0.94f + 0.05f * t, 0.0f, 0.0f);
+        scene_set_transform(&a, c.grp, 40.5f, 30.25f - (float)(20 - f), 0, 0,0,0,1, 1,1,1);   /* whole-pixel steps */
+        if (f == 10) { struct paint np = solidp(1, 0.5f, 0, 1); scene_set_paint(&a, c.box[3], &np); }
+        scene_render_frame(&r, &a, c.root, &rt);
+        if (differs_from_fresh(&a, c.root, &rt)) wrong++;
+    }
+    printf("        (%u frames composited from kept pixels, %u painted anew)\n", r.group_hits, r.group_paints);
+    CHECK(wrong == 0, "every frame of it is what painting it whole gives");
+    CHECK(r.group_hits >= 17 && r.group_paints <= 3,
+          "and it was painted twice -- at the start and when a child changed -- and only composited after");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T19: a group moving is a few dirty rects, not a full repaint. Each of
+ * its children moved too, and each added its old and new place, so a menu of
+ * more than eight things blew the cap and repainted the window ------------ */
+static void t19_group_dirty(void) {
+    printf("T19 a moving group of many children is not a full repaint:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(200, 160);
+    struct card c; card_build(&a, &c, 40);
+    scene_set_opacity(&a, c.grp, 0.5f);
+    scene_render_frame(&r, &a, c.root, &rt);
+    scene_set_transform(&a, c.grp, 40.5f, 32.25f, 0, 0,0,0,1, 1,1,1);
+    scene_set_opacity(&a, c.grp, 0.6f);
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(!r.full, "forty children moving with their group: still a partial frame");
+    CHECK(differs_from_fresh(&a, c.root, &rt) == 0, "and the right picture");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T20: a PROMOTED subtree is a layer's, not the window's --------------
+ * A fake layer host keeps the layers as the application runtime would hand
+ * them to the compositor, and counts what it was asked. */
+struct fake_layer { uint32_t *px; uint32_t w, h; int presents, gos, froms, destroys; struct scene_layer_state at;
+                    uint16_t resp, delay; };
+static struct fake_layer g_fl[8];
+static int g_fl_n;
+static uint32_t fl_create(void *ctx, uint32_t w, uint32_t h, uint32_t **px) {
+    (void)ctx;
+    if (g_fl_n >= 8) return 0;
+    struct fake_layer *l = &g_fl[g_fl_n++];
+    memset(l, 0, sizeof *l);
+    l->px = calloc((size_t)w * h, 4); l->w = w; l->h = h;
+    *px = l->px;
+    return (uint32_t)g_fl_n;
+}
+static void fl_present(void *ctx, uint32_t id, int x, int y, int w, int h) {
+    (void)ctx; (void)x; (void)y; (void)w; (void)h;
+    g_fl[id - 1].presents++;
+}
+static void fl_go(void *ctx, uint32_t id, const struct scene_layer_state *from, const struct scene_layer_state *to,
+                  uint16_t resp, uint16_t damp, uint16_t delay, int destroy, int at_present) {
+    (void)ctx; (void)damp; (void)at_present;
+    struct fake_layer *l = &g_fl[id - 1];
+    l->gos++; l->froms += from != 0; l->destroys += destroy; l->at = *to; l->resp = resp; l->delay = delay;
+}
+static const struct scene_layer_host g_fake_host = { 0, fl_create, fl_present, fl_go, 0 };
+
+/* the ground and a card -- a menu, its shadow, a row in it -- promoted or not */
+static struct node_handle t20_scene(struct scene_arena *ap, struct node_handle *card_out, struct node_handle *row_out,
+                                    int promote) {
+#define a (*ap)
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 200, 160);
+    struct paint gp = solidp(0.1f, 0.2f, 0.6f, 1); scene_set_paint(&a, ground, &gp);
+    struct node_handle card = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, card, 100, 60);
+    scene_set_transform(&a, card, 40, 30, 0, 0,0,0,1, 1,1,1);
+    scene_set_corner_radius(&a, card, 8);
+    struct paint cp = solidp(0.95f, 0.95f, 0.97f, 0.9f); scene_set_paint(&a, card, &cp);
+    scene_set_shadow(&a, card, true, 0, 4, 10, (struct color){ 0, 0, 0, 0.3f });
+    struct node_handle row = scene_create_node(&a, SCENE_NODE_RECT, card);
+    scene_set_size(&a, row, 80, 12); scene_set_transform(&a, row, 10, 10, 0, 0,0,0,1, 1,1,1);
+    struct paint rp = solidp(0.2f, 0.6f, 0.3f, 1); scene_set_paint(&a, row, &rp);
+    struct scene_layer_motion in = { 0, 940, 0, 0, 0, -5, 240, 1000, 0 }, out = { 0, 960, 0, 0, 0, 0, 200, 1000, 0 };
+    if (promote) scene_set_promoted(&a, card, true, &in, &out);
+    *card_out = card; *row_out = row;
+    return root;
+#undef a
+}
+
+static void t20_promoted(void) {
+    printf("T20 a promoted subtree is painted once into a layer, and moved by it:\n");
+    g_fl_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host);
+    struct render_target rt = make_target(200, 160);
+    struct node_handle card, row, root = t20_scene(&a, &card, &row, 1);
+
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == 0 && r.wants_frame, "the first frame it is seen, it settles: no layer yet, and a frame asked for");
+    scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && l->presents == 1, "the card is painted into one layer, presented once");
+    CHECK(l->gos == 1 && l->froms == 1 && l->at.x <= 40 && l->at.opacity == 255,
+          "and sent in from its appear end, to where it stands");
+    CHECK(px_at(&rt, 90, 50) == px_at(&rt, 5, 5), "the window under it is the ground: the card is not in it");
+    /* the layer over the window is the card painted where it stands */
+    {
+        struct render_target f = make_target(200, 160);
+        struct scene_renderer r2; scene_render_init(&r2, cpu_backend_get());
+        struct scene_arena a2; scene_arena_init(&a2);
+        struct node_handle c2, w2, root2 = t20_scene(&a2, &c2, &w2, 0);   /* the same, painted in place */
+        scene_render_frame(&r2, &a2, root2, &f);
+        int worst = 0;
+        for (int y = 0; y < 160; y++)
+            for (int x = 0; x < 200; x++) {
+                uint32_t d = px_at(&rt, x, y), o = d;
+                int lx = x - l->at.x, ly = y - l->at.y;
+                if (lx >= 0 && ly >= 0 && lx < (int)l->w && ly < (int)l->h) {
+                    uint32_t sp = l->px[ly * l->w + lx], ia = 255 - (sp >> 24);
+                    o = 0;
+                    for (int sh = 0; sh < 32; sh += 8)
+                        o |= ((((sp >> sh) & 255) + (((d >> sh) & 255) * ia + 127) / 255) > 255 ? 255u :
+                              (((sp >> sh) & 255) + (((d >> sh) & 255) * ia + 127) / 255)) << sh;
+                }
+                uint32_t want = px_at(&f, x, y);
+                /* AN EDGE IS NOT THE SAME EDGE: painted into the window its
+                 * coverage is blended against the ground, painted into a layer
+                 * it is alpha (blend_cov) -- leave the card's outline out */
+                int ex = x < 40 ? 40 - x : x >= 140 ? x - 139 : 0, ey = y < 30 ? 30 - y : y >= 90 ? y - 89 : 0;
+                int in_x = x >= 40 && x < 140, in_y = y >= 30 && y < 90;
+                int near_edge = (in_x && in_y && (x < 42 || x >= 138 || y < 32 || y >= 88 ||
+                                 ((x < 50 || x >= 130) && (y < 40 || y >= 80)))) ||
+                                ((ex || ey) && ex <= 1 && ey <= 1);
+                if (near_edge) continue;
+                for (int sh = 0; sh < 24; sh += 8) {
+                    int e = (int)((o >> sh) & 255) - (int)((want >> sh) & 255);
+                    if (e < 0) e = -e;
+                }
+            }
+        printf("        (the layer over the window, against painting it in place: %d levels at most)\n", worst);
+        CHECK(worst <= 2, "the layer composited over the window is the card painted in it");
+        scene_render_destroy(&r2); free(f.pixels); scene_arena_destroy(&a2);
+    }
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->presents == 1 && l->gos == 1, "a frame where nothing changed asks nothing of it");
+    scene_set_transform(&a, card, 46, 30, 0, 0,0,0,1, 1,1,1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->presents == 1 && l->gos == 2 && l->froms == 1 && l->at.x >= 46 - 20,
+          "moved, it is told where to go and not painted again");
+    struct paint np = solidp(0.9f, 0.3f, 0.2f, 1); scene_set_paint(&a, row, &np);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->presents == 2 && l->gos == 2, "a child repainted: the layer's pixels again, no move");
+    uint32_t paints = r.layer_paints;
+    scene_destroy_node(&a, card);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->destroys == 1 && l->at.opacity == 0 && l->at.scale_milli == 960 && r.layer_paints == paints,
+          "gone, it leaves on its disappear motion, and the layer goes after");
+    CHECK(px_at(&rt, 90, 50) == px_at(&rt, 5, 5), "and the window was never painted with it");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T21: a node that paints nothing stains nothing -- a menu's scrim, a
+ * window-sized transparent box, coming and going repaints no pixel -------- */
+static void t21_invisible(void) {
+    printf("T21 a box that paints nothing marks nothing when it comes, goes or moves:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(120, 80);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 120, 80);
+    struct paint gp = solidp(0.2f, 0.3f, 0.4f, 1); scene_set_paint(&a, ground, &gp);
+    scene_render_frame(&r, &a, root, &rt);
+    struct node_handle scrim = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, scrim, 120, 80);
+    struct paint cp = solidp(0, 0, 0, 0); scene_set_paint(&a, scrim, &cp);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0 && !r.full, "a transparent window-sized box arriving repaints nothing");
+    scene_set_transform(&a, scrim, 10, 10, 0, 0,0,0,1, 1,1,1);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0, "nor moving");
+    scene_destroy_node(&a, scrim);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0, "nor going");
+    CHECK(differs_from_fresh(&a, root, &rt) == 0, "and the picture is still the one painting it whole gives");
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T22: a promoted GLASS root: the compositor frosts it, the layer holds
+ * only its tint (a host that says how a layer looks) ---------------------- */
+static int g_look_n, g_look_glass, g_look_radius;
+static int g_look_box[4];
+static int g_look_fill;
+static void fl_look(void *ctx, uint32_t id, uint8_t radius, int glass, int x, int y, int w, int h, int fill) {
+    (void)ctx; (void)id; g_look_n++; g_look_fill = fill; g_look_glass = glass; g_look_radius = radius;
+    g_look_box[0] = x; g_look_box[1] = y; g_look_box[2] = w; g_look_box[3] = h;
+}
+static const struct scene_layer_host g_fake_host_look = { 0, fl_create, fl_present, fl_go, fl_look };
+static void t22_glass_layer(void) {
+    printf("T22 a promoted glass root leaves its frost to the compositor:\n");
+    g_fl_n = 0; g_look_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host_look);
+    struct render_target rt = make_target(200, 160);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 200, 160);
+    struct paint gp = solidp(1, 0, 0, 1); scene_set_paint(&a, ground, &gp);   /* red behind */
+    struct node_handle card = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, card, 100, 60); scene_set_transform(&a, card, 40, 30, 0, 0,0,0,1, 1,1,1);
+    scene_set_corner_radius(&a, card, 10);
+    struct paint cp = solidp(0, 0, 1, 0.5f); scene_set_paint(&a, card, &cp);   /* a blue tint, half */
+    scene_set_backdrop_blur(&a, card, 1, 12.0f);
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000, 0 };
+    scene_set_promoted(&a, card, true, &m, &m);
+    scene_render_frame(&r, &a, root, &rt);
+    scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && g_look_n == 1 && g_look_glass && g_look_radius == 10,
+          "its look is said once: glass, its own radius");
+    CHECK(g_look_box[2] == 100 && g_look_box[3] == 60 && g_look_box[0] == 40 - l->at.x && g_look_box[1] == 30 - l->at.y,
+          "and where the glass is in the layer: the card's own box, not its footprint");
+    uint32_t mid = l->px[(30) * l->w + 50];
+    int b, g, rr, al; unbgra(mid, &b, &g, &rr, &al);
+    CHECK(rr == 0 && al >= 126 && al <= 129 && b >= 126 && b <= 129,
+          "and the layer holds the tint alone -- none of the red behind it baked in");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T23: a change inside a layer repaints only what it changed ---------- */
+static void t23_partial_layer(void) {
+    printf("T23 a hover inside a promoted menu repaints only the rows it changed:\n");
+    g_fl_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host);
+    struct render_target rt = make_target(200, 200);
+    struct card c; card_build(&a, &c, 24);                /* a card of 24 boxes: a menu's rows */
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 0, 1000, 0 };
+    scene_set_promoted(&a, c.grp, true, &m, &m);
+    scene_render_frame(&r, &a, c.root, &rt);
+    scene_render_frame(&r, &a, c.root, &rt);              /* settled: the layer made */
+    uint32_t whole = r.layer_paints;
+    struct paint hp = solidp(0.9f, 0.6f, 0.1f, 1); scene_set_paint(&a, c.box[9], &hp);   /* the hover */
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(r.layer_paints == whole && r.layer_partials == 1, "one row's paint: a partial repaint, not the whole");
+    scene_set_transform(&a, c.box[3], 6.0f, 9.0f, 0, 0,0,0,1, 1,1,1);   /* a row moved inside */
+    scene_render_frame(&r, &a, c.root, &rt);
+    CHECK(r.layer_paints == whole && r.layer_partials == 2, "one row moved inside it: partial too");
+    /* the layer as kept, against the same subtree painted whole */
+    struct fake_layer *l = &g_fl[0];
+    uint32_t *kept = malloc((size_t)l->w * l->h * 4); memcpy(kept, l->px, (size_t)l->w * l->h * 4);
+    uint32_t kw = l->w, kh = l->h;
+    scene_render_invalidate(&r);                          /* everything painted again */
+    scene_render_frame(&r, &a, c.root, &rt);
+    int diff = 0;
+    for (uint32_t i = 0; i < kw * kh; i++) diff += kept[i] != g_fl[0].px[i];
+    CHECK(l->w == kw && diff == 0, "and what it kept is what painting it whole gives");
+    free(kept);
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T24: a promoted box of one colour is a fill: a 1 x 1 layer ---------- */
+static void t24_fill_layer(void) {
+    printf("T24 a dimming is a fill layer -- one pixel standing the size of the screen:\n");
+    g_fl_n = 0; g_look_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host_look);
+    struct render_target rt = make_target(160, 100);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle dim = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, dim, 160, 100);
+    struct paint dp = solidp(0, 0, 0, 0.4f); scene_set_paint(&a, dim, &dp);
+    struct scene_layer_motion m = { 0, 1000, 500, 500, 0, 0, 200, 1000, 0 };
+    scene_set_promoted(&a, dim, true, &m, &m);
+    scene_render_frame(&r, &a, root, &rt);
+    scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && l->w == 1 && l->h == 1, "its layer is one pixel");
+    CHECK(g_look_fill && g_look_box[2] == 160 && g_look_box[3] == 100, "said to be a fill, as large as the box");
+    CHECK(l->px[0] == (102u << 24), "its pixel the colour, premultiplied (black at 0.4)");
+    struct paint dp2 = solidp(0, 0, 0, 0.6f); scene_set_paint(&a, dim, &dp2);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->px[0] == (153u << 24) && l->presents == 2, "a new colour is a new pixel, presented");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T25: a promoted node inside another is a layer of its own ---------- */
+static void t25_nested_layers(void) {
+    printf("T25 a sheet over its dimming: two layers, each on its own motion:\n");
+    g_fl_n = 0; g_look_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host_look);
+    struct render_target rt = make_target(160, 100);
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle ground = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, ground, 160, 100);
+    struct paint gp = solidp(0.1f, 0.2f, 0.6f, 1); scene_set_paint(&a, ground, &gp);
+    struct node_handle dim = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, dim, 160, 100);
+    struct paint dp = solidp(0, 0, 0, 0.4f); scene_set_paint(&a, dim, &dp);
+    struct node_handle card = scene_create_node(&a, SCENE_NODE_RECT, dim);
+    scene_set_size(&a, card, 60, 40); scene_set_transform(&a, card, 50, 30, 0, 0,0,0,1, 1,1,1);
+    struct paint cp = solidp(0.9f, 0.9f, 0.9f, 1); scene_set_paint(&a, card, &cp);
+    struct node_handle row = scene_create_node(&a, SCENE_NODE_RECT, card);
+    scene_set_size(&a, row, 40, 10); scene_set_transform(&a, row, 10, 10, 0, 0,0,0,1, 1,1,1);
+    struct paint rp = solidp(0.2f, 0.6f, 0.3f, 1); scene_set_paint(&a, row, &rp);
+    struct scene_layer_motion fade = { 0, 1000, 500, 500, 0, 0, 200, 1000, 0 };
+    struct scene_layer_motion rise = { 0, 950, 500, 500, 0, 8, 240, 900, 0 };
+    scene_set_promoted(&a, dim, true, &fade, &fade);
+    scene_set_promoted(&a, card, true, &rise, &rise);
+    for (int f = 0; f < 3; f++) scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == 2 && g_fl[0].w == 1 && g_fl[0].h == 1 && g_fl[1].w == 60 && g_fl[1].h == 40,
+          "two layers: the dimming first (a fill, though the card is inside it), then the card above it");
+    CHECK(g_fl[0].froms == 1 && g_fl[1].froms == 1, "each sent in from its own appear end");
+    CHECK(px_at(&rt, 80, 50) == px_at(&rt, 2, 2), "the window under them is the ground: neither is in it");
+    { uint32_t c = g_fl[1].px[30 * 60 + 30], w = g_fl[1].px[15 * 60 + 30];
+      CHECK(c >> 24 == 255 && ((c >> 8) & 255) > 200 && ((w >> 16) & 255) < 100 && ((w >> 8) & 255) > 130,
+            "the card's layer holds the card and its row"); }
+    int dim_presents = g_fl[0].presents, card_presents = g_fl[1].presents;
+    struct paint rp2 = solidp(0.8f, 0.3f, 0.3f, 1); scene_set_paint(&a, row, &rp2);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl[1].presents == card_presents + 1 && g_fl[0].presents == dim_presents,
+          "a change in the card is the card's: the dimming is not painted again");
+    scene_set_size(&a, dim, 150, 100);                      /* the window, resized */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == 4 && g_fl[0].destroys == 1 && g_fl[1].destroys == 1,
+          "a dimming of another size is another layer, and the card is made again above it");
+    CHECK(g_fl[2].froms == 0 && g_fl[3].froms == 0 && g_fl[3].w == 60, "both where they stood, with no second arrival");
+    scene_destroy_node(&a, dim);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl[2].destroys == 1 && g_fl[3].destroys == 1 && g_fl[3].at.scale_milli == 950 && g_fl[2].at.scale_milli == 1000,
+          "gone, each leaves on its own motion -- the card sinking, the dimming fading");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
+/* ---- T26: a stagger's delay, a pull let go, a layer taken back ------------ */
+static void t26_layer_springs(void) {
+    printf("T26 a layer waits its turn, springs home when the app moves it, and is taken back at once:\n");
+    g_fl_n = 0;
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    scene_render_set_layer_host(&r, &g_fake_host);
+    struct render_target rt = make_target(200, 160);
+    struct node_handle card, row, root = t20_scene(&a, &card, &row, 1);
+    struct scene_layer_motion in = { 0, 1000, 500, 500, 0, 16, 300, 900, 135 };
+    scene_set_promoted(&a, card, true, &in, &in);
+    for (int f = 0; f < 3; f++) scene_render_frame(&r, &a, root, &rt);
+    struct fake_layer *l = &g_fl[0];
+    CHECK(g_fl_n == 1 && l->delay == 135 && l->resp == 300, "it arrives on its spring, 135 ms after it is sent");
+    scene_set_layer_spring(&a, card, 250, 900);
+    scene_set_transform(&a, card, 60, 30, 0, 0,0,0,1, 1,1,1);   /* the app moved it */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->at.x > 40 && l->resp == 250 && l->delay == 0 && !l->destroys,
+          "moved by the app, it travels there on the spring it was given, at once");
+    int gos = l->gos;
+    scene_set_promoted(&a, card, false, 0, 0);                  /* back in the window */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(l->gos == gos && !l->destroys, "taken back while still there, it stays until the window has its pixels");
+    scene_render_after_present(&r);
+    CHECK(l->gos == gos + 1 && l->destroys == 1 && l->resp == 0, "and then goes at once");
+    CHECK(px_at(&rt, 100, 50) != px_at(&rt, 5, 5), "and the window paints it again");
+    struct scene_layer_motion there = { 255, 1000, 500, 500, 0, 0, 0, 0, 0 };
+    scene_set_promoted(&a, card, true, &there, &there);         /* on screen already: a pull */
+    int before = g_fl_n;
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(g_fl_n == before + 1 && g_fl[g_fl_n - 1].froms == 0 && g_fl[g_fl_n - 1].presents == 1,
+          "promoted where it already is, it is a layer the same frame -- no settling, no arrival");
+    for (int i = 0; i < g_fl_n; i++) free(g_fl[i].px);
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -358,6 +1075,26 @@ int main(void) {
     t5_ghost();
     t6_destroyed();
     t7_layers();
+    t8_image_damage();
+    t9_fractional_edge();
+    t10_clear_outside();
+    t11_glass_in_group();
+    t12_reduced_glass();
+    t13_scaled_group();
+    t14_fade_alone();
+    t15_gradient_table();
+    t16_large_blur();
+    t17_partial_group();
+    t18_group_motion();
+    t19_group_dirty();
+    t20_promoted();
+    t21_invisible();
+    t22_glass_layer();
+    t23_partial_layer();
+    t24_fill_layer();
+    t25_nested_layers();
+    t26_layer_springs();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }
+

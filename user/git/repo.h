@@ -21,8 +21,9 @@ int repo_write_refs(const char *dir, const char *branch, const char *head_hex);
  * intentionally shallow rather than corrupt. No-op (returns 0) when n == 0. */
 int repo_write_shallow(const char *dir, char shas[][41], int n);
 
-/* Check out the working tree of the commit `head_hex` into <dir>. Returns the
- * number of files written, or -1. */
+/* Check out the working tree of the commit `head_hex` into <dir> -- files,
+ * links, submodules' empty directories -- and write .git/index (v2) for it,
+ * so the clone reads clean. Returns the number of files written, or -1. */
 int repo_checkout(const char *dir, const struct pack_obj *objs, int n,
                   const char *head_hex);
 

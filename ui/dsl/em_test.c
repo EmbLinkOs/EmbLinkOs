@@ -196,6 +196,14 @@ static uint8_t *icon_asset(const char *path,size_t *len) {
     if(n<=0 || !p || fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return NULL;}
     fclose(f);*len=(size_t)n;return p;
 }
+/* A mover like the compositor's: the window goes where it may (here, never
+ * above y = 20, as the bar keeps it), and the runtime is told where it went. */
+static int32_t mv_x, mv_y;
+static void clamp_mover(int win, int32_t x, int32_t y) {
+    if (y < 20) y = 20;
+    mv_x = x; mv_y = y;
+    em_window_bind(win, x, y);
+}
 static bool chrome_closed;
 static void chrome_frame(void) {
     ui_frame_begin();em_new_frame();
@@ -307,6 +315,60 @@ static void navigation_regressions(void) {
     ui_input_char('\n');context_frame();context_frame();context_frame();context_frame();
     CHECK(!strcmp(clip_text(),context_text),"context Copy waits for the original field's focus and selection to return");
 
+}
+
+/* ---- the close pull on layers ------------------------------------------ */
+static void pull_view(void) { Window("Pull") { WindowBar("Pull") { CloseGrip(); } Spacer(); } }
+static void pull_frame(void) {
+    ui_frame_begin(); em_new_frame(); pull_view(); em_flush(); ui_frame_end(); ui_run_layout(400, 300);
+}
+/* the grip: the 48 x 28 box, wherever the bar put it */
+static struct instance_handle find_box(struct instance_handle h, float w, float ht) {
+    for (struct instance_handle c = ui_first_child(h); !instance_handle_is_null(c); c = ui_next_sibling(c)) {
+        float x, y, cw, ch;
+        if (ui_rect_of(c, &x, &y, &cw, &ch) && cw == w && ch == ht) return c;
+        struct instance_handle f = find_box(c, w, ht);
+        if (!instance_handle_is_null(f)) return f;
+    }
+    return INSTANCE_HANDLE_NULL;
+}
+static void pull_on_layers(void) {
+    struct ui_appearance moving = {.density = 1, .text_scale = 100, .radius = 8};
+    ui_theme_configure(&moving); em_set_clock(fake_clock); em_set_layers(1); g_ms += 10000;
+    (void)em_take_wake(~0ull);
+    pull_frame(); pull_frame();
+    struct instance_handle win = ui_first_child(ui_root()), grip = find_box(win, 48, 28);
+    float gx, gy, gw, gh;
+    CHECK(!instance_handle_is_null(grip) && ui_rect_of(grip, &gx, &gy, &gw, &gh), "the window has its grip");
+    struct scene_node *root = scene_resolve(&SA, ui_scene_of(win));
+    CHECK(root && !root->promoted, "a window not pulled is the window's pixels");
+    uint32_t ep = em_ui_epoch();
+    ui_pointer(gx + 24, gy + 14, true); pull_frame();
+    ui_pointer(gx + 24 + 40, gy + 14, true); pull_frame(); pull_frame();
+    root = scene_resolve(&SA, ui_scene_of(win));
+    CHECK(root && root->promoted && root->layer_move_ms == 0 && root->opacity < 0.9f && root->tx > 5,
+          "pulled, its content is a layer that follows the hand, fading as it goes");
+    CHECK(em_ui_epoch() != ep && !em_window_pulling(), "going in is one structural frame, and then no forced ones");
+    ui_pointer(gx + 24 + 40, gy + 14, false); pull_frame(); pull_frame();
+    root = scene_resolve(&SA, ui_scene_of(win));
+    int wait = em_wake_wait(g_ms, 100000);
+    CHECK(root && root->promoted && root->layer_move_ms == 250 && root->opacity == 1 && wait > 0 && wait <= 600,
+          "let go short, it is sent home on the compositor's spring, and wakes the app once to take it back");
+    g_ms += (uint64_t)wait; CHECK(em_take_wake(g_ms), "...when it is home");
+    pull_frame();
+    root = scene_resolve(&SA, ui_scene_of(win));
+    CHECK(root && !root->promoted, "home: the window's pixels again");
+    /* pulled all the way: the content is back in the window before it closes */
+    g_ms += 900;
+    ui_pointer(gx + 24, gy + 14, true); pull_frame();
+    ui_pointer(gx + 24 + 140, gy + 14, true); pull_frame();
+    int took[4];
+    for (int f = 0; f < 4; f++) { pull_frame(); took[f] = em_window_take_close(); }
+    root = scene_resolve(&SA, ui_scene_of(win));
+    CHECK(!took[0] && took[1] && root && !root->promoted,
+          "pulled past the threshold, it closes once its picture is back in the window and presented");
+    ui_pointer(0, 0, false); pull_frame();
+    em_set_layers(0);
 }
 
 int main(void) {
@@ -603,6 +665,22 @@ int main(void) {
     CHECK(chrome_closed,"leaving the layout board for Close does not swallow the close press");
     em_feed_pointer(20,18,0,0,0,1);chrome_frame();
 
+    /* A WINDOW DRAGGED INTO A CLAMP COMES BACK WITH THE HAND. The drag has to
+     * take the window's place from the mover, or every pixel the clamp
+     * refused is added to the next step and the window stays pinned while
+     * the pointer goes home. The pointer an app sees is relative to where the
+     * window really is, so the test hands it that. */
+    em_window_set_mover(clamp_mover); em_window_bind(7,100,40);
+    mv_x=100; mv_y=40;
+    int gx=100+200, gy=40+18;
+    em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),0,0,0,1);chrome_frame();
+    em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),1,0,0,1);chrome_frame();
+    for(int k=0;k<8;k++){gy-=5;em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),1,0,0,1);chrome_frame();}
+    int pinned=mv_y;
+    for(int k=0;k<8;k++){gy+=5;em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),1,0,0,1);chrome_frame();}
+    em_feed_pointer((float)(gx-mv_x),(float)(gy-mv_y),0,0,0,1);chrome_frame();
+    CHECK(pinned==20 && mv_x==100 && mv_y==40,"a window dragged against the bar comes back with the pointer");
+
     em_res_set_loader(icon_asset);
     uint32_t iw=0,ih=0;
     CHECK(em_image_at("/system/images/ui-close.eic",16,&iw,&ih)!=NULL,
@@ -636,6 +714,20 @@ int main(void) {
     CHECK(dialog && dialog->data.rect.fill.kind==PAINT_SOLID && dialog->data.rect.fill.solid.a==1,
           "a default Dialog retains an opaque readable surface");
 
+    /* a clear Window background: the theme's on an opaque window, clear on
+     * one that shows through (the Terminal at 60% was the theme's colour) */
+    for (int clear=0;clear<2;clear++) {
+        em_window_set_clear(clear);
+        ui_frame_begin();em_new_frame();Window("Clear",.background=(Color){0,0,0,0}) {Spacer();}
+        em_flush();ui_frame_end();ui_run_layout(400,300);
+        struct scene_node *win=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_root())));
+        bool painted=win && win->data.rect.fill.kind==PAINT_SOLID && win->data.rect.fill.solid.a>0;
+        CHECK(clear?!painted:painted && win->data.rect.fill.solid.a==1,
+              clear?"a window that shows through keeps a clear background clear"
+                   :"an opaque window's clear background is the theme's");
+    }
+    em_window_set_clear(0);
+
     struct ui_appearance calm={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
     ui_theme_configure(&calm);em_set_clock(fake_clock);g_ms+=10000;em_toast("Ready",Success);
     ui_frame_begin();em_new_frame();VStack(.key="calm-toast") {em_toast_host();}
@@ -643,7 +735,113 @@ int main(void) {
     struct scene_node *toast=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
     CHECK(toast && toast->opacity==1,"reduced motion presents a toast without a fade or slide");
 
+    /* ON LAYERS a toast is built once, at rest, and the app sleeps through its
+     * time on screen: no frame asked for, one wake for when it is to leave --
+     * which is the frame that stops building it, so the compositor sinks it. */
+    {
+        struct ui_appearance moving={.density=1,.text_scale=100,.radius=8};
+        ui_theme_configure(&moving);em_set_layers(1);g_ms+=10000;
+        (void)em_take_wake(~0ull);em_toast("Copied",ToneDefault);
+        struct scene_node *pill[3]={0};int asked[3]={0},due[3]={0};int wait=0;
+        for (int f=0;f<3;f++) {
+            (void)em_take_frame_request();
+            ui_frame_begin();em_new_frame();VStack(.key="layer-toast") {em_toast_host();}
+            em_flush();ui_frame_end();ui_run_layout(400,100);
+            asked[f]=em_take_frame_request();
+            struct instance_handle a=ui_first_child(ui_first_child(ui_root()));
+            pill[f]=scene_resolve(&SA,ui_scene_of(ui_first_child(a)));
+            if (f==0) { wait=em_wake_wait(g_ms,100000); due[0]=em_take_wake(g_ms); g_ms+=(uint64_t)wait; }
+            else due[f]=em_take_wake(g_ms);
+        }
+        CHECK(pill[0] && pill[0]->promoted && pill[0]->opacity==1 && !asked[0],
+              "on layers a toast is a promoted pill built at rest, asking for no frame after it");
+        CHECK(wait>1500 && wait<2500 && !due[0],"...and sets one wake, for when its time is up");
+        CHECK(due[1] && !pill[1] && asked[1],"woken then, it is no longer built (the layer leaves on its own)");
+        CHECK(!pill[2] && !due[2],"and stays gone, with no wake left");
+        em_set_layers(0);ui_theme_configure(&calm);
+    }
+
+    /* A glass box rebuilt with nothing changed stays clean. Its fill and border
+     * are the material's; written first as the box's own and then as the
+     * material's, they differed from the last frame every frame, and the dock
+     * re-presented itself ten times a second doing nothing. The renderer clears
+     * the flags after a frame; here the test does. */
+    struct scene_node *glass=0;bool glass_clean=true,glass_tinted=false;
+    for (int f=0;f<3;f++) {
+        ui_frame_begin();em_new_frame();
+        VStack(.key="glass-host") {HStack(.key="glass-dock",.height=40,.glass=1,.corner=14,.border=1,.shadow=2) {Spacer();}}
+        em_flush();ui_frame_end();ui_run_layout(400,100);
+        glass=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+        if (!glass) break;
+        if (f>0 && (glass->dirty || glass->dirty_content)) glass_clean=false;
+        glass_tinted=glass->data.rect.fill.kind==PAINT_SOLID && glass->data.rect.fill.solid.a==ui_theme()->material_alpha &&
+                     glass->border_width==1 && glass->border_color.a==ui_theme()->border_strong.a;
+        glass->dirty=glass->dirty_content=false;
+    }
+    CHECK(glass && glass_clean,"a glass box rebuilt with nothing changed is not dirty");
+    CHECK(glass_tinted,"its fill and border are still the material's");
+
+    /* An idle menu-bar button rebuilt is not dirty either: it was painted the
+     * hover colour and then cleared on every frame, and the bar re-presented
+     * its whole strip on every tick. */
+    struct scene_node *mb=0;bool menu_clean=true;
+    ui_pointer(-100.0f,-100.0f,false);
+    for (int f=0;f<3;f++) {
+        ui_frame_begin();em_new_frame();
+        HStack(.key="menu-host") {Menu("Idle") {MenuItem("Item");}}
+        em_flush();ui_frame_end();ui_run_layout(400,100);
+        mb=scene_resolve(&SA,ui_scene_of(ui_first_child(ui_first_child(ui_root()))));
+        if (!mb) break;
+        if (f>0 && (mb->dirty || mb->dirty_content)) menu_clean=false;
+        mb->dirty=mb->dirty_content=false;
+    }
+    CHECK(mb && menu_clean && mb->data.rect.fill.solid.a==0,"an idle menu button rebuilt is clear and not dirty");
+
     navigation_regressions();
+    pull_on_layers();
+
+    /* em_spring: an entrance from `from`, a turn mid-way, the id copied */
+    {
+        struct ui_appearance moving={.density=1,.text_scale=100,.radius=8};
+        ui_theme_configure(&moving);em_set_clock(fake_clock);g_ms+=10000;
+        char id[16];snprintf(id,sizeof id,"enter%d",7);
+        float v0=em_spring(id,0.0f,1.0f,EmSmooth);
+        snprintf(id,sizeof id,"scribbled");                 /* the caller's buffer reused */
+        g_ms+=60;float v1=em_spring("enter7",0.0f,1.0f,EmSmooth);
+        CHECK(v0==0.0f && v1>0.05f && v1<0.9f,"a new spring starts at `from` and is on its way 60 ms later");
+        CHECK(em_spring_moving("enter7"),"and says it is moving");
+        g_ms+=40;float v2=em_spring("enter7",0.0f,0.0f,EmSmooth);
+        CHECK(v2>v1,"turned round, it keeps the way it was going for a moment");
+        for(int i=0;i<200 && em_spring_moving("enter7");i++){g_ms+=8;v2=em_spring("enter7",0.0f,0.0f,EmSmooth);}
+        CHECK(v2==0.0f && !em_spring_moving("enter7"),"and comes to rest exactly on the new target");
+        struct ui_appearance still={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
+        ui_theme_configure(&still);
+        CHECK(em_spring("enter8",0.0f,1.0f,EmSmooth)==1.0f,"with reduced motion a spring is its target");
+    }
+
+    /* em_spring_throw: a gesture hands a spring its place and its speed */
+    {
+        struct ui_appearance moving={.density=1,.text_scale=100,.radius=8};
+        ui_theme_configure(&moving);g_ms+=10000;
+        em_spring_throw("thrown",100.0f,0.0f);
+        CHECK(em_spring("thrown",0.0f,100.0f,EmSmooth)==100.0f && !em_spring_moving("thrown"),
+              "held by a hand, a spring is where the hand put it -- not at `from`");
+        em_spring_throw("thrown",100.0f,3000.0f);         /* let go toward 400, fast */
+        em_spring_throw("dropped",100.0f,0.0f);           /* ...and one let go still */
+        (void)em_spring("thrown",0.0f,400.0f,EmSmooth);(void)em_spring("dropped",0.0f,400.0f,EmSmooth);
+        g_ms+=60;
+        float thrown=em_spring("thrown",0.0f,400.0f,EmSmooth),dropped=em_spring("dropped",0.0f,400.0f,EmSmooth);
+        CHECK(thrown>dropped+40.0f,"thrown, it is well ahead of one let go still");   /* v0 t e^-wt: 61 px at best */
+        em_spring_throw("back",300.0f,3000.0f);           /* thrown the wrong way: it turns */
+        (void)em_spring("back",0.0f,0.0f,EmSmooth);
+        g_ms+=30;float b1=em_spring("back",0.0f,0.0f,EmSmooth);
+        for(int i=0;i<300 && em_spring_moving("back");i++){g_ms+=8;(void)em_spring("back",0.0f,0.0f,EmSmooth);}
+        CHECK(b1>300.0f && em_spring("back",0.0f,0.0f,EmSmooth)==0.0f,"thrown away from home, it carries on, turns and comes to rest home");
+        struct ui_appearance still={.density=1,.text_scale=100,.radius=8,.reduce_motion=1};
+        ui_theme_configure(&still);
+        em_spring_throw("still",50.0f,3000.0f);
+        CHECK(em_spring("still",0.0f,400.0f,EmSmooth)==400.0f,"with reduced motion a throw lands at once");
+    }
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

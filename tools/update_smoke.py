@@ -6,7 +6,7 @@ The host only observes via GDB; interactions use mouse, keyboard and serial.
 Do not rebuild kernel/apps/libembk.so while this guest is active.
 """
 from pathlib import Path
-import argparse,functools,http.server,json,re,subprocess,tempfile,threading,time
+import os,argparse,functools,http.server,json,re,subprocess,tempfile,threading,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_ui import NativeUI
@@ -15,7 +15,7 @@ from lock_test import keyname
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('fixture',type=Path);p.add_argument('--resume-disk',type=Path);args=p.parse_args()
-    out=Path(tempfile.mkdtemp(prefix='update-acceptance-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='update-acceptance-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     handler=functools.partial(http.server.SimpleHTTPRequestHandler,directory=str(args.fixture))
     server=http.server.ThreadingHTTPServer(('0.0.0.0',18080),handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     disk=out/'live.img';subprocess.run(['cp','--sparse=always',str(args.resume_disk or args.fixture/'base.img'),str(disk)],check=True)
@@ -37,11 +37,11 @@ def main():
         d=desktop('before',setup=not args.resume_disk)
         status(d)
         terminal=d.launch('Terminal','Terminal');screen=TerminalState(d)
-        eventually(d,lambda:screen.integer(terminal,'g_at_prompt',1)==1,'terminal prompt')
+        eventually(d,lambda:screen.at_prompt(terminal),'terminal prompt')
         def type_shell(d,text):
             for c in text:d.key({'>' :'shift-dot','/':'slash','|':'shift-backslash'}.get(c) or keyname(c))
         type_shell(d,'echo UPDATE-PROOF-KEEP-MY-FILES | save Documents/update-proof.txt\n')
-        eventually(d,lambda:screen.integer(terminal,'g_at_prompt',1)==1,'saved personal file')
+        eventually(d,lambda:screen.at_prompt(terminal),'saved personal file')
         settings=d.launch('Settings','Settings');ui=NativeUI(d);ui.click_text(settings,'Paper');d.g.pump(2)
         preferences=d.read('settings',settings['pid'],'g_cfg',64)
         ui.click_text(settings,'Software Update');d.snap('update-ready-to-check')
@@ -71,7 +71,7 @@ def main():
         d.g.wait(b'update: healthy desktop confirmed release 1 in slot A',120)
         assert 'release=1 version=1.0.0' in status(d)
         terminal=d.launch('Terminal','Terminal');screen=TerminalState(d)
-        eventually(d,lambda:screen.integer(terminal,'g_at_prompt',1)==1,'rollback terminal prompt')
+        eventually(d,lambda:screen.at_prompt(terminal),'rollback terminal prompt')
         type_shell(d,'cat Documents/update-proof.txt\n')
         eventually(d,lambda:'UPDATE-PROOF-KEEP-MY-FILES' in screen.text(terminal).splitlines(),'personal file lost across upgrade/rollback')
         d.snap('personal-files-preserved')

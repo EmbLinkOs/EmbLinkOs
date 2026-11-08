@@ -450,6 +450,11 @@ int  em_window_take_close(void);       /* 1 the frame the close gesture committe
 int  em_window_pulling(void);          /* 1 while a close pull is animating (fade/slide) */
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y));
 void em_window_bind(int win, int32_t x, int32_t y);
+/* The drag zones the last frame laid out, as content-local {x, y, w, h}: for
+ * the runtime to give the compositor, which then drags the window itself --
+ * after em_window_set_compositor_drag(1), the zones only watch. */
+int  em_window_drag_rects(int32_t (*out)[4], int max);
+void em_window_set_compositor_drag(int on);
 void em_window_move_to(int32_t x, int32_t y);   /* snap/pin the bound window */
 void em_window_pos(int32_t *x, int32_t *y);     /* current bound-window top-left */
 int  em_window_moved(void);                     /* read-and-clear: window moved since last poll */
@@ -460,11 +465,18 @@ void em_drag_handle_end_(void);
 #define DragHandle(...) EM_SCOPE_(em_drag_handle_((EmProps){__VA_ARGS__}), em_drag_handle_end_())
 
 /* Resizable windows (V5): the runtime enables the grip; Window() then draws a
- * corner handle whose drag, ON RELEASE, records a size delta the runtime
- * collects with em_window_take_resize and applies via embk_win_resize. */
+ * corner handle whose drag records a size delta -- from the size at the grab
+ * -- that the runtime collects with em_window_take_resize and applies via
+ * embk_win_resize_live as it changes, and once more when it is let go.
+ * em_window_take_resize returns 0 when there is nothing new, else
+ * EM_RESIZE_STEP with FIRST on a drag's first take and DONE on release. */
+#define EM_RESIZE_STEP  1
+#define EM_RESIZE_FIRST 2
+#define EM_RESIZE_DONE  4
 void em_window_set_resizable(int on);
 void em_window_set_glass(int on);   /* Window() renders a translucent tint for glass */
-int  em_window_take_resize(int *dw, int *dh);   /* 1 if a resize is pending */
+void em_window_set_clear(int on);   /* the window shows through: a clear Window background stays clear */
+int  em_window_take_resize(int *dw, int *dh);   /* EM_RESIZE_*, or 0 */
 
 /* --- new components ----------------------------------------------------- */
 /* Dropdown / Picker: a field showing labels[*sel]; tap to open a menu, tap an
@@ -728,8 +740,14 @@ int   em_take_clicks(uint64_t *when_ms);
 
 void  em_feed_pointer(float x, float y, int left_down, int right_down,
                       int wheel, int focused);
-void em_shell_band(int bottom, int height); /* translucent shell strip geometry */
+void em_shell_band(int bottom, int height); /* translucent shell strip geometry: the window is a bar, kept that thin but for open menus */
 void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
+/* The window shows through: its canvas starts transparent, what the view
+ * paints is composited by its own alpha, over what is behind the window
+ * blurred by `blur` pixels (0-32). An ordinary window otherwise -- unlike the
+ * Translucent material, which is for the bars. Any time; false puts it back. */
+void  em_window_material(bool see_through, int blur);
+bool  em_window_see_through(void);
 float em_viewport_width(void);
 float em_viewport_height(void);
 
@@ -745,11 +763,32 @@ float em_viewport_height(void);
 void em_set_key_hook(int (*fn)(int ch));
 /* Modifier snapshot of the character currently delivered to a key hook. */
 int em_key_modifiers(void);
+/* WHICH KEY that character came from (EMBK_KC_* or the key's unshifted ASCII;
+ * 0 on a multi-byte character's later bytes) and its EMBK_KEYF_* flags -- so a
+ * hook can tell Up from Ctrl+S, which are the same byte. */
+int em_key_code(void);
+int em_key_flags(void);
+/* The mouse buttons held (EMBK_MOUSE_LEFT|RIGHT|MIDDLE) while the pointer is
+ * over this window's content, as of this frame; 0 elsewhere. The toolkit's
+ * own widgets answer to the left one only; a terminal reports all three. */
+int em_pointer_buttons(void);
+/* Keys with no character (F1-F12, Insert, Menu) reach the key hook as
+ * EM_KEY_ONLY|code only after an app asks for them: a hook written for
+ * characters must never see a value it would misread as one. */
+#define EM_KEY_ONLY 0x10000
+void em_key_hook_wants_key_only(int on);
 /* All ordinary exits (Escape, window controls, GUI+W, request_exit) call this.
  * Return 1 to close, 0 to defer and show a dialog. A deferral acknowledges the
  * compositor request, so waiting for the user has no forced-kill deadline.
  * After Save/Discard, call request_exit again; the hook must then allow it. */
 void em_set_close_hook(int (*fn)(void));
+/* Why the window is closing, for a close hook that treats them differently
+ * (an app with tabs closes one on a request, all of them on a quit):
+ * EM_CLOSE_REQUEST -- GUI+W or the compositor asking; EM_CLOSE_QUIT -- GUI+Q,
+ * the whole app; EM_CLOSE_BUTTON -- the window's close light; EM_CLOSE_OTHER
+ * -- the app itself, Escape, a gesture. */
+enum { EM_CLOSE_OTHER = 1, EM_CLOSE_REQUEST, EM_CLOSE_QUIT, EM_CLOSE_BUTTON };
+int em_close_reason(void);
 void em_set_idle_hook(void (*fn)(void));
 /* Runs after LAYOUT and before the frame is rendered -- the only moment at
  * which every node's resolved position is known and the pixels have not been
@@ -825,6 +864,20 @@ void em_app_set_refresh(int ms);
  * em_request_frame() itself when the state changes. */
 void em_request_frame(void);
 int  em_take_frame_request(void);   /* runtime-internal: read-and-clear */
+int  em_frame_requested(void);      /* runtime-internal: a peek -- is motion still wanted? */
+/* A FRAME AT A TIME, not every frame until then: the view runs again at
+ * uptime `ms` (the soonest of every call), and the runtime sleeps until it.
+ * For something that changes on a clock but not between -- a tooltip's
+ * delay, a toast's time on screen -- that asking for every frame until it
+ * would wake the app sixty times a second to learn nothing. */
+void em_wake_at(uint64_t ms);
+int  em_take_wake(uint64_t now);     /* runtime-internal: due? (and clears it) */
+int  em_wake_wait(uint64_t now, int wait);   /* runtime-internal: `wait`, no later than the wake */
+/* The waits between frames, for a host loop of its own (the desktop's):
+ * em_wait_input until a UI event or `ms`; em_wait_frame until the compositor's
+ * next frame, or `pace` ms on a kernel without a frame clock. */
+void em_wait_input(int ms);
+void em_wait_frame(int pace);
 
 /* --- resources ----------------------------------------------------------- *
  * Path-keyed caches for fonts and images, IO-agnostic: the host installs an
@@ -862,6 +915,10 @@ bool em_image_button_tinted(const char *path, float size, Color tint);
 bool em_image_button_key(const char *path, float size, uint64_t key);
 #define ImageButtonKey(path, size, key) \
     em_image_button_key((path), (size), (uint64_t)(uintptr_t)(key))
+/* Image buttons built while this is on do not light on hover (a press still
+ * shades them): for a surface that draws its own hover, as the dock's plate
+ * does. Turn it off again after. */
+void em_quiet_hover(bool on);
 void em_background_image(const char *path);
 #define BackgroundImage(path) em_background_image(path)
 void em_theme_use(EmTheme t);
@@ -882,6 +939,24 @@ uint64_t em_now_ms(void);   /* current time (0 if no clock set) */
 int   em_dt_ms(void);                 /* ms since the previous frame */
 float em_animate(const char *id, float target, float rate);
 #define Animate(id, target, rate) em_animate((id), (target), (rate))
+/* A VALUE ON A SPRING, by id (copied: a formatted buffer is fine): toward `to`
+ * from wherever it is, turning round mid-way when `to` changes, at a response
+ * (ms) and damping (permille) -- the motion tokens in ui/motion/spring.h are
+ * (250, 900) snappy, (350, 1000) smooth, (450, 700) bouncy. An id seen for the
+ * first time starts at `from`: that is an entrance. Asks for frames while it
+ * moves; with reduced motion, or no clock, it is `to`. */
+float em_spring(const char *id, float from, float to, int response_ms, int damping_permille);
+#define EmSnappy 250, 900      /* the motion tokens, as em_spring's last two arguments */
+#define EmSmooth 350, 1000
+#define EmBouncy 450, 700
+/* Whether the id's spring is still moving (or not yet seen). */
+int em_spring_moving(const char *id);
+/* A HAND LETTING GO: the id's spring is put at `value`, moving at `velocity`
+ * (per second) -- where a drag left it and how fast it was going. The next
+ * em_spring(id, ...) carries on from there toward its `to`: a flick thrown
+ * far enough flies on, one let go still springs home. Called every frame
+ * while the hand holds it (velocity 0), the spring is simply where the hand is. */
+void em_spring_throw(const char *id, float value, float velocity);
 
 /* Reusable views are just C functions. This is optional sugar for the no-arg
  * case so `Component(ProfileCard) { ... }` reads nicely; call it as ProfileCard(). */
@@ -913,6 +988,15 @@ void em_overlay_(void);
 void em_overlay_end_(void);
 int  em_overlay_dismissed(void);
 int  em_overlay_active(void);
+int  em_overlay_settling(void);   /* active, and still in the frames its scrim-dismiss waits out */
+/* LAYERS: the runtime turns them on when the compositor will move promoted
+ * subtrees for the window -- menus, tooltips -- painted once (ui_set_promoted). */
+void em_set_layers(int on);
+int  em_layers_on(void);
+/* For a program running its own loop: the layer host for its window (hand it
+ * to scene_render_set_layer_host, then em_set_layers(1)), or NULL. */
+struct scene_layer_host;
+const struct scene_layer_host *em_layers_attach(int win, int shows_through);
 void em_dialog_(EmProps p);
 void em_dialog_end_(void);
 #define NavigationStack(root) em_nav(root)

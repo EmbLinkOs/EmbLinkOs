@@ -54,5 +54,10 @@ bool i8042_aux_write(uint8_t byte);
  * exist. Called by the drivers once their handlers are registered, so a byte
  * cannot arrive before there is somewhere to put it. */
 void i8042_irq_enable(bool kbd, bool aux);
+/* a kernel thread that delivers a byte a lost interrupt left in the buffer */
+void i8042_watch_start(void);
+/* read and deliver every byte waiting, each to its port (x86; `source` is the
+ * IRQ that fired, 1 or 12, or 0) -- both devices' interrupt handlers call it */
+uint32_t i8042_service(int source);
 
 #endif /* __I8042_H__ */

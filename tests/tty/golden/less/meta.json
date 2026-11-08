@@ -1,0 +1,16 @@
+{
+  "cursor_x": 1,
+  "cursor_y": 23,
+  "alternate": 1,
+  "cursor_visible": 1,
+  "cols": 80,
+  "rows": 24,
+  "command": [
+    "less",
+    "-R",
+    "history.txt"
+  ],
+  "frozen": true,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

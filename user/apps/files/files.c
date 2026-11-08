@@ -50,6 +50,11 @@ static bool  g_dirty = true;              /* re-read the directory this frame */
 static bool  g_initialized = false;
 static float g_scroll = 0;
 static char  g_status[128] = "";
+static char  g_toast_msg[128];        /* em_toast keeps the pointer: its own buffer */
+static void  toast(EmTone tone, const char *fmt, const char *name) {
+    snprintf(g_toast_msg, sizeof g_toast_msg, fmt, name);
+    em_toast(g_toast_msg, tone);
+}
 static char  g_query[64] = "";            /* the live filter                  */
 static int   g_view = 0;                  /* 0 = grid, 1 = list               */
 static int   g_sel = -1;
@@ -340,7 +345,8 @@ static void do_delete(int i) {
                             full, dst, rc); embk_puts(1, b); }
     if (rc == 0) {
         trash_index_set(leaf, full);
-        snprintf(g_status, sizeof g_status, "Moved %s to the Trash", e->name);
+        g_status[0] = 0;                                     /* said by the toast, not twice */
+        toast(Success, "Moved %s to the Trash", e->name);   /* out of the list, said where it went */
     } else {
         snprintf(g_status, sizeof g_status, "Could not move %s to the Trash", e->name);
     }
@@ -835,7 +841,8 @@ static void app(void) {
                             else {
                                 join(g_clip_path, sizeof g_clip_path, e->name);
                                 snprintf(g_clip_name, sizeof g_clip_name, "%s", e->name);
-                                snprintf(g_status, sizeof g_status, "Copied %s", e->name);
+                                g_status[0] = 0;
+                                toast(ToneDefault, "Copied %s", e->name);   /* nothing else shows it */
                             }
                         }
                         if (MenuItem("Rename...")) {
@@ -914,6 +921,7 @@ static void app(void) {
                     Spacer();
                     if (g_status[0]) Text(g_status).caption().tertiary();
                 }
+                ToastHost();      /* over the list's foot: Copied, Moved to the Trash */
             }
         }
 

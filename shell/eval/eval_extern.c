@@ -758,6 +758,7 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
     if (out_open) close(EXT_FD_OUTPUT_READ);
 
     int64_t code = embk_wait((int)child);
+    if (cw.killed || embk_child_cancelled((int)child) == 1) exec_interrupt_note();   /* ^C ended it: 130 */
 
     /* Take the console back: from here on ^C means THIS shell again. Done
      * unconditionally -- a route left pointing at a reaped child makes the next

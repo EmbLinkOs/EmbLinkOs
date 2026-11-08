@@ -83,14 +83,37 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
                      const uint32_t *argb, uint32_t stride, uint32_t alpha);
 // Scale an image into a destination rect and composite it at a uniform alpha,
 // clipped to [clx0,cly0)-(clx1,cly1). The window open/minimize motion.
+// `smooth`: filtered (bilinear), not nearest-neighbour -- six times the cost.
 void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             const uint32_t *argb, int32_t sw, int32_t sh,
-                            uint32_t stride, uint32_t alpha,
+                            uint32_t stride, uint32_t alpha, int smooth,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
+/* A picture with its own (premultiplied) alpha, scaled and composited over at
+ * `opacity` -- a compositor layer; see framebuffer.c. */
+/* Each colour of a drawn region moved away from its grey (pix_saturate_row). */
+void fb_blit_scaled_over(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                         const uint32_t *argb, int32_t sw, int32_t sh,
+                         uint32_t stride, uint32_t opacity, int smooth,
+                         int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
+// The composed pixels of a rect, as 0x00RRGGBB, into `dst` (stride in pixels):
+// the backdrop a window that shows through keeps. The part off the screen is
+// left as it was; returns 0 when none of it is on the screen.
+int fb_read_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t *dst, uint32_t stride);
 // In-place box blur of a framebuffer region (the backdrop behind a glass window).
 void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius);
 // Soft accent glow band around the OUTSIDE of a rect (the focused-window halo),
 // clipped to [clx0,cly0)-(clx1,cly1) and the screen.
+/* A window's SHADOW, in layers: each a rounded rect -- the frame [fx0,fy0)-
+ * (fx1,fy1) with corner `radius`, moved down by `dy` -- whose darkness falls
+ * from `peak` (0-255) at its edge to nothing `width` px out, quadratically (the
+ * GPU path's falloff, soft_compose.c's sc_shadow). The layers darken together
+ * (1 - (1-a)(1-b)), in one pass, and only outside the window's own rounded
+ * shape: under the corners' arcs too, where the window does not reach. Clipped
+ * to the caller's region. */
+struct fb_shadow_layer { int32_t dy, width; uint32_t peak; };
+void fb_shadow_layers(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t radius,
+                      const struct fb_shadow_layer *layers, int n,
+                      int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 void fb_glow_rect(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t gw,
                   uint8_t cr, uint8_t cg, uint8_t cb, uint8_t max_a,
                   int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);

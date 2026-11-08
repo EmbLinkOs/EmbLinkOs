@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Recovery-install a managed image to disposable NVMe, then boot it alone."""
 from pathlib import Path
-import json,re,subprocess,tempfile
+import os,json,re,subprocess,tempfile
 from recovery_smoke import Guest,ROOT,digest
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='update-managed-install-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='update-managed-install-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     source=out/'source.img';target=out/'installed.img'
     subprocess.run(['cp','--sparse=always',str(ROOT/'managed-uefi.img'),str(source)],check=True)
     with target.open('wb') as f:f.truncate(source.stat().st_size+64*1048576)

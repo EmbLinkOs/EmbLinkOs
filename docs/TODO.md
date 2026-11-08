@@ -1,3 +1,475 @@
+## Fluid desktop: frame clock, motion, materials, type (2026-10-26)
+
+The roadmap the user set: from a hobby-OS look to a macOS-class desktop, fluid
+at 60-120 Hz with the rate adapting as macOS does, on any hardware (no machine is
+the default target). Measured before and after every step
+([DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)).
+
+- [x] P0 Measure, and quick wins (241cb9d..ec0718b; [DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md)).
+  - [x] The compositor measures each compose (cause, time, area, presenter and its rect) and the
+        pointer's motion-to-screen latency: GUI+Shift+P overlay, serial `perf`, syscall 160;
+        `tools/perf_smoke.py` measures five scenes (baseline at 241cb9d).
+  - [x] An idle desktop composed 10 times a second; now none. A glass box and an idle menu button
+        were dirty on every frame, and apps and the desktop presented their whole window when a
+        frame changed nothing.
+  - [x] A dragged window re-presented all of itself on every move; now nothing.
+  - [x] The kernel's pixel loops at `-O2`, two channels per multiply, bit-exact (`make pix-test`).
+  - [x] Blur allocated two region-sized buffers on every call (`fb_blur_region` keeps them now).
+        `backdrop_blur` still allocates per call -- its host test asserts the memory is given back;
+        it is replaced by P3's blur.
+  - [x] Real-speed numbers: the same scenes on arm64 under HVF (`perf_smoke.py --arch aarch64`,
+        which types first-boot setup as the x86 scenes do).
+  - [x] System shortcuts and GUI editing commands were decided only for PS/2 keyboards; on arm64's
+        virtio keyboard GUI+Space typed a space. Decided for every keyboard now.
+- [ ] **The arm64 desktop's text sits wrong -- with the DejaVu faces.** With Inter as the UI face
+      (P4) arm64 lays text out exactly as x86 does (the perf capture after the switch matches x86's
+      pixel for pixel in layout), so the fault is in how something about DejaVu's faces is read or
+      used; nothing in font.c reads a signed byte through `char`. Condensed and Serif, still DejaVu,
+      very likely still show it on arm64. What it looked like:
+      in Settings the sidebar icons fall below their
+      labels, segmented buttons are tall with their text at the top, the top bar's text is cut
+      off at the top edge and the dock's label is an empty box. The same with the P0 UI changes
+      reverted, so it predates them; x86 draws the same build correctly. Not investigated --
+      a text metric (char signedness in the font parser is the first suspect) differs between
+      the two userlands. Seen in the arm64 perf captures (gallery 210). The same fault puts a
+      title bar's drag zone at (104,-7,864,51) there, above the window's content: the
+      compositor refuses a zone outside the content and the toolkit then keeps dragging the
+      window itself (`em_app.c` claims the compositor's drag only when every zone was taken).
+- [ ] **Two desktop smokes fail before any of this work** (6eed0ad, checked by building it):
+      `menu_smoke.py` clicks (916,195) for Settings' Light appearance, which is now at about
+      (1005,426), so the light menu never comes; `desktop_smoke.py`'s mute click at (1000,306)
+      misses the same way (volume stays 100). Their coordinates predate the current Settings
+      layout. **And a third**: `files_document_smoke.py` clicks Files' New Document at the
+      window's (930, 90), and the Contour redesign (26988d7, after the smoke's 7d15db6) put the
+      button's row at y 64 -- the click lands in the empty row below the toolbar.
+- [ ] A drag step still recomposes the window's old and new footprints (about 0.7 Mpx for
+      Settings): 2 ms a step on an M5 core (arm64 drag p50 2.08 ms), an order more on slow
+      ones. The compositor drags the window now (P1), so the app no longer presents, but the
+      repaint is still both footprints; repainting only the strips a move exposes and copying
+      the window's own pixels is P3's, with the corner masks and cached shadows that make the
+      copy exact.
+- [x] P1 Frame clock (3635fef..3641c51; [DESKTOP_PERFORMANCE.md](DESKTOP_PERFORMANCE.md#after-p1-3641c51)).
+  - [x] A compositor thread composes once a frame from recorded damage (16 rectangles), on a
+        phase-locked beat while something moves and at once after stillness.
+  - [x] Nanosecond sleeps for the beat: the sleeping core's timer armed for the instant, and the
+        timer's own lateness learned and spun out (the lead). arm64 under HVF keeps 60 and 120 Hz
+        within 1 ms at the 95th percentile.
+  - [x] A deadline reservation sized to the frames' cost, held only while frames keep coming.
+  - [x] Applications wait for input or the next frame instead of sleeping (syscalls 161, 162);
+        an app may ask for a frame rate (163).
+  - [x] The rate adapts: the display's top rate under a hand, an app's rate as the slowest
+        fraction of the refresh at or above it (exact on VRR), 60 for the rest; a governor and
+        the Efficiency profile cap it. `perf display` simulates a 120 Hz and a VRR display.
+  - [x] The pointer on virtio-gpu's cursor plane: moving it composes nothing.
+  - [x] The compositor drags windows by the regions their apps declare (164); the toolkit's
+        title bars are such regions, and a drag into an edge still tiles.
+- [ ] **Late compose**: a frame is composed when its beat starts, not at the next vblank less its
+      predicted cost. No display path here has a vblank to aim at (virtio-gpu, Bochs, GOP, the
+      Pi's framebuffer); Intel's native path does, untested here.
+- [ ] **High refresh rates as a choice**: Settings → Displays offers no refresh rate, and the
+      frame clock reads the mode's (`display_refresh_mhz`). Picking a 120 Hz EDID mode needs a
+      driver that programs one; none here can be tested at 120 Hz.
+- [ ] **Flips and the other cursor planes**: Intel Gen9's plane flips and cursor plane, and the
+      Pi mailbox cursor, are not used; every path still copies to the front. Untestable here.
+- [ ] **A multi-rect present** (`embk_win_present_region`): an app still presents one bounding
+      rectangle of what changed.
+- [ ] **Window motion composes slowly under TCG**: three frames of a Terminal opening and
+      closing took about 90 ms each, the slowest 208 ms, against under 3 ms on arm64 under HVF.
+      P2 replaces this motion; measure it again then.
+- [ ] P2 Motion and input feel.
+  - [x] Springs and a velocity fit in fixed point, shared by the kernel and the toolkit, the same at
+        any frame rate (c38f573; `make spring-test`).
+  - [x] Window motion on springs: any number of windows at once, interruptible, into the window's
+        own dock tile; GUI+M minimises; `perf slowmo` (dd046be; `tools/motion_smoke.py`).
+  - [x] The ghost is filtered (bilinear) on the CPU path while the frame can afford it, six times
+        nearest's cost; nearest when frames cost over half the period (under TCG, always).
+  - [ ] A ghost shrinking far (into the dock) still aliases: bilinear reads 2 x 2 pixels, and at
+        a twentieth of the size a mip level is what is wanted.
+  - [x] Toolkit motion on springs: em_animate, page navigation, the menu drop-in, the toast's rise
+        and the close pull's spring back -- which sprang back by a fraction a FRAME, twice as fast at
+        120 Hz as at 60.
+  - [x] The wheel glides: a notch moves where the view is going and the view follows on a spring;
+        fast notches go further; past an edge it gives (Apple's rubber-band curve) and springs back
+        (`make kit-test`; one notch is 19 frames under HVF, `tools/motion_smoke.py`).
+  - [ ] Pixel-precise scrolling and momentum after a touchpad flick: needs pixel deltas and a
+        lift event from the touchpad driver (velocity.h is ready for the fling).
+  - [x] USB boot mice on the generic path the older controllers share (UHCI, OHCI, EHCI), which
+        found one and printed "no driver"; xHCI's own path already fed them
+        (`tools/usb_mouse_smoke.py`: a mouse on UHCI and one on EHCI move the pointer 1:1 and click).
+  - [x] Pointer acceleration: 1:1 while aiming (under 0.6 counts/ms), up to 3x across a sweep,
+        fractions carried (`make pointer-accel-test`; in the guest a slow 32-count aim moves 32 px
+        and a 300-count burst 571). PS/2, USB and I2C touchpads alike; absolute tablets are not.
+        Test launchers boot it 1:1 (`opt/emblink/pointer`); `pointer accel|linear` on serial.
+  - [ ] A tracking-speed preference in Settings: the curve takes one (tracking_permille), nothing
+        sets it yet.
+  - [ ] Event timestamps on the input path for the toolkit's velocity fit (a touchpad flick).
+- [ ] P3 Materials.
+  - [x] Windows cast two shadow layers (key and ambient), rounded with their corners, on both paths
+        (gallery 214). Drawn per pixel band with the straight edges computed once, not from a
+        cached 9-slice: the corner zones are the only 2-D work.
+  - [ ] Corner masks precomputed per radius (the carve supersamples 4 x 4 per corner pixel).
+  - [x] Vibrancy: every glass surface saturates what shows through it, compositor and toolkit;
+        translucent (35%) with a 12 px blur by default (gallery 215).
+  - [x] Vibrancy on the GPU path (virgl, Intel): the blur primitive saturates its last pass
+        (`sat`, PIX_VIBRANCY; virgl in the blur shader, Intel in `sc_blur`) -- windows' glass and
+        materials, translucent bars and layers alike. Compose check 7c against pix_saturate_row's
+        arithmetic, on virglrenderer and the Intel engine model.
+  - [x] An effects governor with an Effects setting (Automatic / Full / Reduced): reduced draws
+        a tint instead of a blur behind what shows through and only the ambient shadow layer;
+        judged against a 60 Hz frame, down on a sustained run of dear frames, up after a hold that
+        backs off (DESKTOP_PERFORMANCE.md; `tools/effects_smoke.py`, x86).
+  - [ ] The tier between them: a blur at a quarter resolution for large glass (the box blur costs
+        the same at any radius, but a big translucent window re-blurs its whole backdrop while it
+        is dragged).
+  - [x] Apps' own glass follows the tier: the runtime and the desktop read it (`embk_comp_stats`,
+        twice a second) and the toolkit draws a glass node's tint whole, with no blur
+        (`scene_render_set_reduced`; `make backend-test` T12).
+  - [x] The toolkit's gradient table and dither, and a blur at half resolution from radius 6, with
+        a reciprocal box blur and a row-major vertical pass: the library's entrance frame went from
+        43-66 ms to 17 ms (DESKTOP_PERFORMANCE.md; T15, T16). Gradients were projected from the
+        rect's corner and showed only the second half of their stops; now from the centre.
+  - [x] Scrolling by moving pixels: the scroll blit takes a page under a bar (the thumb's move no
+        longer vetoes it), a scroll view shifts by whole pixels, rects walk only the dirty spans
+        of their rows, and a rect's partly covered pixels have one blend wherever its clip is.
+        Settings' scroll frames went from 2.85-3.84 ms to 0.44-1.23 ms (DESKTOP_PERFORMANCE.md;
+        `make kit-test`, `tools/scroll_smoke.py`, gallery 230).
+  - [ ] The rest of the span rasterizer: shadows, borders, images and glyphs still clamp to the
+        dirty bounding box, so a primitive between two far-apart dirty rects still walks the gap.
+  - [ ] One blend policy everywhere: rects and borders now share one (paint in sRGB, coverage in
+        linear light); text, the kernel compositor and the virgl shaders keep their own.
+  - [ ] Layer caching (a group that only fades or scales could reuse its last flattened pixels;
+        the library's tiles animate inside it, so it would not help there).
+- [x] The x86 kernel runs on AMD: STAR's SYSRET selector carries RPL 3 itself (0x13). AMD's SYSRET
+      forces RPL 3 on CS only, so every program ran with SS 0x18 and the first exception's iretq
+      back to ring 3 raised #GP(0x18) -- every boot under KVM on GitHub's AMD EPYC runners. QEMU's
+      emulator, like Intel, forces it on both, which is why it was never seen here.
+- [x] PS/2: one reader for both ports under one lock, each byte routed by the status register's
+      aux bit (`i8042_service`); under KVM the keyboard's and mouse's handlers ran on two cores at
+      once and took each other's bytes (a menu that would not close, a scroll that came back
+      wrong). A watch thread delivers a byte a lost interrupt left in the buffer.
+- [ ] ...the watch still delivers: in a green CI run on KVM, 7 times (mostly 4 bytes, one mouse
+      packet). Interrupts are still lost there -- the IOAPIC's edge trigger against the 8042's
+      level line, or a re-raise inside the handler's window. Nothing breaks now, but a packet
+      that waits 100-200 ms for the watch is a stutter a real touchpad would show.
+- [ ] CI (`.github/workflows/ci.yml`): the host suites, tests/drivers (virgl's compose checks when
+      the runner has a render node), the x86 image on EmbCC's library and its desktop smokes under
+      KVM. arm64 stays local (HVF). Open: the shell's completion paths build with
+      `-Wno-format-truncation` on GCC (candidates are cut at 512 bytes on purpose; a cut should be
+      said, not silent); the Homebrew cross toolchain floats with Homebrew (pin it if it drifts).
+- [ ] P7 Layers: a render server ([plan](DESKTOP_PERFORMANCE.md#what-the-applications-pay-for-motion-p7-m0)).
+  Apps paint a piece of UI once into a layer and give the compositor targets on a spring; the
+  compositor animates it on its own clock.
+  - [x] M0: `perf apps on` and `tools/app_prof_smoke.py` -- what each app's frames cost it, per
+        run of frames; baselines for menus, tooltips, the library, the dock and scrolling.
+  - [x] M1: groups keep their flattened pixels (`struct group_cache`), dirty rects merge at the
+        cap, and a group's children are no longer culled against window-space rects in its own
+        buffer (`make backend-test` T17-T19). Menus' full repaints 25 -> 2.
+  - [ ] A group's buffer is repainted whole when anything inside it changes (a hover inside an
+        open menu repaints the menu); repainting only its own dirty rects into the kept buffer
+        would make those frames as cheap as the rest.
+  - [ ] Glass inside a group is never kept (its pixels depend on what is behind it): the menus'
+        drop-in still paints its blur every frame. Compositor layers with `material=blur` (M3,
+        M4) are the answer; until then menus pay about 0.9 ms a frame on an M5 core.
+  - [x] M2: a premultiplied, per-pixel-alpha scaled blit (`pix_scale_over_row`,
+        `fb_blit_scaled_over`; `make pix-test` against exact arithmetic and `sc_draw`).
+  - [ ] Translucent windows still do not fly (open, close, minimise): the blit that would let
+        them is here, but the notification banners and the top bar already move themselves, and
+        a compositor zoom over that would be motion twice. Decide per kind of window.
+  - [x] M3: kernel layers (syscalls 166-168, `user/lib/embk_layer.h`): created, set on springs
+        (held for a present), presented, parked for reuse, hit by the pointer outside their window,
+        freed with it; reduce motion makes them jump and keeps a short fade. `tools/layer_smoke.py`
+        (arm64, x86, virgl), `user/tests/layerdemo`, gallery 231.
+  - [x] A layer's material (`EMBK_LM_BLUR`): the compositor frosts the screen under the layer's
+        glass box, rounded, faded with it (`region_grow_layers`; GPU blur primitive). Promoted
+        glass roots use it (backend-test T22), and the top bar's menus are layers now.
+  - [ ] `tools/layer_menu_smoke.py --graphics virgl` (Lima VM): Files' context menu never opened.
+        The same happened in CI (Ubuntu's QEMU 8.2, as in the VM) and never under Homebrew's QEMU
+        11. The cause was the compositor: it latched every LEFT press and replayed it to an app that
+        had not polled in time, and handed the right button over as its level only -- a right-click
+        made while Files was busy or the machine slow was simply never seen. Right presses are
+        latched and replayed now (down one poll, up the next).
+  - [ ] Esc with nothing open quits an EmUI app (`em_app.c`, `em_app_request_exit`): a stray Esc
+        closed Files in the middle of a smoke. A desktop app should not quit on Esc.
+  - [x] A layer's frost is saturated as the windows' materials are, on both paths. (It was
+        saturated twice on the CPU from 6a3ddb3: `fb_blur_region` already saturates; the extra
+        `fb_saturate_region` is gone.)
+  - [x] A layer's frost is kept at rest on the CPU (`fr_sharp`/`fr_blur`): laid back when what is
+        behind it did not change (a hover down the top bar's menu: 0 blurs, 13 kept).
+  - [ ] ...the GPU path re-blurs a glass layer each time it draws it (cheap there, but not free),
+        and a moving or fading layer is blurred every frame on both.
+  - [ ] A layer above everything (`z` 1 in the plan) is not offered: layers stand at their
+        window's place in the stack.
+  - [ ] An app that dies takes its layers at once; a closing menu of a crashed app does not
+        fade (the pages would have to outlive the address space, on a doomed list).
+  - [ ] Parked layers keep their client mapping: a window's parked pages count against its
+        8 MB, and the client VA they hold is not returned until the window goes.
+  - [x] M4: EmUI's menus, context menus and tooltips are promoted subtrees (`ui_set_promoted`):
+        painted once into a layer, in and out on the compositor's springs (`make backend-test`
+        T20, `tools/layer_menu_smoke.py`, gallery 232). Files' context menu: 29 app frames -> 9,
+        11.6 M px presented -> 1.2 M.
+  - [x] A menu opening is an ordinary frame on layers (no epoch), and a node that paints nothing
+        marks nothing (T21): Files' context menu presents 0.79 M px (M0 11.6 M), 0 full repaints.
+  - [x] The top bar's menus are promoted: its menu frames 41 -> 22, pixels 24 M -> 0.4 M.
+  - [x] Toasts are promoted, and wake their app once, to leave (`em_wake_at`): Files toasts Copy
+        and Move to Trash; `tools/layer_menu_smoke.py` sees 2 frames while one stays. The tooltip's
+        600 ms delay is a wake too (Settings' tooltip 46 frames -> 12).
+  - [x] A change inside a promoted subtree repaints only the nodes it changed, old and new places
+        (backend-test T23).
+  - [x] M5: EmUI's dialogs and sheets arrive on layers (scale and fade in, sink out).
+  - [x] The scrim behind a sheet fades in and out: a promoted node inside another is a layer of
+        its own, above it (backend-test T25, `tools/layer_menu_smoke.py` sheet step). A promotion
+        lasts only the frames that declare it (declare-test T10).
+  - [x] While a sheet is up the runtime builds frames only in its first four (the scrim-click
+        debounce, `em_overlay_settling`), then waits for input like any other screen.
+  - [ ] `overview_smoke.py` failed once on x86 under TCG at its turn-back step (the windows were
+        still in flight when sampled) and passed alone on x86 and arm64; its wait for the windows
+        to land should be a wait for the condition, not a fixed pause.
+  - [x] The close pull is moved by the compositor: the window's content is a layer while pulled,
+        springs home on the compositor's clock (`ui_set_layer_spring`), and is back in the window
+        before it closes (`tools/layer_pull_smoke.py`, v7demo). No syscall was needed.
+  - [ ] The pulled content may slide past its window's edge (a layer is not clipped by its
+        window); the frame stays behind it, which reads as peeling, but is not what it did.
+  - [x] M6: the library and its dimming are layers of the desktop (`em_layers_attach`; a
+        window's layers stack in the order they were made); `tools/layer_library_smoke.py`,
+        gallery 233. Full repaints 23 -> 4, paint 5.12 -> 1.01 ms a frame.
+  - [x] The library's rows stagger in on layers: a layer a row over the sheet while it arrives,
+        each on a delay the compositor keeps (`delay_ms`), then the sheet's pixels again.
+  - [ ] Rows beyond the first five, or not wholly in view, arrive with the sheet (a layer is not
+        clipped by the scroller); a layer clipped to a parent's rect would lift both limits.
+  - [x] The library's last four full repaints went with the dimming's layer (it was painted and
+        presented whole into a screen-sized layer).
+  - [x] The dimming is a fill layer (`EMBK_LF_FILL`, backend-test T24): the library's paint
+        0.74 -> 0.15 ms a frame, its pixels presented 4.1 M -> 0.
+  - [x] A blinking caret in a promoted subtree repaints its own rect, not the layer.
+  - [ ] Only the v4/v6/v7 demos use the close grip (`em_close_grip`); no shipped application does.
+- [ ] P4 Type and tokens.
+  - [x] Inter (OFL, vendored) is the UI face: Regular for text, SemiBold for emphasis; DejaVu Sans
+        stays as the fallback for what Inter lacks -- a face now borrows missing codepoints from its
+        fallback (`make font-test`) -- and as the Condensed, Serif and Mono faces (gallery 216).
+  - [x] Exact area coverage (256 levels, where 4 x 4 supersampling had 17), quarter-pixel
+        subpixel positioning, and GPOS pair kerning (formats 1 and 2, extension lookups; ASCII pairs
+        cached per face) in every walk over text -- the renderer's, the layout's, the caret's.
+        `make font-test` holds all three against exact areas and Inter's own pairs.
+  - [x] Per-size tracking: Inter (found by its family name) is spaced by its own dynamic metrics,
+        -0.0223 + 0.185 e^(-0.1745 px) em -- a 32 px title closes up by 0.7 px a pair, 13 px body
+        is left nearly as drawn, 11 px captions open by 0.05 px -- added in every walk over text
+        with the kerning (`font_pair_px`), so measure, wrap, caret and pixels agree. The theme's
+        type scale (caption, body, title, heading) gets it at each of its sizes (`make font-test` T11).
+  - [ ] Hinting or stem darkening at small sizes; tracking for the other faces (DejaVu publishes none).
+  - [ ] `contour_modal_smoke` failed once with "scaled serif paragraph lost its wrapped height" while
+        seven emulators ran at once, and passed twice alone: a read before the Serif/115% change had
+        settled, most likely. Watch it.
+  - [x] A light/dark audit: every text tone (primary, secondary, tertiary, the accent, success,
+        warning, danger) on every ground it is set on (window, card, input well, sidebar, chrome)
+        at 4.5:1, selected text on its tint at 4.5:1, and a control's edge (`border_strong`:
+        buttons, fields, a switch that is off) at 3:1 -- across light and dark, every surface,
+        every contrast level and every accent (`make contour-test`, 9333 checks). It found
+        control edges at 1.9:1 in light and dark, light captions unreadable in input wells, and,
+        on custom surfaces, tertiary text and danger red below 4.5. Each tone is now designed as
+        before and then moved toward the text colour only as far as it must (`legible` in
+        theme.c), so a tone that read is unchanged. Gallery 229.
+  - [x] Tokens for what was hard-coded: the modal scrim (`scrim`: 55% black in dark, 38% in light,
+        where 55% read as switched off), a dragged chip's shadow (`shadow_lift`), where a toast
+        rests (`toast_inset`), the wheel's step (`scroll_step`, scaling with the interface), and
+        the tooltip's radius and padding (the shared `radius_sm`, `control_py`, `sp2`).
+  - [ ] Small spacings (2, 3, 5 and 6 px) inside kit and EmUI controls are still literals off the
+        4 px grid; text over translucent materials is not part of the audit.
+  - [ ] `contour_controls_smoke` failed once at "dock auto-hide preference" with four emulators
+        running at once, and passed alone straight after (2026-11-06): the press held across a
+        desktop publication, under load. Watch it.
+- [ ] P5 Shell: chrome, dock, menu bar, launcher, notifications, workspaces in motion.
+  - [x] Apps have springs of their own: `em_spring(id, from, to, response, damping)` and the
+        EmSnappy/EmSmooth/EmBouncy tokens (`make em-test`).
+  - [x] The library (launcher) comes in and goes out on a spring over its scrim, its tiles
+        staggered; closing hands input back at once, so a dock click during it is not lost.
+  - [x] Glass inside an opacity group frosts what the group lands on, not its empty scratch.
+  - [x] Changing workspace slides the spaces: the one left goes off one side while the next comes
+        in from the other, each window drawn as itself (shadow, corners, material) on four
+        springs; switching back mid-slide turns them round in flight. The keys, the top bar's
+        Space menu and the dock all slide (`tools/motion_smoke.py`: x86 and arm64 on the CPU,
+        and `--graphics virgl` on the GPU path in the Lima VM; gallery 217). A translucent window
+        carries the blur it kept while it slides rather than blurring again under itself.
+  - [ ] With several monitors the desktop slides as one strip: a window crosses its neighbour
+        on the way. Per-display spaces (the Mac's default) would need a space per output.
+  - [ ] Traffic lights that show their glyphs only on hover were not adopted: Contour draws
+        them always, by design (CONTOUR_DESKTOP.md). Revisit only with the design.
+  - [x] Dock: one pointer's plate that glides from tile to tile (snappy), and an icon that hops
+        while its app starts (bouncy) until the app's window is up (`tools/dock_motion_smoke.py`,
+        both arches; gallery 218-219). The plate the dock was designed with had never appeared:
+        the hovered tile was asked for before the dock's rect was known that frame, so it was
+        always none; what showed was the icon button's own highlight, now quiet in the dock.
+  - [ ] The hop starts when the spawn call returns: the desktop renders nothing while it is in
+        `embk_spawn_env`, which under TCG is seconds after the click. Spawning off the render
+        loop would let the icon answer the click itself.
+  - [x] Notifications: banners slide in from the screen's edge, stack newest on top and glide as
+        others come and go, slide out when their time is up (held while the pointer is on one),
+        spring home from a short drag and fly off when flicked (`em_spring_throw`;
+        `tools/banner_motion_smoke.py`). The banner window had been squeezed to the menu bar's
+        34 px since the Contour foundations -- the toolkit thinned every translucent window, not
+        just bars -- so a banner showed only its top 24 px; only a window that declares a shell
+        band (`em_shell_band`) is a bar now.
+  - [ ] arm64 has no system notices (sessions and their notice ring are x86-only), so
+        `perf notice` and the banner smoke are x86-only; banners from programs (the notify
+        service) work there.
+  - [x] Menus and popovers grow out of the corner they open from as they fade in, and the library
+        zooms in from a little smaller: a group's scale (`ui_set_scale`; the flattened group drawn
+        smaller toward an anchor, shrinking only; `make backend-test` T13).
+  - [x] A fade with nothing moving repainted nothing: opacity marked a node dirty but not its
+        content (T14). Every toolkit fade so far also moved, which hid it.
+  - [x] A double click on a window's bar zooms it (fill, or back), timed by when the presses
+        happened, so a slow tick carrying both -- or a whole click between two ticks -- still
+        counts. Any big resize at once flies: the old picture is held where it was until the app
+        has drawn at its new size, then flies to the new frame (a `zoom` ghost;
+        `tools/motion_smoke.py` on x86, arm64 and virgl; gallery 221). Every window in the air
+        now keeps its rounded corners and shadow, on both paths.
+  - [x] Live resize by the corner grip: the window takes the size the drag says each frame it
+        changes, drawn at it, both ways (it used to change only when let go). The compositor
+        resizes within a window's pages in place (same pages, same VA) and grows them half again
+        when they run out, so a drag re-allocates a handful of times instead of every step
+        leaking its page tables and VA; new edges repeat the window's own last column and row
+        until the app draws, not black. A grip step (`embk_win_resize_live`) is never a zoom and
+        is not logged; the app says its size once, on release (`tools/resize_smoke.py`: x86 and
+        arm64; gallery 227).
+  - [ ] Resizing is from the bottom-right grip only: no edges, no other corners, no Option-drag
+        from the centre. The window edge moves at the app's frame rate: an app slow to draw
+        trails the pointer (the compositor could stretch the last frame meanwhile).
+  - [ ] VA given up by a replaced backing is still never reused (bump allocation), now only on
+        growth past the pages a window has.
+  - [ ] Ghost shadows cost a band per frame on the CPU path; under TCG that slowed the park
+        flight enough that the interrupt test needed `perf slowmo`. Not measured on hardware.
+- [ ] P6 Overview, touchpad gestures, tiling previews.
+  - [x] The overview (GUI+Up): the space's windows in a grid of their own, live, over the dimmed
+        desktop; hover rings one, a click brings it in front as they fly home, Esc or a click
+        elsewhere leaves them as they were; at rest it composes nothing (`tools/overview_smoke.py`:
+        x86 and arm64 on the CPU, virgl in the Lima VM; gallery 223).
+  - [x] Each window goes to the grid cell nearest where it stands (the screen shrunk into the
+        overview's area; the nearest window-cell pair first), so a window on the left is found on
+        the left. The arrows move the ring between windows (the nearest that way) and Return
+        brings the ringed one in front; the ring is rounded, an even band concentric with the
+        thumbnail's corners, on the CPU and the GPU; no app has the pointer while it is up (the
+        dock lit its labels under it); asked for again while it closes, it turns back from where
+        the windows are (`tools/overview_smoke.py`; gallery 228).
+  - [ ] Still a grid, not the Mac's packing of windows at their own sizes; at most GHOSTS_MAX (16)
+        windows take part. No strip of spaces to drag a window to.
+  - [ ] The tile preview's outline is still square: drawn over its window, it would need a ring
+        with a hole on the GPU path, which draws filled rects and images only.
+  - [x] Three-finger gestures on a touchscreen (`kernel/drivers/input/gesture.c`, fed every contact
+        by virtio-input): sideways, the space shown and the next lie side by side and follow the
+        hand one to one; lifted past a third of the screen, or flicked (over 400 px/s, from the
+        same velocity fit as scrolling), the next is taken and the windows carry on at the hand's
+        speed, else they spring back; past the first or last space a rubber band (swipes do not
+        wrap: that preference is the keys'). Up opens the overview, down closes it. Two fingers
+        down hold the pointer until all lift, so a gesture never clicks (`tools/gesture_smoke.py`:
+        x86 and arm64; gallery 226).
+  - [x] Beside a touchscreen, clicks reached the pointer at the wrong place or not at all: the
+        touch path ran on every device's sync and cleared the tablet's button, and QEMU hands
+        buttons to the newest device that takes them (the touchscreen), whose clicks were
+        published at the tablet's last point. Now the touch path is the touchscreen's alone, with
+        its own range, and a click it is handed is held at the pointer (`mouse_hold_buttons`).
+  - [ ] Real touchpads: the I2C-HID driver reads the primary contact only and never sets a
+        Precision Touchpad's input mode, so its fingers never reach the recogniser. Needs the
+        Input Mode feature report, per-finger collections (parallel and hybrid reporting) and a
+        pad-to-screen scale, tested on hardware.
+  - [x] A touchscreen's first finger pressed as it landed, before the others: a three-finger
+        swipe clicked under it. A lone finger now moves the pointer at once and presses only
+        after 60 ms alone, 8 px of travel, or on lifting (a tap clicks as it lifts); a second
+        finger in that time makes it a gesture (`gesture_smoke.py` landing: fails without it).
+        The cost: a press held still starts 60 ms late.
+  - [ ] No pinch, no two-finger scrolling from a touchscreen, no four-finger variants.
+  - [x] Tiling previews: held against an edge, a window shows the half (or, at the top, all) of
+        the work area it will take -- a wash under it, the outline over it -- by the runtime's own
+        rule (`EMBK_WINF_RESIZABLE` tells the compositor which windows tile;
+        `tools/tile_smoke.py`: x86, arm64 and virgl; gallery 224).
+  - [ ] The preview does not know an app's minimum size: where half the screen is smaller than
+        that, the runtime fills instead and the preview showed a half.
+  - [ ] A minimise warp on the GPU path.
+
+## A real Terminal, then a Powerlevel10k-style prompt (2026-10-25)
+
+The roadmap the user set: the Terminal first, then the customisation system.
+Each step ships tests, captures and docs ([TERMINAL.md](TERMINAL.md)).
+
+- [x] M0 Test probe (`g_term_probe`) and golden streams from real programs, compared with tmux.
+- [x] M1 Keys with identity: kernel queue, syscall 157, toolkit, xterm encoder; USB keyboards decoded like PS/2.
+- [x] M2 The shell owns its line: editor, persistent history, completion, OSC 133 A-D (+R), in-band resize.
+- [ ] `$status` is 0/1/130: an external program's own exit code does not reach it yet, so the prompt's
+      status shows 1 for any failure (130, Ctrl+C, is real: typed and abandoned, or stopped while it ran).
+- [ ] History is read once per session: lines run in another tab appear after the next start
+      (bash's default; zsh's share_history is not offered).
+- [ ] On the kernel console the editor works line by line: a multi-line program's earlier lines
+      cannot be edited there, and Ctrl+Q/R/S/T/B/E are the console's arrows and Home/End.
+- [x] M3 `sh` on the editor (its own history, POSIX completion); Terminal's local prompt removed.
+- [x] M4 Screen model v2: 8-byte cells with interned styles (palette index or RGB, underline style and
+      colour, links), any size to 1000 x 500, logical-line scrollback capped at 8 MB, reflow on every
+      resize, a DEC parser with xterm's sequences and replies, mouse/focus reporting (syscall 158),
+      `TERM=xterm-256color`; the golden corpus matches tmux on all nine cases.
+- [ ] Left/right margins (DECSLRM), double-width/height lines, sixel and inline images.
+- [ ] No terminfo database on the image: a ported ncurses program would not find xterm-256color.
+- [x] M5 Fonts and renderer: MesloLGS Nerd Font Mono in four faces (vendored, on both images), DejaVu
+      fallback, drawn box/block/braille/Powerline glyphs, blink, cursor shapes, row damage presented
+      alone (`ui_image_sized_damage`); the font engine reads cmap 12, holds 16 fonts, flags missing
+      glyphs and caches in LRU atlas pages.
+- [ ] No CJK or emoji font on the image (boxes, two cells wide), no colour emoji, ZWJ sequences or
+      ligatures: the font engine does not shape.
+- [x] M6 Tabs with their own sessions, mouse selection (word, line, rectangle, kept while scrolling),
+      find in the scrollback, links (OSC 8 and URLs, opened in Vellum/Files/Editor), the menu, zoom;
+      PTYs allocated on demand (64, 32 KiB output); Super+Q its own window action.
+      A double or triple click no longer loses a click under emulation: the compositor hands an app
+      that still holds the last press its release before replaying the next one.
+      Damage rects are rounded out to whole pixels, so a title that shrinks leaves no sliver of the old one.
+- [ ] Tabs cannot be dragged to reorder or into a window of their own; no Super+N for a new window.
+- [x] M7 Profiles (`~/.config/terminal`, Clear Dark by default, four more built in, rewritten without losing
+      unknown keys, read again when changed), the macOS profile importer, Preferences beside the screen
+      (Super+,), and windows that show through: per-pixel alpha over a kept, incrementally re-blurred backdrop
+      (`embk_win_set_material`) on the CPU and the GPU; OSC 52 writes, bold-as-bright and bold colour as options.
+- [ ] A profile is the window's: its tabs cannot each have their own (Terminal.app allows it).
+- [ ] Two font families (Meslo NF, DejaVu Sans Mono): Preferences lists what the image ships, not any font
+      file; no audible bell (a profile's audible bell is shown as the visual one).
+- [x] M8 Shell plumbing for the prompt: `~/.config/shell/rc.esh` read by interactive shells, the `prompt`
+      builtin (options by Powerlevel10k's names), the editor's right prompt and transient prompt, a prompt
+      built again for a new width; the Terminal passes the system's TZ so the prompt's clock agrees.
+- [x] M9 Prompt engine: Powerlevel10k 1.20's segments, glue, frames, gap, directory shortening and transient
+      prompt in C (`shell/prompt/p10k*.c`); `prompt style` (lean, lean-8colors, classic, rainbow, pure, on both
+      images) and `prompt import-p10k` (a ~/.p10k.zsh read: typeset, brace lists, arrays, `if`s, the git
+      formatter's colours), options on top by p10k's names. The user's configuration and the four styles match
+      recordings of p10k itself cell for cell at 100, 60 and 36 columns (`make prompt-test`).
+- [ ] Prompt segments with nothing to read here: `battery` (no battery reading reaches the shell, so it is
+      not drawn at all), `os_icon`
+      (EmbLinkOS is not an OS p10k knows, so it draws nothing, as p10k does for an unknown uname), `context`
+      only DEFAULT or ROOT (no ssh, no sudo), `prompt_char` only insert mode (the editor has no vi mode),
+      `status` without the pipe states (no per-stage exit codes). Segments for tools the system lacks
+      (direnv, asdf, kubecontext, ...) draw nothing and the import lists them; custom `prompt_*` functions
+      and `p10k segment` need zsh.
+- [ ] `prompt import-p10k` reads what p10k writes, not zsh: other functions and commands joined by `&&`/`||`
+      are skipped, conditions are `[[ == != -n -z ]]`, and an edited `my_git_formatter` keeps its colours but
+      not its logic (the wizard's is built in). Directory names past 58 bytes are compared on their first 58
+      for truncate_to_unique (readdir's name field).
+- [ ] `DIR_SHOW_WRITABLE` never shows a lock: the system's `access(2)` allows writing anything that exists, and a
+      read-only namespace binding (`/system`) cannot be asked for its mode. `truncate_with_package_name` falls
+      back to `truncate_from_right`, as p10k does without `jq`.
+- [x] M10 Git status: `/system/bin/gitstatus.elf` speaks gitstatusd's protocol and reads repositories itself
+      (packs, index v2-v4, refs, config, ignore rules, worktrees, submodules), keeping trees, file names and
+      directory listings between prompts; the shell waits VCS_MAX_SYNC_LATENCY_SECONDS and redraws when a late
+      answer comes. 201 of 201 answers match gitstatusd 1.5.4 (`make gitstatus-test`); gitclone writes an index;
+      `~/Projects/hello` on both images.
+- [ ] The git status daemon reads SHA-1 repositories with the files ref backend: not SHA-256 objects, reftable,
+      a split or sparse index, config `include` files, or `GIT_DIR` requests (`:dir`). Contents are compared as
+      bytes: clean/smudge filters and line-ending conversion (core.autocrlf, `text` attributes) are not applied,
+      so such files can read as changed. `status.showUntrackedFiles=all` is not taken as `-e`. One thread.
+- [x] M11 `prompt configure`: Powerlevel10k's wizard -- its questions, pages and their shortening for small
+      windows -- writing the configuration p10k configure writes (~/.config/shell/p10k.zsh, loaded by
+      prompt.esh); it starts by itself in the first shell that finds no prompt configuration, outside Live
+      sessions. 454 pages and 13 configurations match p10k configure 1.20 (`make prompt-test`). Instant prompt
+      and the .zshrc question are zsh's and are not asked.
+- [x] M12 suggestions from history and colours as the line is typed, as zsh-autosuggestions 0.7.1 and
+      zsh-syntax-highlighting 0.8.0 draw them by default: 26 lines match the plugins under zsh
+      (`make shell-test`). Only their defaults: no other suggestion strategies (completion, match_prev_cmd), no
+      styles to set, and the other highlighters (brackets, pattern, cursor) are not there.
+- [ ] Split panes (after M12).
+- [ ] The kitty keyboard protocol and `modifyOtherKeys`: keys follow xterm's PC-style encoding only.
+- [ ] USB keyboards do not auto-repeat: boot-protocol devices send no repeats, and the OS does not
+      generate them (PS/2 typematic repeat works).
+
 ## Development shell (2026-10-24)
 
 - [x] Private descriptor-backed PTYs, canonical/raw modes, echo and nonblocking queues.
@@ -6,8 +478,10 @@
 - [x] VT screen model, alternate screen, basic Unicode widths, colours and live resize.
 - [x] Screen copy, safe native-prompt paste and application bracketed paste.
 - [x] Shared controls receive paste commands without key-queue truncation.
-- [ ] Terminal range selection, complete grapheme rendering and modified-key identity.
-- [ ] Terminfo/application compatibility and mouse reporting.
+- [x] Modified-key identity: the key behind every byte, F-keys, the keypad, xterm PC-style encoding.
+- [x] Terminal range selection (M6) and grapheme rendering (M5: font fallback, combining marks); the
+      shaping it still lacks (emoji ZWJ, ligatures) is in the roadmap above.
+- [x] Mouse reporting and an xterm-compatible screen (`TERM=xterm-256color`), see the roadmap above.
 - [x] Descriptor pipes, real access-mode queries and nonblocking/atomic pipe I/O.
 - [x] Owned-PID waitpid/wait, typed child results and opt-in status retention.
 - [x] Copyout retry, competing waiters, cancellation and native multi-child pipeline checks.
@@ -929,6 +1403,15 @@ The measurement immediately earned itself twice:
 ## Raspberry Pi 4 (docs/RPI4.md)
 
 P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in order:
+
+- [ ] **`make ARCH=aarch64 test-arm64-boot` fails A6/A7 (desktop session, home ready,
+      launcher)** -- found 2026-10-25, once arm64 booted again (f2613e7). The kernel,
+      userland witnesses and drivers pass (282 checks); then init finds no account
+      and waits in first-boot setup, because the aarch64 boot protocol never sets a
+      boot mode and nothing seeds an account. x86 tests either log in through the
+      setup screen or pick the live-session mode at the boot menu. The test needs a
+      live-session mode on arm64 (e.g. from the device tree's /chosen) or a seeded
+      account in its root filesystem.
 
 - [ ] **P0 + P0b on the real board** (planned Monday 2026-09-28, on a TV). Only
       QEMU has seen them. `rpi4-sdboot`, HDMI0; the expected screen and the
@@ -5656,14 +6139,13 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped
 
 ### Minimize / restore (shipped 2026-08-06)
-- [ ] No minimize ANIMATION -- the window vanishes and reappears instantly.
-      The Mac genie is the obvious want; a scale+fade toward the dock icon is
-      the cheap version. Blocked on the same window-motion work as the reverted
-      open/close animation below.
+- [x] No minimize ANIMATION -- DONE: the window flies into its own dock tile
+      on springs and back out of it (dd046be). The genie warp is P6's, on the
+      GPU path.
 - [ ] Restore is per-PROCESS, not per-window: an app with two windows gets both
       back. Fine while apps are single-window; revisit with a real window list.
-- [ ] No keyboard path (Super+M) and no "minimize all" -- the dock icon is the
-      only way back.
+- [ ] No "minimize all", and no keyboard path BACK -- the dock icon is the only
+      way to restore. GUI+M minimises the front window (dd046be).
 - [ ] A minimized app still runs its render loop if it is timer-driven (a clock
       widget keeps painting into a buffer nobody composites). Retained-update
       apps idle correctly; a `minimized` bit in win_input would let the rest
@@ -5784,17 +6266,18 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 ### Window motion (shipped 2026-08-06, compositor-side)
 - [ ] Closing animates via a full-window pixel COPY (~1.4MB kmalloc per close;
       the live buffer is freed under the ghost when the process is reaped).
-      Cheap enough at one motion at a time, but if closes ever overlap or
-      windows get much bigger, a deferred free of the shared buffer would beat
-      copying it.
-- [ ] The park target is the bottom CENTRE of the screen, not the app's actual
-      dock icon: the dock is drawn by home and the kernel has no idea where its
-      icons are. Plumbing the icon rect through (win_set_park_target?) would
-      make it land on the right icon.
-- [ ] Only one motion runs at a time; a second window animating while one is in
-      flight is simply not animated (anim_start returns).
-- [ ] The window is un-hittable for the 170-200ms it is in flight (it is hidden
-      and the ghost takes no input). Fine at these durations, wrong if they grow.
+      Closes can overlap now (one ghost each, dd046be), so a quit of an app
+      with several big windows copies all of them; a deferred free of the
+      shared buffer would beat copying it.
+- [x] The park target is the bottom CENTRE of the screen -- DONE: the desktop
+      publishes its dock tiles (syscall 165) and a window lands on its own app's
+      tile (dd046be). An app with no tile still goes to the bottom centre.
+- [x] Only one motion runs at a time -- DONE: up to eight ghosts on springs,
+      and a motion in flight can be turned around (dd046be).
+- [x] The window is un-hittable while it is in flight -- DONE for an
+      arriving window: one opening or coming back from the dock takes clicks
+      and the keyboard at its real place while its ghost is in the air (the
+      hand aims at where it is going). One leaving takes nothing, as it should.
 - [ ] Frame pacing rides the main loop's ~100Hz timer wake. Under heavy TCG load
       the loop can be slower, and the motion degrades to fewer frames rather
       than slowing down (it is time-based, so it still lands on schedule).
@@ -7239,7 +7722,12 @@ unsigned-char rule index). These are what remain.
       the top of declare.c).
 - [ ] python.org fails the scroll-blit pixel-exactness check ("pixels differ").
       Not yet diagnosed -- the blit path is taken and disagrees with a full
-      repaint, which is a correctness bug in the fast path.
+      repaint, which is a correctness bug in the fast path. Two causes of
+      exactly that were found and fixed in the toolkit since (a fractional move
+      copied by a rounded amount; a rect whose edges blended differently once
+      it slid under its clip -- DESKTOP_PERFORMANCE.md, "a page scrolling"),
+      so re-run it against the live page before digging further: the fetched
+      copy was not at hand to check.
 - [ ] `:is()`, `:not()` and `:has()` with a COMMA inside are split on that
       comma by the selector-group scanner, which produces one bogus selector
       per argument. They currently fail to match rather than mis-matching, so

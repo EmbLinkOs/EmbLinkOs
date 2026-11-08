@@ -50,6 +50,8 @@ import uuid as uuidlib
 
 from crc32c import crc32c
 import layout as L
+import fonts
+import share
 
 # v2.2: real wall-clock timestamps for every object this formatter creates,
 # instead of the placeholder zeros v2.0/v2.1 shipped with (the kernel had no
@@ -302,8 +304,8 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
-    # 128 MB (was 64, 8, 4). Each bump had the same trigger: content grew past
+def make_image(path: str, size_bytes: int = 192 * 1024 * 1024, objects=None):
+    # 192 MB (was 128, 64, 8, 4). Each bump had the same trigger: content grew past
     # the volume and free_blocks went NEGATIVE -- struct.pack('Q') then refuses
     # it, which is the (cryptic) way this failure announces itself.
     #   4 -> 8 MB: shell.elf (~410 KB static-newlib)
@@ -313,6 +315,8 @@ def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
     #   64 -> 128 MB: staging the KERNEL source tree on the image (/data/src/
     #               kernel, ~180 files) for EmbBuild-builds-the-kernel (BUILD.md
     #               §12) tipped the near-full 64 MB volume over.
+    #   128 -> 192 MB: Terminal's four MesloLGS Nerd Font Mono faces (11.7 MB,
+    #               fonts.py) put the root mirror block on file data.
     # The kernel reads total_blocks from the superblock, so growing is safe;
     # the image is sparse-ish on disk and QEMU only reads what's used.
     bs = L.BLOCK_SIZE
@@ -819,7 +823,10 @@ _SYSTEM_BIN = {"sh.elf", "init.elf", "primtest.elf", "shell.elf", "home.elf",
                # never by a user: it is the only program in reach of a session
                # that can read /etc/shadow, so it belongs with the system's
                # own, not among the applications.
-               "authd.elf", "updateworker.elf"}   # -> /system/bin/
+               "authd.elf", "updateworker.elf",
+               # The shell's git status daemon (docs/SHELL.md, "The prompt"):
+               # the system's, started by every shell whose prompt shows git.
+               "gitstatus.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -994,24 +1001,13 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
     # UI fonts are part of the sealed OS, not root stragglers: they live under
     # /system/fonts (USERSPACE_v2 UP1 -- nothing at bare /). The EmUI runtime
-    # (ui/dsl/em_app.c) and the explicit readers default to these paths.
-    font = _read_font("DejaVuSans.ttf")
-    if font is not None:
-        objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
-    for source, destination in [("DejaVuSansMono-Bold.ttf", "mono-bold.ttf"),
-                                ("DejaVuSans-Bold.ttf", "bold.ttf"),
-                                ("DejaVuSansCondensed.ttf", "condensed.ttf"),
-                                ("DejaVuSansCondensed-Bold.ttf", "condensed-bold.ttf"),
-                                ("DejaVuSerif.ttf", "serif.ttf"),
-                                ("DejaVuSerif-Bold.ttf", "serif-bold.ttf")]:
-        face = _read_font(source)
-        if face is not None:
-            objects.append((("system/fonts/" + destination).encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, face))
-    # The terminal's MONOSPACE face (same DejaVu family, so the same
-    # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
-    mono = _read_font("DejaVuSansMono.ttf")
-    if mono is not None:
-        objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
+    # (ui/dsl/em_app.c) and the explicit readers default to these paths. The
+    # list is fonts.py's, shared with the ARM image.
+    for name, data in fonts.font_files(_read_font):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    # /system/share: the prompt's Powerlevel10k styles (share.py, shared with ARM).
+    for name, data in share.share_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
     # Sealed visual assets used by full-screen system experiences (login/setup).
     objects.extend(_tree_objects("system/images", b"system/images/", (".ppm", ".pam", ".eic")))
     # Vellum's built-in documents (docs/BROWSER.md). Sealed with the OS: the
@@ -1054,8 +1050,12 @@ def discover_userland_objects(build_dir="build"):
     # the sealed region) and links with `-L/system/abi`; it is an app in /data,
     # not part of the contract. libc.a (~6.6 MB) is the biggest object on the
     # image and earns it: without it `tcc t.c -o t.elf` cannot resolve exit().
+    # EMBK_ABI_OBJDIR: where those two objects are, when it is not build/ --
+    # under LIBC=emblibc, build/'s are EmbCC's C library's, and the ABI tcc
+    # links against stays newlib's (the Makefile builds that pair in build/abi)
+    abi_dir = os.environ.get("EMBK_ABI_OBJDIR") or build_dir
     for tc in ("crt0.o", "syscalls.o"):
-        blob = _read_file(f"{build_dir}/{tc}")
+        blob = _read_file(f"{abi_dir}/{tc}")
         if blob is not None:
             objects.append((b"system/abi/" + tc.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
     libc = _read_file(NEWLIB_LIBC) if NEWLIB_LIBC else None
@@ -1078,8 +1078,11 @@ def discover_userland_objects(build_dir="build"):
         if blob is not None:
             objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
-    # Device firmware is data; never compile it into the kernel image.
-    for prefix in ("system/firmware", "system/licenses"):
+    # Device firmware is data; never compile it into the kernel image. The
+    # licences go with what they license (fonts.py, shared with ARM).
+    for name, data in fonts.licence_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    for prefix in ("system/firmware",):
         directory=Path(prefix)
         if directory.is_dir():
             for host in sorted(directory.rglob("*")):
@@ -1299,6 +1302,15 @@ def discover_userland_objects(build_dir="build"):
                   "lex/lex.c", "lex/lex.h",
                   "parse/parse.c", "parse/parse.h",
                   "eval/eval.c", "eval/eval_extern.c", "eval/eval.h",
+                  "eval/exec.c", "eval/exec.h",
+                  "edit/edit.c", "edit/edit.h", "edit/wcwidth.c", "edit/wcwidth.h",
+                  "complete/complete.c", "complete/complete.h", "complete/highlight.c", "complete/highlight.h",
+                  "prompt/prompt.c", "prompt/prompt.h",
+                  "prompt/p10k.c", "prompt/p10k.h", "prompt/p10k_int.h",
+                  "prompt/p10k_zsh.c", "prompt/p10k_render.c", "prompt/p10k_import.c",
+                  "prompt/icons.c", "prompt/icons.h", "prompt/colors.c", "prompt/colors.h",
+                  "prompt/prompt_os.c", "prompt/prompt_os.h",
+                  "prompt/wizard.c", "prompt/wizard.h", "prompt/wizard_os.c", "prompt/wizard_os.h",
                   "builtins/builtins.c", "builtins/builtins_os.c",
                   "builtins/builtins.h",
                   "hist/hist.c", "hist/hist.h",
@@ -1330,17 +1342,21 @@ def discover_userland_objects(build_dir="build"):
                         # -- sysinfo.c and embbuild.c #include them, so
                         # declaring the ABI joins the ABI (BUILD.md's rule).
                         ("user/lib/document.h",            b"system/abi/include/document.h"),
-                        ("user/lib/embk_desktop.h",        b"system/abi/include/embk_desktop.h"),
-                        ("user/lib/embk_terminal.h",       b"system/abi/include/embk_terminal.h"),
-                        ("user/lib/embk_child.h",          b"system/abi/include/embk_child.h"),
                         ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
                         ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
-                        ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),
-                        ("user/lib/embk.h",                b"system/abi/include/embk.h"),
-                        ("user/lib/embk_syscall.h",        b"system/abi/include/embk_syscall.h")):
+                        ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h")):
         blob = _read_file(host)
         if blob is not None:
             objects.append((image, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+    # embk.h and EVERY embk_*.h it includes: a program built on the OS includes
+    # embk.h, and embk.h includes the rest (wifi, power, gpu, session, ...).
+    # Listing them by hand fell behind as the ABI grew -- `test embbuild shell`
+    # stopped at a missing embk_wifi.h -- so the whole family is installed.
+    for header in sorted(Path("user/lib").glob("embk*.h")):
+        rel = f"user/lib/{header.name}"
+        blob = _read_file(rel)
+        if blob is not None:
+            objects.append((b"system/abi/include/" + header.name.encode(), L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
     # CPython's stdlib zip + ._pth live WITH the interpreter under /data/apps/
     # python/. The ._pth holds a RELATIVE name ("python314.zip"), joined onto the
@@ -1386,6 +1402,10 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink.\n\nThis is your home directory.\n"))
+    # A sample project under git (share.py, shared with ARM): the prompt's git
+    # status has something to show, and git something to try.
+    for name, data in share.sample_files(b"home/yves"):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
     # OS update trust is an explicit publisher input, never the public dev key.
     objects.append((b"system/update", L.DT_DIR, L.S_IFDIR | 0o755, None))
     update_key = os.environ.get("EMBK_UPDATE_KEY")

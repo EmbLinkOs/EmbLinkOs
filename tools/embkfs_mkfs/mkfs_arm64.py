@@ -26,6 +26,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import layout as L
+import fonts
+import share
 from mkfs_embkfs import (make_image, _read_font, _tree_objects,
                           FIXTURE_OBJECTS, _prog_meta,
                           _SYSTEM_BIN as _X86_SYSTEM_BIN)
@@ -164,19 +166,15 @@ def main(argv):
             objects.append((b"system/kernel.embdbg", L.DT_REG,
                             L.S_IFREG | 0o644, fh.read()))
 
-    # The UI fonts, from the HOST's DejaVu install, exactly as the x86 image
-    # gets them (_read_font is the same finder, so the two images cannot end up
-    # with different faces). The toolkit renders no text without these -- a
-    # window comes up empty rather than failing, which is a worse symptom than
-    # a missing file, so say so at pack time.
-    for host_name, image_name in (("DejaVuSans.ttf", b"system/fonts/font.ttf"),
-                                  ("DejaVuSansMono.ttf", b"system/fonts/mono.ttf")):
-        data = _read_font(host_name)
-        if data is None:
-            print(f"mkfs_arm64: WARNING: {host_name} not found on this host -- "
-                  f"EmUI text will not render")
-            continue
-        objects.append((image_name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    # The fonts and their licences: fonts.py's list, the same the x86 image
+    # installs, so the two cannot end up with different faces (_read_font says
+    # at pack time when the host lacks a DejaVu face -- the toolkit would draw
+    # no text without it, a worse symptom than a missing file).
+    for name, data in fonts.font_files(_read_font) + fonts.licence_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
+    # /system/share: the prompt's Powerlevel10k styles (share.py).
+    for name, data in share.share_files():
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
 
     # ICONS AND THE WALLPAPER. /system/images is what the desktop draws itself
     # from: the dock's app icons (.eic) and the backdrop (.ppm). Without it the
@@ -224,6 +222,9 @@ def main(argv):
     objects.append((b"home/" + DEV_USER + b"/readme.txt", L.DT_REG,
                     L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink on aarch64.\n"))
+    # The sample project under git (share.py), as on the x86 image.
+    for name, data in share.sample_files(b"home/" + DEV_USER):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, data))
 
     # Say it in words BEFORE struct.pack says it in hex. A rough block count is
     # enough: this is a guard against "the image is too small", not an

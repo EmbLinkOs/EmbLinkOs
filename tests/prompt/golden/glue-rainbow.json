@@ -1,0 +1,691 @@
+{
+ "config": [
+  "third_party/powerlevel10k/config/p10k-rainbow.zsh",
+  "tests/prompt/configs/variants/glue-rainbow.zsh"
+ ],
+ "home": "/tmp/emblink-prompt-home",
+ "dirs": [
+  "projects",
+  "projects/detached",
+  "projects/detached/.git",
+  "projects/embedded",
+  "projects/emblink",
+  "projects/emblink/.git",
+  "projects/emblink/kernel",
+  "projects/emblink/kernel/drivers",
+  "projects/emblink/kernel/drivers/video",
+  "projects/fork",
+  "projects/fork/.git",
+  "projects/merging",
+  "projects/merging/.git",
+  "sources",
+  "src",
+  "src/operating-systems",
+  "src/operating-systems/emacs",
+  "src/operating-systems/emblink",
+  "src/operating-systems/emblink/user",
+  "src/operating-systems/emblink/user/term",
+  "src/operating-systems/emblink/user/terminal",
+  "src/operating-systems/emblink/user/terminal/renderer",
+  "src/operating-systems/emblink/user/terminal/renderer/fonts",
+  "src/operating-systems/emblink/user/terminal/renderer/fonts/with-a-rather-long-name",
+  "src/operating-systems/emblink/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it",
+  "src/other"
+ ],
+ "files": [
+  "projects/detached/a.txt",
+  "projects/emblink/README.md",
+  "projects/emblink/kernel.c",
+  "projects/emblink/notes.txt",
+  "projects/emblink/shell.c",
+  "projects/emblink/todo.txt",
+  "projects/fork/a.txt",
+  "projects/fork/c.txt",
+  "projects/fork/d.txt",
+  "projects/merging/f.txt",
+  "src/operating-systems/emblink/user/package.json"
+ ],
+ "recorded": "2026-10-26",
+ "reference": "Powerlevel10k powerlevel10k under tmux 3.8",
+ "sessions": [
+  {
+   "name": "wide",
+   "cols": 100,
+   "rows": 16,
+   "steps": [
+    {
+     "step": "home",
+     "typed": null,
+     "state": {
+      "dir": "~",
+      "status": null,
+      "time": [
+       9,
+       8,
+       7
+      ]
+     },
+     "cursor": [
+      4,
+      1
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                                                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:07 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deep",
+     "typed": "cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 0,
+      "time": [
+       9,
+       8,
+       9
+      ]
+     },
+     "cursor": [
+      4,
+      4
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                                                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:07 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts       \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m         \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:09 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "error",
+     "typed": "false",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 1,
+      "time": [
+       9,
+       8,
+       10
+      ]
+     },
+     "cursor": [
+      4,
+      7
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                                                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:07 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts       \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m         \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:09 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m false                                                                                        \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m       \u001b[31m\u001b[33m\u001b[41m 1 ✘ \u001b[37m\u001b[30m\u001b[47m at  09:08:10 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deeper",
+     "typed": "cd $deeper",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts/with-a-rather-long-name/and-another-one-below-it",
+      "status": 0,
+      "time": [
+       9,
+       8,
+       11
+      ]
+     },
+     "cursor": [
+      4,
+      10
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                                                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:07 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts       \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m         \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:09 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m false                                                                                        \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m       \u001b[31m\u001b[33m\u001b[41m 1 ✘ \u001b[37m\u001b[30m\u001b[47m at  09:08:10 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m cd $deeper                                                                                   \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[38;5;250mf\u001b[38;5;254m/\u001b[38;5;250mw\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mand-another-one-below-it\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:11 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "git",
+     "typed": "cd /tmp/emblink-prompt-home/projects/emblink",
+     "state": {
+      "dir": "~/projects/emblink",
+      "status": 0,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": [
+       9,
+       8,
+       13
+      ]
+     },
+     "cursor": [
+      4,
+      13
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                                                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:07 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts       \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m         \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:09 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m false                                                                                        \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m       \u001b[31m\u001b[33m\u001b[41m 1 ✘ \u001b[37m\u001b[30m\u001b[47m at  09:08:10 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m cd $deeper                                                                                   \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[38;5;250mf\u001b[38;5;254m/\u001b[38;5;250mw\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mand-another-one-below-it\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:11 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink                                                 \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                   \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:13 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "slow",
+     "typed": "sleep 3.2",
+     "state": {
+      "dir": "~/projects/emblink",
+      "status": 0,
+      "duration_ms": 3200,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": [
+       9,
+       8,
+       17
+      ]
+     },
+     "cursor": [
+      4,
+      15
+     ],
+     "screen": [
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/src/operating-systems/emblink/user/terminal/renderer/fonts       \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m         \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:09 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m false                                                                                        \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m       \u001b[31m\u001b[33m\u001b[41m 1 ✘ \u001b[37m\u001b[30m\u001b[47m at  09:08:10 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m cd $deeper                                                                                   \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[38;5;250mf\u001b[38;5;254m/\u001b[38;5;250mw\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mand-another-one-below-it\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:11 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink                                                 \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                   \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:13 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 3.2                                                                                    \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                              \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[30m\u001b[43m3s  \u001b[37m\u001b[30m\u001b[47m at  09:08:17 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      ""
+     ]
+    },
+    {
+     "step": "jobs",
+     "typed": "sleep 100 &",
+     "state": {
+      "dir": "~/projects/emblink",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": [
+       9,
+       8,
+       18
+      ]
+     },
+     "cursor": [
+      4,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/src/operating-systems/emblink/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/terminal/renderer/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m       \u001b[31m\u001b[33m\u001b[41m 1 ✘ \u001b[37m\u001b[30m\u001b[47m at  09:08:10 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m cd $deeper                                                                                   \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[38;5;250mf\u001b[38;5;254m/\u001b[38;5;250mw\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mand-another-one-below-it\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:11 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink                                                 \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                   \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:13 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 3.2                                                                                    \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                              \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[30m\u001b[43m3s  \u001b[37m\u001b[30m\u001b[47m at  09:08:17 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 100 &                                                                                  \u001b[38;5;242m─╯\u001b[39m ",
+      "[1] 73921                ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:18 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      ""
+     ],
+     "output": true
+    },
+    {
+     "step": "fork",
+     "typed": "cd $fork",
+     "state": {
+      "dir": "~/projects/fork",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "branch": "main",
+       "remote_branch": "main",
+       "ahead": 2,
+       "behind": 1,
+       "remote_url": "/tmp/emblink-prompt-remote.git",
+       "stashes": 1,
+       "summary": "wip: four"
+      },
+      "time": [
+       9,
+       8,
+       19
+      ]
+     },
+     "cursor": [
+      4,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[38;5;250mf\u001b[38;5;254m/\u001b[38;5;250mw\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mand-another-one-below-it\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:11 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd /tmp/emblink-prompt-home/projects/emblink                                                 \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                   \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:13 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 3.2                                                                                    \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                              \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[30m\u001b[43m3s  \u001b[37m\u001b[30m\u001b[47m at  09:08:17 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 100 &                                                                                  \u001b[38;5;242m─╯\u001b[39m ",
+      "[1] 73921                ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:18 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $fork                                                                                     \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255mfork\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[42m main wip ⇣1⇡2 *1 \u001b[32m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:19 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      ""
+     ]
+    },
+    {
+     "step": "detached",
+     "typed": "cd $detached",
+     "state": {
+      "dir": "~/projects/detached",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "commit": "e802fca6b87c91cfa6a1295b0c4d3a423baa0090",
+       "summary": "One"
+      },
+      "time": [
+       9,
+       8,
+       20
+      ]
+     },
+     "cursor": [
+      4,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                   \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:13 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 3.2                                                                                    \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                              \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[30m\u001b[43m3s  \u001b[37m\u001b[30m\u001b[47m at  09:08:17 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 100 &                                                                                  \u001b[38;5;242m─╯\u001b[39m ",
+      "[1] 73921                ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:18 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $fork                                                                                     \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255mfork\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[42m main wip ⇣1⇡2 *1 \u001b[32m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:19 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $detached                                                                                 \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255mdetached\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[42m \u001b[37m@\u001b[30me802fca6 \u001b[32m\u001b[49m\u001b[39m                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:20 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      ""
+     ]
+    },
+    {
+     "step": "merging",
+     "typed": "cd $merging",
+     "state": {
+      "dir": "~/projects/merging",
+      "status": 0,
+      "jobs": 1,
+      "git": {
+       "conflicted": 1,
+       "branch": "main",
+       "action": "merge",
+       "summary": "Main"
+      },
+      "time": [
+       9,
+       8,
+       22
+      ]
+     },
+     "cursor": [
+      4,
+      15
+     ],
+     "screen": [
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                              \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[30m\u001b[43m3s  \u001b[37m\u001b[30m\u001b[47m at  09:08:17 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 100 &                                                                                  \u001b[38;5;242m─╯\u001b[39m ",
+      "[1] 73921                ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:18 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $fork                                                                                     \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255mfork\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[42m main wip ⇣1⇡2 *1 \u001b[32m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:19 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $detached                                                                                 \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255mdetached\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[42m \u001b[37m@\u001b[30me802fca6 \u001b[32m\u001b[49m\u001b[39m                                    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:20 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $merging                                                                                  \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/projects/\u001b[1m\u001b[38;5;255mmerging\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[42m main \u001b[31mmerge ~1\u001b[30m \u001b[32m\u001b[49m\u001b[39m                                 \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[38;5;196m|\u001b[36m  \u001b[30m\u001b[47mat  09:08:22 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                                                              \u001b[38;5;242m─╯\u001b[39m ",
+      ""
+     ]
+    }
+   ]
+  },
+  {
+   "name": "narrow",
+   "cols": 60,
+   "rows": 16,
+   "steps": [
+    {
+     "step": "home",
+     "typed": null,
+     "state": {
+      "dir": "~",
+      "status": null,
+      "time": [
+       9,
+       8,
+       23
+      ]
+     },
+     "cursor": [
+      4,
+      1
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                            \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:23 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                      \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deep",
+     "typed": "cd $deep",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 0,
+      "time": [
+       9,
+       8,
+       23
+      ]
+     },
+     "cursor": [
+      4,
+      4
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                            \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:23 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $deep                                             \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                      ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                      \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "interrupt",
+     "typed": "sleep 30",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 130,
+      "time": [
+       9,
+       8,
+       23
+      ]
+     },
+     "cursor": [
+      4,
+      8
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                            \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:23 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $deep                                             \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                      ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 30                                             \u001b[38;5;242m─╯\u001b[39m ",
+      "^C             ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                      ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m                                                      \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ],
+     "output": true
+    },
+    {
+     "step": "repo",
+     "typed": "cd $repodeep",
+     "state": {
+      "dir": "~/projects/emblink/kernel/drivers/video",
+      "status": 0,
+      "git": {
+       "branch": "main",
+       "staged": 1,
+       "unstaged": 1,
+       "untracked": 2
+      },
+      "time": [
+       9,
+       8,
+       23
+      ]
+     },
+     "cursor": [
+      4,
+      11
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                            \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:23 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $deep                                             \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                      ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m sleep 30                                             \u001b[38;5;242m─╯\u001b[39m ",
+      "^C             ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m                      ",
+      "\u001b[38;5;242m╰─\u001b[38;5;196m❯\u001b[39m cd $repodeep                                         \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mp\u001b[38;5;254m/\u001b[1m\u001b[38;5;255memblink\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mk\u001b[38;5;254m/\u001b[38;5;250md\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mvideo\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[30m\u001b[43m main +1 !1 ?2 \u001b[33m\u001b[49m\u001b[39m               ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                                                      \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    }
+   ]
+  },
+  {
+   "name": "tiny",
+   "cols": 36,
+   "rows": 12,
+   "steps": [
+    {
+     "step": "home",
+     "typed": null,
+     "state": {
+      "dir": "~",
+      "status": null,
+      "time": [
+       9,
+       8,
+       29
+      ]
+     },
+     "cursor": [
+      4,
+      1
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:29 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    },
+    {
+     "step": "deep",
+     "typed": "cd $deep",
+     "state": {
+      "dir": "~/src/operating-systems/emblink/user/terminal/renderer/fonts",
+      "status": 0,
+      "time": [
+       9,
+       8,
+       29
+      ]
+     },
+     "cursor": [
+      4,
+      5
+     ],
+     "screen": [
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m    \u001b[30m\u001b[32m\u001b[40m ✔ \u001b[37m\u001b[30m\u001b[47m at  09:08:29 \u001b[38;5;242m\u001b[49m─╮\u001b[39m ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m cd $deep                     \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "\u001b[38;5;242m╭─\u001b[38;5;254m\u001b[44m \u001b[1m\u001b[38;5;255m~\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250msr\u001b[38;5;254m/\u001b[38;5;250mop\u001b[38;5;254m/\u001b[38;5;250memb\u001b[38;5;254m/\u001b[1m\u001b[38;5;255muser\u001b[0m\u001b[38;5;254m\u001b[44m/\u001b[38;5;250mtermi\u001b[38;5;254m/\u001b[38;5;250mr\u001b[38;5;254m/\u001b[1m\u001b[38;5;255mfonts\u001b[0m\u001b[38;5;254m\u001b[44m \u001b[38;5;226m\u001b[38;5;196m!",
+      "\u001b[38;5;254m \u001b[34m\u001b[49m\u001b[39m       ",
+      "\u001b[38;5;242m╰─\u001b[38;5;76m❯\u001b[39m                              \u001b[38;5;242m─╯\u001b[39m ",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+     ]
+    }
+   ]
+  }
+ ]
+}

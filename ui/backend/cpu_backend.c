@@ -52,26 +52,42 @@ static void blend_over(struct render_target *rt, int ix, int iy,
     *px = px_pack(nb, ng, nr, na);
 }
 
-/* Gamma-correct (linear-light, ~gamma 2.0) over-blend for ANTI-ALIASED EDGES:
- * `c` is the straight src color, `eff` its effective coverage/alpha at this
- * pixel. Blending edge coverage in linear light removes the dark fringe naive
- * sRGB blending leaves at high-contrast edges -- the same reason text does it.
- * Only ever called on partial-coverage pixels (interiors take the opaque fast
- * path), so the per-pixel sqrtf is confined to the thin AA band. */
-static void blend_edge_gamma(struct render_target *rt, int ix, int iy, struct color c, float eff) {
-    if (eff <= 0.0f) return;
+/* ONE BLEND FOR EVERY PIXEL A SHAPE ONLY PARTLY COVERS. The paint goes over
+ * what is there in sRGB, exactly as the shape's interior does; then COVERAGE,
+ * and only coverage, is applied in linear light, which is what keeps a
+ * high-contrast edge from the dark fringe a plain sRGB blend leaves.
+ *
+ * There used to be two edge blends inside one rect: a gamma blend on the
+ * side columns when the rect sat wholly inside its clips, blend_over on its
+ * top and bottom rows and on every pixel once it did not. The gamma one also
+ * linearised the PAINT's alpha, so a translucent row's straight edges came out
+ * lighter than its interior -- a one-pixel seam down both sides -- and a row
+ * drew its edges differently the moment it slid under a clip's edge. A
+ * picture that depends on where its clip happens to be cannot be scrolled by
+ * copying it; this is one picture wherever the shape is. At full coverage it
+ * is blend_over, the interior's blend. */
+static void blend_cov(struct render_target *rt, int ix, int iy, struct color c, float a, float cov) {
+    if (a <= 0.0f || cov <= 0.0f) return;
+    if (cov >= 0.999f) { blend_over(rt, ix, iy, c.r * a, c.g * a, c.b * a, a); return; }
     if (ix < 0 || iy < 0 || (uint32_t)ix >= rt->width || (uint32_t)iy >= rt->height) return;
     uint32_t *px = &rt_row(rt, (uint32_t)iy)[ix];
     int db, dg, dr, da; px_unpack(*px, &db, &dg, &dr, &da);
-    float inv = 1.0f - eff;
-    float sr = c.r * c.r, sg = c.g * c.g, sb = c.b * c.b;          /* linearise src */
-    float lr = (dr / 255.0f) * (dr / 255.0f);                      /* linearise dst */
-    float lg = (dg / 255.0f) * (dg / 255.0f);
-    float lb = (db / 255.0f) * (db / 255.0f);
-    int nr = clampi((int)(sqrtf(sr * eff + lr * inv) * 255.0f + 0.5f), 0, 255);
-    int ng = clampi((int)(sqrtf(sg * eff + lg * inv) * 255.0f + 0.5f), 0, 255);
-    int nb = clampi((int)(sqrtf(sb * eff + lb * inv) * 255.0f + 0.5f), 0, 255);
-    int na = clampi((int)(eff * 255.0f + da * inv + 0.5f), 0, 255);
+    /* ...but only over something OPAQUE. Over a picture that is itself
+     * transparent there -- a layer, a group's own buffer, a window that shows
+     * through -- linear light has no ground to be measured against: lerping
+     * toward transparent black in it boosts the colour past its own alpha,
+     * which is no premultiplied pixel at all, and the edge composites a
+     * bright fringe. There coverage is plain alpha, as Core Animation's
+     * layers have it: the paint, scaled by its coverage, over. */
+    if (da < 255) { float k = a * cov; blend_over(rt, ix, iy, c.r * k, c.g * k, c.b * k, k); return; }
+    float inv = 1.0f - a, k = cov, ik = 1.0f - cov;
+    float lr = dr / 255.0f, lg = dg / 255.0f, lb = db / 255.0f;
+    float orr = c.r * a + lr * inv, og = c.g * a + lg * inv, ob = c.b * a + lb * inv;   /* paint over, sRGB */
+    float oa = a + (da / 255.0f) * inv;
+    int nr = clampi((int)(sqrtf(orr * orr * k + lr * lr * ik) * 255.0f + 0.5f), 0, 255);
+    int ng = clampi((int)(sqrtf(og * og * k + lg * lg * ik) * 255.0f + 0.5f), 0, 255);
+    int nb = clampi((int)(sqrtf(ob * ob * k + lb * lb * ik) * 255.0f + 0.5f), 0, 255);
+    int na = clampi((int)((oa * k + (da / 255.0f) * ik) * 255.0f + 0.5f), 0, 255);
     *px = px_pack(nb, ng, nr, na);
 }
 
@@ -247,6 +263,21 @@ static int clamp_to_dirty(struct render_target *rt, int *x0, int *y0, int *x1, i
  * Conservative by construction: it must never claim coverage the exact path
  * would not give, so a clip stack deeper than CLIP_MAX (whose extra entries we
  * did not record) answers no. */
+/* The clip half of box_fully_covered: every pixel of the box in the
+ * fast-accept interior of every clip, the dirty region not asked about. */
+static int box_clip_covered(int bx0, int by0, int bx1, int by1) {
+    if (bx1 <= bx0 || by1 <= by0) return 1;
+    float fx0 = (float)bx0 + 0.5f, fy0 = (float)by0 + 0.5f;
+    float fx1 = (float)bx1 - 0.5f, fy1 = (float)by1 - 0.5f;
+    if (g_clip_n > CLIP_MAX) return 0;               /* clips we never stored */
+    for (int i = 0; i < g_clip_n; i++) {
+        struct clip_rect *c = &g_clip[i];
+        float inset = c->corner_radius + 0.5f;       /* same margin as coverage_full_at */
+        if (fx0 < c->x + inset || fx1 > c->x + c->w - inset) return 0;
+        if (fy0 < c->y + inset || fy1 > c->y + c->h - inset) return 0;
+    }
+    return 1;
+}
 static int box_fully_covered(int bx0, int by0, int bx1, int by1) {
     if (bx1 <= bx0 || by1 <= by0) return 1;          /* empty: vacuously true */
     float fx0 = (float)bx0 + 0.5f, fy0 = (float)by0 + 0.5f;   /* first centre */
@@ -265,14 +296,41 @@ static int box_fully_covered(int bx0, int by0, int bx1, int by1) {
         }
         if (!inside) return 0;
     }
-    if (g_clip_n > CLIP_MAX) return 0;               /* clips we never stored */
-    for (int i = 0; i < g_clip_n; i++) {
-        struct clip_rect *c = &g_clip[i];
-        float inset = c->corner_radius + 0.5f;       /* same margin as coverage_full_at */
-        if (fx0 < c->x + inset || fx1 > c->x + c->w - inset) return 0;
-        if (fy0 < c->y + inset || fy1 > c->y + c->h - inset) return 0;
+    return box_clip_covered(bx0, by0, bx1, by1);
+}
+
+/* THE DIRTY REGION ALONG ONE ROW, as disjoint spans [a,b) inside [x0,x1).
+ *
+ * A primitive clamped to the dirty BOUNDING BOX does work over everything
+ * between the rects: a scroll repaints a strip at the bottom of the view and a
+ * band at its top, and the box of those two is the whole view -- every pixel
+ * of the page's background then paid the per-pixel dirty test and the exact
+ * SDF path only to be thrown away, which made a blitted scroll frame dearer
+ * than painting everything. Per row the rects reduce to a few spans; walking
+ * those makes a primitive's cost the dirty area it actually covers. Merged, so
+ * a pixel two overlapping rects share is painted once -- a translucent fill
+ * blended twice would be visibly darker exactly there. Pixel ix is in a rect
+ * when its centre is, as in dirty_coverage. */
+static int dirty_row_spans(float fy, int x0, int x1, int *sa, int *sb) {
+    if (g_dirty_full) { sa[0] = x0; sb[0] = x1; return x1 > x0; }
+    int n = g_dirty_n < DIRTY_MAX ? g_dirty_n : DIRTY_MAX, k = 0;
+    for (int i = 0; i < n; i++) {
+        struct clip_rect *c = &g_dirty[i];
+        if (!(fy >= c->y && fy < c->y + c->h)) continue;
+        int a = (int)ceilf(c->x - 0.5f), b = (int)ceilf(c->x + c->w - 0.5f);
+        if (a < x0) a = x0;
+        if (b > x1) b = x1;
+        if (b <= a) continue;
+        int j = k++;                                  /* insertion by start */
+        while (j > 0 && sa[j - 1] > a) { sa[j] = sa[j - 1]; sb[j] = sb[j - 1]; j--; }
+        sa[j] = a; sb[j] = b;
     }
-    return 1;
+    int m = 0;
+    for (int i = 0; i < k; i++) {
+        if (m && sa[i] <= sb[m - 1]) { if (sb[i] > sb[m - 1]) sb[m - 1] = sb[i]; }
+        else { sa[m] = sa[i]; sb[m] = sb[i]; m++; }
+    }
+    return m;
 }
 
 /* Public accessors for the Piece-4b text blit (separate translation unit). */
@@ -365,11 +423,19 @@ static void cpu_begin_frame(struct render_target *rt, const struct clip_rect *di
                 memset((uint8_t *)rt->pixels + (size_t)y * rt->stride, 0, (size_t)rt->width * 4);
         } else {
             for (uint32_t i = 0; i < n; i++) {
-                int x0 = (int)dirty[i].x, y0 = (int)dirty[i].y;
-                int x1 = (int)(dirty[i].x + dirty[i].w) + 1, y1 = (int)(dirty[i].y + dirty[i].h) + 1;
-                if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+                /* the pixels the rect touches, and no more: one row past it
+                 * (what a "+ 1" cleared) is a row nothing repaints, left
+                 * transparent across a window that shows through */
+                int x0 = (int)floorf(dirty[i].x), y0 = (int)floorf(dirty[i].y);
+                int x1 = (int)ceilf(dirty[i].x + dirty[i].w), y1 = (int)ceilf(dirty[i].y + dirty[i].h);
+                if (x0 < 0) x0 = 0;
+                if (y0 < 0) y0 = 0;
                 if (x1 > (int)rt->width)  x1 = (int)rt->width;
                 if (y1 > (int)rt->height) y1 = (int)rt->height;
+                /* a rect beyond the right or bottom edge clears nothing --
+                 * not (x1 - x0) * 4 bytes of a negative width, which memset
+                 * reads as most of the address space */
+                if (x1 <= x0 || y1 <= y0) continue;
                 for (int y = y0; y < y1; y++)
                     memset((uint8_t *)rt->pixels + (size_t)y * rt->stride + (size_t)x0 * 4,
                            0, (size_t)(x1 - x0) * 4);
@@ -410,7 +476,11 @@ struct color cpu_paint_at(const struct paint *p, float u, float v, float w, floa
             float ang = p->angle_deg * 3.14159265f / 180.0f;
             float dx = cosf(ang), dy = sinf(ang);
             float denom = fabsf(dx) * w + fabsf(dy) * h;
-            float t = denom > 1e-6f ? (u * dx + v * dy) / denom + 0.5f : 0.0f;
+            /* projected from the rect's CENTRE, as CSS does: t runs 0..1
+             * corner to corner. From the corner it ran 0.5..1.5, and every
+             * gradient showed the second half of its stops and then the last
+             * colour flat. */
+            float t = denom > 1e-6f ? ((u - w * 0.5f) * dx + (v - h * 0.5f) * dy) / denom + 0.5f : 0.0f;
             return gradient_at(p, t);
         }
         case PAINT_RADIAL_GRADIENT: {
@@ -475,11 +545,38 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
      * which is carry-safe (max is 255) and bakes into four 256-entry LUTs. */
     int fast_alpha = (fill->kind == PAINT_SOLID && !fast_solid && opacity >= 0.999f &&
                       fill->solid.a > 0.003f && fill->solid.a < 0.999f);
+    /* OPAQUE LINEAR GRADIENT FAST PATH: the desktop's wallpaper is one, the
+     * whole screen, repainted every frame anything over it fades. Per pixel it
+     * took two trig calls, a search of the stops and a float blend; here the
+     * colour comes from a table along the gradient, t steps along the row, and
+     * a 4x4 ordered dither spends the table's extra bits so a dark sweep
+     * across a screen does not band. */
+    #define GRAD_LUT 512
+    int fast_grad = 0;
+    uint16_t glR[GRAD_LUT], glG[GRAD_LUT], glB[GRAD_LUT];     /* 8.8 */
+    float g_dx = 0.0f, g_dy = 0.0f, g_den = 1.0f;
+    if (fill->kind == PAINT_LINEAR_GRADIENT && opacity >= 0.999f && fill->n_stops >= 2) {
+        fast_grad = 1;
+        for (int i = 0; i < fill->n_stops; i++) if (fill->stops[i].color.a < 0.999f) fast_grad = 0;
+        float ang = fill->angle_deg * 3.14159265f / 180.0f;
+        g_dx = cosf(ang); g_dy = sinf(ang);
+        g_den = fabsf(g_dx) * w + fabsf(g_dy) * h;
+        if (g_den <= 1e-6f) fast_grad = 0;
+        for (int i = 0; fast_grad && i < GRAD_LUT; i++) {
+            struct color c = gradient_at(fill, (float)i / (GRAD_LUT - 1));
+            glR[i] = (uint16_t)(c.r * 255.0f * 256.0f + 0.5f);
+            glG[i] = (uint16_t)(c.g * 255.0f * 256.0f + 0.5f);
+            glB[i] = (uint16_t)(c.b * 255.0f * 256.0f + 0.5f);
+        }
+    }
+    static const uint8_t bayer4[4][4] = { { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 } };
     uint32_t solid_pix = 0;
     uint8_t lutB[256], lutG[256], lutR[256], lutA[256];
     int in_x0 = 0, in_x1 = -1, in_y0 = 0, in_y1 = -1;
-    if (fast_solid || fast_alpha) {
-        if (fast_solid) {
+    if (fast_solid || fast_alpha || fast_grad) {
+        if (fast_grad) {
+            /* (the table is the fill) */
+        } else if (fast_solid) {
             solid_pix = px_pack((int)(fill->solid.b * 255.0f + 0.5f),
                                 (int)(fill->solid.g * 255.0f + 0.5f),
                                 (int)(fill->solid.r * 255.0f + 0.5f), 255);
@@ -505,59 +602,80 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
     }
     /* one interior pixel: opaque -> a bare store; translucent -> an integer
      * LUT blend over the existing dst. Both avoid the float blend_over. */
+    /* a gradient pixel: t from where it is, its colour from the table */
+    #define CPU_GRAD_PIX(IX, IY, TQ) do {                                      \
+        int _k = (TQ) >> 16; _k = _k < 0 ? 0 : _k > GRAD_LUT - 1 ? GRAD_LUT - 1 : _k; \
+        int _d = bayer4[(IY) & 3][(IX) & 3] * 16 + 8;                           \
+        int _r = (glR[_k] + _d) >> 8, _g = (glG[_k] + _d) >> 8, _b = (glB[_k] + _d) >> 8; \
+        row[IX] = px_pack(_b > 255 ? 255 : _b, _g > 255 ? 255 : _g, _r > 255 ? 255 : _r, 255); \
+    } while (0)
+    #define GRAD_TQ(FX, FY) ((int32_t)((((FX) - cx) * g_dx + ((FY) - cy) * g_dy) / g_den * (GRAD_LUT - 1) * 65536.0f \
+                                       + 0.5f * (GRAD_LUT - 1) * 65536.0f))
     #define CPU_INTERIOR_STORE(ROW, IX) do {                                   \
-        if (fast_solid) (ROW)[IX] = solid_pix;                                 \
+        if (fast_grad) CPU_GRAD_PIX(IX, iy, GRAD_TQ((IX) + 0.5f, fy));         \
+        else if (fast_solid) (ROW)[IX] = solid_pix;                            \
         else { int _b,_g,_r,_a; px_unpack((ROW)[IX], &_b,&_g,&_r,&_a);         \
                (ROW)[IX] = px_pack(lutB[_b], lutG[_g], lutR[_r], lutA[_a]); }  \
     } while (0)
 
-    /* the interior box is provably at coverage 1.0 -> the fill degenerates to a
-     * bare row of stores. Asked once for the whole rect, not once per pixel. */
-    int cov_trivial = box_fully_covered(x0 > in_x0 ? x0 : in_x0, y0 > in_y0 ? y0 : in_y0,
-                                        x1 < in_x1 ? x1 : in_x1, y1 < in_y1 ? y1 : in_y1);
+    /* the interior box is provably inside every clip -> within a dirty span
+     * (dirty_row_spans: wholly damaged by construction) the fill degenerates
+     * to a bare row of stores. Asked once for the whole rect, not per pixel. */
+    int cov_trivial = box_clip_covered(x0 > in_x0 ? x0 : in_x0, y0 > in_y0 ? y0 : in_y0,
+                                       x1 < in_x1 ? x1 : in_x1, y1 < in_y1 ? y1 : in_y1);
+    const int rx0 = x0, rx1 = x1;
+    int spa[DIRTY_MAX], spb[DIRTY_MAX];
 
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         uint32_t *row = rt_row(rt, (uint32_t)iy);
-        int row_interior = (fast_solid || fast_alpha) && iy >= in_y0 && iy < in_y1;
-        int sp_a = in_x0 > x0 ? in_x0 : x0, sp_b = in_x1 < x1 ? in_x1 : x1;
-        if (row_interior && cov_trivial && sp_a < sp_b) {
-            int a = sp_a, b = sp_b;
-            for (int ix = a; ix < b; ix++) CPU_INTERIOR_STORE(row, ix);
-            /* left/right AA columns still take the exact path below */
+        int row_interior = (fast_solid || fast_alpha || fast_grad) && iy >= in_y0 && iy < in_y1;
+        int nsp = dirty_row_spans(fy, rx0, rx1, spa, spb);
+        for (int si = 0; si < nsp; si++) {
+            int x0 = spa[si], x1 = spb[si];
+            int sp_a = in_x0 > x0 ? in_x0 : x0, sp_b = in_x1 < x1 ? in_x1 : x1;
+            if (row_interior && cov_trivial && sp_a < sp_b) {
+                int a = sp_a, b = sp_b;
+                if (fast_grad) {                     /* t stepped along the row */
+                    int32_t tq = GRAD_TQ(a + 0.5f, fy);
+                    int32_t dtq = (int32_t)(g_dx / g_den * (GRAD_LUT - 1) * 65536.0f);
+                    for (int ix = a; ix < b; ix++, tq += dtq) CPU_GRAD_PIX(ix, iy, tq);
+                } else
+                for (int ix = a; ix < b; ix++) CPU_INTERIOR_STORE(row, ix);
+                /* left/right AA columns still take the exact path below */
+                for (int ix = x0; ix < x1; ix++) {
+                    if (ix == a) { ix = b - 1; continue; }   /* skip the filled span */
+                    float fx = ix + 0.5f;
+                    float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
+                    float cov = sdf_coverage(dist);
+                    if (cov <= 0.0f) continue;
+                    cov *= coverage_at(fx, fy);
+                    if (cov <= 0.0f) continue;
+                    struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
+                    blend_cov(rt, ix, iy, c, c.a * opacity, cov);
+                }
+                continue;
+            }
             for (int ix = x0; ix < x1; ix++) {
-                if (ix == a) { ix = b - 1; continue; }   /* skip the filled span */
                 float fx = ix + 0.5f;
+                if (row_interior && ix >= in_x0 && ix < in_x1 && coverage_full_at(fx, fy)) {
+                    CPU_INTERIOR_STORE(row, ix);
+                    continue;
+                }
                 float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
                 float cov = sdf_coverage(dist);
                 if (cov <= 0.0f) continue;
                 cov *= coverage_at(fx, fy);
                 if (cov <= 0.0f) continue;
                 struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
-                float eff = c.a * cov * opacity;
-                if (eff <= 0.0f) continue;
-                blend_edge_gamma(rt, ix, iy, c, eff);
+                blend_cov(rt, ix, iy, c, c.a * opacity, cov);
             }
-            continue;
-        }
-        for (int ix = x0; ix < x1; ix++) {
-            float fx = ix + 0.5f;
-            if (row_interior && ix >= in_x0 && ix < in_x1 && coverage_full_at(fx, fy)) {
-                CPU_INTERIOR_STORE(row, ix);
-                continue;
-            }
-            float dist = rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius);
-            float cov = sdf_coverage(dist);
-            if (cov <= 0.0f) continue;
-            cov *= coverage_at(fx, fy);
-            if (cov <= 0.0f) continue;
-            struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
-            float eff = c.a * cov * opacity;
-            if (eff <= 0.0f) continue;
-            blend_over(rt, ix, iy, c.r * eff, c.g * eff, c.b * eff, eff);
         }
     }
     #undef CPU_INTERIOR_STORE
+    #undef CPU_GRAD_PIX
+    #undef GRAD_TQ
+    #undef GRAD_LUT
 }
 
 /* ------------------------------------------------------------------------- */
@@ -631,7 +749,8 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         int32_t sfy = basey + (iy - y0) * stepy;
-        if (sfy < 0) sfy = 0; if (sfy > maxfy) sfy = maxfy;
+        if (sfy < 0) sfy = 0;
+        if (sfy > maxfy) sfy = maxfy;
         uint32_t sy = (uint32_t)(sfy >> 16);
         uint32_t syn = (sy + 1 < src_h) ? sy + 1 : sy;
         uint32_t wy = (uint32_t)((sfy >> 8) & 0xFF);
@@ -692,6 +811,8 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
 static void box_blur_1d(uint32_t *dst, const uint32_t *src, int n, int stride, int radius) {
     if (radius < 1) { for (int i = 0; i < n; i++) dst[i * stride] = src[i * stride]; return; }
     int win = 2 * radius + 1;
+    /* a reciprocal multiply, not four divides a sample (box_blur_1d_u8) */
+    uint32_t recip = (65536u + (uint32_t)win / 2) / (uint32_t)win;
     long sb = 0, sg = 0, sr = 0, sa = 0;
     /* prime the window with clamped-edge samples */
     for (int k = -radius; k <= radius; k++) {
@@ -700,7 +821,8 @@ static void box_blur_1d(uint32_t *dst, const uint32_t *src, int n, int stride, i
         sb += b; sg += g; sr += r; sa += a;
     }
     for (int i = 0; i < n; i++) {
-        dst[i * stride] = px_pack((int)(sb / win), (int)(sg / win), (int)(sr / win), (int)(sa / win));
+        dst[i * stride] = px_pack((int)(((uint32_t)sb * recip) >> 16), (int)(((uint32_t)sg * recip) >> 16),
+                                  (int)(((uint32_t)sr * recip) >> 16), (int)(((uint32_t)sa * recip) >> 16));
         int out_idx = clampi(i - radius, 0, n - 1);
         int in_idx  = clampi(i + radius + 1, 0, n - 1);
         int ob, og, orr, oa; px_unpack(src[out_idx * stride], &ob, &og, &orr, &oa);
@@ -740,25 +862,96 @@ static void box_blur_u8(uint8_t *buf, int w, int h, int radius) {
     free(tmp);
 }
 
+/* The vertical pass, ROW BY ROW: a running sum per column, so the image is
+ * read and written in the order it lies in memory. Down a column it was a
+ * stride of a whole row per sample, a cache miss nearly every time. */
+static void box_blur_cols(uint32_t *dst, const uint32_t *src, int w, int h, int radius, uint32_t *sums) {
+    int win = 2 * radius + 1;
+    uint32_t recip = (65536u + (uint32_t)win / 2) / (uint32_t)win;
+    for (int x = 0; x < w; x++) sums[x * 4] = sums[x * 4 + 1] = sums[x * 4 + 2] = sums[x * 4 + 3] = 0;
+    for (int k = -radius; k <= radius; k++) {
+        const uint32_t *r = &src[(size_t)clampi(k, 0, h - 1) * w];
+        for (int x = 0; x < w; x++) {
+            uint32_t p = r[x];
+            sums[x * 4] += p & 255; sums[x * 4 + 1] += (p >> 8) & 255;
+            sums[x * 4 + 2] += (p >> 16) & 255; sums[x * 4 + 3] += p >> 24;
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        uint32_t *out = &dst[(size_t)y * w];
+        const uint32_t *in = &src[(size_t)clampi(y + radius + 1, 0, h - 1) * w];
+        const uint32_t *old = &src[(size_t)clampi(y - radius, 0, h - 1) * w];
+        for (int x = 0; x < w; x++) {
+            uint32_t *s4 = &sums[x * 4];
+            out[x] = ((s4[0] * recip) >> 16) | (((s4[1] * recip) >> 16) << 8) |
+                     (((s4[2] * recip) >> 16) << 16) | (((s4[3] * recip) >> 16) << 24);
+            uint32_t pi = in[x], po = old[x];
+            s4[0] += (pi & 255) - (po & 255);
+            s4[1] += ((pi >> 8) & 255) - ((po >> 8) & 255);
+            s4[2] += ((pi >> 16) & 255) - ((po >> 16) & 255);
+            s4[3] += (pi >> 24) - (po >> 24);
+        }
+    }
+}
+
 static void box_blur_region(uint32_t *buf, int w, int h, int radius) {
     if (radius < 1 || w <= 0 || h <= 0) return;
     uint32_t *tmp = (uint32_t *)malloc((size_t)w * h * 4);
-    if (!tmp) return;
+    uint32_t *sums = (uint32_t *)malloc((size_t)w * 4 * sizeof(uint32_t));
+    if (!tmp || !sums) { free(tmp); free(sums); return; }
     for (int pass = 0; pass < 3; pass++) {          /* 3 passes ~= Gaussian */
         for (int y = 0; y < h; y++)                  /* horizontal */
             box_blur_1d(&tmp[y * w], &buf[y * w], w, 1, radius);
-        for (int x = 0; x < w; x++)                  /* vertical */
-            box_blur_1d(&buf[x], &tmp[x], h, w, radius);
+        box_blur_cols(buf, tmp, w, h, radius, sums); /* vertical */
     }
-    free(tmp);
+    free(tmp); free(sums);
+}
+
+/* A LARGE BLUR AT HALF RESOLUTION: averaged down 2 x 2, blurred at half the
+ * radius, filtered back up. At a radius of 6 or more the difference is not
+ * there to see, and it is a quarter of the pixels -- the library's glass,
+ * 720 x 536, re-blurred on every frame of its entrance, was half the
+ * desktop's frame. Smaller radii keep the full-resolution blur. */
+#define BLUR_HALF_FROM 6
+static void blur_tile(uint32_t *tile, int w, int h, int radius) {
+    if (radius < BLUR_HALF_FROM || w < 8 || h < 8) { box_blur_region(tile, w, h, radius); return; }
+    int hw = (w + 1) / 2, hh = (h + 1) / 2;
+    uint32_t *half = (uint32_t *)malloc((size_t)hw * hh * 4);
+    if (!half) { box_blur_region(tile, w, h, radius); return; }
+    for (int y = 0; y < hh; y++) {
+        const uint32_t *r0 = &tile[(size_t)(2 * y) * w], *r1 = &tile[(size_t)(2 * y + 1 < h ? 2 * y + 1 : 2 * y) * w];
+        for (int x = 0; x < hw; x++) {
+            int xa = 2 * x, xb = 2 * x + 1 < w ? 2 * x + 1 : 2 * x;
+            uint32_t p[4] = { r0[xa], r0[xb], r1[xa], r1[xb] }, out = 0;
+            for (int sh = 0; sh < 32; sh += 8)
+                out |= ((((p[0] >> sh) & 255u) + ((p[1] >> sh) & 255u) + ((p[2] >> sh) & 255u) +
+                         ((p[3] >> sh) & 255u) + 2u) >> 2) << sh;
+            half[(size_t)y * hw + x] = out;
+        }
+    }
+    box_blur_region(half, hw, hh, (radius + 1) / 2);
+    /* back up: each pixel's centre at (x + .5) / 2 - .5 in the half image, in 1/256ths */
+    for (int y = 0; y < h; y++) {
+        int sy = y * 128 - 64, y0 = sy < 0 ? 0 : sy >> 8, wy = sy < 0 ? 0 : sy & 255;
+        int y1 = y0 + 1 < hh ? y0 + 1 : y0;
+        for (int x = 0; x < w; x++) {
+            int sx = x * 128 - 64, x0 = sx < 0 ? 0 : sx >> 8, wx = sx < 0 ? 0 : sx & 255;
+            int x1 = x0 + 1 < hw ? x0 + 1 : x0;
+            tile[(size_t)y * w + x] = bilerp4(half[(size_t)y0 * hw + x0], half[(size_t)y0 * hw + x1],
+                                              half[(size_t)y1 * hw + x0], half[(size_t)y1 * hw + x1],
+                                              (uint32_t)wx, (uint32_t)wy);
+        }
+    }
+    free(half);
 }
 
 /* ------------------------------------------------------------------------- */
 /* draw_backdrop_blur (Section 4): sample rt, blur, SDF-clipped write-back    */
 /* ------------------------------------------------------------------------- */
 
-static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, float w, float h,
-                                   float radius, float blur_radius) {
+static void cpu_draw_backdrop_blur_from(struct render_target *rt, float x, float y, float w, float h,
+                                        float radius, float blur_radius,
+                                        const struct render_target *src, float sx, float sy) {
     if (w <= 0 || h <= 0) return;
     int x0 = clampi((int)floorf(x), 0, (int)rt->width);
     int y0 = clampi((int)floorf(y), 0, (int)rt->height);
@@ -769,19 +962,56 @@ static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, f
 
     uint32_t *tile = (uint32_t *)malloc((size_t)rw * rh * 4);
     if (!tile) return;
-    for (int j = 0; j < rh; j++)
-        for (int i = 0; i < rw; i++)
-            tile[j * rw + i] = rt_row(rt, (uint32_t)(y0 + j))[x0 + i];   /* everything BEHIND is already here */
+    /* everything BEHIND is already in `src`, where this rect lies at (sx, sy)
+     * -- the same target when not in a group */
+    int ddx = (int)floorf(sx) - (int)floorf(x), ddy = (int)floorf(sy) - (int)floorf(y);
+    for (int j = 0; j < rh; j++) {
+        int syy = y0 + j + ddy, sx0 = x0 + ddx;
+        if (syy >= 0 && syy < (int)src->height && sx0 >= 0 && sx0 + rw <= (int)src->width) {
+            /* the whole row lies inside: one copy, not a checked read a pixel */
+            memcpy(&tile[j * rw], &rt_row((struct render_target *)src, (uint32_t)syy)[sx0], (size_t)rw * 4);
+            continue;
+        }
+        for (int i = 0; i < rw; i++) {
+            int sxx = sx0 + i;
+            tile[j * rw + i] = sxx >= 0 && syy >= 0 && sxx < (int)src->width && syy < (int)src->height
+                ? rt_row((struct render_target *)src, (uint32_t)syy)[sxx] : 0;
+        }
+    }
 
-    box_blur_region(tile, rw, rh, (int)(blur_radius + 0.5f));
+    blur_tile(tile, rw, rh, (int)(blur_radius + 0.5f));
+    /* VIBRANCY: frosted glass, not fog. A blur on its own goes muddy; what
+     * shows through glass that looks like glass is saturated -- 1.7 times
+     * away from its own grey, as the compositor's materials are (pix.h).
+     * Premultiplied, so each channel is held to the pixel's alpha. */
+    for (int k = 0; k < rw * rh; k++) {
+        int b_, g_, r_, a_; px_unpack(tile[k], &b_, &g_, &r_, &a_);
+        int l = (77 * r_ + 150 * g_ + 29 * b_) >> 8;
+        r_ = clampi(l + (((r_ - l) * 435) >> 8), 0, a_);
+        g_ = clampi(l + (((g_ - l) * 435) >> 8), 0, a_);
+        b_ = clampi(l + (((b_ - l) * 435) >> 8), 0, a_);
+        tile[k] = px_pack(b_, g_, r_, a_);
+    }
 
     float half_w = w * 0.5f, half_h = h * 0.5f, cx = x + half_w, cy = y + half_h;
     if (radius > half_w) radius = half_w;
     if (radius > half_h) radius = half_h;
+    /* clear of the corners and a pixel in from the edges, and wholly inside
+     * what may be painted: the blurred pixel, as it is */
+    int in_y0 = (int)ceilf(y + radius + 1.0f), in_y1 = (int)floorf(y + h - radius - 1.0f);
+    int in_x0 = (int)ceilf(x + 1.0f), in_x1 = (int)floorf(x + w - 1.0f);
+    int trivial = in_x1 > in_x0 && in_y1 > in_y0 &&
+                  box_fully_covered(in_x0 > x0 ? in_x0 : x0, in_y0 > y0 ? in_y0 : y0,
+                                    in_x1 < x1 ? in_x1 : x1, in_y1 < y1 ? in_y1 : y1);
     for (int j = 0; j < rh; j++) {
         int iy = y0 + j; float fy = iy + 0.5f;
+        int row_in = trivial && iy >= in_y0 && iy < in_y1;
         for (int i = 0; i < rw; i++) {
             int ix = x0 + i; float fx = ix + 0.5f;
+            if (row_in && ix >= in_x0 && ix < in_x1) {
+                rt_row(rt, (uint32_t)iy)[ix] = tile[j * rw + i];
+                continue;
+            }
             float cov = sdf_coverage(rounded_box_sdf(fx - cx, fy - cy, half_w, half_h, radius));
             cov *= coverage_at(fx, fy);
             if (cov <= 0.0f) continue;
@@ -797,6 +1027,10 @@ static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, f
         }
     }
     free(tile);
+}
+static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, float w, float h,
+                                   float radius, float blur_radius) {
+    cpu_draw_backdrop_blur_from(rt, x, y, w, h, radius, blur_radius, rt, x, y);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -849,8 +1083,7 @@ static void cpu_draw_border(struct render_target *rt, float x, float y, float w,
                 if (ring <= 0.0f) continue;
                 struct color bc = has_grad ? cpu_paint_at(paint, fx - x, fy - y, w, h) : color;
                 if (bc.a <= 0.0f) continue;
-                float eff = bc.a * ring;
-                blend_edge_gamma(rt, ix, iy, bc, eff);
+                blend_cov(rt, ix, iy, bc, bc.a, ring);
             }
         }
     }
@@ -1001,6 +1234,7 @@ static struct render_backend g_cpu_backend = {
     .draw_image         = cpu_draw_image,
     .draw_shadow        = cpu_draw_shadow,
     .draw_backdrop_blur = cpu_draw_backdrop_blur,
+    .draw_backdrop_blur_from = cpu_draw_backdrop_blur_from,
     .draw_border        = cpu_draw_border,
     .draw_text          = 0,   /* Piece 4b */
 };

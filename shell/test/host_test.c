@@ -10,9 +10,11 @@
 #include "wire/wire.h"
 #include "sval/sval.h"
 #include "hist/hist.h"
+#include "prompt/prompt.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int g_fail = 0;
 #define CHECK(cond, name) do { \
@@ -372,6 +374,49 @@ static void test_hist(void) {
     CHECK(hist_get(hist_count()) == NULL, "out-of-range index is NULL");
 }
 
+/* --- history on disk ------------------------------------------------------- */
+static size_t file_lines(const char *path) {
+    FILE *f = fopen(path, "r");
+    size_t n = 0;
+    for (int c; f && (c = fgetc(f)) != EOF;) n += c == '\n';
+    if (f) fclose(f);
+    return n;
+}
+static void test_hist_file(void) {
+    printf("history file:\n");
+    char path[] = "/tmp/emblink-hist-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "a scratch file");
+    if (fd < 0) return;
+    close(fd);
+    remove(path);
+    hist_reset();
+    CHECK(hist_open(path) == 0 && hist_count() == 0, "a missing file is an empty history");
+    hist_push("one");
+    hist_push("if x {\n  echo \"a\\b\"\n}");
+    hist_push("if x {\n  echo \"a\\b\"\n}");
+    CHECK(file_lines(path) == 2, "accepted lines are appended, one file line each; a repeat is not");
+    hist_reset();
+    CHECK(hist_open(path) == 2 && hist_count() == 2, "a new session reads them back");
+    CHECK(!strcmp(hist_get(0), "one"), "in order");
+    CHECK(!strcmp(hist_get(1), "if x {\n  echo \"a\\b\"\n}"), "a multi-line entry with a backslash survives the file");
+    hist_push("two");
+    CHECK(file_lines(path) == 3, "the reopened history appends to the same file");
+    /* Years of appends: the file is trimmed to what the ring holds. */
+    FILE *f = fopen(path, "a");
+    for (int i = 0; f && i < 2 * HIST_MAX; i++) fprintf(f, "line%d\n", i);
+    if (f) fclose(f);
+    hist_reset();
+    hist_open(path);
+    CHECK(hist_count() == HIST_MAX, "the ring holds HIST_MAX");
+    CHECK(file_lines(path) == HIST_MAX, "and the file is rewritten to the same");
+    char want[32];
+    snprintf(want, sizeof want, "line%d", 2 * HIST_MAX - 1);
+    CHECK(!strcmp(hist_get(HIST_MAX - 1), want), "keeping the newest");
+    hist_reset();
+    remove(path);
+}
+
 /* ---------------------------------------------------------------------------
  * The PROGRAM grammar: statements, blocks, control flow, definitions.
  *
@@ -399,6 +444,21 @@ static bool prog_fails(const char *src) {
     lex_free_tokens(t, n);
     if (b) { block_free(b); return false; }
     return true;
+}
+
+/* Unfinished is not wrong: what the line editor asks before Enter runs. */
+static void test_incomplete(void) {
+    printf("unfinished programs:\n");
+    CHECK(program_incomplete("if x {"), "an open block is unfinished");
+    CHECK(program_incomplete("ls |"), "a trailing pipe is unfinished");
+    CHECK(program_incomplete("echo \"abc"), "a string that runs off the end is unfinished");
+    CHECK(program_incomplete("echo $(ls"), "an open command substitution is unfinished");
+    CHECK(program_incomplete("def f(a,"), "a parameter list is unfinished");
+    CHECK(!program_incomplete("echo hi"), "a whole statement is finished");
+    CHECK(!program_incomplete("if x {\n echo 1\n}"), "a closed block is finished");
+    CHECK(!program_incomplete("echo }"), "a stray '}' is an error, not unfinished");
+    CHECK(!program_incomplete("ls | | count"), "an error before the end is an error");
+    CHECK(!program_incomplete(""), "nothing is finished");
 }
 
 static void test_program(void) {
@@ -723,6 +783,190 @@ static void test_redirect_text(void) {
     value_free(&t); wire_buf_free(&b);
 }
 
+static bool count_is(const char *line, struct scope *top, int64_t want) {
+    struct value v = run(line, value_null(), top);
+    bool ok = v.type == VAL_INT && v.u.i == want;
+    value_free(&v);
+    return ok;
+}
+static bool string_is(const char *line, struct scope *top, const char *want) {
+    struct value v = run(line, value_null(), top);
+    bool ok = v.type == VAL_STRING && v.u.s.len == strlen(want) && !memcmp(v.u.s.bytes, want, v.u.s.len);
+    value_free(&v);
+    return ok;
+}
+static bool fails(const char *line, struct scope *top) {
+    struct value v = run(line, value_null(), top);
+    bool ok = v.type == VAL_ERROR;
+    value_free(&v);
+    return ok;
+}
+static const char *after(const char *hay, const char *needle, const char *from) {
+    const char *at = strstr(from ? from : hay, needle);
+    return at ? at : NULL;
+}
+
+static void test_prompt(void) {
+    printf("the prompt: options and what they build:\n");
+    struct scope top;
+    scope_init(&top, NULL);
+    prompt_opt_reset();
+    struct value v = run("prompt set right status duration time", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("right"), "status duration time"), "set: the words are one value");
+    value_free(&v);
+    v = run("prompt set char \"\xe2\x9d\xaf\"", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("char"), "\xe2\x9d\xaf"), "a quoted string is its value");
+    value_free(&v);
+    v = run("prompt set duration.threshold 5", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("duration.threshold"), "5"), "a number too");
+    value_free(&v);
+    v = run("prompt set time.format 12h", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("time.format"), "12h"), "12h is one word, though it lexes as 12 and h");
+    value_free(&v);
+    v = run("prompt set right 12 h", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("right"), "12 h") && prompt_opt_unset("time.format"), "apart, two");
+    value_free(&v);
+    v = run("prompt set right status duration time", value_null(), &top);
+    value_free(&v);
+    CHECK(string_is("prompt get char", &top, "\xe2\x9d\xaf"), "get: the value");
+    CHECK(count_is("prompt | count", &top, 3), "prompt: a table of them");
+    CHECK(fails("prompt set Dir.fg 4", &top) && fails("prompt set \"a..b\" 4", &top) && fails("prompt set \".a\" 4", &top) &&
+          fails("prompt set \"a b\" 4", &top) && fails("prompt set \"a.\" 4", &top),
+          "a key is lower-case words joined by single dots");
+    v = run("prompt set \"dir.fg\" 4", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("dir.fg"), "4") && prompt_opt_unset("dir.fg"), "and may be quoted");
+    value_free(&v);
+    CHECK(fails("prompt set right", &top) && fails("prompt frob", &top), "and usage errors say so");
+    v = run("prompt set dir.anchor.fg 39", value_null(), &top);
+    CHECK(v.type == VAL_NULL && !strcmp(prompt_opt("dir.anchor.fg"), "39"), "a key the builder does not use yet is kept");
+    value_free(&v);
+    v = run("prompt unset char", value_null(), &top);
+    value_free(&v);
+    v = run("prompt get char", value_null(), &top);
+    CHECK(v.type == VAL_NULL && count_is("prompt | count", &top, 3), "unset: gone");
+    value_free(&v);
+    v = run("prompt reset", value_null(), &top);
+    value_free(&v);
+    CHECK(count_is("prompt | count", &top, 0), "reset: all of them");
+
+    struct prompt_state st = { .user = "yves", .host = "emblink", .dir = "~/src", .last_dir = "~/src", .status = 1,
+                               .duration_ms = 4200, .hour = 14, .minute = 5, .second = 9 };
+    struct prompt_text t;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.left, "yves@emblink:~/src$") && !t.right[0] && !t.transient[0],
+          "by default: the prompt as before, nothing on the right, no transient prompt");
+    prompt_opt_set("right", "status duration time");
+    prompt_build(&st, 80, &t);
+    const char *a = after(t.right, "\xe2\x9c\x98 1", NULL), *b = a ? after(t.right, "4s", a) : NULL, *c = b ? after(t.right, "14:05:09", b) : NULL;
+    CHECK(a && b && c, "the right side: ✘ and the status, the duration, the time -- in that order");
+    prompt_opt_set("time.format", "12h");
+    st.status = 0; st.duration_ms = 500;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "\xe2\x9c\x94") && !strstr(t.right, "0s") && strstr(t.right, "02:05:09 PM"),
+          "✔ for success; a short command shows no duration; a 12-hour clock");
+    st.status = -1;
+    prompt_build(&st, 80, &t);
+    CHECK(!strstr(t.right, "\xe2\x9c") && strstr(t.right, "PM"), "before the first command: the time alone");
+    st.status = 0;
+    st.duration_ms = 3725000;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "1h 2m 5s") != NULL, "an hour and more");
+    st.duration_ms = 65000;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "1m 5s") != NULL, "a minute and more");
+    prompt_opt_set("duration.threshold", "90");
+    prompt_build(&st, 80, &t);
+    CHECK(!strstr(t.right, "1m 5s"), "under the threshold: not shown");
+    prompt_opt_set("right", "status nonsense time");
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.right, "\xe2\x9c\x94") && !strstr(t.right, "nonsense"), "an element it does not know is left out");
+    prompt_opt_set("transient", "always");
+    prompt_opt_set("char", "\xe2\x9d\xaf");
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.transient, "\033[1;32m\xe2\x9d\xaf") && strstr(t.left, "\xe2\x9d\xaf"),
+          "transient: the prompt character alone, green after success");
+    st.status = 2;
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.transient, "\033[1;31m") != NULL, "red after a failure");
+    prompt_opt_set("transient", "same-dir");
+    st.last_dir = "~";
+    prompt_build(&st, 80, &t);
+    CHECK(!t.transient[0], "same-dir: not right after the directory changed");
+    st.last_dir = "~/src";
+    prompt_build(&st, 80, &t);
+    CHECK(t.transient[0] != 0, "and again once it stays");
+    prompt_opt_reset();
+    scope_free(&top);
+}
+
+/* Powerlevel10k as the base: a style, a person's ~/.p10k.zsh, options on top. */
+static void test_prompt_p10k(void) {
+    printf("the prompt: Powerlevel10k styles and configurations:\n");
+    struct scope top;
+    scope_init(&top, NULL);
+    prompt_opt_reset();
+    setenv("PROMPT_STYLES", "third_party/powerlevel10k/config", 1);
+    CHECK(string_is("prompt style", &top, "plain"), "no style: the plain prompt");
+    struct value v = run("prompt style lean", value_null(), &top);
+    CHECK(v.type == VAL_NULL && string_is("prompt style", &top, "lean"), "style: lean loaded as the base");
+    value_free(&v);
+    struct prompt_state st = { .user = "yves", .host = "emblink", .dir = "~/src", .last_dir = "", .status = -1,
+                               .hour = 14, .minute = 5, .second = 9, .pwd = "/home/yves/src", .home = "/home/yves" };
+    struct prompt_text t;
+    prompt_build(&st, 80, &t);
+    const char *dir = strstr(t.left, "src");
+    CHECK(dir && strstr(dir, "\xe2\x9d\xaf") && !strstr(t.left, "yves@emblink"), "drawn by Powerlevel10k: the directory, then \xe2\x9d\xaf");
+    CHECK(strstr(t.left, "\r\n") && strncmp(t.left, "\r\n", 2), "two lines, \\r\\n between them; no empty line above the first prompt");
+    st.status = 0;
+    prompt_build(&st, 80, &t);
+    CHECK(!strncmp(t.left, "\r\n", 2), "then an empty line above every prompt (PROMPT_ADD_NEWLINE)");
+    v = run("prompt set dir.anchor.fg 196", value_null(), &top);
+    value_free(&v);
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.left, "38;5;196m") != NULL, "an option on top: dir.anchor.fg is DIR_ANCHOR_FOREGROUND");
+    v = run("prompt set time.format 12h", value_null(), &top);
+    value_free(&v);
+    v = run("prompt set right status time", value_null(), &top);
+    value_free(&v);
+    prompt_build(&st, 80, &t);
+    CHECK(strstr(t.left, "02:05:09 PM") != NULL, "the plain prompt's options keep their meaning: right, time.format");
+    char name[64];
+    prompt_p10k_name("dir.anchor.fg", name, sizeof name);
+    bool ok = !strcmp(name, "DIR_ANCHOR_FOREGROUND");
+    prompt_p10k_name("left_prompt_elements", name, sizeof name);
+    ok &= !strcmp(name, "LEFT_PROMPT_ELEMENTS");
+    prompt_p10k_name("multiline.first.prompt.gap.bg", name, sizeof name);
+    CHECK(ok && !strcmp(name, "MULTILINE_FIRST_PROMPT_GAP_BACKGROUND"), "names: dots are underscores, fg and bg in full");
+
+    v = run("prompt import-p10k tests/prompt/configs/user.p10k.zsh", value_null(), &top);
+    const struct value *n = v.type == VAL_RECORD ? value_record_get(&v, "parameters") : NULL;
+    const struct value *ign = v.type == VAL_RECORD ? value_record_get(&v, "ignored") : NULL;
+    CHECK(n && n->type == VAL_INT && n->u.i > 300 && ign && ign->type == VAL_LIST && ign->u.list.count > 10,
+          "import-p10k: a ~/.p10k.zsh read, and the segments that draw nothing here listed");
+    value_free(&v);
+    CHECK(strstr(prompt_p10k_source(), "user.p10k.zsh") != NULL, "the imported file is the base");
+    CHECK(fails("prompt import-p10k tests/prompt/configs/nothing-here.zsh", &top) && fails("prompt style frob", &top),
+          "a missing file or an unknown style is an error");
+    FILE *f = fopen("/tmp/emblink-broken.p10k.zsh", "w");
+    if (f) { fputs("typeset -g POWERLEVEL9K_MODE=ascii\nif [[ x == x ]]; then\n", f); fclose(f); }
+    v = run("prompt import-p10k /tmp/emblink-broken.p10k.zsh", value_null(), &top);
+    CHECK(v.type == VAL_ERROR && strstr(v.u.s.bytes, "if without fi") && strstr(prompt_p10k_source(), "user.p10k.zsh"),
+          "one that does not read says where, and the prompt stays as it was");
+    value_free(&v);
+    remove("/tmp/emblink-broken.p10k.zsh");
+    v = run("prompt configure", value_null(), &top);
+    CHECK(v.type == VAL_ERROR && strstr(v.u.s.bytes, "terminal") && strstr(prompt_p10k_source(), "user.p10k.zsh"),
+          "configure: with no terminal to draw on it says so, and changes nothing");
+    value_free(&v);
+    v = run("prompt style plain", value_null(), &top);
+    value_free(&v);
+    prompt_build(&st, 80, &t);
+    CHECK(string_is("prompt style", &top, "plain") && strstr(t.left, "yves@emblink:~/src"), "style plain: back to the plain prompt");
+    prompt_opt_reset();
+    unsetenv("PROMPT_STYLES");
+    scope_free(&top);
+}
+
 int main(void) {
     printf("=== shell host tests ===\n");
     test_lexer();
@@ -732,7 +976,11 @@ int main(void) {
     test_eval();
     test_vocabulary();
     test_hist();
+    test_hist_file();
+    test_incomplete();
     test_redirect_text();
+    test_prompt();
+    test_prompt_p10k();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);
     return g_fail;
 }

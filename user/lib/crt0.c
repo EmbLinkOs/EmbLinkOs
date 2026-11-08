@@ -163,9 +163,9 @@ extern void (*__ctors_end[])(void) __attribute__((weak));
  * ld's DEFAULT script), which does NOT. A strong reference would break every
  * EmUI app's link instantly. Weak ⇒ absent ⇒ 0 ⇒ memsz == 0 ⇒ the setup
  * below does nothing, which is exactly right for a program with no TLS.
- * KNOWN GAP: that also means dynamically-linked EmUI apps get no TLS at all --
- * fine while nothing there uses __thread, but a `__thread` variable in one
- * would fault on %fs. Fix by teaching the dynamic link the same symbols. */
+ * Those links find the template through the program headers instead
+ * (tls_from_phdrs below), so a dynamically-linked EmUI app gets its block
+ * too -- which LIBC=emblibc needs, its errno being a __thread variable. */
 /* Both are ADDRESSES -- __tls_geom points at three quadwords (filesz, memsz,
  * align) the linker script emitted as DATA. The geometry used to be three
  * linker symbols holding the numbers themselves, and that does not survive a
@@ -175,6 +175,26 @@ extern void (*__ctors_end[])(void) __attribute__((weak));
  * bias. newlib-body.ld's comment carries the full reasoning. */
 extern char __tls_image[] __attribute__((weak));
 extern char __tls_geom[]  __attribute__((weak));   /* 3 quadwords: filesz, memsz, align */
+
+/* The default script (the dynamic EmUI apps) defines neither of those, but
+ * it maps the ELF header into the first PT_LOAD, and ld then defines
+ * __ehdr_start at it -- so the program headers, PT_TLS among them, can be
+ * read from memory. newlib.ld does not map the header: there it is absent
+ * (weak, 0) and __tls_geom answers instead. */
+extern const char __ehdr_start[] __attribute__((weak));
+
+/* LIBC=emblibc: EmbCC's C library defines this, and once it is filled in
+ * that library makes errno per thread and gives every new thread a copy of
+ * the template (lib/libc/os/tls-template.h there, which is the layout's
+ * other copy -- grow both together). newlib defines no such thing: weak,
+ * absent, never written. */
+struct emblibc_tls {
+    const void *image;
+    unsigned long filesz;
+    unsigned long memsz;
+    unsigned long align;
+};
+extern struct emblibc_tls __emblibc_tls __attribute__((weak));
 
 extern void *malloc(unsigned long size);
 extern void *memcpy(void *dst, const void *src, unsigned long n);
@@ -223,21 +243,80 @@ extern void *memset(void *dst, int c, unsigned long n);
  *
  * Called before the constructors: a C++ ctor may touch a __thread variable.
  * malloc() is safe this early -- newlib is built --enable-threads=single, so its
- * allocator uses _impure_ptr, not TLS; it would be circular otherwise. */
+ * allocator uses _impure_ptr, not TLS; it would be circular otherwise. EmbCC's
+ * library is safe for the reason at the end of this function: until it is told
+ * the pointer is in place, its errno is an ordinary variable. */
+/* The ELF64 header and program header fields read below (the System V
+ * gABI's layout; no <elf.h> this early). */
+struct crt0_ehdr {
+    unsigned char  e_ident[16];
+    unsigned short e_type, e_machine;
+    unsigned int   e_version;
+    unsigned long  e_entry, e_phoff, e_shoff;
+    unsigned int   e_flags;
+    unsigned short e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+};
+struct crt0_phdr {
+    unsigned int  p_type, p_flags;
+    unsigned long p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+};
+#define CRT0_PT_LOAD 1
+#define CRT0_PT_TLS  7
+
+/* PT_TLS from the program headers: 1 and the geometry, or 0. The image's
+ * address is its p_vaddr moved by however far the program was loaded from
+ * where it was linked -- measured on the segment that holds the header
+ * itself, whose file offset is 0. */
+static int tls_from_phdrs(const char **image, unsigned long *filesz,
+                          unsigned long *memsz, unsigned long *align)
+{
+    if (!__ehdr_start) {
+        return 0;
+    }
+    const struct crt0_ehdr *eh = (const struct crt0_ehdr *)__ehdr_start;
+    if (eh->e_phentsize != sizeof(struct crt0_phdr)) {
+        return 0;
+    }
+    const struct crt0_phdr *ph =
+        (const struct crt0_phdr *)(__ehdr_start + eh->e_phoff);
+    const struct crt0_phdr *tls = 0;
+    unsigned long bias = 0;
+    int have_bias = 0;
+    for (unsigned i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == CRT0_PT_TLS) {
+            tls = &ph[i];
+        } else if (ph[i].p_type == CRT0_PT_LOAD && ph[i].p_offset == 0) {
+            bias = (unsigned long)__ehdr_start - ph[i].p_vaddr;
+            have_bias = 1;
+        }
+    }
+    if (!tls || !have_bias) {
+        return 0;
+    }
+    *image  = (const char *)(tls->p_vaddr + bias);
+    *filesz = tls->p_filesz;
+    *memsz  = tls->p_memsz;
+    *align  = tls->p_align;
+    return 1;
+}
+
 static void setup_tls(void)
 {
-    /* Absent (a dynamically-linked EmUI app, or the stubs in
-     * emlink_dynstubs.s) => __tls_geom is a null pointer => the program has no
-     * TLS and we do nothing, which is the same answer the old absolute symbols
-     * gave for memsz == 0. Checked BEFORE the load, not after: dereferencing it
-     * is the one thing we must not do. */
-    if (!__tls_geom) {
+    /* newlib.ld's links describe the template in __tls_geom; the default
+     * script's (a dynamically-linked EmUI app) only through the program
+     * headers. Neither => the program has no TLS and we do nothing.
+     * __tls_geom is checked BEFORE the load, not after: dereferencing a
+     * null one is the one thing we must not do. */
+    const char *image = __tls_image;
+    unsigned long filesz, memsz, align;
+    if (__tls_geom) {
+        const unsigned long *geom = (const unsigned long *)__tls_geom;
+        filesz = geom[0];
+        memsz  = geom[1];
+        align  = geom[2];
+    } else if (!tls_from_phdrs(&image, &filesz, &memsz, &align)) {
         return;
     }
-    const unsigned long *geom = (const unsigned long *)__tls_geom;
-    unsigned long filesz = geom[0];
-    unsigned long memsz  = geom[1];
-    unsigned long align  = geom[2];
 
     if (memsz == 0) {
         return;             /* no PT_TLS: nothing to set up, the thread pointer
@@ -285,7 +364,7 @@ static void setup_tls(void)
 #endif
 
     if (filesz) {
-        memcpy(block, __tls_image, filesz);        /* the .tdata initialisers */
+        memcpy(block, image, filesz);              /* the .tdata initialisers */
     }
     memset(block + filesz, 0, tls_size - filesz);  /* .tbss + alignment tail */
 
@@ -295,9 +374,21 @@ static void setup_tls(void)
      * but it must not, because process.c reinstalls thread::fs_base on every
      * context switch, so a base this process set behind the kernel's back would
      * survive exactly until the next preemption. One syscall, one owner, one
-     * value that stays true. Ignore the return -- if it fails the first TLS
-     * access faults, which is a better signal than anything we could print. */
-    embk_syscall1(EMBK_SYS_set_fs_base, (int64_t)tp);
+     * value that stays true. If it fails the first TLS access faults, which
+     * is a better signal than anything we could print -- and the C library
+     * is not told there is a template, so it keeps one shared errno. */
+    if (embk_syscall1(EMBK_SYS_set_fs_base, (int64_t)tp) != 0) {
+        return;
+    }
+
+    /* Only now, with the pointer in place: from here errno is this thread's,
+     * and a thread the library starts gets a copy of the same template. */
+    if (&__emblibc_tls) {
+        __emblibc_tls.image  = image;
+        __emblibc_tls.filesz = filesz;
+        __emblibc_tls.align  = align;
+        __emblibc_tls.memsz  = memsz;        /* last: it is the "ready" flag */
+    }
 }
 
 static void run_init_array(void)

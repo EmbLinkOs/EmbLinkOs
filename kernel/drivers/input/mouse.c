@@ -26,6 +26,10 @@ static spinlock_t pointer_state_lock=SPINLOCK_INIT;
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"
 #include "drivers/timer/timer.h"   /* timer_uptime_ms: a press knows its own time */
+#include "drivers/input/pointer_accel.h"
+#if defined(__x86_64__)
+#include "arch/x86_64/boot/fw_cfg.h"   /* opt/emblink/pointer: a test asks for 1:1 */
+#endif
 
 #define PS2_DATA   0x60
 #define PS2_STATUS 0x64
@@ -45,8 +49,51 @@ static spinlock_t pointer_state_lock=SPINLOCK_INIT;
 #define PKT_Y_SIGN   0x20
 
 static volatile int32_t  g_x, g_y;
+/* When the pointer first moved since the compositor last drew it (ns, 0 = it
+ * has not): the start of the motion-to-screen latency comp_stats reports. The
+ * OLDEST unshown motion, so a burst of packets is timed from its first. */
+static volatile uint64_t g_motion_ns;
+static inline void note_motion(int32_t nx, int32_t ny) {
+    if ((nx != g_x || ny != g_y) && !g_motion_ns) g_motion_ns = time_get_ns();
+}
+/* Who to tell that the pointer changed: the compositor's frame thread. Called
+ * after the lock is let go -- it takes the scheduler's. */
+static void (*volatile g_notify)(void);
+void mouse_set_notify(void (*fn)(void)) { g_notify = fn; }
+static void notify(void) {
+    void (*fn)(void) = g_notify;
+    if (fn) fn();
+}
+
+uint64_t mouse_take_motion_ns(void) {
+    uint64_t t = g_motion_ns;
+    g_motion_ns = 0;
+    return t;
+}
 static volatile uint32_t g_buttons;
 static volatile int32_t  g_wheel;        /* accumulated scroll notches (IntelliMouse Z) */
+
+/* RELATIVE MOTION IS ACCELERATED (pointer_accel.h): 1:1 while aiming, up to
+ * three times across a sweep. Absolute devices are not -- a tablet's position
+ * is a position. `pointer linear` on the serial console turns it off, for the
+ * test tools that aim a relative mouse by counting what they sent. Caller
+ * holds pointer_state_lock. */
+static struct ptr_accel g_accel;
+static volatile int g_accel_on = 1;
+static uint32_t g_tracking_permille = 1000;
+static void accelerate(int32_t *dx, int32_t *dy) {
+    if (g_accel_on) ptr_accel_apply(&g_accel, dx, dy, time_get_ns(), g_tracking_permille);
+}
+
+int pointer_command(const char *cmd) {
+    const char *p = "pointer ";
+    for (int i = 0; p[i]; i++) if (cmd[i] != p[i]) return 0;
+    cmd += 8;
+    if (cmd[0] == 'l') { g_accel_on = 0; kprintf("pointer: linear\n"); return 1; }
+    if (cmd[0] == 'a') { g_accel_on = 1; kprintf("pointer: accelerated\n"); return 1; }
+    kprintf("pointer: linear | accel\n");
+    return 1;
+}
 
 /* LEFT-BUTTON PRESSES THAT HAVE HAPPENED, counted as the packets arrive.
  *
@@ -76,10 +123,29 @@ static volatile int32_t  g_wheel;        /* accumulated scroll notches (IntelliM
 static volatile uint32_t g_press_t[MOUSE_PRESS_Q];
 static volatile uint8_t  g_press_head, g_press_n;
 
+/* BUTTONS FROM A DEVICE WITH NO POSITION OF ITS OWN (mouse_hold_buttons):
+ * QEMU hands a click to the newest device that takes buttons, which beside a
+ * touchscreen is the touchscreen, while motion still comes from the mouse.
+ * Those buttons are held here and added to whatever the pointing devices
+ * report, so a press lands where the pointer is and a drag survives the
+ * mouse's own reports (which never saw the press). */
+static uint32_t g_reported, g_held;
+/* RIGHT PRESSES, counted as they arrive like the left ones: a context click
+ * held for less than the compositor's input tick (a slow tick, slow motion)
+ * left no trace in the level at all */
+static volatile uint32_t g_rpress_t;
+static volatile uint8_t  g_rpress_n;
+
 /* Apply a new button mask, recording the DOWN transition of the left button.
  * Both device paths go through here so neither can forget to. */
-static void buttons_set(uint32_t nb) {
+static void buttons_set(uint32_t reported) {
+    g_reported = reported;
+    uint32_t nb = reported | g_held;
     uint32_t ob = g_buttons;
+    if ((nb & MOUSE_BTN_RIGHT) && !(ob & MOUSE_BTN_RIGHT)) {
+        g_rpress_t = (uint32_t)timer_uptime_ms();
+        if (g_rpress_n < 255) g_rpress_n++;
+    }
     if ((nb & MOUSE_BTN_LEFT) && !(ob & MOUSE_BTN_LEFT)) {
         if (g_press_n < MOUSE_PRESS_Q) {
             uint8_t slot = (uint8_t)((g_press_head + g_press_n) % MOUSE_PRESS_Q);
@@ -105,8 +171,21 @@ int mouse_take_press(uint32_t *when_ms) {
     spin_unlock(&pointer_state_lock);return result;
 }
 
+int mouse_presses_pending(void) { return g_press_n != 0 || g_rpress_n != 0; }
+
+/* a right press since the last call (how many, folded: one is all a context
+ * menu needs), and when the last one was made */
+int mouse_take_right_press(uint32_t *when_ms) {
+    spin_lock(&pointer_state_lock);
+    int n = g_rpress_n;
+    if (n && when_ms) *when_ms = g_rpress_t;
+    g_rpress_n = 0;
+    spin_unlock(&pointer_state_lock);
+    return n;
+}
+
 void mouse_discard_presses(void) {
-    spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;spin_unlock(&pointer_state_lock);
+    spin_lock(&pointer_state_lock);g_press_head=g_press_n=0;g_rpress_n=0;spin_unlock(&pointer_state_lock);
 }
 
 static int32_t  g_w = 1024, g_h = 768;
@@ -152,10 +231,13 @@ static void apply_motion(void) {
     int32_t dy = g_pkt[2];
     if (g_pkt[0] & PKT_X_SIGN) dx |= ~0xFF;   /* sign-extend 8->32 */
     if (g_pkt[0] & PKT_Y_SIGN) dy |= ~0xFF;
+    dy = -dy;                                  /* PS/2 y is up-positive; screen is down */
+    accelerate(&dx, &dy);
     int32_t nx = g_x + dx;
-    int32_t ny = g_y - dy;                     /* PS/2 y is up-positive; screen is down */
+    int32_t ny = g_y + dy;
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
+    note_motion(nx, ny);
     g_x = nx; g_y = ny;
     buttons_set(g_pkt[0] & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE));
 }
@@ -175,6 +257,7 @@ void mouse_set_absolute_inner(int32_t x, int32_t y, int32_t range,
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     if(g_x!=nx || g_y!=ny || wheel || buttons!=g_buttons)POINTER_ACTIVITY();
+    note_motion(nx, ny);
     g_x = nx; g_y = ny;
     buttons_set(buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
     if (wheel) g_wheel += wheel;
@@ -183,15 +266,18 @@ void mouse_set_absolute(int32_t x,int32_t y,int32_t range,uint32_t buttons,int32
     spin_lock(&pointer_state_lock);
     mouse_set_absolute_inner(x,y,range,buttons,wheel);
     spin_unlock(&pointer_state_lock);
+    notify();
 }
 
 
 void mouse_move_relative_inner(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel) {
+    accelerate(&dx, &dy);
     int32_t nx = g_x + dx;
     int32_t ny = g_y + dy;                     /* screen convention: +y is DOWN */
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     if(g_x!=nx || g_y!=ny || wheel || buttons!=g_buttons)POINTER_ACTIVITY();
+    note_motion(nx, ny);
     g_x = nx; g_y = ny;
     buttons_set(buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
     if (wheel) g_wheel += wheel;
@@ -200,14 +286,27 @@ void mouse_move_relative(int32_t dx,int32_t dy,uint32_t buttons,int32_t wheel) {
     spin_lock(&pointer_state_lock);
     mouse_move_relative_inner(dx,dy,buttons,wheel);
     spin_unlock(&pointer_state_lock);
+    notify();
+}
+void mouse_hold_buttons(uint32_t mask) {
+    spin_lock(&pointer_state_lock);
+    g_held = mask & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE);
+    if ((g_reported | g_held) != g_buttons) POINTER_ACTIVITY();
+    buttons_set(g_reported);
+    spin_unlock(&pointer_state_lock);
+    notify();
 }
 
 
 #if defined(__x86_64__)
+static uint8_t g_given;          /* a byte handed over by mouse_ps2_byte */
+static int g_have_given;
+#endif
+#if defined(__x86_64__)
 static void mouse_handler_inner(void) {
     /* On IRQ12 the pending byte is mouse data; read it directly. (Some 8042
      * emulations don't set the AUX status bit reliably, so we don't gate on it.) */
-    uint8_t b = inb(PS2_DATA);
+    uint8_t b = g_have_given ? g_given : inb(PS2_DATA);
 
     switch (g_cycle) {
         case 0:
@@ -234,10 +333,16 @@ static void mouse_handler_inner(void) {
         }
     }
 }
-static void mouse_handler(void) {
+static void mouse_handler(void) { (void)i8042_service(12); }    /* reads, routes, drains */
+/* one byte the controller had for the aux port, read by someone else (the
+ * i8042 watch, recovering a lost interrupt) */
+void mouse_ps2_byte(uint8_t b) {
     spin_lock(&pointer_state_lock);
+    g_given = b; g_have_given = 1;
     mouse_handler_inner();
+    g_have_given = 0;
     spin_unlock(&pointer_state_lock);
+    notify();
 }
 
 
@@ -247,7 +352,10 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     serial_write_string("\n=== Mouse init ===\n");
     g_w = (int32_t)screen_w; g_h = (int32_t)screen_h;
     g_x = g_w / 2; g_y = g_h / 2;
-    g_cycle = 0; g_buttons = 0; g_press_head = g_press_n = 0;
+    g_cycle = 0; g_buttons = g_reported = g_held = 0; g_press_head = g_press_n = 0;
+#if defined(__x86_64__)
+    if (boot_qemu_linear_pointer()) { g_accel_on = 0; kprintf("mouse: pointer 1:1 (opt/emblink/pointer)\n"); }
+#endif
 
 #if !defined(__x86_64__)
     /* The clamp bounds and the centred cursor ARE the whole of mouse_init()

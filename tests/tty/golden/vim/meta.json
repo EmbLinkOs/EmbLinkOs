@@ -1,0 +1,24 @@
+{
+  "cursor_x": 16,
+  "cursor_y": 21,
+  "alternate": 1,
+  "cursor_visible": 1,
+  "cols": 80,
+  "rows": 24,
+  "command": [
+    "vim",
+    "-u",
+    "NONE",
+    "-i",
+    "NONE",
+    "-N",
+    "-c",
+    "syntax on",
+    "-c",
+    "set number laststatus=2 ruler",
+    "vt.h"
+  ],
+  "frozen": true,
+  "recorded": "2026-10-25",
+  "reference": "tmux 3.8"
+}

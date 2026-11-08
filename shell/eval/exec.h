@@ -45,6 +45,14 @@ int block_exec(const struct block *b, struct scope *env,
  * even AIMED at this process is the driver's business, not the executor's. */
 void exec_set_interrupt_check(bool (*fn)(void));
 
+/* For what waits inside a command: poll for ^C (a builtin's sleep), or say a
+ * child was cancelled by it. exec_interrupt_hit: whether either happened (or
+ * the executor stopped on one) since it was last cleared -- the driver turns
+ * that into status 130. */
+bool exec_interrupt_poll(void);
+void exec_interrupt_note(void);
+bool exec_interrupt_hit(bool clear);
+
 /* A `def` stores a BORROWED pointer into the parsed AST, so the AST has to
  * outlive it. The driver hands the parsed program here INSTEAD of freeing it
  * when it contained a definition. Returns false if the retain table is full

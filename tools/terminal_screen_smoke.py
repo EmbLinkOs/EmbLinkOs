@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """A real full-screen child, driven through Terminal with QMP input only."""
 from pathlib import Path
-import re,shutil,tempfile,time
+import os,re,shutil,tempfile,time
 from recovery_smoke import Guest,ROOT
 from workspace_smoke import Desktop
 from native_terminal import TerminalState
 from lock_test import keyname
 
 def main():
-    out=Path(tempfile.mkdtemp(prefix='terminal-screen-',dir='/workspace/.setup'));print(out,flush=True)
+    out=Path(tempfile.mkdtemp(prefix='terminal-screen-',dir='/workspace/.setup' if os.path.isdir('/workspace/.setup') else None));print(out,flush=True)
     disk=out/'live.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop.__new__(Desktop);d.out=out/'boot';d.g=Guest(d.out,disk,menu=4,boot_nvme=True,resolution=(1280,800));d.sock=d.out/'gdb.sock';d.symbols={}
     def eventually(check,message):
@@ -19,7 +19,7 @@ def main():
     def type_text(value):
         extra={'/':'slash','"':'shift-apostrophe'}
         for c in value:d.key(extra[c] if c in extra else keyname(c))
-    def prompt(w):return screen.integer(w,'g_at_prompt',1)==1
+    def prompt(w):return screen.at_prompt(w)
     def text(w,s):return s in screen.text(w)
     def edit_text(w):return d.read('edit',w['pid'],'g_doc',32768).split(b'\0',1)[0].decode()
     def focus_id():return d.debug("import gdb,json\nprint('RESULT '+json.dumps(int(gdb.parse_and_eval(\"'kernel/gfx/compositor.c'::g_top_id\"))))")
@@ -27,7 +27,9 @@ def main():
         d.g.wait(b'TopBar: first frame presented');d.g.wait(b'home: time zone')
         d.g.qmp.cmd('human-monitor-command',**{'command-line':f'gdbserver unix:{d.sock},server=on,wait=off'})
         screen=TerminalState(d);w=d.launch('Terminal','Terminal');eventually(lambda:prompt(w),'initial prompt')
-        initial=screen.state(w);assert initial['cursor']==(0,1) and initial['text'][0].startswith('EmbLink shell'),initial['text']
+        initial=screen.state(w)
+        assert initial['text'][0].startswith('EmbLink shell') and initial['text'][1].endswith('$'),initial['text']
+        assert initial['cursor']==(len(initial['text'][1])+1,1),initial['cursor']   # after the shell's own prompt
         type_text('echo 48126\n');eventually(lambda:prompt(w) and '48126' in screen.text(w).splitlines(),'native command result')
         d.snap('screen-native-prompt')
         type_text('/data/apps/ttyprobe/ttyprobe.elf "--screen"\n')
@@ -45,13 +47,14 @@ def main():
         d.key('r');eventually(lambda:text(w,'Cursor reply verified: row 4, column 10'),'DSR round trip')
         d.snap('screen-cursor-reply')
         normal=d.window('Terminal');dimensions=(normal['cw'],normal['ch'])
+        normal_cols=screen.state(w)['cols']      # the profile's size (Clear Dark: 120 x 30)
         d.click(normal['x']+84,normal['y']+18)
         eventually(lambda:d.window('Terminal')['cw']==1280,'fill work area')
-        eventually(lambda:screen.state(w)['cols']>100 and text(w,'Live PTY dimensions: '+str(screen.state(w)['cols'])),'live resized screen')
+        eventually(lambda:screen.state(w)['cols']>normal_cols and text(w,'Live PTY dimensions: '+str(screen.state(w)['cols'])),'live resized screen')
         d.snap('screen-resized')
         current=d.window('Terminal');d.click(current['x']+84,current['y']+18)
         eventually(lambda:(d.window('Terminal')['cw'],d.window('Terminal')['ch'])==dimensions,'restore window')
-        eventually(lambda:screen.state(w)['cols']<100,'restore terminal dimensions')
+        eventually(lambda:screen.state(w)['cols']==normal_cols,'restore terminal dimensions')
         editor=d.launch('Editor','Editor');d.click(editor['x']+120,editor['y']+155)
         d.type('first line\nsecond line');eventually(lambda:edit_text(editor)=='first line\nsecond line','editor clipboard source')
         d.key('meta_l-a');d.key('meta_l-c');d.key('meta_l-tab');eventually(lambda:focus_id()==w['id'],'return focus to Terminal')
@@ -67,8 +70,12 @@ def main():
         state=screen.state(w);assert '48126' in '\n'.join(state['text']) and 'Alternate screen restored.' in '\n'.join(state['text'])
         assert 'EmbLink terminal screen check' not in '\n'.join(state['text']),'alternate pixels escaped into primary output'
         d.snap('screen-primary-restored')
-        d.key('meta_l-v');d.g.pump(1)
-        assert prompt(w) and screen.integer(w,'g_in_n')==0,'oversized paste executed or partially inserted'
+        # A paste at the prompt arrives bracketed: text in the shell's line,
+        # never a command run (no new prompt follows it).
+        before=screen.probe(w,text=False)['prompt_serial']
+        d.key('meta_l-v');d.g.pump(2)
+        assert prompt(w) and screen.probe(w,text=False)['prompt_serial']==before,'a paste at the prompt ran as a command'
+        d.key('ctrl-c');d.g.pump(1)
         # Build a >8 KiB clipboard using real editor commands, then exercise
         # Note++'s custom hook as well as the shared TextEditor paste path.
         d.key('meta_l-tab');eventually(lambda:focus_id()==editor['id'],'focus Editor for long clipboard')

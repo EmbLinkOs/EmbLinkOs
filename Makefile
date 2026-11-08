@@ -223,6 +223,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
+             kernel/drivers/input/pointer_accel.c \
+             kernel/drivers/input/gesture.c \
              kernel/drivers/input/i8042.c \
              kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \
@@ -315,6 +317,11 @@ KERNEL_SRC = kernel/main.c \
              kernel/kworker/kworker.c \
              kernel/gfx/surface.c \
              kernel/gfx/compositor.c \
+             kernel/gfx/comp_stats.c \
+             kernel/gfx/ui_events.c \
+             kernel/gfx/frameclock.c \
+             kernel/gfx/backdrop.c \
+             kernel/gfx/pix.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
              kernel/lib/random.c \
@@ -438,6 +445,51 @@ ASM_GAS      = $(USER_TRIPLE)-as   # GNU as for the dynstubs (.set/.weak)
 USER_LD      = $(USER_TRIPLE)-ld
 USER_INC     = -Iuser/lib
 
+# ---- which C library the userland links -------------------------------------
+# LIBC=newlib (the default) is the cross-built newlib under NEWLIB_PREFIX, with
+# user/lib/syscalls.c as its retargeting layer -- everything below as it was.
+#
+# LIBC=emblibc is EmbCC's C library (lib/libc in EMBCC_ROOT, built for this OS
+# by `make emblibc`): ISO C and as much of POSIX as this kernel can carry, with
+# its EmbLinkOS backend in place of syscalls.c. The programs are still compiled
+# by $(USER_CC); only the headers and the archive change. So that every name
+# below keeps meaning one thing, the NEWLIB_* variables are kept and pointed at
+# it -- read NEWLIB_ as "the userland's libc".
+#
+# The two must never meet in one program: an object compiled against newlib's
+# <sys/stat.h> linked with this libc's stat() is a silent wrong layout. Make
+# cannot see a change of LIBC, so build/.libc records the one build/ was made
+# with, and a different one stops the build until `make clean`.
+#
+# What emblibc does not build: the out-of-tree ports configured against
+# newlib -- CPython and git (HAVE_PY/HAVE_GIT are empty) and tcc (copied as
+# built, never relinked) -- and C++ by g++ (HAVE_CXX is empty; EmbCC builds
+# the C++ programs instead, see CXX_APPS). A binary of theirs in build/ is a
+# static newlib program, whole in itself, packed as it is.
+LIBC ?= newlib
+EMBCC_ROOT  ?= $(HOME)/EmbCC
+# one library per machine: build/libc/emblinkos (x86_64), emblinkos-aarch64
+# -- named in either mode, as `make emblibc` builds it from a newlib tree
+EMBLIBC_ARCH = $(if $(filter aarch64,$(ARCH)),aarch64,x86_64)
+EMBLIBC_SFX  = $(if $(filter aarch64,$(ARCH)),-aarch64,)
+EMBLIBC_DIR  = $(EMBCC_ROOT)/build/libc/emblinkos$(EMBLIBC_SFX)
+ifeq ($(LIBC),emblibc)
+EMBLIBC     := yes
+EMBLIBC_A    = $(EMBLIBC_DIR)/libc.a
+# The library's headers first -- ahead of user/lib, whose <time.h>, <termios.h>
+# and <sys/*.h> are newlib's missing pieces and would otherwise shadow them --
+# then the compiler's own (stddef.h, stdarg.h, limits.h), never newlib's.
+# EMBK_LIBC_EMBLIBC tells the code that has to know (syscalls.c).
+EMBLIBC_INC := -I$(EMBCC_ROOT)/lib/libc/include -nostdinc \
+               -isystem $(shell $(USER_CC) -print-file-name=include) \
+               -isystem $(shell $(USER_CC) -print-file-name=include-fixed) \
+               -isystem $(EMBCC_ROOT)/include -DEMBK_LIBC_EMBLIBC=1
+else ifeq ($(LIBC),newlib)
+EMBLIBC     :=
+else
+$(error LIBC=$(LIBC): it is newlib or emblibc)
+endif
+
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
 # Authentication is the default. UI tests select explicit live mode through
@@ -525,8 +577,13 @@ check-tools:
 	if command -v aarch64-elf-gcc >/dev/null 2>&1; then \
 	  printf '  [ ok ]  aarch64-elf-gcc   -- make ARCH=aarch64 && make ARCH=aarch64 run-arm64\n'; \
 	else printf '  [ -- ]  aarch64-elf-gcc  (absent => the x86 build is unaffected; brew install aarch64-elf-gcc)\n'; fi
+ifeq ($(EMBLIBC),yes)
+NEWLIB_INC    =
+NEWLIB_LIB    = -L$(EMBLIBC_DIR)
+else
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/$(USER_TRIPLE)/lib,)
+endif
 # -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
 # in depth against uninitialized-read UB -- and the concrete fix for a git-over-
 # HTTPS heisenbug where libtls's ECDSA verify (user/lib/tls/crypto/ecdsa.c) read
@@ -550,6 +607,13 @@ ifeq ($(ARCH),aarch64)
 NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 else
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+endif
+ifeq ($(EMBLIBC),yes)
+ifeq ($(ARCH),aarch64)
+NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(EMBLIBC_INC) $(USER_INC)
+else
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(EMBLIBC_INC) $(USER_INC)
+endif
 endif
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
@@ -604,10 +668,19 @@ NEWLIB_PIC_PREFIX ?= $(HOME)/cross/newlib-aarch64-pic
 else
 NEWLIB_PIC_PREFIX ?= $(HOME)/cross/newlib-pic
 endif
+ifeq ($(EMBLIBC),yes)
+# One archive serves both links: EmbCC's x86-64 code addresses everything
+# PC-relative, and its data's absolute addresses are R_X86_64_64, which a
+# PIE carries as relative relocations. So there is no second, -fPIC build.
+PIE_OK := yes
+NEWLIB_PIC_INC =
+NEWLIB_PIC_LIB = -L $(EMBLIBC_DIR)
+else
 PIE_OK := $(if $(wildcard $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib/libc.a),yes,)
 
 NEWLIB_PIC_INC = -isystem $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/include
 NEWLIB_PIC_LIB = -L $(NEWLIB_PIC_PREFIX)/$(USER_TRIPLE)/lib
+endif
 
 # -fPIC on every object of a PIE app, and the PIC libc's headers so a PIE app
 # cannot half-link against the other newlib's.
@@ -676,7 +749,7 @@ pie-check:
 # Constructors are already handled: crt0.c walks .init_array AND .ctors.
 CXX_PREFIX ?= $(HOME)/cross/gcc-cxx
 USER_CXX    = $(CXX_PREFIX)/bin/x86_64-elf-g++
-HAVE_CXX   := $(if $(wildcard $(USER_CXX)),yes,)
+HAVE_CXX   := $(if $(EMBLIBC),,$(if $(wildcard $(USER_CXX)),yes,))
 
 # -fno-exceptions/-fno-rtti for now: both want unwind tables + a personality
 # routine wired into the runtime, which is its own piece of work. Plain C++
@@ -698,7 +771,42 @@ cxx-check:
 # like shell.elf; the g++ driver pulls in libstdc++/libsupc++ (which
 # function-local statics need for __cxa_guard_acquire). CXX_APPS is EMPTY when
 # no C++ toolchain is installed, so the whole tree still builds without one.
-ifeq ($(HAVE_CXX),yes)
+ifeq ($(EMBLIBC),yes)
+# C++ under LIBC=emblibc needs no second toolchain: EmbCC compiles it, against
+# its own C++ library (lib/libcxx, built for this OS by `make emblibc`) over
+# the same C library, and EmbCC's runtime brings the unwinder exceptions need
+# (newlib-body.ld brackets .eh_frame for it). The link is the C programs' --
+# crt0, the script, gcc as the driver -- with the C++ library in front.
+EMBCXX       = $(EMBCC_ROOT)/embcc --target=$(USER_TRIPLE) -x c++ -O2
+EMBCXX_INC   = -I$(EMBCC_ROOT)/lib/libcxx/include -I$(EMBCC_ROOT)/lib/libc/include \
+               $(USER_INC) -DEMBK_LIBC_EMBLIBC=1
+EMBLIBCXX_A  = $(EMBCC_ROOT)/build/libcxx/emblinkos$(EMBLIBC_SFX)/libcxx.a
+EMBCXX_LIBS  = -L$(EMBCC_ROOT)/build/libcxx/emblinkos$(EMBLIBC_SFX) \
+               -Wl,--start-group -lcxx -lrt -lc -Wl,--end-group -lgcc
+CXX_APPS     = $(if $(wildcard $(EMBLIBCXX_A)),build/cxxdemo.elf build/cxxlib.elf,)
+
+# -MD, not -MMD: the C and C++ library headers are EmbCC's own system
+# directories, which -MMD leaves out -- and they are exactly what changes
+# under these objects (their inline functions are compiled INTO them).
+build/cxxdemo.o: user/tests/cxxdemo/cxxdemo.cc | $(BUILD)
+	$(EMBCXX) $(EMBCXX_INC) -MD -MP -MF $@.d -c $< -o $@
+build/cxxlib.o: user/tests/cxxlib/cxxlib.cc | $(BUILD)
+	$(EMBCXX) $(EMBCXX_INC) -MD -MP -MF $@.d -c $< -o $@
+build/cxxdemo.elf build/cxxlib.elf: build/%.elf: build/%.o build/crt0.o build/syscalls.o $(EMBLIBCXX_A) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< $(EMBCXX_LIBS) -o $@
+
+# POSIX threads, checked by the same program EmbCC checks its library
+# with on Linux against glibc (tests/exec/posix-threads.c): `test pthreads`.
+# fork is ENOSYS here, which it allows for.
+PTHREAD_PROBE_SRC = $(EMBCC_ROOT)/tests/exec/posix-threads.c
+ifneq ($(wildcard $(PTHREAD_PROBE_SRC)),)
+CXX_APPS += build/pthreadprobe.elf
+build/pthreadprobe.o: $(PTHREAD_PROBE_SRC) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/pthreadprobe.elf: build/pthreadprobe.o build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $< -lc -lgcc -o $@
+endif
+else ifeq ($(HAVE_CXX),yes)
 CXX_APPS = build/cxxdemo.elf
 
 build/cxxdemo.o: user/tests/cxxdemo/cxxdemo.cc | $(BUILD)
@@ -721,7 +829,7 @@ endif
 # before configuring CPython -- and a libc change means reconfiguring it.
 PY_BUILD ?= $(HOME)/cross/build-py
 PY_BIN   := $(PY_BUILD)/python
-HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
+HAVE_PY  := $(if $(EMBLIBC),,$(if $(wildcard $(PY_BIN)),yes,))
 
 # git, same shape as HAVE_PY: absent cross-built binary == GIT_APPS empty ==
 # the tree still builds. Build it with $(HOME)/cross/build-git-emblink.sh.
@@ -743,7 +851,7 @@ GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
 TCC_SRC ?= $(HOME)/cross/tcc-0.9.27
 TCC_BIN ?= $(TCC_SRC)/tcc
 HAVE_TCC := $(if $(wildcard $(TCC_BIN)),yes,)
-HAVE_GIT := $(if $(wildcard $(GIT_BIN)),yes,)
+HAVE_GIT := $(if $(EMBLIBC),,$(if $(wildcard $(GIT_BIN)),yes,))
 
 PY_SRC   ?= $(HOME)/cross/Python-3.14.6
 
@@ -823,6 +931,67 @@ NEWLIB_DYN_WL      = -Wl,--export-dynamic -Wl,--no-dynamic-linker -Wl,--hash-sty
 build/crt0.o: user/lib/crt0.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
+# Under emblibc, syscalls.c compiles to nothing (the library's backend is the
+# layer it was) and the objects stand for the library instead: they depend on
+# its archive, so the relink checks that ask "is syscalls.o newer than this
+# binary?" (python.elf, tcc.elf) keep asking the right question.
+ifeq ($(EMBLIBC),yes)
+build/syscalls.o build/syscalls_pic.o: $(EMBLIBC_A) build/.libc
+$(EMBLIBC_A):
+	@echo "*** LIBC=emblibc: no $@"; \
+	 echo "    build it:  make emblibc   (EMBCC_ROOT=$(EMBCC_ROOT))"; exit 1
+endif
+
+# build/.libc: the C library build/ was compiled against (see LIBC above).
+# Rewritten only when it does not exist, so it never makes anything stale by
+# itself; a different one is an error, here at parse time, before any object
+# of the other library is linked to this one.
+# A build/ with objects and no record predates LIBC, so it is newlib's.
+ifneq ($(filter clean distclean emblibc,$(MAKECMDGOALS)),)
+else ifneq ($(wildcard build/.libc),)
+ifneq ($(shell cat build/.libc),$(LIBC))
+$(error build/ was built with LIBC=$(shell cat build/.libc), not LIBC=$(LIBC): `make clean` first)
+endif
+else ifneq ($(wildcard build/crt0.o),)
+ifneq ($(LIBC),newlib)
+$(error build/ was built with newlib (it has no build/.libc), not LIBC=$(LIBC): `make clean` first)
+endif
+endif
+build/.libc: | $(BUILD)
+	@echo $(LIBC) > $@
+# written by the first compile of either library's startup, so it is there
+# from the first build on (order-only: it never makes those objects stale)
+build/crt0.o build/syscalls.o: | build/.libc
+
+# /system/abi -- what tcc links ON the OS -- stays newlib's under emblibc: its
+# libc.a and headers come from NEWLIB_PREFIX as before, so its crt0 and
+# syscalls must be newlib's too, compiled against newlib's headers here.
+ifeq ($(EMBLIBC),yes)
+ifeq ($(ARCH),aarch64)
+ABI_NEWLIB_CFLAGS = -mno-outline-atomics -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall \
+                    $(USER_INC) -isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include
+else
+ABI_NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall \
+                    $(USER_INC) -isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include
+endif
+# ...only where there IS a newlib to build them against: without one there is no
+# libc.a for /system/abi either (a fresh tree, CI), and mkfs leaves it out
+ABI_NEWLIB_OBJS = $(if $(wildcard $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include/stdio.h),build/abi/crt0.o build/abi/syscalls.o,)
+build/abi/crt0.o: user/lib/crt0.c | $(BUILD)
+	@mkdir -p build/abi
+	$(USER_CC) $(ABI_NEWLIB_CFLAGS) -c $< -o $@
+build/abi/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
+	@mkdir -p build/abi
+	$(USER_CC) $(ABI_NEWLIB_CFLAGS) -c $< -o $@
+else
+ABI_NEWLIB_OBJS =
+endif
+
+.PHONY: emblibc
+emblibc:
+	$(MAKE) -C $(EMBCC_ROOT) libc-emblinkos libcxx-emblinkos EMBLINKOS=$(CURDIR) \
+	    EMBLINKOS_ARCH=$(EMBLIBC_ARCH)
+
 build/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_syscall.h user/lib/embk_child.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 
@@ -835,8 +1004,12 @@ build/syscalls.o: user/lib/syscalls.c user/lib/spawn_compat.inc user/lib/embk_sy
 # Cross-built here (both are just as/C); shipped to /system/abi by mkfs.
 build/emlink_dynstubs.o: user/lib/emlink_dynstubs.s | $(BUILD)
 	$(ASM_GAS) $< -o $@
-build/libtcc1.o: $(TCC_SRC)/lib/libtcc1.c | $(BUILD)
-	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $< -o $@
+# va_list.c too: on x86-64 tcc turns va_start into a call to __va_start, so a
+# program with a varargs function (the shell's editor has one) needs it at link.
+build/libtcc1.o: $(TCC_SRC)/lib/libtcc1.c $(TCC_SRC)/lib/va_list.c | $(BUILD)
+	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $(TCC_SRC)/lib/libtcc1.c -o $(BUILD)/libtcc1_core.o
+	$(USER_CC) -c -O2 -mno-red-zone -fno-stack-protector -ffreestanding $(TCC_SRC)/lib/va_list.c -o $(BUILD)/libtcc1_va.o
+	$(USER_CC) -r -nostdlib $(BUILD)/libtcc1_core.o $(BUILD)/libtcc1_va.o -o $@
 
 # hello.elf, posixdemo.elf, ioracer.elf and crasher.elf are built by
 # NEWLIB_SIMPLE_PROG above -- one source file each, so each is a PIE when a PIC
@@ -1184,6 +1357,16 @@ GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack
 build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
+# gitstatus -- the prompt's git status daemon (gitstatusd's protocol): reads a
+# repository's objects (zlib), refs, index and ignore rules itself.
+GITSTATUS_SRC := user/gitstatus/gitstatus.c user/gitstatus/gs_util.c user/gitstatus/gs_odb.c \
+                 user/gitstatus/gs_index.c user/gitstatus/gs_ignore.c user/gitstatus/gs_status.c
+GITSTATUS_OBJS := $(patsubst user/gitstatus/%.c,build/gitstatus_%.o,$(GITSTATUS_SRC)) build/git_sha1.o
+build/gitstatus_%.o: user/gitstatus/%.c user/gitstatus/gs.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -DEMBLINK_TARGET -Iuser/gitstatus -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/gitstatus.elf: build/crt0.o build/syscalls.o $(GITSTATUS_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITSTATUS_OBJS) $(ZLIB_A) -lc -lgcc -o $@
+
 # gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
 build/gitpush.o: user/tools/gitpush/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
@@ -1481,7 +1664,10 @@ build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o $(NEWLIB_LDSCRIPT)
 SHELL_INC = -Ishell
 SHELL_HDRS = shell/value/value.h shell/wire/wire.h shell/sval/sval.h \
              shell/lex/lex.h shell/parse/parse.h shell/eval/eval.h \
-             shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h
+             shell/builtins/builtins.h shell/hist/hist.h shell/eval/exec.h \
+             shell/edit/edit.h shell/edit/wcwidth.h shell/complete/complete.h shell/complete/highlight.h \
+             shell/prompt/prompt.h shell/prompt/p10k.h shell/prompt/p10k_int.h shell/prompt/icons.h \
+             shell/prompt/colors.h shell/prompt/prompt_os.h shell/prompt/wizard.h shell/prompt/wizard_os.h
 
 $(BUILD)/shobj_value.o: shell/value/value.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
@@ -1501,6 +1687,34 @@ $(BUILD)/shobj_builtins.o: shell/builtins/builtins.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_hist.o: shell/hist/hist.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_edit.o: shell/edit/edit.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wcwidth.o: shell/edit/wcwidth.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_complete.o: shell/complete/complete.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_highlight.o: shell/complete/highlight.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_prompt.o: shell/prompt/prompt.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k.o: shell/prompt/p10k.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k_zsh.o: shell/prompt/p10k_zsh.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k_render.o: shell/prompt/p10k_render.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_p10k_import.o: shell/prompt/p10k_import.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_icons.o: shell/prompt/icons.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_colors.o: shell/prompt/colors.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_prompt_os.o: shell/prompt/prompt_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wizard.o: shell/prompt/wizard.c $(SHELL_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
+$(BUILD)/shobj_wizard_os.o: shell/prompt/wizard_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_eval_extern.o: shell/eval/eval_extern.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/lib/embk.h | $(BUILD)
@@ -1508,11 +1722,24 @@ $(BUILD)/shobj_builtins_os.o: shell/builtins/builtins_os.c $(SHELL_HDRS) user/li
 $(BUILD)/shobj_main.o: shell/main.c $(SHELL_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(SHELL_INC) -c $< -o $@
 
+# The shell's own sources ride in the image (/data/src/shell) for `test embbuild
+# shell` to rebuild it with tcc, so a change to any of them -- or to a manifest
+# -- has to remake the image even when shell.elf itself did not change.
+# The fonts and licences fonts.py installs on both images, and share.py's
+# prompt styles: one that changes rebuilds the image.
+IMAGE_FONT_INPUTS = tools/embkfs_mkfs/fonts.py $(wildcard third_party/fonts/*/*.ttf) $(wildcard system/licenses/*) \
+                    tools/embkfs_mkfs/share.py $(wildcard third_party/powerlevel10k/config/*.zsh)
+SHELL_SELFBUILD_SRC = $(wildcard shell/*.c shell/*/*.c shell/*/*.h) shell/build.ebm $(wildcard shell/tools/*.ebm)
+
 SHELL_OBJS = $(BUILD)/shobj_value.o $(BUILD)/shobj_wire.o $(BUILD)/shobj_sval.o \
              $(BUILD)/shobj_lex.o $(BUILD)/shobj_parse.o $(BUILD)/shobj_eval.o \
              $(BUILD)/shobj_exec.o \
              $(BUILD)/shobj_builtins.o $(BUILD)/shobj_hist.o \
-             $(BUILD)/shobj_eval_extern.o \
+             $(BUILD)/shobj_edit.o $(BUILD)/shobj_wcwidth.o $(BUILD)/shobj_complete.o $(BUILD)/shobj_highlight.o \
+             $(BUILD)/shobj_prompt.o $(BUILD)/shobj_p10k.o $(BUILD)/shobj_p10k_zsh.o \
+             $(BUILD)/shobj_p10k_render.o $(BUILD)/shobj_p10k_import.o $(BUILD)/shobj_icons.o \
+             $(BUILD)/shobj_colors.o $(BUILD)/shobj_prompt_os.o $(BUILD)/shobj_wizard.o \
+             $(BUILD)/shobj_wizard_os.o $(BUILD)/shobj_eval_extern.o \
              $(BUILD)/shobj_builtins_os.o $(BUILD)/shobj_main.o
 
 build/shell.elf: $(SHELL_OBJS) build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
@@ -1679,12 +1906,32 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
-# Terminal's screen parser/model is pure userspace and separately host-tested.
-build/vt.o: user/terminal/vt.c user/terminal/vt.h | $(BUILD)
+# Terminal's screen model (grid, parser, key encoders) is pure userspace and
+# separately host-tested.
+VT_SRC  := user/terminal/vt_grid.c user/terminal/vt_parse.c user/terminal/vt_keys.c
+VT_HDRS := user/terminal/vt.h user/terminal/vt_internal.h shell/edit/wcwidth.h
+VT_OBJS := $(patsubst user/terminal/%.c,build/%.o,$(VT_SRC))
+$(VT_OBJS): build/%.o: user/terminal/%.c $(VT_HDRS) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
-build/term.o: user/terminal/vt.h
-build/term.elf: build/term.o build/vt.o build/crt0.o build/syscalls.o build/libembk.so
-	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o build/vt.o \
+# The cell width table the shell's editor uses too: one table, both sides.
+build/wcwidth.o: shell/edit/wcwidth.c shell/edit/wcwidth.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+# The renderer and its drawn glyphs: Terminal's own, beside the screen model
+# (user/apps/*/*.c would each be taken for a program of their own).
+TERM_UI_OBJS := build/term_render.o build/term_glyphs.o build/term_screentext.o build/term_profile.o build/term_profile_store.o
+build/term_render.o: user/terminal/render.c user/terminal/render.h user/terminal/glyphs.h user/terminal/screentext.h $(VT_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/terminal -c $< -o $@
+build/term_glyphs.o: user/terminal/glyphs.c user/terminal/glyphs.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term_screentext.o: user/terminal/screentext.c user/terminal/screentext.h $(VT_HDRS) | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/terminal -c $< -o $@
+build/term_profile.o: user/terminal/profile.c user/terminal/profile.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term_profile_store.o: user/terminal/profile_store.c user/terminal/profile_store.h user/terminal/profile.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/term.o: user/terminal/vt.h user/terminal/render.h user/terminal/profile_store.h user/apps/term/term_probe.h
+build/term.elf: build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/term.o $(VT_OBJS) $(TERM_UI_OBJS) build/wcwidth.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Photos -- the picture viewer. Like vellum it needs more than one object, so
@@ -1953,8 +2200,20 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 # coarse (any header touch rebuilds the whole kernel) but the kernel is one
 # compile anyway, so the granularity is already all-or-nothing; correctness wins.
 KERNEL_HDRS := $(shell find kernel -name '*.h')
-$(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
-	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
+# THE PIXEL LOOPS ARE OPTIMISED; the rest of the kernel is not. -O0 keeps every
+# local where GDB (and the smokes that read kernel state through it) expect it,
+# and that matters for policy code. It costs nothing there and a great deal in
+# the loops every compose runs: the same blend measured five times slower
+# (docs/DESKTOP_PERFORMANCE.md). These files are compiled on their own, -O2 --
+# still no SSE: the kernel keeps no FPU state, and pix.h is integer by design.
+KERNEL_FAST_SRC = kernel/gfx/pix.c kernel/drivers/video/framebuffer.c kernel/gfx/backdrop.c kernel/gfx/soft_compose.c
+KERNEL_FAST_OBJ = $(patsubst %.c,$(BUILD)/kfast/%.o,$(KERNEL_FAST_SRC))
+$(BUILD)/kfast/%.o: %.c $(FB_STAMP) $(KERNEL_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -O2 -c $< -o $@
+
+$(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(KERNEL_FAST_OBJ) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
+	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(filter-out $(KERNEL_FAST_SRC),$(KERNEL_SRC)) $(KERNEL_FAST_OBJ) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 	@# AND DOES IT STILL FIT WHERE IT IS LOADED? The kernel is placed at a
 	@# fixed physical address by both boot paths, and firmware reserves low
 	@# memory wherever it likes. A kernel that has grown past that is a
@@ -2021,6 +2280,15 @@ TCC_APPS = build/tcc.elf
 # Same libc-embedding problem as python.elf/git.elf (see those rules): tcc links
 # build/crt0.o + build/syscalls.o via LDFLAGS, which its own Makefile treats as
 # raw paths. Relink only when the libc is genuinely newer.
+ifeq ($(EMBLIBC),yes)
+# Under LIBC=emblibc tcc is shipped as it was built: a static newlib program,
+# whole in itself. Relinking it here would hand its newlib link an empty
+# syscalls.o. What it compiles ON the OS is unchanged too -- mkfs still packs
+# newlib's libc.a and headers into /system/abi for it.
+build/tcc.elf: $(TCC_BIN) | $(BUILD)
+	cp -f $(TCC_BIN) $@
+	$(STRIP) $@
+else
 build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	@if [ build/syscalls.o -nt $(TCC_BIN) ] || [ build/crt0.o -nt $(TCC_BIN) ]; then \
 	    echo "  RELINK   tcc     (libc changed under it)"; \
@@ -2031,10 +2299,11 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	cp -f $(TCC_BIN) $@
 	$(STRIP) $@
 endif
+endif
 
 EMBKFS_APPS := build/updateprobe.elf build/updatectl.elf build/updateworker.elf build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.elf build/posixdemo.elf build/ioracer.elf build/ttyprobe.elf build/processprobe.elf build/spawnprobe.elf build/shprobe.elf build/fdprobe.elf build/sh.elf $(if $(PIE_OK),build/pieprobe.elf,) \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf build/gitstatus.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf build/notepp.elf \
                build/install.elf \
@@ -2105,7 +2374,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(IMAGE_FONT_INPUTS) $(SHELL_SELFBUILD_SRC) $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(ABI_NEWLIB_OBJS) $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -2147,7 +2416,7 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(
 	EMBK_NEWLIB_LIBM="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/lib/libm.a,)" \
 	EMBK_NEWLIB_INC="$(if $(NEWLIB_PREFIX),$(NEWLIB_PREFIX)/x86_64-elf/include,)" \
 	EMBK_TCC_INC="$(if $(HAVE_TCC),$(TCC_SRC)/include,)" \
-	  python3 tools/embkfs_mkfs/mkfs_embkfs.py
+	$(if $(EMBLIBC),EMBK_ABI_OBJDIR=build/abi )  python3 tools/embkfs_mkfs/mkfs_embkfs.py
 
 
 # Create a 64MB AHCI test disk (separate from disk.img)
@@ -2682,8 +2951,87 @@ compile-commands:
 
 .PHONY: terminal-screen-test
 terminal-screen-test: | $(BUILD)
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal user/terminal/vt.c tests/tty/vt_test.c -o $(BUILD)/vt_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test
 	$(BUILD)/vt_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_test.c -o $(BUILD)/vt_test_asan
+	$(BUILD)/vt_test_asan --fuzz 20000
+
+.PHONY: terminal-render-test
+# Terminal's renderer (glyphs drawn and taken from the vendored Meslo faces,
+# DejaVu as the fallback) on real screens from the screen model.
+terminal-render-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -g -Iuser/terminal -Iui/backend -Iui/scene \
+	    user/terminal/render.c user/terminal/glyphs.c user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c \
+	    ui/backend/font.c ui/backend/cpu_backend.c ui/scene/scene.c tests/tty/render_test.c -lm -o $(BUILD)/render_test
+	$(BUILD)/render_test $(RENDER_SAMPLE)
+
+.PHONY: terminal-screentext-test
+# Selection, find and links over the screen model.
+terminal-screentext-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Iuser/terminal \
+	    user/terminal/screentext.c $(VT_SRC) shell/edit/wcwidth.c tests/tty/screentext_test.c -o $(BUILD)/screentext_test
+	$(BUILD)/screentext_test
+
+.PHONY: frameclock-test
+# The compositor's frame-rate policy (kernel/gfx/frameclock.c): the rate for
+# motion, requests and content that asked nothing; the governor; the beat.
+frameclock-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Ikernel tests/gfx/frameclock_test.c kernel/gfx/frameclock.c -o $(BUILD)/frameclock_test
+	$(BUILD)/frameclock_test
+
+.PHONY: pointer-accel-test
+# The pointer's acceleration curve (kernel/drivers/input/pointer_accel.c).
+pointer-accel-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Ikernel tests/input/pointer_accel_test.c kernel/drivers/input/pointer_accel.c -o $(BUILD)/pointer_accel_test
+	$(BUILD)/pointer_accel_test
+
+.PHONY: spring-test
+# The springs and the velocity fit everything on the desktop moves by
+# (ui/motion/): one trajectory at any frame rate, against the exact curve.
+spring-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -D_DEFAULT_SOURCE -Iui tests/motion/spring_test.c -lm -o $(BUILD)/spring_test
+	$(BUILD)/spring_test
+
+.PHONY: pix-test pix-bench
+# The compositor's pixel loops (kernel/gfx/pix.c): every row bit-exact with
+# the framebuffer's old per-pixel arithmetic; pix-bench times old against new,
+# both SCALAR as the kernel builds them -- a host compiler left to vectorise
+# would time NEON/SSE the kernel can never use.
+pix-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	    -Ikernel -I. tests/gfx/pix_test.c kernel/gfx/pix.c tests/gfx/sc_bridge.c kernel/gfx/soft_compose.c -o $(BUILD)/pix_test
+	$(BUILD)/pix_test
+pix-bench: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O2 -fno-tree-vectorize -fno-tree-slp-vectorize \
+	    -Ikernel -I. tests/gfx/pix_test.c kernel/gfx/pix.c tests/gfx/sc_bridge.c kernel/gfx/soft_compose.c -o $(BUILD)/pix_bench
+	$(BUILD)/pix_bench --bench
+
+.PHONY: backdrop-test
+# The compositor's backdrop blur: any part of a picture blurs to exactly the
+# whole picture's pixels there, so only what changed is blurred again.
+backdrop-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ikernel \
+	    tests/gfx/backdrop_host.c -o $(BUILD)/backdrop_test
+	$(BUILD)/backdrop_test
+
+.PHONY: terminal-profile-test
+# Terminal's profiles: the presets, the parser's limits, rewriting a file
+# without losing what it does not understand.
+terminal-profile-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Iuser/terminal \
+	    user/terminal/profile.c tests/tty/profile_test.c -lm -o $(BUILD)/profile_test
+	$(BUILD)/profile_test
+
+.PHONY: terminal-golden-test
+# Real programs' output (tests/tty/golden, made by tools/record_golden.py on a
+# Mac) replayed into the screen model and compared with tmux, cell by cell.
+terminal-golden-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -Iuser/terminal $(VT_SRC) shell/edit/wcwidth.c tests/tty/vt_dump.c -o $(BUILD)/vt_dump
+	python3 tools/golden_terminal.py $(BUILD)/vt_dump
 
 .PHONY: terminal-test
 terminal-test: | $(BUILD)
@@ -2695,13 +3043,71 @@ terminal-test: | $(BUILD)
 # builtins + the wire round-trip), host-run. The two OS-backed pieces (ls,
 # external spawn) link as stubs; they get exercised live by `test shell`.
 
+# The prompt and its Powerlevel10k engine, as the shell links them.
+PROMPT_SRC = shell/prompt/prompt.c shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c \
+             shell/prompt/p10k_import.c shell/prompt/icons.c shell/prompt/colors.c
+
+# The prompt engine against Powerlevel10k itself: its pieces (p10k_test.c),
+# then whole prompts, cell for cell, against recordings of p10k drawing the
+# same states on a Mac (tools/golden_prompt.py, tests/prompt/golden).
+P10K_HOST_SRC = shell/prompt/p10k.c shell/prompt/p10k_zsh.c shell/prompt/p10k_render.c shell/prompt/p10k_import.c \
+                shell/prompt/icons.c shell/prompt/colors.c shell/edit/wcwidth.c
+# Then `prompt configure` against p10k configure, page for page and its
+# configuration line for line (tools/golden_wizard.py, tests/prompt/wizard).
+prompt-test: | $(BUILD)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
+	    $(P10K_HOST_SRC) tests/prompt/p10k_test.c -o $(BUILD)/p10k_test
+	$(BUILD)/p10k_test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
+	    $(P10K_HOST_SRC) tests/prompt/prompt_dump.c -o $(BUILD)/prompt_dump
+	python3 tools/golden_prompt.py
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell \
+	    $(P10K_HOST_SRC) shell/prompt/wizard.c tests/prompt/wizard_dump.c -o $(BUILD)/wizard_dump
+	python3 tools/golden_wizard.py
+.PHONY: prompt-test
+
+# The git status daemon against gitstatusd itself (tools/gitstatus_golden.py:
+# 38 repositories in every state, five flag sets, a repository changed under
+# one daemon), and gitclone's checkout against git (fsck, status).
+GS_HOST_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined
+gitstatus-test: | $(BUILD)
+	$(HOSTCC) $(GS_HOST_CFLAGS) -Iuser/gitstatus -Iuser/git $(GITSTATUS_SRC) user/git/sha1.c -lz -o $(BUILD)/gitstatus_host
+	python3 tools/gitstatus_golden.py
+	$(HOSTCC) $(GS_HOST_CFLAGS) -Iuser/git user/git/pack.c user/git/repo.c user/git/sha1.c tests/git/checkout_host.c \
+	    -lz -o $(BUILD)/checkout_host
+	python3 tools/gitclone_index_test.py
+.PHONY: gitstatus-test
+
+# strdup, mkstemp, setenv under -std=c11: glibc hides them without this (macOS
+# does not), and an undeclared strdup is an int -- a pointer cut in half. And
+# GCC's format-truncation: completion candidates are cut at 512 bytes on
+# purpose (docs/TODO.md), which clang does not flag and GCC does.
+SHELL_HOST_CFLAGS = -D_DEFAULT_SOURCE -Wno-format-truncation
 shell-test:
-	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -Ishell \
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -O1 -g -Ishell \
 	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
 	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
-	    shell/builtins/builtins.c shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/builtins/builtins.c $(PROMPT_SRC) shell/edit/wcwidth.c shell/hist/hist.c shell/test/host_stubs.c \
 	    shell/test/host_test.c -o $(BUILD)/shell_test
 	$(BUILD)/shell_test
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -Werror -O1 -g -Ishell -Iuser/terminal \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/hist/hist.c $(VT_SRC) \
+	    shell/test/edit_test.c -o $(BUILD)/edit_test
+	$(BUILD)/edit_test
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -Werror -O1 -g -Ishell \
+	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/complete.c shell/complete/highlight.c \
+	    shell/test/complete_test.c -o $(BUILD)/complete_test
+	$(BUILD)/complete_test
+	$(HOSTCC) -std=c11 $(SHELL_HOST_CFLAGS) -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ishell -Iuser/terminal \
+	    shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+	    shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+	    shell/builtins/builtins.c $(PROMPT_SRC) shell/hist/hist.c shell/test/host_stubs.c \
+	    shell/edit/edit.c shell/edit/wcwidth.c shell/complete/highlight.c $(VT_SRC) \
+	    tests/edit/highlight_dump.c -o $(BUILD)/highlight_dump
+	python3 tools/golden_highlight.py
 
 scene-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene \
@@ -2725,7 +3131,7 @@ html-test:
 	$(BUILD)/html_test
 
 backend-test:
-	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend \
+	$(HOSTCC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -Iui/scene -Iui/backend \
 	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/scene_render.c \
 	    ui/backend/backend_test.c -lm -o $(BUILD)/backend_test
 	$(BUILD)/backend_test

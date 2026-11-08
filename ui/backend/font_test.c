@@ -35,7 +35,10 @@ static int alpha_px(struct render_target *rt, int x, int y) {
 }
 
 /* ---- build the synthetic font; returns total length ------------------- */
-static uint32_t build_ttf(void) {
+/* with_cmap12: a second, (3,10) format-12 subtable beside the format-4 one:
+ * 'A'-'C' as before, U+1F600 -> 2, U+F0001..U+F0002 -> 1, and U+10FFF0 ->
+ * glyph 99, which the font does not have. */
+static uint32_t build_ttf_with(int with_cmap12) {
     g_len = 0;
     const int n_tables = 7;
 
@@ -81,9 +84,11 @@ static uint32_t build_ttf(void) {
     /* cmap: header + one (3,1) format-4 subtable. 'A'->1 'B'->2 'C'->3 */
     BEGIN("cmap");
     { uint32_t cmap_start = g_len;
-      w16(0); w16(1);                       /* version, numTables */
-      w16(3); w16(1); w32(12);              /* platform 3, enc 1, offset 12 from cmap start */
-      uint32_t sub = g_len; (void)sub;      /* == cmap_start + 12 */
+      w16(0); w16(with_cmap12 ? 2 : 1);     /* version, numTables */
+      w16(3); w16(1); uint32_t off4 = g_len; w32(0);     /* platform 3, enc 1 */
+      uint32_t off12 = 0;
+      if (with_cmap12) { w16(3); w16(10); off12 = g_len; w32(0); }
+      w32_at(off4, g_len - cmap_start);
       /* format 4, segCount = 2 (real seg + 0xFFFF terminator) */
       w16(4);                               /* format */
       uint32_t lenoff = g_len; w16(0);      /* length (backpatch) */
@@ -95,7 +100,13 @@ static uint32_t build_ttf(void) {
       w16(0x0041); w16(0xFFFF);             /* startCode[] */
       wi16(-64);  w16(1);                   /* idDelta[] : 0x41-64=1, 0x42..=2, 0x43..=3 */
       w16(0); w16(0);                       /* idRangeOffset[] (0 => direct) */
-      w16_at(lenoff, (uint16_t)(g_len - cmap_start - 12)); /* subtable length */
+      w16_at(lenoff, (uint16_t)(g_len - lenoff + 2));      /* subtable length */
+      if (with_cmap12) {
+          w32_at(off12, g_len - cmap_start);
+          static const uint32_t groups[][3] = {{0x41,0x43,1},{0x1F600,0x1F600,2},{0xF0001,0xF0002,1},{0x10FFF0,0x10FFF0,99}};
+          w16(12); w16(0); w32(16 + 12 * 4); w32(0); w32(4);
+          for (int i = 0; i < 4; i++) { w32(groups[i][0]); w32(groups[i][1]); w32(groups[i][2]); }
+      }
     }
     END();
 
@@ -152,6 +163,7 @@ static uint32_t build_ttf(void) {
     }
     return g_len;
 }
+static uint32_t build_ttf(void) { return build_ttf_with(0); }
 
 /* ---- T1: parse + rasterize a known square ------------------------------ */
 static uint32_t t1_load_and_square(void) {
@@ -183,6 +195,33 @@ static uint32_t t1_load_and_square(void) {
     /* a corner-ish sample inside, and outside-of-bitmap is by definition uncovered */
     CHECK(cov && cov[2*w + 2] >= 250, "square interior covered");
     free(cov);
+    /* EXACT AREA: at 103 px the square spans x 10.3..41.2, so its left column
+     * is 70% covered and its right one 20% -- 179 and 51. Sampling 4 x 4 gave
+     * 191 and 64: only the multiples of a quarter it could see. */
+    cov = 0;
+    CHECK(font_rasterize_glyph(f, 1, 103.0f, &cov, &w, &h, &bx, &by, &adv), "rasterize square @103px");
+    if (cov) {
+        int l = cov[(h/2)*w], r = cov[(h/2)*w + w - 1];
+        printf("        (edge columns: %d and %d)\n", l, r);
+        CHECK(l >= 178 && l <= 180, "a 70%-covered edge pixel is 179, the area it covers");
+        CHECK(r >= 50 && r <= 52, "a 20%-covered one is 51");
+    }
+    free(cov);
+    /* SUBPIXEL: at 100 px the square's left edge is on a whole pixel; moved
+     * half a pixel right it half-covers that column instead */
+    cov = 0;
+    CHECK(font_rasterize_glyph_at(f, 1, 100.0f, 0.5f, &cov, &w, &h, &bx, &by, &adv), "rasterize square half a pixel right");
+    if (cov) {
+        int l = cov[(h/2)*w];
+        CHECK(bx == 10 && l >= 126 && l <= 129, "half a pixel right: the edge column is half covered (128)");
+        CHECK(adv == 50.0f, "and the advance is the advance at every phase");
+    }
+    free(cov);
+    struct glyph_cache_entry *p0 = glyph_cache_lookup_phase(font_global_atlas(), f, 'A', 40.0f, 0);
+    uint16_t p0x = p0 ? p0->atlas_x : 0, p0y = p0 ? p0->atlas_y : 0;
+    struct glyph_cache_entry *p2 = glyph_cache_lookup_phase(font_global_atlas(), f, 'A', 40.0f, 2);
+    CHECK(p0 && p2 && p2->phase == 2 && (p2->atlas_x != p0x || p2->atlas_y != p0y),
+          "each phase is its own cache entry, with its own pixels");
     return fh;
 }
 
@@ -306,6 +345,183 @@ static void t6_wrapped_pixels(struct font *f,uint32_t fh) {
     free(rt.pixels);f->ascent=ascent;f->descent=descent;
 }
 
+/* ---- T7: cmap format 12, chosen over format 4, every plane ------------- */
+static uint8_t g_ttf12[4096];
+static void t7_cmap12(void) {
+    printf("T7 cmap format 12:\n");
+    uint32_t len = build_ttf_with(1);
+    memcpy(g_ttf12, g_ttf, len);
+    uint32_t fh = font_load(g_ttf12, len);
+    struct font *f = font_for_handle(fh);
+    CHECK(f && f->cmap_format == 12, "the format-12 subtable is chosen over format 4");
+    if (!f) return;
+    CHECK(font_codepoint_to_glyph(f, 'A') == 1 && font_codepoint_to_glyph(f, 'C') == 3, "BMP codepoints through format 12");
+    CHECK(font_codepoint_to_glyph(f, 0x1F600) == 2, "a supplementary-plane codepoint (U+1F600)");
+    CHECK(font_codepoint_to_glyph(f, 0xF0002) == 2 && font_codepoint_to_glyph(f, 0xF0003) == 0,
+          "a range in plane 15 maps by offset and ends where it ends");
+    CHECK(font_codepoint_to_glyph(f, 0x10FFF0) == 0, "a glyph past numGlyphs is no glyph");
+
+    /* THE FALLBACK: a face without U+1F600 borrows it from one with it */
+    static uint8_t g_ttf4[4096];
+    uint32_t len4 = build_ttf_with(0);
+    memcpy(g_ttf4, g_ttf, len4);
+    uint32_t ph = font_load(g_ttf4, len4);
+    struct font *p = font_for_handle(ph);
+    CHECK(p && font_for_codepoint(p, 0x1F600) == p, "with no fallback, a missing codepoint stays with its face");
+    font_set_fallback(ph, fh);
+    CHECK(p && font_for_codepoint(p, 0x1F600) == f, "with one, the fallback draws what the face lacks");
+    CHECK(p && font_for_codepoint(p, 'A') == p, "and the face still draws what it has");
+    CHECK(p && font_for_codepoint(p, 0xF0003) == p, "a codepoint neither has stays with the face (its .notdef)");
+    font_set_fallback(ph, ph);
+    CHECK(p && p->fallback == fh, "a face is never its own fallback");
+    CHECK(font_has_glyph(f, 0x1F600) && !font_has_glyph(f, 0x40), "font_has_glyph");
+}
+
+/* ---- T8: the cache under pressure: pages fill, the oldest is emptied, ---- *
+ * ---- what is in use stays, and nothing live is overwritten.           ---- */
+static uint32_t coverage_sum(const struct glyph_cache_entry *e) {
+    const uint8_t *c = glyph_coverage(font_global_atlas(), e);
+    uint32_t sum = 0;
+    for (int y = 0; c && y < e->atlas_h; y++)
+        for (int x = 0; x < e->atlas_w; x++) sum = sum * 31 + c[(size_t)y * GLYPH_ATLAS_SIZE + x];
+    return sum;
+}
+static void t8_cache_pressure(struct font *f) {
+    printf("T8 the glyph cache under pressure:\n");
+    struct glyph_atlas *atlas = font_global_atlas();
+    struct glyph_cache_entry *hot = glyph_cache_lookup_or_rasterize(atlas, f, 'B', 21.0f);
+    uint32_t hot_sum = coverage_sum(hot), hot_misses = 0, evicted_seen = 0;
+    CHECK(hot && hot_sum, "a glyph with pixels");
+    struct glyph_cache_entry *missing = glyph_cache_lookup_or_rasterize(atlas, f, 0x1234, 21.0f);
+    CHECK(missing && missing->missing, "a codepoint the font lacks is flagged missing");
+    CHECK(!glyph_cache_lookup_or_rasterize(atlas, f, 'A', 21.0f)->missing, "one it has is not");
+    for (int size = 8; size <= 700; size++) {
+        for (uint32_t cp = 'A'; cp <= 'C'; cp++) glyph_cache_lookup_or_rasterize(atlas, f, cp, (float)size);
+        uint32_t before = font_debug_rasterize_count();
+        hot = glyph_cache_lookup_or_rasterize(atlas, f, 'B', 21.0f);   /* used every round */
+        hot_misses += font_debug_rasterize_count() != before;
+    }
+    int pages = 0;
+    for (int p = 0; p < GLYPH_ATLAS_PAGES; p++) pages += atlas->pages[p].coverage != 0;
+    CHECK(pages == GLYPH_ATLAS_PAGES, "the churn filled every page");
+    CHECK(hot_misses == 0, "the glyph used every frame was never evicted");
+    CHECK(coverage_sum(hot) == hot_sum, "and its pixels were never overwritten");
+    /* every live entry is found again without rasterizing; the evicted come back */
+    int consistent = 1;
+    uint32_t gone_cp = 0; float gone_size = 0;
+    for (uint32_t i = 0; i < atlas->n_entries; i++) {
+        struct glyph_cache_entry *e = &atlas->entries[i];
+        if (!e->used) { if (!evicted_seen++) { gone_cp = e->codepoint; gone_size = e->size_px_x4 / 4.0f; } continue; }
+        uint32_t before = font_debug_rasterize_count();
+        struct glyph_cache_entry *again = glyph_cache_lookup_phase(atlas, f, e->codepoint, e->size_px_x4 / 4.0f, e->phase);
+        if (again != e || font_debug_rasterize_count() != before) consistent = 0;
+    }
+    CHECK(consistent, "every cached glyph is found by its key");
+    CHECK(evicted_seen > 0, "pages were emptied to make room");
+    /* an evicted glyph (its entry keeps its key until reused) comes back */
+    uint8_t *cov = 0; int w = 0, h = 0, bx = 0, by = 0; float adv = 0;
+    font_rasterize_glyph(f, font_codepoint_to_glyph(f, gone_cp), gone_size, &cov, &w, &h, &bx, &by, &adv);
+    free(cov);
+    uint32_t before = font_debug_rasterize_count();
+    struct glyph_cache_entry *back = glyph_cache_lookup_or_rasterize(atlas, f, gone_cp, gone_size);
+    CHECK(font_debug_rasterize_count() == before + 1 && back && back->atlas_w == w && back->atlas_h == h,
+          "an evicted glyph is rasterized again, at its own size");
+}
+
+/* ---- T9: the vendored terminal face, from the tree ---------------------- */
+static void t9_meslo(void) {
+    printf("T9 MesloLGS Nerd Font Mono (third_party/fonts/meslo-nf):\n");
+    FILE *file = fopen("third_party/fonts/meslo-nf/MesloLGSNerdFontMono-Regular.ttf", "rb");
+    CHECK(file != 0, "the vendored face is in the tree");
+    if (!file) return;
+    fseek(file, 0, SEEK_END); long n = ftell(file); fseek(file, 0, SEEK_SET);
+    uint8_t *data = malloc((size_t)n);
+    CHECK(data && fread(data, 1, (size_t)n, file) == (size_t)n, "read it");
+    fclose(file);
+    struct font *f = font_for_handle(font_load(data, (size_t)n));
+    CHECK(f && f->cmap_format == 12, "it loads, with its format-12 cmap");
+    if (!f) return;
+    CHECK(font_has_glyph(f, 'A') && font_has_glyph(f, 0xE0B0) && font_has_glyph(f, 0xE0B6),
+          "letters and the powerline separators");
+    CHECK(font_has_glyph(f, 0xF0001) && font_has_glyph(f, 0xF0A1A), "Material Design icons in plane 15");
+    CHECK(font_has_glyph(f, 0xF113) && font_has_glyph(f, 0xE718), "the icons p10k's segments draw (git, os)");
+    CHECK(!font_has_glyph(f, 0x754C), "no CJK: the fallback chain's job");
+    struct glyph_atlas *atlas = font_global_atlas();
+    float m = glyph_cache_lookup_or_rasterize(atlas, f, 'M', 16)->advance_px;
+    float pl = glyph_cache_lookup_or_rasterize(atlas, f, 0xE0B0, 16)->advance_px;
+    float md = glyph_cache_lookup_or_rasterize(atlas, f, 0xF0001, 16)->advance_px;
+    CHECK(m > 8 && m == pl && m == md, "every glyph is one cell wide (the Mono build)");
+    struct glyph_cache_entry *sep = glyph_cache_lookup_or_rasterize(atlas, f, 0xE0B0, 16);
+    CHECK(sep->atlas_w > 4 && sep->atlas_h > 12 && !sep->missing, "the separator rasterizes");
+}
+
+/* ---- T10: the interface's face, and its kerning ------------------------- */
+static float g_kx[8];
+static int g_kn;
+static void kern_visit(void *ctx, uint32_t cp, float x, float y) { (void)ctx; (void)cp; (void)y; if (g_kn < 8) g_kx[g_kn++] = x; }
+static void t10_inter(void) {
+    printf("T10 Inter and its kerning (third_party/fonts/inter):\n");
+    FILE *file = fopen("third_party/fonts/inter/Inter-Regular.ttf", "rb");
+    CHECK(file != 0, "the vendored face is in the tree");
+    if (!file) return;
+    fseek(file, 0, SEEK_END); long n = ftell(file); fseek(file, 0, SEEK_SET);
+    uint8_t *data = malloc((size_t)n);
+    CHECK(data && fread(data, 1, (size_t)n, file) == (size_t)n, "read it");
+    fclose(file);
+    struct font *f = font_for_handle(font_load(data, (size_t)n));
+    CHECK(f && f->gpos_len > 0 && f->n_kern_lookups > 0, "it loads, with GPOS and a 'kern' feature");
+    if (!f) return;
+    float av = font_kern_px(f, 'A', 'V', 100), to = font_kern_px(f, 'T', 'o', 100);
+    float vertical = font_kern_px(f, 'H', 'H', 100);
+    printf("        (at 100 px: AV %.2f, To %.2f, HH %.2f)\n", av, to, vertical);
+    CHECK(av < -2.0f && to < -2.0f, "AV and To sit closer than their advances say");
+    CHECK(vertical == 0.0f, "two upright stems keep their spacing (HH is not kerned)");
+    CHECK(font_kern_px(f, 0x00C5, 'V', 100) < -2.0f, "an accented capital (\u00c5, outside the ASCII table) kerns as A does");
+    CHECK(font_kern_px(f, 'A', 'V', 20) * 5 > av - 0.3f && font_kern_px(f, 'A', 'V', 20) * 5 < av + 0.3f,
+          "kerning scales with the size");
+    CHECK(font_kern_px(f, 0, 'V', 100) == 0.0f, "nothing before the first glyph");
+    /* the text walk places the V at A's advance plus the pair's kerning */
+    g_kn = 0;
+    font_layout_text(f, "AV", 100, 0, kern_visit, 0);
+    float adv_a = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'A', 100)->advance_px;
+    float pair = font_pair_px(f, 'A', 'V', 100);   /* the kerning, and Inter's tracking (T11) */
+    CHECK(g_kn == 2 && g_kx[1] > adv_a + pair - 0.01f && g_kx[1] < adv_a + pair + 0.01f,
+          "the text walk puts V at A's advance plus the kerning");
+    /* a box exactly as wide as the kerned word holds all of it: the fit test
+     * once left the pair's kerning out and wrapped the last letter away
+     * ("Keyboar", "Slat" in Settings) */
+    const char *words[] = { "Keyboard", "Slate", "preview", "Update", "AVATAR" };
+    int whole = 1;
+    for (int i = 0; i < 5; i++) {
+        float w = 0; uint32_t prev = 0;
+        for (const char *p = words[i]; *p; p++) {
+            w += font_pair_px(f, prev, (uint32_t)*p, 14) + glyph_cache_lookup_or_rasterize(font_global_atlas(), f, (uint32_t)*p, 14)->advance_px;
+            prev = (uint32_t)*p;
+        }
+        if (font_layout_text(f, words[i], 14, w, NULL, NULL) != 1) { whole = 0; printf("        (\"%s\" wrapped at its own width %.3f)\n", words[i], w); }
+        g_kn = 0;
+        if (font_layout_text(f, words[i], 14, w, kern_visit, 0) != 1) whole = 0;
+    }
+    CHECK(whole, "a word in a box its own kerned width stays on one line, measured and drawn");
+
+    /* T11: Inter's dynamic tracking -- large type closes up, small type keeps
+     * its air -- on every pair the walks add (font_pair_px), and nowhere else */
+    printf("T11 Inter's dynamic tracking:\n");
+    CHECK(f->dyn_tracking, "the face is recognised as Inter by its family name");
+    float t32 = font_pair_px(f, 'H', 'H', 32), t11 = font_pair_px(f, 'H', 'H', 11), t13 = font_pair_px(f, 'H', 'H', 13);
+    printf("        (HH at 32 px %.3f, 13 px %.3f, 11 px %.3f)\n", t32, t13, t11);
+    CHECK(t32 < -0.6f && t32 > -0.8f, "at 32 px a title closes up by about 0.7 px a pair");
+    CHECK(t11 > 0.0f && t11 < 0.1f, "at 11 px a caption opens a touch");
+    CHECK(t13 > -0.1f && t13 < 0.0f, "at 13 px body text is all but untouched");
+    CHECK(font_pair_px(f, 'A', 'V', 32) < font_kern_px(f, 'A', 'V', 32), "kerning and tracking add up");
+    CHECK(font_pair_px(f, 0, 'V', 32) == 0.0f, "nothing before the first glyph");
+    g_kn = 0;
+    font_layout_text(f, "HH", 32, 0, kern_visit, 0);
+    float adv_h = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, 'H', 32)->advance_px;
+    CHECK(g_kn == 2 && g_kx[1] > adv_h + t32 - 0.01f && g_kx[1] < adv_h + t32 + 0.01f,
+          "the text walk spaces the letters by it");
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4b: font-rasterizer selftests ===\n");
     uint32_t fh = t1_load_and_square();
@@ -316,7 +532,11 @@ int main(void) {
         t4_atlas_cache(f);
         t5_pen_advance(f, fh);
         t6_wrapped_pixels(f,fh);
+        t8_cache_pressure(f);
     } else { printf("  FAIL: no font handle; skipping T2-T5\n"); g_fail++; }
+    t7_cmap12();
+    t9_meslo();
+    t10_inter();
     printf("=== font-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -12,6 +12,7 @@
 #include "drivers/video/rawcon.h"
 #include "include/spinlock.h"
 #include "boot/boot_protocol.h"
+#include "gfx/pix.h"   /* the 32 bpp loops: two channels per multiply, bit-exact */
 
 
 static fb_info_t fb;
@@ -118,6 +119,12 @@ static inline uint32_t fb_load(const uint8_t *p) {
     default: return *p;
     }
 }
+
+/* 32 bpp scanouts, in either byte order, take pix.h's rows; every other depth
+ * keeps the per-pixel path each primitive below carries. `swap`: the scanout
+ * is R,G,B,X, so a 0x00RRGGBB source has its red and blue exchanged first. */
+static inline bool fb_fast(void) { return fb.bpp == 32; }
+static inline int  fb_swap(void) { return fb.format != FB_FORMAT_BGR; }
 
 // Clip a rect against the screen. Returns false when nothing remains.
 /* What drawing may touch besides the screen: everything, unless a caller
@@ -426,10 +433,8 @@ void fb_blit(int32_t x, int32_t y, int32_t w, int32_t h,
 
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
     for (int32_t j = 0; j < ch; j++) {
-        if (fb.bpp == 32 && fb.format == FB_FORMAT_BGR) {
-            // Native layout matches 0x00RRGGBB stores directly.
-            uint32_t *p = (uint32_t *)row;
-            for (int32_t i = 0; i < cw; i++) p[i] = src[i] & 0x00FFFFFFU;
+        if (fb_fast()) {
+            pix_copy_row((uint32_t *)row, src, cw, fb_swap());
         } else {
             uint8_t *p = row;
             for (int32_t i = 0; i < cw; i++, p += fb_bypp)
@@ -441,6 +446,25 @@ void fb_blit(int32_t x, int32_t y, int32_t w, int32_t h,
     fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
 }
 
+int fb_read_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t *dst, uint32_t stride) {
+    int32_t cx = x, cy = y, cw = w, ch = h;
+    if (!fb_clip(&cx, &cy, &cw, &ch)) return 0;
+    uint32_t *out = dst + (uint64_t)(cy - y) * stride + (cx - x);
+    const uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    for (int32_t j = 0; j < ch; j++) {
+        if (fb.bpp == 32 && fb.format == FB_FORMAT_BGR) {
+            const uint32_t *p = (const uint32_t *)row;
+            for (int32_t i = 0; i < cw; i++) out[i] = p[i] & 0x00FFFFFFU;
+        } else {
+            const uint8_t *p = row;
+            for (int32_t i = 0; i < cw; i++, p += fb_bypp) out[i] = fb_unpack(fb_load((uint8_t *)p)) & 0xFFFFFFu;
+        }
+        out += stride;
+        row += fb.pitch;
+    }
+    return 1;
+}
+
 void fb_blit_blend(int32_t x, int32_t y, int32_t w, int32_t h,
                    const uint32_t *argb, uint32_t stride) {
     int32_t cx = x, cy = y, cw = w, ch = h;
@@ -448,6 +472,12 @@ void fb_blit_blend(int32_t x, int32_t y, int32_t w, int32_t h,
     const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
 
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    if (fb_fast()) {
+        for (int32_t j = 0; j < ch; j++, src += stride, row += fb.pitch)
+            pix_blend_row((uint32_t *)row, src, cw, fb_swap());
+        fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+        return;
+    }
     for (int32_t j = 0; j < ch; j++) {
         uint8_t *p = row;
         for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
@@ -479,6 +509,12 @@ void fb_blit_over(int32_t x, int32_t y, int32_t w, int32_t h,
     if (!fb_clip(&cx, &cy, &cw, &ch)) return;
     const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    if (fb_fast()) {
+        for (int32_t j = 0; j < ch; j++, src += stride, row += fb.pitch)
+            pix_over_row((uint32_t *)row, src, cw, fb_swap());
+        fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+        return;
+    }
     for (int32_t j = 0; j < ch; j++) {
         uint8_t *p = row;
         for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
@@ -512,6 +548,12 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
     uint32_t inv = 255 - alpha;
     const uint32_t *src = argb + (uint64_t)(cy - y) * stride + (cx - x);
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)cy);
+    if (fb_fast()) {
+        for (int32_t j = 0; j < ch; j++, src += stride, row += fb.pitch)
+            pix_mix_row((uint32_t *)row, src, cw, alpha, fb_swap());
+        fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+        return;
+    }
     for (int32_t j = 0; j < ch; j++) {
         uint8_t *p = row;
         for (int32_t i = 0; i < cw; i++, p += fb_bypp) {
@@ -533,12 +575,17 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
 // is the window-motion primitive: the compositor already owns a window's
 // finished pixels, so a scale+fade of that buffer is all an open/minimize
 // animation needs -- no app involvement, no scene graph, no per-frame layout.
-// Nearest-neighbour with a 16.16 source step: the frames are in motion and the
-// whole thing is over in a few hundred ms, so filtering would cost more than
-// anyone can see.
+// BILINEAR on a 32-bit scanout when `smooth` (pix_scale_row): nearest-
+// neighbour was the first choice, on the theory that a motion over in a few
+// hundred ms hides it, and it does not -- the text of a shrinking window
+// crawls as rows and columns drop in and out. Pixel centres map to pixel
+// centres. It costs about six times as much (1.15 ms against 0.19 for a
+// 980 x 660 window at 88% on an M5 core, `make pix-bench`), so the caller
+// asks for it only while the frame can afford it. At the image's own size
+// -- where every motion lands -- it is a copy.
 void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                             const uint32_t *argb, int32_t sw, int32_t sh,
-                            uint32_t stride, uint32_t alpha,
+                            uint32_t stride, uint32_t alpha, int smooth,
                             int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
     if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || !argb || alpha == 0) return;
     int32_t x0 = dx, y0 = dy, x1 = dx + dw, y1 = dy + dh;
@@ -553,6 +600,50 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
     uint32_t stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
     uint32_t inv = 255 - alpha;
     uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
+    if (fb_fast() && dw == sw && dh == sh) {
+        /* AT ITS OWN SIZE -- where every motion lands, and opacity-only
+         * frames -- a copy: nothing to filter, at a sixth of the cost */
+        int swap = fb_swap();
+        for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+            const uint32_t *s = argb + (uint64_t)(y - dy) * stride + (x0 - dx);
+            if (alpha >= 255) pix_copy_row((uint32_t *)row, s, x1 - x0, swap);
+            else pix_mix_row((uint32_t *)row, s, x1 - x0, alpha, swap);
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
+    if (fb_fast() && smooth) {
+        int swap = fb_swap();
+        int32_t sx0 = (int32_t)(((int64_t)(2 * (x0 - dx) + 1) * stepx) / 2) - 32768;
+        for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+            int32_t sy = (int32_t)(((int64_t)(2 * (y - dy) + 1) * stepy) / 2) - 32768;
+            if (sy < 0) sy = 0;
+            int32_t r0 = sy >> 16, r1 = r0 + 1;
+            uint32_t fy = ((uint32_t)sy >> 8) & 0xffu;
+            if (r0 >= sh - 1) { r0 = r1 = sh - 1; fy = 0; }
+            pix_scale_row((uint32_t *)row, x1 - x0, argb + (uint64_t)r0 * stride, argb + (uint64_t)r1 * stride,
+                          sw, sx0, (int32_t)stepx, fy, alpha, swap);
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
+    if (fb_fast()) {                         /* nearest: the frame cannot afford more */
+        int swap = fb_swap();
+        for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+            uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
+            if (sy >= (uint32_t)sh) sy = (uint32_t)sh - 1;
+            const uint32_t *srow = argb + (uint64_t)sy * stride;
+            uint32_t sx_fx = (uint32_t)(x0 - dx) * stepx, *p = (uint32_t *)row;
+            for (int32_t x = x0; x < x1; x++, p++, sx_fx += stepx) {
+                uint32_t sx = sx_fx >> 16;
+                if (sx >= (uint32_t)sw) sx = (uint32_t)sw - 1;
+                uint32_t sp = swap ? pix_swap_rb(srow[sx]) : srow[sx];
+                *p = alpha >= 255 ? (sp & 0x00FFFFFFu) : pix_mix(sp, *p, alpha);
+            }
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
 
     for (int32_t y = y0; y < y1; y++) {
         uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
@@ -579,14 +670,129 @@ void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
     fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
 }
 
+
+// A LAYER: a picture with its own alpha (premultiplied 0xAARRGGBB, as the
+// toolkit paints it) scaled into a destination rect and composited OVER what
+// is there at `opacity`, clipped as fb_blit_scaled_uniform is. Where that one
+// lays a window's colour down whole -- a window is opaque, and the alpha it
+// carries is the compositor's to ignore -- this keeps what is transparent in
+// the picture transparent: a menu's rounded corners and soft shadow fly as
+// they are. Filtered (pix_scale_over_row) when `smooth`, else the nearest
+// source pixel; at the picture's own size a premultiplied over.
+void fb_blit_scaled_over(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                         const uint32_t *argb, int32_t sw, int32_t sh,
+                         uint32_t stride, uint32_t opacity, int smooth,
+                         int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || !argb || opacity == 0) return;
+    if (opacity > 255) opacity = 255;
+    int32_t x0 = dx > clx0 ? dx : clx0, y0 = dy > cly0 ? dy : cly0;
+    int32_t x1 = dx + dw < clx1 ? dx + dw : clx1, y1 = dy + dh < cly1 ? dy + dh : cly1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)fb.width)  x1 = (int32_t)fb.width;
+    if (y1 > (int32_t)fb.height) y1 = (int32_t)fb.height;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    uint32_t stepx = ((uint32_t)sw << 16) / (uint32_t)dw;
+    uint32_t stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
+    uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
+    if (fb_fast()) {
+        int swap = fb_swap();
+        if (dw == sw && dh == sh) {
+            for (int32_t y = y0; y < y1; y++, row += fb.pitch)
+                pix_over_fade_row((uint32_t *)row, argb + (uint64_t)(y - dy) * stride + (x0 - dx),
+                                  x1 - x0, opacity, swap);
+        } else {
+            int32_t sx0 = (int32_t)(((int64_t)(2 * (x0 - dx) + 1) * stepx) / 2) - 32768;
+            for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+                int32_t sy = (int32_t)(((int64_t)(2 * (y - dy) + 1) * stepy) / 2) - 32768;
+                if (sy < 0) sy = 0;
+                int32_t r0 = sy >> 16, r1 = r0 + 1;
+                uint32_t fy = ((uint32_t)sy >> 8) & 0xffu;
+                if (r0 >= sh - 1) { r0 = r1 = sh - 1; fy = 0; }
+                if (!smooth) { r0 = (sy + 32768) >> 16; if (r0 > sh - 1) r0 = sh - 1; r1 = r0; }
+                pix_scale_over_row((uint32_t *)row, x1 - x0, argb + (uint64_t)r0 * stride,
+                                   argb + (uint64_t)r1 * stride, sw, sx0, (int32_t)stepx, fy,
+                                   opacity, smooth, swap);
+            }
+        }
+        fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+        return;
+    }
+    /* any other depth: nearest, a pixel at a time */
+    for (int32_t y = y0; y < y1; y++, row += fb.pitch) {
+        uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
+        if (sy >= (uint32_t)sh) sy = (uint32_t)sh - 1;
+        const uint32_t *srow = argb + (uint64_t)sy * stride;
+        uint32_t sx_fx = (uint32_t)(x0 - dx) * stepx;
+        uint8_t *p = row;
+        for (int32_t x = x0; x < x1; x++, p += fb_bypp, sx_fx += stepx) {
+            uint32_t sx = sx_fx >> 16;
+            if (sx >= (uint32_t)sw) sx = (uint32_t)sw - 1;
+            uint32_t c = opacity < 255 ? pix_fade4(srow[sx], opacity) : srow[sx], a = c >> 24;
+            if (a == 0) continue;
+            fb_color_t d = fb_unpack(fb_load(p));
+            uint32_t o = a == 255 ? (c & 0x00ffffffu) : pix_over_round(c, d & 0x00ffffffu);
+            fb_store(p, fb_pack(FB_RGB((o >> 16) & 0xFF, (o >> 8) & 0xFF, o & 0xFF)));
+        }
+    }
+    fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+}
+
 // In-place separable box blur of an fb_draw region (the backdrop behind a glass
 // window). Two passes (H then V) with a rolling per-channel sum ~= a small
 // Gaussian. Clamped-edge sampling. Silently no-ops if scratch can't be had.
+/* The blur's working memory, KEPT: it used to be two fresh kmallocs of the
+ * region on every call, which on a glass window is every compose. Grown when a
+ * bigger region asks, never shrunk; its own lock, though only the compositor
+ * (under its lock) blurs today. */
+static spinlock_t fb_blur_lock = SPINLOCK_INIT;
+static uint32_t  *fb_blur_px, *fb_blur_tmp, *fb_blur_col;
+static uint64_t   fb_blur_cap, fb_blur_colcap;
+
+static bool fb_blur_scratch(uint64_t n, uint64_t cols) {
+    if (n > fb_blur_cap) {
+        uint32_t *a = kmalloc(n * 4), *b = a ? kmalloc(n * 4) : 0;
+        if (!a || !b) { if (a) kfree(a); return false; }
+        if (fb_blur_px) { kfree(fb_blur_px); kfree(fb_blur_tmp); }
+        fb_blur_px = a; fb_blur_tmp = b; fb_blur_cap = n;
+    }
+    if (cols * 3 > fb_blur_colcap) {
+        uint32_t *c = kmalloc(cols * 3 * 4);
+        if (!c) return false;
+        if (fb_blur_col) kfree(fb_blur_col);
+        fb_blur_col = c; fb_blur_colcap = cols * 3;
+    }
+    return true;
+}
+
 void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius) {
     if (radius < 1) return;
     int32_t cx = x, cy = y, cw = w, ch = h;
     if (!fb_clip(&cx, &cy, &cw, &ch)) return;
     if (cw <= 1 || ch <= 1) return;
+    /* Blurring treats every channel alike, so the scanout's own words are
+     * blurred as they are, whichever their byte order. */
+    if (fb_fast() && 2 * radius + 1 <= PIX_BOX_MAX_WIN) {
+        spin_lock(&fb_blur_lock);
+        if (fb_blur_scratch((uint64_t)cw * (uint64_t)ch, (uint64_t)cw)) {
+            for (int32_t j = 0; j < ch; j++) {
+                const uint32_t *p = (const uint32_t *)fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j));
+                uint32_t *o = fb_blur_px + (uint64_t)j * cw;
+                for (int32_t i = 0; i < cw; i++) o[i] = p[i] & 0x00FFFFFFu;
+            }
+            pix_box_blur(fb_blur_px, cw, ch, radius, fb_blur_tmp, fb_blur_col);
+            /* frosted glass, not fog: what shows through is saturated */
+            for (int32_t j = 0; j < ch; j++) pix_saturate_row(fb_blur_px + (uint64_t)j * cw, cw, PIX_VIBRANCY, fb_swap());
+            for (int32_t j = 0; j < ch; j++)
+                memcpy(fb_pixel_ptr(fb_draw, (uint32_t)cx, (uint32_t)(cy + j)),
+                       fb_blur_px + (uint64_t)j * cw, (uint64_t)cw * 4);
+            spin_unlock(&fb_blur_lock);
+            fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
+            return;
+        }
+        spin_unlock(&fb_blur_lock);   /* no memory: the old path, which tries its own */
+    }
     uint32_t *a = (uint32_t *)kmalloc((size_t)cw * ch * 4);
     if (!a) return;
     uint32_t *b = (uint32_t *)kmalloc((size_t)cw * ch * 4);
@@ -635,6 +841,113 @@ void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius) 
     kfree(b); kfree(a);
 }
 
+/* ---- the window shadow (see framebuffer.h) ---- */
+static uint32_t isqrt_u32(uint32_t v) {
+    uint32_t r = 0, b = 1u << 30;
+    while (b > v) b >>= 2;
+    while (b) {
+        if (v >= r + b) { v -= r + b; r = (r >> 1) + b; }
+        else r >>= 1;
+        b >>= 2;
+    }
+    return r;
+}
+
+/* Signed distance from pixel (x, y)'s centre to a rounded rect, in 1/16 px:
+ * negative inside. Inside the straight part it reports -r, which is all a
+ * shadow needs to know (fully under it). */
+static inline int32_t rr_sdf16(int32_t x, int32_t y, int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t r) {
+    int32_t X = x * 16 + 8, Y = y * 16 + 8;
+    int32_t ax = (x0 + r) * 16, bx = (x1 - r) * 16, ay = (y0 + r) * 16, by = (y1 - r) * 16;
+    int32_t dx = X < ax ? ax - X : X > bx ? X - bx : 0;
+    int32_t dy = Y < ay ? ay - Y : Y > by ? Y - by : 0;
+    int32_t d = dx && dy ? (int32_t)isqrt_u32((uint32_t)(dx * dx + dy * dy)) : (dx > dy ? dx : dy);
+    return d - r * 16;
+}
+
+#define SHADOW_LAYERS_MAX 3
+#define SHADOW_FALL_MAX   (96 * 16)      /* the widest falloff a table holds, 1/16 px */
+void fb_shadow_layers(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t radius,
+                      const struct fb_shadow_layer *L, int n,
+                      int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
+    if (n <= 0 || fx1 <= fx0 || fy1 <= fy0) return;
+    if (n > SHADOW_LAYERS_MAX) n = SHADOW_LAYERS_MAX;
+    int32_t m = (fx1 - fx0 < fy1 - fy0 ? fx1 - fx0 : fy1 - fy0) / 2, r = radius > m ? m : radius;
+    if (r < 0) r = 0;
+    /* each layer's falloff by distance, once per call: (1 - e/w)^2 * peak */
+    static uint8_t fall[SHADOW_LAYERS_MAX][SHADOW_FALL_MAX + 1];
+    int32_t bx0 = fx0, by0 = fy0, bx1 = fx1, by1 = fy1, wq[SHADOW_LAYERS_MAX];
+    for (int l = 0; l < n; l++) {
+        int32_t w = L[l].width < 1 ? 1 : L[l].width > 96 ? 96 : L[l].width;
+        wq[l] = w * 16;
+        for (int32_t e = 0; e <= wq[l]; e++) {
+            uint32_t t = (uint32_t)(wq[l] - e);
+            fall[l][e] = (uint8_t)((uint64_t)L[l].peak * t * t / ((uint64_t)wq[l] * wq[l]));
+        }
+        if (fx0 - w < bx0) bx0 = fx0 - w;
+        if (fx1 + w > bx1) bx1 = fx1 + w;
+        if (fy0 + L[l].dy - w < by0) by0 = fy0 + L[l].dy - w;
+        if (fy1 + L[l].dy + w > by1) by1 = fy1 + L[l].dy + w;
+    }
+    if (bx0 < clx0) bx0 = clx0; if (by0 < cly0) by0 = cly0;
+    if (bx1 > clx1) bx1 = clx1; if (by1 > cly1) by1 = cly1;
+    if (bx0 < 0) bx0 = 0; if (by0 < 0) by0 = 0;
+    if (bx1 > (int32_t)fb.width)  bx1 = (int32_t)fb.width;
+    if (by1 > (int32_t)fb.height) by1 = (int32_t)fb.height;
+    if (bx1 <= bx0 || by1 <= by0) return;
+    /* WHERE THE SHAPE IS STRAIGHT, the shadow depends on one coordinate: in
+     * the columns between the corners it is the same along a row, and in the
+     * rows between every layer's corners the same down a column. Only the
+     * corner zones need the distance in two dimensions -- a few thousand
+     * pixels against the band's hundreds of thousands. */
+    int32_t dmin = L[0].dy, dmax = L[0].dy;
+    for (int l = 1; l < n; l++) { if (L[l].dy < dmin) dmin = L[l].dy; if (L[l].dy > dmax) dmax = L[l].dy; }
+    int32_t sx0 = fx0 + r, sx1 = fx1 - r;                 /* straight columns */
+    int32_t sy0 = fy0 + dmax + r, sy1 = fy1 + dmin - r;   /* straight rows, every layer */
+    static uint8_t colkeep[8192];
+    int32_t bw = bx1 - bx0 < 8192 ? bx1 - bx0 : 8192;
+    #define KEEP_AT(x_, y_) ({ uint32_t k_ = 255; \
+        for (int l_ = 0; l_ < n; l_++) { \
+            int32_t e_ = rr_sdf16((x_), (y_), fx0, fy0 + L[l_].dy, fx1, fy1 + L[l_].dy, r); \
+            if (e_ < 0) e_ = 0; \
+            if (e_ < wq[l_]) k_ = k_ * (255u - fall[l_][e_]) / 255u; } \
+        k_; })
+    if (sy1 > sy0) {
+        int32_t ymid = sy0 + (sy1 - sy0) / 2;
+        for (int32_t i = 0; i < bw; i++) colkeep[i] = (uint8_t)KEEP_AT(bx0 + i, ymid);
+    }
+    int fast = fb_fast();
+    for (int32_t y = by0; y < by1; y++) {
+        int straight_row = y >= sy0 && y < sy1;
+        int covered_row = y >= fy0 + r && y < fy1 - r;     /* the window covers its whole width */
+        uint32_t rowkeep = sx1 > sx0 ? KEEP_AT(sx0 + (sx1 - sx0) / 2, y) : 255;
+        uint8_t *rowp = fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
+        for (int32_t x = bx0; x < bx1; x++) {
+            if (covered_row && x >= fx0 && x < fx1) { x = fx1 - 1; continue; }
+            uint32_t keep;
+            if (straight_row && (x < fx0 || x >= fx1) && x - bx0 < bw) keep = colkeep[x - bx0];
+            else if (x >= sx0 && x < sx1 && (y < fy0 || y >= fy1)) keep = rowkeep;
+            else {
+                /* under the window's own rounded shape: it will be painted over */
+                if (x >= fx0 && x < fx1 && y >= fy0 && y < fy1 && rr_sdf16(x, y, fx0, fy0, fx1, fy1, r) < -8) continue;
+                keep = KEEP_AT(x, y);
+            }
+            if (keep >= 255) continue;
+            if (fast) {
+                uint32_t *p = (uint32_t *)rowp + (x - bx0);
+                *p = pix_mix(0, *p, 255u - keep);
+            } else {
+                uint8_t *p = rowp + (size_t)(x - bx0) * fb_bypp;
+                fb_color_t d = fb_unpack(fb_load(p));
+                fb_store(p, fb_pack(FB_RGB(((d >> 16) & 0xFF) * keep / 255, ((d >> 8) & 0xFF) * keep / 255,
+                                           (d & 0xFF) * keep / 255)));
+            }
+        }
+    }
+    #undef KEEP_AT
+    fb_mark_dirty((uint32_t)bx0, (uint32_t)by0, (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+}
+
 // Soft accent GLOW around the OUTSIDE of a rect [fx0,fy0)-(fx1,fy1): a band of
 // width `gw` whose alpha falls off quadratically with distance from the edge,
 // blended over the framebuffer. Clipped to the given rect (the caller's repaint
@@ -650,6 +963,31 @@ void fb_glow_rect(int32_t fx0, int32_t fy0, int32_t fx1, int32_t fy1, int32_t gw
     if (bx1 > (int32_t)fb.width)  bx1 = (int32_t)fb.width;
     if (by1 > (int32_t)fb.height) by1 = (int32_t)fb.height;
     int32_t gw2 = gw * gw;
+    if (fb_fast() && gw <= 255) {
+        /* the falloff by distance, once per call rather than a divide a pixel */
+        uint8_t fall[256];
+        for (int32_t d = 0; d < gw; d++) {
+            int32_t t = gw - d;
+            fall[d] = (uint8_t)((uint32_t)max_a * (uint32_t)(t * t) / (uint32_t)gw2);
+        }
+        uint32_t c = FB_RGB(cr, cg, cb);
+        if (fb_swap()) c = pix_swap_rb(c);
+        for (int32_t y = by0; y < by1; y++) {
+            uint32_t *p = (uint32_t *)fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
+            int32_t dy = y < fy0 ? fy0 - y : (y >= fy1 ? y - (fy1 - 1) : 0);
+            for (int32_t x = bx0; x < bx1; x++, p++) {
+                if (!dy && x >= fx0 && x < fx1) { p += fx1 - x - 1; x = fx1 - 1; continue; }  /* window covers */
+                int32_t dx = x < fx0 ? fx0 - x : (x >= fx1 ? x - (fx1 - 1) : 0);
+                int32_t d = dx > dy ? dx : dy;
+                if (d >= gw) continue;
+                uint32_t ea = fall[d];
+                if (!ea) continue;
+                *p = pix_mix(c, *p, ea);
+            }
+        }
+        fb_mark_dirty((uint32_t)bx0, (uint32_t)by0, (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+        return;
+    }
     for (int32_t y = by0; y < by1; y++) {
         uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)bx0, (uint32_t)y);
         for (int32_t x = bx0; x < bx1; x++, row += fb_bypp) {
